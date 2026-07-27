@@ -1,0 +1,548 @@
+---
+title: Friends (pairwise relationships & invites)
+description: Client-side management of friend relationships — send invites, accept via mutual invite, block, remove, and list friends. Uses the generic RPC transport with reserved method names.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A **friend** is a pairwise relationship between two accounts (invites → mutual friendship, blocking is one-sided). A client calls **four RPC methods** to manage relationships: `friends.add` (invite or accept), `friends.remove` (unblock and delete), `friends.block` (one-sided), and `friends.list` (read your relations). These are **built-in server RPC methods** (reserved, not overridable by game script), reachable over the existing [generic RPC transport](../../concepts/envelopes#generic-rpc-requestresponse-pattern) — no new wire kinds, no SDK binding changes.
+
+:::note[Engine coverage]
+All shipped client SDKs expose the generic RPC transport, so all engines (Unreal C++, Blueprint, Unity C#, Godot GDScript, Rust `citadel-client`) can call friends methods by sending a `KIND_RPC_REQUEST` and awaiting the correlated `KIND_RPC_RESPONSE`. The examples below show the idiomatic call pattern for each engine.
+:::
+
+:::tip[Caller identity]
+The caller is always the authenticated session's `user_id`. Guests (unauthenticated) receive `RPC_STATUS_ERROR` with body `"authentication required"`. Reserved `friends.*` methods cannot be shadowed by a game script's `on_rpc` handler.
+:::
+
+## State machine: from invite to friend
+
+| From state | Action | Result |
+| --- | --- | --- |
+| (none) | `friends.add` | `invited_sent` on the caller; `invited_received` on the other |
+| `invited_received` | `friends.add` (matching) | Both sides become `friend` |
+| `friend` | `friends.add` (re-invite) | No-op; state stays `friend` |
+| Any | `friends.block` | Caller-side becomes `blocked` (one-sided; blocks re-invites) |
+| `blocked` | `friends.remove` | Clears the block; the relation is deleted |
+| Any | `friends.remove` | Both-sided deletion; unblocked if either side was blocked |
+
+Attempting to add when either side has blocked returns `409 conflict`. A user cannot befriend or block themselves — returns `400 invalid request`.
+
+## `friends.add` — invite or accept
+
+**Purpose:** Invite another user to be friends, or complete a mutual friendship if they already invited the caller (how "accept" happens).
+
+**Request body (JSON):**
+```json
+{ "other": "<user_id>" }
+```
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `other` | string | yes | The account to invite. |
+
+**Success response (`status=0`, JSON):**
+```json
+{ "state": "<friend_state>" }
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `state` | string | The caller's new state: `invited_sent`, `invited_received` (unchanged, caller sent first), `friend` (mutual or re-invite), or `blocked` (rejected). |
+
+**Errors (`status != 0`, UTF-8 message body)**
+
+| Case | Message |
+| --- | --- |
+| Unauthenticated (guest) | `"authentication required"` |
+| Invalid JSON body | `"invalid JSON body"` |
+| Missing or empty `other` field | `"missing string field: other"` |
+| Caller == other (self-friendship) | `"validation: cannot befriend yourself"` |
+| Either side is blocked | `"relationship is blocked"` |
+
+**Examples**
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+// Send the friends.add RPC with a JSON body.
+auto* Client = GetGameInstance->GetSubsystem<UCitadelClientSubsystem>;
+
+FString payload = FString::Printf(TEXT(R"({"other":"%s"})"), *OtherId);
+auto status = Client->Send(
+    CitadelWire::KindRpcRequest,
+    FStringToBinary(payload),
+    true  // reliable
+);
+if (status != ECitadelStatus::Ok && status != ECitadelStatus::Again) {
+    UE_LOG(LogTemp, Error, TEXT("RPC send failed: %s"), *Client->LastError);
+    return;
+}
+
+// Poll until the correlated KIND_RPC_RESPONSE arrives.
+uint16 kind;
+TArray<uint8> body;
+while (Client->Poll(kind, body) == ECitadelStatus::Ok) {
+    if (kind == CitadelWire::KindRpcResponse) {
+        uint64 requestId;
+        uint8 status;
+        TArray<uint8> payload;
+        if (CitadelWire::DecodeRpcResponse(body, requestId, status, payload)) {
+            if (status == CitadelWire::RpcStatusOk) {
+                // Parse the JSON: { "state": "invited_sent"|"friend"|... }
+                FString stateStr = BinaryToFString(payload);
+                // Extract and use the state.
+                UE_LOG(LogTemp, Warning, TEXT("Add succeeded; new state: %s"), *stateStr);
+            } else {
+                FString errorMsg = BinaryToFString(payload);
+                UE_LOG(LogTemp, Error, TEXT("Add failed: %s"), *errorMsg);
+            }
+            return;
+        }
+    }
+}
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+Blueprints aren't text, so this is the node recipe:
+
+1. From **Citadel Client Subsystem**, call **Send** with:
+   - **Kind** = RPC Request (use a Blueprint-callable constant or numeric 3)
+   - **Payload** = JSON string `{"other":"user_id"}` converted to **Get Bytes** (string encoding)
+   - **bReliable** = true
+2. In a **Tick** or timer, repeatedly call **Poll** (do not block; poll each frame).
+3. When **Poll** returns **Ok** and **Kind** = RPC Response (numeric 4), call **Decode RPC Response** (implement as a Blueprint Library function or use the native subsystem's helper).
+4. Extract **Status** and **Payload**; if **Status** = 0, parse the JSON **Payload** as UTF-8 text and read the `state` field.
+
+(Blueprint best practice: encapsulate the polling and JSON parsing in a reusable Blueprint Library function to avoid the boilerplate in each call site.)
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+// Using the unity demo's RpcClient helper.
+var rpcClient = GetComponent<Citadel.Demo.RpcClient>;
+
+byte[] payload = System.Text.Encoding.UTF8.GetBytes(
+    System.Text.Json.JsonSerializer.Serialize(new { other = otherId })
+);
+
+rpcClient.CallRpc("friends.add", payload, result =>
+{
+    if (result.Ok)
+    {
+        string json = System.Text.Encoding.UTF8.GetString(result.Payload);
+        var response = System.Text.Json.JsonSerializer.Deserialize<FriendsAddResponse>(json);
+        Debug.Log($"Add succeeded; new state: {response.state}");
+    }
+    else
+    {
+        Debug.LogError($"Add failed: {result.PayloadAsText}");
+    }
+});
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+# Target API (bindings land via client-sdk-sync).
+var citadel := CitadelClient.new
+
+var payload := JSON.stringify({"other": other_id}).to_utf8_buffer
+citadel.call_rpc("friends.add", payload, func(result: CitadelRpcResult):
+    if result.ok:
+        var json = JSON.parse_string(result.payload.get_string_from_utf8)
+        print("Add succeeded; new state: ", json.state)
+    else:
+        print("Add failed: ", result.payload.get_string_from_utf8)
+)
+```
+
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+```rust
+use serde_json::json;
+
+let payload = json!({"other": other_id}).to_string.into_bytes;
+match client.call_rpc("friends.add", &payload).await {
+    Ok(reply) => {
+        let response: serde_json::Value = serde_json::from_slice(&reply)?;
+        println!("Add succeeded; new state: {}", response["state"]);
+    }
+    Err(e) => {
+        eprintln!("Add failed: {}", e);
+    }
+}
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const payload = new TextEncoder.encode(JSON.stringify({ other: otherId }));
+const response = JSON.parse(new TextDecoder.decode(await client.callRpc("friends.add", payload)));
+console.log(response.state);
+```
+
+</TabItem>
+</Tabs>
+
+## `friends.remove` — delete and unblock
+
+**Purpose:** Delete a friend relation in both directions. If either side was blocked, this also clears the block.
+
+**Request body (JSON):**
+```json
+{ "other": "<user_id>" }
+```
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `other` | string | yes | The account to remove. |
+
+**Success response (`status=0`, JSON):**
+```json
+{ "removed": true|false }
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `removed` | bool | `true` if a relation existed and was deleted; `false` if no relation existed (no-op success). |
+
+**Errors (`status != 0`, UTF-8 message body)**
+
+| Case | Message |
+| --- | --- |
+| Unauthenticated (guest) | `"authentication required"` |
+| Invalid JSON body | `"invalid JSON body"` |
+| Missing or empty `other` field | `"missing string field: other"` |
+
+**Examples**
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+auto* Client = GetGameInstance->GetSubsystem<UCitadelClientSubsystem>;
+
+FString payload = FString::Printf(TEXT(R"({"other":"%s"})"), *OtherId);
+Client->Send(CitadelWire::KindRpcRequest, FStringToBinary(payload), true);
+
+// Poll for response (see friends.add for the polling pattern).
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+Same polling pattern as `friends.add`; the method name is `"friends.remove"`. Parse the response JSON: `{"removed": true|false}`.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+byte[] payload = System.Text.Encoding.UTF8.GetBytes(
+    System.Text.Json.JsonSerializer.Serialize(new { other = otherId })
+);
+
+rpcClient.CallRpc("friends.remove", payload, result =>
+{
+    if (result.Ok)
+    {
+        string json = System.Text.Encoding.UTF8.GetString(result.Payload);
+        var response = System.Text.Json.JsonSerializer.Deserialize<FriendsRemoveResponse>(json);
+        Debug.Log($"Remove result: removed={response.removed}");
+    }
+    else
+    {
+        Debug.LogError($"Remove failed: {result.PayloadAsText}");
+    }
+});
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+var payload := JSON.stringify({"other": other_id}).to_utf8_buffer
+citadel.call_rpc("friends.remove", payload, func(result: CitadelRpcResult):
+    if result.ok:
+        var json = JSON.parse_string(result.payload.get_string_from_utf8)
+        print("Remove result: removed=", json.removed)
+    else:
+        print("Remove failed: ", result.payload.get_string_from_utf8)
+)
+```
+
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+```rust
+let payload = json!({"other": other_id}).to_string.into_bytes;
+match client.call_rpc("friends.remove", &payload).await {
+    Ok(reply) => {
+        let response: serde_json::Value = serde_json::from_slice(&reply)?;
+        println!("Remove result: removed={}", response["removed"]);
+    }
+    Err(e) => {
+        eprintln!("Remove failed: {}", e);
+    }
+}
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const payload = new TextEncoder.encode(JSON.stringify({ other: otherId }));
+const response = JSON.parse(new TextDecoder.decode(await client.callRpc("friends.remove", payload)));
+console.log(response.removed);
+```
+
+</TabItem>
+</Tabs>
+
+## `friends.block` — block one-sided
+
+**Purpose:** One-sidedly block another user, preventing them from re-inviting the caller.
+
+**Request body (JSON):**
+```json
+{ "other": "<user_id>" }
+```
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `other` | string | yes | The account to block. |
+
+**Success response (`status=0`, JSON):**
+```json
+{}
+```
+
+An empty object (no fields).
+
+**Errors (`status != 0`, UTF-8 message body)**
+
+| Case | Message |
+| --- | --- |
+| Unauthenticated (guest) | `"authentication required"` |
+| Invalid JSON body | `"invalid JSON body"` |
+| Missing or empty `other` field | `"missing string field: other"` |
+| Caller == other (self-block) | `"validation: cannot befriend yourself"` |
+
+**Examples**
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+auto* Client = GetGameInstance->GetSubsystem<UCitadelClientSubsystem>;
+
+FString payload = FString::Printf(TEXT(R"({"other":"%s"})"), *OtherId);
+Client->Send(CitadelWire::KindRpcRequest, FStringToBinary(payload), true);
+
+// Poll for response (see friends.add for the polling pattern).
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+Same pattern as `friends.add`; method name is `"friends.block"`. The success response body is `{}`.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+byte[] payload = System.Text.Encoding.UTF8.GetBytes(
+    System.Text.Json.JsonSerializer.Serialize(new { other = otherId })
+);
+
+rpcClient.CallRpc("friends.block", payload, result =>
+{
+    if (result.Ok)
+    {
+        Debug.Log("Block succeeded.");
+    }
+    else
+    {
+        Debug.LogError($"Block failed: {result.PayloadAsText}");
+    }
+});
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+var payload := JSON.stringify({"other": other_id}).to_utf8_buffer
+citadel.call_rpc("friends.block", payload, func(result: CitadelRpcResult):
+    if result.ok:
+        print("Block succeeded.")
+    else:
+        print("Block failed: ", result.payload.get_string_from_utf8)
+)
+```
+
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+```rust
+let payload = json!({"other": other_id}).to_string.into_bytes;
+match client.call_rpc("friends.block", &payload).await {
+    Ok(_) => {
+        println!("Block succeeded.");
+    }
+    Err(e) => {
+        eprintln!("Block failed: {}", e);
+    }
+}
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const payload = new TextEncoder.encode(JSON.stringify({ other: otherId }));
+await client.callRpc("friends.block", payload);
+```
+
+</TabItem>
+</Tabs>
+
+## `friends.list` — read all relations
+
+**Purpose:** Retrieve all friend relations for the caller, ordered by the other user's id.
+
+**Request body (JSON):**
+```json
+{}
+```
+
+(Empty object; no fields required.)
+
+**Success response (`status=0`, JSON):**
+```json
+{
+  "friends": [
+    {
+      "user_id": "<id>",
+      "state": "<friend_state>",
+      "updated_unix_ms": <u64>
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `friends` | array | List of relation rows. |
+| `friends[].user_id` | string | The other account. |
+| `friends[].state` | string | The caller's state: `invited_sent`, `invited_received`, `friend`, or `blocked`. |
+| `friends[].updated_unix_ms` | number | Unix milliseconds when this relation last changed. |
+
+**Errors (`status != 0`, UTF-8 message body)**
+
+| Case | Message |
+| --- | --- |
+| Unauthenticated (guest) | `"authentication required"` |
+| Invalid JSON body | `"invalid JSON body"` |
+
+**Examples**
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+auto* Client = GetGameInstance->GetSubsystem<UCitadelClientSubsystem>;
+
+FString payload = TEXT("{}");
+Client->Send(CitadelWire::KindRpcRequest, FStringToBinary(payload), true);
+
+// Poll for response (see friends.add for the polling pattern).
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+Same pattern as `friends.add`; method name is `"friends.list"`. Parse the response JSON: `{"friends": [{user_id, state, updated_unix_ms}, ...]}`.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+byte[] payload = System.Text.Encoding.UTF8.GetBytes("{}");
+
+rpcClient.CallRpc("friends.list", payload, result =>
+{
+    if (result.Ok)
+    {
+        string json = System.Text.Encoding.UTF8.GetString(result.Payload);
+        var response = System.Text.Json.JsonSerializer.Deserialize<FriendsListResponse>(json);
+        foreach (var friend in response.friends)
+        {
+            Debug.Log($"{friend.user_id}: {friend.state} (updated {friend.updated_unix_ms})");
+        }
+    }
+    else
+    {
+        Debug.LogError($"List failed: {result.PayloadAsText}");
+    }
+});
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+var payload := JSON.stringify({}).to_utf8_buffer
+citadel.call_rpc("friends.list", payload, func(result: CitadelRpcResult):
+    if result.ok:
+        var json = JSON.parse_string(result.payload.get_string_from_utf8)
+        for friend in json.friends:
+            print(friend.user_id, ": ", friend.state, " (", friend.updated_unix_ms, ")")
+    else:
+        print("List failed: ", result.payload.get_string_from_utf8)
+)
+```
+
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+```rust
+let payload = json!({}).to_string.into_bytes;
+match client.call_rpc("friends.list", &payload).await {
+    Ok(reply) => {
+        let response: serde_json::Value = serde_json::from_slice(&reply)?;
+        for friend in response["friends"].as_array.unwrap_or(&vec![]) {
+            println!(
+                "{}: {} ({})",
+                friend["user_id"], friend["state"], friend["updated_unix_ms"]
+            );
+        }
+    }
+    Err(e) => {
+        eprintln!("List failed: {}", e);
+    }
+}
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const response = JSON.parse(new TextDecoder.decode(await client.callRpc("friends.list")));
+for (const friend of response.friends) console.log(friend.user_id, friend.state);
+```
+
+</TabItem>
+</Tabs>
+
+## Related surfaces
+
+- **Operator console (admin API):** Friends can also be managed via the [admin-console friends endpoints](/reference/admin-api/friends) for operator-side tooling and batch operations.
+- **Server-side scripting (host API):** A server-side Lua, Python, or JavaScript script can manage friends via the `citadel.friends.*` host-API functions — a tracked follow-on, not yet shipped. When available, it will expose identical semantics over the scripting runtime.

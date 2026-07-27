@@ -1,0 +1,22 @@
+---
+title: Server SDK API reference
+description: API reference for Citadel server-side game logic runtimes and server SDK surfaces.
+---
+
+Server SDK pages document APIs that run inside or alongside the Citadel server:
+runtime hooks, RPC handlers, authoritative simulation helpers, and server-side
+message send/broadcast operations.
+
+:::note[Current shipped runtimes]
+Lua ships in the default embedded server runtime. Python ships as an embedded
+CPython trusted-tier runtime with `--features runtime-python`. JavaScript ships
+as capped embedded QuickJS with `--features runtime-js`.
+:::
+
+## Modules
+
+- [Lua runtime API](/reference/server-sdk/lua-runtime/)
+- [Python runtime API](/reference/server-sdk/python-runtime/)
+- [JavaScript runtime API](/reference/server-sdk/js-runtime/)
+- [NetworkPeer server authority](/reference/server-sdk/networkpeer-authority/)
+- [NetworkPeer schema evolution contract](/reference/server-sdk/networkpeer-schema-evolution/)

@@ -1,0 +1,149 @@
+{
+  "abi_version": 2,
+  "http": {
+    "auth_request_fields": [
+      "id",
+      "create",
+      "username",
+      "display_name",
+      "metadata"
+    ],
+    "auth_response_fields": [
+      "token",
+      "refresh_token",
+      "user_id",
+      "username",
+      "created"
+    ],
+    "custom_auth_path": "/v1/auth/custom",
+    "device_auth_path": "/v1/auth/device",
+    "email_auth_path": "/v1/auth/email",
+    "email_auth_request_fields": [
+      "email",
+      "password",
+      "create",
+      "username",
+      "display_name",
+      "metadata"
+    ]
+  },
+  "netcode": {
+    "baseline": {
+      "ack_history_bits": 32,
+      "token": "server-issued monotonic nonzero u64 (0 reserved for none/is_full)"
+    },
+    "bit_order": "msb-first-within-byte",
+    "codec_ids": {
+      "BOOL": 1,
+      "QUAT_SMALLEST3_10": 5,
+      "QUAT_SMALLEST3_15": 6,
+      "QUAT_SMALLEST3_9": 4,
+      "SCALAR_QUANT": 2,
+      "VECTOR3_QUANT": 3
+    },
+    "netpeer": {
+      "base_id": "token diffed against; 0 iff is_full (no base)",
+      "caps": {
+        "max_ack_entries": 8192,
+        "max_bunches_per_envelope": 4096,
+        "max_bytes_field_len": 1048576,
+        "max_collection_ops": 65536,
+        "max_envelope_alloc": 4194304,
+        "max_schema_entries": 8192
+      },
+      "collections": "FastArray-style keyed delta: rep_id {index:u32, gen:u32} + rep_key u64; removed/added/changed; duplicate rep_ids rejected",
+      "layout_version_bits": 32,
+      "object_id_bits": 32,
+      "result_id": "server-issued nonzero token every bunch establishes; acks name it",
+      "varint": "bit-packed LEB128, [continuation:1][data:7] groups, least-significant first, canonical (overlong rejected)",
+      "varint_max_groups": 10
+    },
+    "quantization": {
+      "canonical_unit": "cm",
+      "default_world_bounds": {
+        "max": [
+          262144.0,
+          262144.0,
+          32768.0
+        ],
+        "min": [
+          -262144.0,
+          -262144.0,
+          -32768.0
+        ],
+        "values_per_unit": 8
+      },
+      "formula": "levels = round((max-min)*values_per_unit); bits = ceil_log2(levels+1); inclusive endpoints",
+      "quat_modes": {
+        "Bits10": 10,
+        "Bits15": 15,
+        "Bits9": 9
+      },
+      "rounding": "floor(x + 0.5) in f64",
+      "saturation": "encode clamps to bounds (never wraps); decode rejects out-of-range codes"
+    },
+    "schema_hash": {
+      "algorithm": "blake3-128/citadel.schema.v1",
+      "bytes": 16
+    },
+    "test_vectors": "crates/citadel-wire/tests/wire_vectors.json"
+  },
+  "wire": {
+    "ACK_HISTORY_BITS": 32,
+    "AUTH_REASON_AUTH_FAILED": 0,
+    "AUTH_REASON_AUTH_REQUIRED": 1,
+    "AUTH_REASON_PROTOCOL": 2,
+    "AUTH_STATUS_AUTHENTICATED": 0,
+    "AUTH_STATUS_GUEST": 1,
+    "AUTH_STATUS_REJECTED": 2,
+    "CHAT_KIND_MAX": 28,
+    "CHAT_KIND_MIN": 28,
+    "KIND_AUTH": 5,
+    "KIND_AUTH_RESULT": 6,
+    "KIND_CHAT_EVENT": 28,
+    "KIND_MATCHMAKER_MATCHED": 26,
+    "KIND_NA_DESPAWN": 19,
+    "KIND_NA_PRESENCE": 16,
+    "KIND_NA_SPAWN": 17,
+    "KIND_NA_SPAWN_BATCH": 18,
+    "KIND_NA_STATE": 20,
+    "KIND_NOTIFICATION": 27,
+    "KIND_PEER_POSITION": 2,
+    "KIND_POSITION": 1,
+    "KIND_REP_ACK": 14,
+    "KIND_REP_DELTA": 13,
+    "KIND_REP_SCHEMA": 15,
+    "KIND_ROOM_CREATE": 21,
+    "KIND_ROOM_JOIN": 22,
+    "KIND_ROOM_JOINED": 23,
+    "KIND_ROOM_LEAVE": 24,
+    "KIND_ROOM_MAP_READY": 25,
+    "KIND_RPC_REQUEST": 3,
+    "KIND_RPC_RESPONSE": 4,
+    "KIND_TSYNC_ACK": 10,
+    "KIND_TSYNC_HELLO": 7,
+    "KIND_TSYNC_INPUT": 9,
+    "KIND_TSYNC_REWIND": 12,
+    "KIND_TSYNC_ROLE": 11,
+    "KIND_TSYNC_SNAPSHOT": 8,
+    "MATCHMAKER_KIND_MAX": 26,
+    "MATCHMAKER_KIND_MIN": 26,
+    "NA_KIND_MAX": 20,
+    "NA_KIND_MIN": 16,
+    "NOTIFICATION_KIND_MAX": 27,
+    "NOTIFICATION_KIND_MIN": 27,
+    "POSITION_BYTES": 8,
+    "REP_KIND_MAX": 15,
+    "REP_KIND_MIN": 13,
+    "ROOM_KIND_MAX": 25,
+    "ROOM_KIND_MIN": 21,
+    "RPC_METHOD_LEN_BYTES": 2,
+    "RPC_REQUEST_ID_BYTES": 8,
+    "RPC_STATUS_ERROR": 1,
+    "RPC_STATUS_OK": 0,
+    "SCHEMA_HASH_BYTES": 16,
+    "SENDER_ID_BYTES": 8,
+    "TSYNC_KIND_MAX": 12,
+    "TSYNC_KIND_MIN": 7
+  }
+}

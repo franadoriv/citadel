@@ -1,0 +1,729 @@
+---
+title: Build Knights vs Monsters
+description: "A friendly, from-zero tutorial for a tiny online game: one Citadel server, many knights, one grumpy monster, and real server authority."
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+This tutorial builds a very small online game called **Knights vs Monsters**.
+Every player controls a knight. Everybody can see the same monster. Knights can
+walk near it and attack it. The **server** decides whether an attack counts and
+how much HP the monster has left.
+
+It is deliberately tiny. Tiny is good: you can understand it, change it, break
+it, and fix it without needing a committee meeting with a dragon.
+
+By the end, you will have:
+
+- a Citadel server running a Lua game script;
+- a monster definition owned by the game script, not by a browser tab;
+- a small three-message protocol: move, attack, and state update;
+- a client path for Unreal C++, Unreal Blueprint, Unity C#, Godot GDScript, and
+  Web JavaScript with Three.js;
+- a clear next step for saving player-owned data safely.
+
+## Before we begin: the picture in your head
+
+There are two jobs in an online game:
+
+```text
+your game client                    Citadel + Lua game script
+---------------                     --------------------------
+draw knight                  -->    remember the real positions
+ask to move                  -->    check the request is sensible
+ask to attack                -->    check range, reduce monster HP
+draw received state          <--    announce the approved result
+```
+
+Your client is allowed to **ask**. The server is the referee that says **yes**,
+**no**, or occasionally *nice try*. This is called **server authority**. It is
+the first habit that keeps an online game fair and debuggable.
+
+:::tip[Keep the first goal small]
+Do not start with inventories, twenty monster species, paid battle passes, and
+a weather system that reacts to moon phases. First make one knight move and one
+monster lose HP. That is a real win.
+:::
+
+## Step 1: make a clean game folder
+
+Start from a Citadel checkout or a Citadel server package. In the folder that
+contains `citadel.toml`, create this layout:
+
+```text
+your-game/
+  citadel.toml
+  game/
+    main.lua
+```
+
+Citadel loads `game/main.lua` as the Lua game layer. The standalone default
+configuration already points at `./game`; the smallest useful runtime section
+looks like this:
+
+```toml
+[runtime]
+enabled = true
+language = "lua"
+tier = "trusted"       # your own server-side game code
+scripts_dir = "./game"
+tick_hz = 10
+hot_reload = true       # save main.lua; Citadel reloads a valid edit
+hot_reload_poll_ms = 500
+
+[transport.websocket]
+enabled = true
+bind = "127.0.0.1:7352"
+```
+
+Why WebSocket? It is the easiest first transport to inspect in a browser. You
+can move to QUIC later when your first knight has stopped walking into walls.
+
+Start the server from the repository root:
+
+```powershell
+# Windows PowerShell
+.\make server
+```
+
+```bash
+# macOS / Linux / Git Bash
+make server
+```
+
+You should see a line that says Citadel loaded an embedded Lua runtime. Keep
+this terminal open. It is now your game server, not a decorative terminal plant.
+
+## Step 2: agree on three messages
+
+Games are easier when you write down what crosses the network. Citadel reserves
+kinds `1` through `25` for its built-in protocol, so our game uses values above
+`100`.
+
+| Kind | Name | Direction | Body | Why it exists |
+| --- | --- | --- | --- | --- |
+| `100` | `MOVE` | client → server | `"x,z"` | A knight asks to move. |
+| `101` | `ATTACK` | client → server | monster id, e.g. `"moss-ogre"` | A knight asks to swing. |
+| `102` | `STATE` | server → clients | a small text record | Everyone redraws the approved world. |
+
+For a learning project, human-readable text records are wonderfully boring in a
+good way: you can log them and understand them. A production game will normally
+move to a compact binary schema after the rules are stable.
+
+The `STATE` records below have these shapes:
+
+```text
+knight,<player-id>,<x>,<z>
+monster,<monster-id>,<x>,<z>,<hp>,<max-hp>,<alive>
+```
+
+## Step 3: write the server rules
+
+Put this complete first version in `game/main.lua`.
+
+```lua
+-- Knights vs Monsters: a tiny authoritative server.
+-- Kinds 1..25 are Citadel-reserved. Game kinds begin at 100.
+local KIND_MOVE = 100
+local KIND_ATTACK = 101
+local KIND_STATE = 102
+
+local ARENA_LIMIT = 20.0
+local ATTACK_RANGE = 3.0
+local RESPAWN_SECONDS = 5.0
+
+-- A Lua "class" is a table plus a metatable. We keep behaviour in Lua and
+-- store/transmit plain data, never the metatable itself.
+local Character = {}
+Character.__index = Character
+function Character:new(fields)
+  return setmetatable(fields or {}, self)
+end
+
+local Monster = setmetatable({}, { __index = Character })
+Monster.__index = Monster
+function Monster:new(fields)
+  return Character.new(self, fields)
+end
+
+-- This is global game content. It belongs in Lua/Git so a code review can see
+-- it. It is not a player-owned storage object.
+local moss_ogre = Monster:new({
+  id = "moss-ogre", name = "Moss Ogre", x = 0.0, z = 0.0,
+  hp = 80, max_hp = 80, alive = true, respawn_in = 0.0,
+})
+
+local knights = {} -- participant id -> { x, z }
+
+local function clamp(value, low, high)
+  return math.max(low, math.min(high, value))
+end
+
+local function distance(ax, az, bx, bz)
+  local dx, dz = bx - ax, bz - az
+  return math.sqrt(dx * dx + dz * dz)
+end
+
+local function knight_state(id, knight)
+  return string.format("knight,%d,%.2f,%.2f", id, knight.x, knight.z)
+end
+
+local function monster_state
+  return string.format("monster,%s,%.2f,%.2f,%d,%d,%d",
+    moss_ogre.id, moss_ogre.x, moss_ogre.z, moss_ogre.hp,
+    moss_ogre.max_hp, moss_ogre.alive and 1 or 0)
+end
+
+local function tell_everyone_the_monster_state
+  citadel.broadcast(KIND_STATE, monster_state, true)
+end
+
+citadel.on_join(function(ctx)
+  knights[ctx.sender] = { x = -8.0, z = 0.0 }
+  citadel.broadcast(KIND_STATE, knight_state(ctx.sender, knights[ctx.sender]), true)
+  citadel.send(ctx.sender, KIND_STATE, monster_state, true)
+  citadel.log("A knight joined. Helmets are optional; server authority is not.", "info")
+end)
+
+citadel.on_leave(function(ctx)
+  knights[ctx.sender] = nil
+end)
+
+citadel.on_message(KIND_MOVE, function(ctx, body)
+  local knight = knights[ctx.sender]
+  if not knight then return end
+
+  local x_text, z_text = string.match(body, "^([^,]+),([^,]+)$")
+  local x, z = tonumber(x_text), tonumber(z_text)
+  if not x or not z then return end -- malformed request: ignore it safely
+
+  knight.x = clamp(x, -ARENA_LIMIT, ARENA_LIMIT)
+  knight.z = clamp(z, -ARENA_LIMIT, ARENA_LIMIT)
+  citadel.broadcast(KIND_STATE, knight_state(ctx.sender, knight), false)
+end)
+
+citadel.on_message(KIND_ATTACK, function(ctx, body)
+  local knight = knights[ctx.sender]
+  if not knight or body ~= moss_ogre.id or not moss_ogre.alive then return end
+
+  if distance(knight.x, knight.z, moss_ogre.x, moss_ogre.z) > ATTACK_RANGE then
+    citadel.send(ctx.sender, KIND_STATE, "notice,Too far away. Your sword is not Wi-Fi.", true)
+    return
+  end
+
+  moss_ogre.hp = math.max(0, moss_ogre.hp - 10)
+  if moss_ogre.hp == 0 then
+    moss_ogre.alive = false
+    moss_ogre.respawn_in = RESPAWN_SECONDS
+  end
+  tell_everyone_the_monster_state
+end)
+
+citadel.on_tick(function(dt)
+  if moss_ogre.alive then return end
+  moss_ogre.respawn_in = moss_ogre.respawn_in - dt
+  if moss_ogre.respawn_in <= 0 then
+    moss_ogre.hp = moss_ogre.max_hp
+    moss_ogre.alive = true
+    tell_everyone_the_monster_state
+  end
+end)
+```
+
+### Read the important parts once
+
+1. `knights` and `moss_ogre` live on the **server**. A browser refresh cannot
+   award itself a legendary sword by changing one JavaScript variable.
+2. A move is clamped to the arena. The client can ask for `(999999, 0)`; the
+   server calmly says “nope” and uses `(20, 0)`.
+3. The server checks attack range **before** it subtracts HP.
+4. Every accepted change is broadcast as `STATE`. Clients draw what the server
+   said happened.
+
+Save the file. With hot reload enabled, Citadel accepts a valid edit without a
+restart. If your edit has a syntax error, it keeps the previous working script.
+That is less dramatic than a server crash, which is exactly the point.
+
+## Step 4: connect your first client
+
+Choose one client path below. All paths share the exact three game kinds and
+the same text bodies from [Step 2](#step-2-agree-on-three-messages).
+
+:::caution[Current engine status]
+Unreal and Unity have usable native client routes. The Godot SDK currently
+contains real protocol code but its native GDExtension transport is still a
+skeleton, so its tab shows the intended game code but cannot yet make a live
+connection. Blueprint can call the Unreal connection/auth nodes, while raw game
+envelopes (`Send`/`Poll`) are currently C++ only; the Blueprint recipe below uses
+a small C++ bridge component.
+:::
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+### Unreal: make a small game component
+
+1. Follow the [Unreal plugin guide](/guides/engines/#unreal-c-drop-in-plugin) to
+   bundle and copy the `Citadel` plugin into your project.
+2. Create a C++ `UActorComponent` named `UKnightsClientComponent` and add it to
+   your player pawn.
+3. In `BeginPlay`, get `UCitadelClientSubsystem`, connect, then send the empty
+   guest handshake (`KIND_AUTH = 5`) before game messages.
+
+```cpp
+// KnightsClientComponent.cpp (important parts)
+#include "CitadelClientSubsystem.h"
+#include "CitadelWire.h"
+
+static constexpr uint16 KIND_MOVE = 100;
+static constexpr uint16 KIND_ATTACK = 101;
+static constexpr uint16 KIND_STATE = 102;
+
+void UKnightsClientComponent::BeginPlay
+{
+    Super::BeginPlay;
+    Client = GetWorld->GetGameInstance->GetSubsystem<UCitadelClientSubsystem>;
+    if (Client->ConnectWebSocket(TEXT("ws://127.0.0.1:7352/")) != ECitadelStatus::Ok)
+    {
+        UE_LOG(LogTemp, Error, TEXT("Citadel: %s"), *Client->GetLastError);
+        return;
+    }
+    Client->Send(CitadelWire::KIND_AUTH, {}, true); // explicit guest handshake
+}
+
+void UKnightsClientComponent::SendMove(FVector2D Position)
+{
+    const FString Text = FString::Printf(TEXT("%.2f,%.2f"), Position.X, Position.Y);
+    FTCHARToUTF8 Utf8(*Text);
+    TArray<uint8> Bytes;
+    Bytes.Append(reinterpret_cast<const uint8*>(Utf8.Get), Utf8.Length);
+    Client->Send(KIND_MOVE, Bytes, false);
+}
+
+void UKnightsClientComponent::AttackMossOgre
+{
+    const char* Target = "moss-ogre";
+    TArray<uint8> Bytes;
+    Bytes.Append(reinterpret_cast<const uint8*>(Target), FCStringAnsi::Strlen(Target));
+    Client->Send(KIND_ATTACK, Bytes, true);
+}
+
+void UKnightsClientComponent::TickComponent(float DeltaTime, ELevelTick TickType,
+    FActorComponentTickFunction* ThisTickFunction)
+{
+    uint16 Kind = 0;
+    TArray<uint8> Payload;
+    while (Client && Client->Poll(Kind, Payload) == ECitadelStatus::Ok)
+    {
+        if (Kind == KIND_STATE)
+        {
+            Payload.Add(0); // make a temporary NUL-terminated UTF-8 string
+            const FString State = UTF8_TO_TCHAR(reinterpret_cast<const char*>(Payload.GetData));
+            ApplyStateLine(State); // split `knight,...`, `monster,...`, or `notice,...`
+        }
+    }
+}
+```
+
+`ApplyStateLine` is your presentation code: move a knight mesh, update an HP
+bar, or show a notice. It must not decide damage. The Lua script already did
+that work.
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+### Unreal Blueprint: use a tiny bridge, then wire nodes
+
+Raw `Send` and `Poll` use byte arrays and a `uint16` kind, so they are C++ only
+today. Add the small `UKnightsClientComponent` from the **Unreal C++** tab to
+your pawn and mark these methods/events Blueprint-friendly:
+
+- `SendMove(Vector2D)` and `AttackMossOgre` as **BlueprintCallable**;
+- `OnKnightState`, `OnMonsterState`, and `OnNotice` as Blueprint events/delegates.
+
+Now the Blueprint graph is pleasantly boring:
+
+1. In your **Knight Pawn**, add **Knights Client Component**.
+2. On **Begin Play**, use **Get Game Instance Subsystem → Citadel Client
+   Subsystem → Connect Web Socket** with `ws://127.0.0.1:7352/`.
+3. Bind **On Monster State**. Set your monster actor location from `(X, Z)` and
+   set the progress bar to `HP / Max HP`.
+4. On **Event Tick**, read your movement input, make a `Vector2D(X, Z)`, then
+   call **Send Move** on the component.
+5. On your attack input action, call **Attack Moss Ogre**. Do not subtract HP in
+   Blueprint; wait for **On Monster State**.
+6. Bind **On Notice** to a `Print String` node for now. A tiny “Too far away”
+   toast is a surprisingly good teacher.
+
+The `Citadel Client Subsystem` also exposes **Authenticate Device** and its
+`On Authenticated` event for account flows. That is separate from this first
+guest-only game loop.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+### Unity: one component owns the network queue
+
+1. Follow the [Unity sample setup](/guides/unity-quic-sample/) to place the C#
+   bindings and native DLL in your project.
+2. Add this component to an empty `Network` GameObject.
+3. Drag a monster GameObject into `monsterVisual`. Two editor windows running
+   the scene are enough for a delightful first multiplayer test.
+
+```csharp
+using System;
+using System.Globalization;
+using System.Text;
+using Citadel;
+using UnityEngine;
+
+public sealed class KnightsClient : MonoBehaviour
+{
+    const ushort KindMove = 100, KindAttack = 101, KindState = 102;
+    public Transform monsterVisual;
+    CitadelClient client;
+    readonly byte[] buffer = new byte[1024];
+    Vector2 localPosition;
+
+    void Start
+    {
+        client = CitadelClient.ConnectWebSocket("ws://127.0.0.1:7352/");
+        client.Send(CitadelProtocol.KindAuth, Array.Empty<byte>, reliable: true);
+    }
+
+    void Update
+    {
+        var move = new Vector2(Input.GetAxisRaw("Horizontal"), Input.GetAxisRaw("Vertical"));
+        localPosition += move * 5f * Time.deltaTime;
+        var body = Encoding.UTF8.GetBytes($"{localPosition.x.ToString(CultureInfo.InvariantCulture)},{localPosition.y.ToString(CultureInfo.InvariantCulture)}");
+        client.Send(KindMove, body, reliable: false);
+
+        if (Input.GetKeyDown(KeyCode.Space))
+            client.Send(KindAttack, Encoding.UTF8.GetBytes("moss-ogre"), reliable: true);
+
+        while (client.Poll(buffer, out ushort kind, out int length, out bool truncated) == PollResult.Message)
+        {
+            if (truncated || kind != KindState) continue;
+            ApplyState(Encoding.UTF8.GetString(buffer, 0, length));
+        }
+    }
+
+    void ApplyState(string line)
+    {
+        var parts = line.Split(',');
+        if (parts[0] == "monster" && parts.Length == 7)
+        {
+            float x = float.Parse(parts[2], CultureInfo.InvariantCulture);
+            float z = float.Parse(parts[3], CultureInfo.InvariantCulture);
+            monsterVisual.position = new Vector3(x, 0, z);
+            Debug.Log($"Ogre HP: {parts[4]}/{parts[5]}");
+        }
+        else if (parts[0] == "notice") Debug.Log(parts[1]);
+    }
+
+    void OnDestroy => client?.Dispose;
+}
+```
+
+One component drains `Poll`. That rule prevents two scripts from racing to eat
+the same packet. Networking is a team sport; packet queues dislike tug-of-war.
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+### Godot: write the game-side script now, wire transport next
+
+Copy the Godot protocol/client scripts as described in the
+[Godot SDK README](../../../../../../clients/godot/README.md).
+The protocol encoding below is real, but the native GDExtension bridge is not
+yet shipped; `connect_websocket`/`connect_quic` will report a non-OK status until
+that bridge lands. Use this tab to prepare your game code, then run the live
+version through Web, Unity, or Unreal today.
+
+```gdscript
+extends Node2D
+
+const KIND_MOVE := 100
+const KIND_ATTACK := 101
+const KIND_STATE := 102
+
+var client := CitadelClient.new
+var local_position := Vector2.ZERO
+
+func _ready -> void:
+    var status := client.connect_websocket("ws://127.0.0.1:7352/")
+    if status != CitadelClient.Status.OK:
+        push_warning("Transport bridge pending: %s" % client.last_error)
+        return
+    client.send(CitadelProtocol.KIND_AUTH, PackedByteArray, true)
+
+func _process(_delta: float) -> void:
+    var move := Input.get_vector("ui_left", "ui_right", "ui_up", "ui_down")
+    local_position += move * 5.0 * _delta
+    client.send(KIND_MOVE, ("%.2f,%.2f" % [local_position.x, local_position.y]).to_utf8_buffer, false)
+    if Input.is_action_just_pressed("ui_accept"):
+        client.send(KIND_ATTACK, "moss-ogre".to_utf8_buffer, true)
+
+    var envelope := {}
+    while client.poll(envelope) == CitadelClient.Status.OK:
+        if int(envelope.get("kind", -1)) == KIND_STATE:
+            apply_state(String(envelope["payload"].get_string_from_utf8))
+
+func apply_state(line: String) -> void:
+    var parts := line.split(",")
+    if parts[0] == "monster":
+        $MossOgre.position = Vector2(parts[2].to_float, parts[3].to_float)
+        $Hud/HpLabel.text = "Ogre HP: %s/%s" % [parts[4], parts[5]]
+```
+
+The important part is the shape: one owner for `poll`, input sends a request,
+and only `STATE` changes the monster visual.
+
+</TabItem>
+<TabItem label="Web JavaScript + Three.js">
+
+### Web: render the shared world with Three.js
+
+Start from the [runnable Three.js SDK starter](/guides/web-client/) so you have
+an HTTP-served ES module, a camera, and a render loop. Replace its relay handler
+with this game's three message kinds. The blue knight is local visual prediction;
+the monster is never predicted — only `STATE` is allowed to change its Three.js
+mesh or HP display.
+
+```js
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { CitadelClient } from '../../src/index.js'; // inside examples/threejs-starter/app.js
+
+const KIND_MOVE = 100;
+const KIND_ATTACK = 101;
+const KIND_STATE = 102;
+const text = new TextDecoder;
+const bytes = new TextEncoder;
+const keys = new Set;
+const remoteKnights = new Map;
+let localX = -8;
+let localZ = 0;
+let lastMoveSentAt = 0;
+
+const scene = new THREE.Scene;
+scene.add(new THREE.GridHelper(40, 40));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x1b263b, 2));
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 24, 24);
+camera.lookAt(0, 0, 0);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.append(renderer.domElement);
+
+function cube(color) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color }),
+  );
+  mesh.position.y = 0.5;
+  scene.add(mesh);
+  return mesh;
+}
+
+const localKnight = cube(0x377dff); // local input prediction only
+const monster = new THREE.Mesh(
+  new THREE.SphereGeometry(1.4, 20, 12), new THREE.MeshStandardMaterial({ color: 0x8ac44a }),
+);
+monster.position.set(6, 1.4, 0);
+scene.add(monster);
+
+const client = await CitadelClient.connect('ws://127.0.0.1:7352/');
+client.on(KIND_STATE, (body) => applyState(text.decode(body)));
+await client.handshakeGuest;
+
+window.addEventListener('keydown', (event) => {
+  keys.add(event.key.toLowerCase);
+  if (event.code === 'Space' && !event.repeat) {
+    client.send(KIND_ATTACK, bytes.encode('moss-ogre'));
+  }
+});
+window.addEventListener('keyup', (event) => keys.delete(event.key.toLowerCase));
+
+function applyState(line) {
+  const parts = line.split(',');
+  if (parts[0] === 'monster') {
+    const [, id, x, z, hp, maxHp, alive] = parts;
+    monster.position.set(Number(x), 1.4, Number(z));
+    monster.visible = alive === '1';
+    console.info(`${id}: ${hp}/${maxHp} HP`); // replace with a Three.js HUD later
+  } else if (parts[0] === 'knight') {
+    const [, playerId, x, z] = parts;
+    const peer = remoteKnights.get(playerId) ?? { mesh: cube(0x63d27d), target: new THREE.Vector3 };
+    remoteKnights.set(playerId, peer);
+    peer.target.set(Number(x), 0.5, Number(z));
+  } else if (parts[0] === 'notice') {
+    console.info(parts.slice(1).join(','));
+  }
+}
+
+let previousFrameAt = performance.now;
+function frame(now) {
+  const dt = Math.min(0.05, (now - previousFrameAt) / 1000);
+  previousFrameAt = now;
+  const dx = Number(keys.has('d') || keys.has('arrowright')) - Number(keys.has('a') || keys.has('arrowleft'));
+  const dz = Number(keys.has('s') || keys.has('arrowdown')) - Number(keys.has('w') || keys.has('arrowup'));
+  if (dx || dz) {
+    localX += dx * 5 * dt;
+    localZ += dz * 5 * dt;
+    localKnight.position.set(localX, 0.5, localZ); // immediate visual prediction
+    if (now - lastMoveSentAt > 50) {
+      lastMoveSentAt = now;
+      client.send(KIND_MOVE, bytes.encode(`${localX.toFixed(2)},${localZ.toFixed(2)}`));
+    }
+  }
+  for (const { mesh, target } of remoteKnights.values) {
+    mesh.position.lerp(target, Math.min(1, dt * 12)); // visual smoothing only
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+```
+
+Open two browser tabs. Move in both. The blue cube is your immediate input
+prediction; green cubes are remote, server-approved knight states. Press Space
+near the monster. Both tabs render the same HP update because neither browser
+is the authority.
+
+</TabItem>
+<TabItem label="Web JavaScript (raw DOM, advanced)">
+
+### Web: inspect the protocol without a renderer (advanced)
+
+1. Use the **Web JavaScript + Three.js** tab for the playable browser-game path.
+2. This optional version leaves out a scene on purpose, so you can inspect the
+   smallest SDK message flow before bringing it into another renderer.
+3. Connect and register the state handler before sending input. The same server
+   authority rule applies even when the response is printed to the DOM.
+
+```js
+import { CitadelClient } from './clients/js/src/index.js';
+
+const KIND_MOVE = 100;
+const KIND_ATTACK = 101;
+const KIND_STATE = 102;
+const text = new TextDecoder;
+const bytes = new TextEncoder;
+let localX = 0;
+let localZ = 0;
+
+const client = await CitadelClient.connect('ws://127.0.0.1:7352/');
+client.on(KIND_STATE, (body) => applyState(text.decode(body)));
+await client.handshakeGuest;
+
+window.addEventListener('keydown', (event) => {
+  if (event.key === ' ') {
+    client.send(KIND_ATTACK, bytes.encode('moss-ogre'));
+    return;
+  }
+
+  const step = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }[event.key];
+  if (step) {
+    localX += step[0];
+    localZ += step[1];
+    client.send(KIND_MOVE, bytes.encode(`${localX},${localZ}`));
+  }
+});
+
+function applyState(line) {
+  const parts = line.split(',');
+  if (parts[0] === 'monster') {
+    const [, id, x, z, hp, maxHp, alive] = parts;
+    document.querySelector('#monster').textContent =
+      `${id}: ${hp}/${maxHp} HP at (${x}, ${z}) ${alive === '1' ? '😠' : '💤'}`;
+  } else if (parts[0] === 'notice') {
+    document.querySelector('#notice').textContent = parts.slice(1).join(',');
+  }
+}
+```
+
+Open two browser tabs. Move in both. Press Space near the monster. Both tabs
+receive the same HP update because neither tab is the authority. Congratulations:
+you have made a tiny shared world.
+
+</TabItem>
+</Tabs>
+
+## Step 5: test it like a player, not like a hopeful poet
+
+Use two clients of the same engine or mix engines that have a live transport.
+Check these four things in order:
+
+1. Both clients receive a monster `STATE` after joining.
+2. A movement request produces a knight `STATE` for both clients.
+3. Attacking from far away produces `notice,Too far away...` and **does not**
+   reduce HP.
+4. Attacking near the ogre reduces HP by `10` for every connected client; at
+   zero it sleeps for five seconds, then respawns with full HP.
+
+If step 3 fails, celebrate briefly: you found a server-authority bug before a
+player did. Then fix the Lua rule, not the client animation.
+
+## Step 6: make the game feel better (without changing who is in charge)
+
+Your next upgrades can stay small and safe:
+
+- Add a second monster by creating another `Monster:new({...})` definition.
+- Broadcast a `notice` when a monster dies and display it in the HUD.
+- Add a cooldown per knight in Lua so holding the attack key does not become an
+  industrial-grade sword factory.
+- Replace the CSV-like text records with a typed binary or JSON protocol once
+  you are tired of counting commas.
+- Draw interpolation on clients so remote movement looks smooth; do not invent
+  damage client-side to make an animation feel faster.
+
+## Optional: save a player-owned monster unlock
+
+The moss ogre definition above is **global game content**, so it stays in Lua
+and Git. A player's unlock, pet, or quest progress is different: it belongs to
+that player and should survive a restart.
+
+For an authenticated player (not a guest), Lua can write one JSON object with a
+version. `""` means *create this only if it does not exist*.
+
+```lua
+-- Call this only when ctx.user_id exists (the player authenticated).
+local saved = citadel.storage_write(
+  ctx.user_id,
+  "knights_progress",
+  "moss-ogre-unlock",
+  '{"schema_version":1,"monster":"moss-ogre","unlocked":true}',
+  "",  -- create-only; prevents an accidental overwrite
+  1,    -- owner may read
+  0     -- only trusted game logic may write
+)
+
+-- For a later edit: read first, then pass current.version to make it a CAS.
+local current = citadel.storage_read(ctx.user_id, "knights_progress", "moss-ogre-unlock")
+local updated = citadel.storage_write(
+  ctx.user_id,
+  "knights_progress",
+  "moss-ogre-unlock",
+  '{"schema_version":1,"monster":"moss-ogre","unlocked":true,"victories":2}',
+  current.version,
+  1,
+  0
+)
+```
+
+Do not invent an account called `"system"` for global monster definitions. The
+storage core has a system owner, but the shipped script API is deliberately
+user-owned today. Keep static game content in your game files until an explicit
+system-storage host API exists.
+
+## You did it
+
+You now have the important shape of an online action game:
+
+```text
+input → request → server validates → server changes state → everyone renders it
+```
+
+That shape scales much better than “every client edits its own truth and hopes
+for the best.” Next, read the [Lua runtime reference](/reference/server-sdk/lua-runtime/)
+for every host function, or add [rooms](/reference/client-sdk/rooms/) when your
+knights need separate arenas.

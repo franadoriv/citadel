@@ -1,0 +1,44 @@
+# Container-safe configuration for the Compose sample.
+#
+# Config, game logic, and maps are bind-mounted read-only. SQLite state is kept
+# in the named Docker volume mounted at /citadel/data.
+
+[server]
+node_id = "citadel-docker"
+# Change this to the externally reachable DNS name/IP when serving remote peers.
+public_addr = "127.0.0.1:7350"
+
+[http]
+bind = "0.0.0.0:7350"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[database]
+# This is a bare absolute SQLite path, intentionally independent of WORKDIR.
+url = "/citadel/data/data.sqlite"
+
+[runtime]
+language = "lua"
+scripts_dir = "/citadel/game"
+maps_dir = "/citadel/maps"
+hot_reload = true
+hot_reload_poll_ms = 500
+
+[transport.quic]
+enabled = true
+bind = "0.0.0.0:7351"
+
+[transport.websocket]
+enabled = true
+bind = "0.0.0.0:7352"
+
+[transport.webtransport]
+enabled = true
+bind = "0.0.0.0:7353"
+
+[console]
+username = "admin"
+# Compose requires CITADEL_CONSOLE_PASSWORD, which overrides this placeholder.
+password = "replace-me-through-CITADEL_CONSOLE_PASSWORD"

@@ -1,0 +1,9 @@
+[runtime]
+language = "lua"
+scripts_dir = "./game"
+# Static gameplay files are intentionally outside the script directory. Citadel
+# reads them only through citadel.static_data and never writes this tree.
+static_data_dir = "./common"
+static_data_max_file_bytes = 65536
+hot_reload = true
+hot_reload_poll_ms = 250

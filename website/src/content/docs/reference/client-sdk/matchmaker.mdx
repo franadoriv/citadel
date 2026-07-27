@@ -1,0 +1,299 @@
+---
+title: Matchmaker
+description: Authenticated ticket matchmaking through generic RPC, with optional durable cross-node routing.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Citadel's matchmaker evaluates **tickets**, not room names. An authenticated
+player submits properties, a typed query, and acceptable cohort sizes. The server
+uses oldest-first ordering and forms the smallest cohort where every ticket accepts
+every other ticket. Once formed, Citadel allocates a closed server-owned room and
+sends a reliable `KIND_MATCHMAKER_MATCHED` handoff. The client must present its
+short-lived opaque token through `matchmaker.accept`; a match id alone cannot join
+the room. With the optional durable cluster configuration, the same client RPCs
+work when the ticket's shard owner or match room lives on another node: the
+session node forwards typed commands through mTLS, while the client socket stays
+local. See [Run a two-node matchmaker](/guides/distributed-matchmaker/).
+
+The methods below use the existing generic RPC request/response envelope; there are
+no new wire kinds or per-engine SDK bindings. Guests receive `"authentication required"`.
+
+## Ticket request
+
+`matchmaker.add` takes this JSON object:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `query` | string | no | Candidate predicate. Empty accepts any candidate. |
+| `properties` | object | no | String or finite-number properties visible to other ticket queries. |
+| `min_count` | integer | yes | Minimum final cohort size; at least `2`. |
+| `max_count` | integer | yes | Maximum final cohort size; at least `min_count`. |
+| `count_multiple` | integer | no | Required final-size multiple; defaults to `1`. |
+| `party_id` | string | no | Opaque party id. Only that party's leader may submit it; every connected member occupies a slot atomically. |
+| `ttl_ms` | integer | yes | Positive ticket lifetime in milliseconds. |
+
+The query grammar supports `==`, `!=`, `<`, `<=`, `>`, `>=`, parentheses, and
+case-insensitive `AND` / `OR`. Strings support only `==` and `!=`; ordered operators
+require numbers. For example: `mode == "ranked" AND skill >= 1200`.
+
+## `matchmaker.add`
+
+**Signature:** generic RPC method `matchmaker.add(payload)`.
+
+**Returns:** `{"ticket_id":"…"}`. The id is opaque. A participant has one queued
+ticket at a time. An invalid query, invalid counts, zero TTL, or a second queued
+ticket returns `RPC_STATUS_ERROR` with a descriptive message.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+const FString Payload = TEXT("{\"query\":\"mode == \\\"duo\\\"\",\"properties\":{\"mode\":\"duo\"},\"min_count\":2,\"max_count\":2,\"ttl_ms\":30000}");
+const uint64 RequestId = 42;
+Client->Send(CitadelWire::KindRpcRequest,
+    CitadelWire::EncodeRpcRequest(RequestId, TEXT("matchmaker.add"), Payload), true);
+// Poll KIND_RPC_RESPONSE; DecodeRpcResponse returns {"ticket_id":"..."} on OK.
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+1. Build the JSON payload shown above with **Make Json Object**.
+2. Call **Encode RPC Request** with method `matchmaker.add` and a new request id.
+3. Send the resulting bytes reliably with kind **RPC Request** (`3`).
+4. On **Poll** kind **RPC Response** (`4`), call **Decode RPC Response** and read `ticket_id` when status is `OK`.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+rpcClient.CallRpc("matchmaker.add",
+    "{\"query\":\"mode == \\\"duo\\\"\",\"properties\":{\"mode\":\"duo\"},\"min_count\":2,\"max_count\":2,\"ttl_ms\":30000}",
+    result => Debug.Log(result.Payload)); // {"ticket_id":"..."}
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+citadel.call_rpc("matchmaker.add", JSON.stringify({
+  "query": "mode == \"duo\"", "properties": {"mode": "duo"},
+  "min_count": 2, "max_count": 2, "ttl_ms": 30000
+}), func(result): print(result.payload)) # {"ticket_id":"..."}
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+let reply = client.call_rpc("matchmaker.add", br#"{"query":"mode == \"duo\"","properties":{"mode":"duo"},"min_count":2,"max_count":2,"ttl_ms":30000}"#).await?;
+assert!(reply.is_ok); // payload is {"ticket_id":"..."}
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const body = new TextEncoder.encode(JSON.stringify({ query: 'mode == "duo"', properties: { mode: "duo" }, min_count: 2, max_count: 2, ttl_ms: 30000 }));
+const reply = JSON.parse(new TextDecoder.decode(await client.callRpc("matchmaker.add", body)));
+```
+
+</TabItem>
+</Tabs>
+
+When another compatible ticket completes the cohort, each player receives
+`KIND_MATCHMAKER_MATCHED` (kind `26`) with
+`{"ticket_id","match_id","join_token","expires_at"}`. Save that handoff and
+call [`matchmaker.accept`](#matchmakeraccept) before loading the room. A delivery
+failure does not requeue the cohort: reconnect with the same account and call
+`matchmaker.status` to recover the still-valid handoff.
+
+## `matchmaker.accept`
+
+**Signature:** generic RPC method
+`matchmaker.accept({"ticket_id":"…","join_token":"…"})`.
+
+**Returns:** `{"accepted":true,"match_id":…}` followed by the normal reliable
+`ROOM_JOINED` frame. The token is bound to the authenticated account that created
+the ticket and expires after 30 seconds. Another account, an expired token, or a
+raw `ROOM_JOIN` request with the match id is rejected.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+Client->Send(CitadelWire::KindRpcRequest,
+    CitadelWire::EncodeRpcRequest(43, TEXT("matchmaker.accept"),
+        TEXT("{\"ticket_id\":\"TICKET\",\"join_token\":\"TOKEN\"}")), true);
+// On success, wait for KIND_ROOM_JOINED before loading the room map.
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+1. On kind **Matchmaker Matched** (`26`), save `ticket_id` and `join_token`.
+2. Send generic RPC method `matchmaker.accept` with both values.
+3. On successful RPC response, handle the following **Room Joined** notification.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+rpcClient.CallRpc("matchmaker.accept",
+    "{\"ticket_id\":\"TICKET\",\"join_token\":\"TOKEN\"}",
+    result => Debug.Log(result.Payload)); // then await KindRoomJoined
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+citadel.call_rpc("matchmaker.accept", JSON.stringify({
+  "ticket_id": ticket_id, "join_token": join_token
+}), func(result): print(result.payload))
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+let reply = client.call_rpc("matchmaker.accept", br#"{"ticket_id":"TICKET","join_token":"TOKEN"}"#).await?;
+assert!(reply.is_ok); // next envelope is ROOM_JOINED
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const body = new TextEncoder.encode(JSON.stringify({ ticket_id: ticketId, join_token: joinToken }));
+await client.callRpc("matchmaker.accept", body);
+```
+
+</TabItem>
+</Tabs>
+
+## `matchmaker.cancel`
+
+**Signature:** generic RPC method `matchmaker.cancel({"ticket_id":"…"})`.
+
+**Returns:** `{"cancelled":true|false}`. Cancellation is idempotent. A ticket can
+only be cancelled by its owning authenticated participant; another player receives
+`false`, not ticket data.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+Client->Send(CitadelWire::KindRpcRequest,
+    CitadelWire::EncodeRpcRequest(43, TEXT("matchmaker.cancel"), TEXT("{\"ticket_id\":\"TICKET\"}")), true);
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+1. Make JSON `{ "ticket_id": "TICKET" }` from the saved add response.
+2. Encode method `matchmaker.cancel` as an RPC Request and send reliably.
+3. Decode the correlated response and read boolean `cancelled`.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+rpcClient.CallRpc("matchmaker.cancel", "{\"ticket_id\":\"TICKET\"}", result => Debug.Log(result.Payload));
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+citadel.call_rpc("matchmaker.cancel", JSON.stringify({"ticket_id": ticket_id}), func(result): print(result.payload))
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+let reply = client.call_rpc("matchmaker.cancel", br#"{"ticket_id":"TICKET"}"#).await?;
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+await client.callRpc("matchmaker.cancel", new TextEncoder.encode(JSON.stringify({ ticket_id: ticketId })));
+```
+
+</TabItem>
+</Tabs>
+
+## `matchmaker.status`
+
+**Signature:** generic RPC method `matchmaker.status({"ticket_id":"…"})`.
+
+**Returns:** `{"state":"queued"|"matched"|"removed"}`. When `state` is
+`matched`, the response additionally contains
+`{"match":{"ticket_id":"…","match_id":…,"join_token":"…","expires_at":…}}`;
+use those values exactly as the `matchmaker.accept` payload after reconnecting.
+A disconnected participant's queued ticket becomes `removed`; tickets also become
+`removed` once their TTL elapses. Unknown tickets return `RPC_STATUS_ERROR`.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+Client->Send(CitadelWire::KindRpcRequest,
+    CitadelWire::EncodeRpcRequest(44, TEXT("matchmaker.status"), TEXT("{\"ticket_id\":\"TICKET\"}")), true);
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+1. Make JSON `{ "ticket_id": "TICKET" }`.
+2. Send method `matchmaker.status` as a reliable RPC Request.
+3. Decode the response and branch on `state`: `queued`, `matched`, or `removed`.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+rpcClient.CallRpc("matchmaker.status", "{\"ticket_id\":\"TICKET\"}", result => Debug.Log(result.Payload));
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+citadel.call_rpc("matchmaker.status", JSON.stringify({"ticket_id": ticket_id}), func(result): print(result.payload))
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+let reply = client.call_rpc("matchmaker.status", br#"{"ticket_id":"TICKET"}"#).await?;
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const status = JSON.parse(new TextDecoder.decode(await client.callRpc("matchmaker.status", new TextEncoder.encode(JSON.stringify({ ticket_id: ticketId })) )));
+```
+
+</TabItem>
+</Tabs>
+
+## Deployment limits
+
+- Without `[cluster]`, the queue is local and in-memory. With `[cluster]`, the
+  active shard's lease, whole-cohort formation claims, and one-time admissions
+  are durable; the queue's working index remains resident on its active owner.
+- Formation happens immediately after a ticket reaches its owner. The single-node
+  lifecycle tick continues to expire idle local queues; the live cluster worker
+  evaluates on submission and never evaluates a remote copy of the shard.
+- Party tickets remain created and managed by the local [party API](/reference/client-sdk/parties/),
+  but the indivisible party ticket can be forwarded to a remote shard and its
+  members receive owner-bound handoffs on their session node. Party persistence,
+  leader failover, generic match migration, and game-controlled match labels are
+  separate capabilities. A match id alone never authorizes a join.

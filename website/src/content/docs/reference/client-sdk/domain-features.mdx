@@ -1,0 +1,142 @@
+---
+title: Groups, leaderboards, chat, and wallet
+description: Reserved game-client RPC operations for Citadel domain features.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+These authenticated built-in RPC methods use the existing generic RPC envelope;
+they cannot be overridden by game logic. Every method returns `status=0` and a
+UTF-8 JSON body on success; guests receive `"authentication required"`.
+
+## Groups
+
+All group RPCs use `group_id` and, where applicable, `user_id`; the server
+always derives the acting user from the authenticated session. `groups.create`,
+`list`, `get`, `update`, `delete`, `add_member`, `leave`, `kick`, `promote`, and
+`demote` retain their existing metadata fields (`name`, `description`, `open`,
+`max_size`). Updates/deletes/promotions require superadmin; the last
+superadmin cannot leave, be kicked, or be demoted.
+
+| Method | Parameters | Result / errors |
+| --- | --- | --- |
+| `groups.join` | `{ "group_id": number }` | Open groups add the caller and return `{ "state":"joined", "group":… }`; closed groups return `{ "state":"requested", "admission":… }`. Fails if full or already a member. |
+| `groups.invite` | `{ "group_id": number, "user_id": string }` | An admin or superadmin creates an invitation and receives `{ "state":"invited", "admission":… }`. Fails for insufficient role, a member, or conflicting pending state. |
+| `groups.approve_request` | `{ "group_id": number, "user_id": string }` | An admin or superadmin admits a pending requester and returns the group. Fails if no request exists or capacity is exhausted. |
+| `groups.accept_invitation` | `{ "group_id": number }` | The invited caller becomes a member and receives the group. Fails without a pending invitation or when full. |
+| `groups.cancel_admission` | `{ "group_id": number }` | Cancels the caller's request or invitation and returns `{}`. Repeating it is safe. |
+| `groups.transfer_ownership` | `{ "group_id": number, "user_id": string }` | Only the current superadmin may transfer ownership to an existing member; returns the group with the new superadmin. |
+
+Only one pending admission state is allowed for a player in a group. Invitations
+and requests are persisted, so they survive server restart; they do not by
+themselves deliver a player notification.
+
+## Leaderboards
+
+`leaderboards.list({})` lists definitions. `leaderboards.records({"board_id":
+"daily","limit":50,"offset":0})` pages ranked records. `leaderboards.submit`
+accepts `board_id`, signed `score`, optional signed `subscore`, and optional
+object `metadata`; it always writes the authenticated caller's record. Board
+creation and deletion remain operator operations.
+
+## Chat
+
+:::caution[Join before using a channel]
+`chat.join` is the only method that accepts a server-derived `target`. It
+returns an opaque `channel_id` after authentication and authorization. Every
+other chat method requires that `channel_id` and a live local subscription; a
+copied id never authorizes an operation. The retired raw `{ "channel",
+"channel_type" }` shape, and a `target` after joining, return
+`CHAT_PROTOCOL_UPGRADE_REQUIRED`.
+:::
+
+| Method | Request | Success result | Errors |
+| --- | --- | --- | --- |
+| `chat.join` | `{ "target": { "kind":"direct", "other_user_id":"player-b" } }` (or current `group` / `room`) | `{ "channel_id", "channel_type", "presence", "watermark_event_id", "subscription" }` | `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
+| `chat.leave` | `{ "channel_id":"ch_…" }` | `{ "left": boolean }` | `CHAT_NOT_SUBSCRIBED` only for a conflicting session identity |
+| `chat.send` | `{ "channel_id":"ch_…", "content":"hello" }` | `{ "message", "event_id" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
+| `chat.history` | `{ "channel_id":"ch_…", "limit":50, "before_message_id":123, "acknowledge_watermark":9 }` | `{ "items", "watermark_event_id" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
+| `chat.edit` | `{ "channel_id":"ch_…", "message_id":123, "content":"replacement" }` | `{ "message", "event_id" }` | author/window/access/rate errors |
+| `chat.delete` | `{ "channel_id":"ch_…", "message_id":123 }` | `{ "message_id", "deleted", "event_id" }` | author/window/access/rate errors |
+| `chat.moderate` | `{ "channel_id":"ch_…", "message_id":123 }` for a group subscription | `{ "message_id", "deleted", "event_id" }` | group-role/access/rate errors |
+
+Direct targets need mutual friendship with no block in either direction; group
+targets need current membership; room targets need current room presence.
+Unknown, forbidden, and revoked targets all return `CHAT_UNAVAILABLE`.
+
+### `KIND_CHAT_EVENT` callback
+
+`KIND_CHAT_EVENT` (28) is a reliable UTF-8 JSON **server-to-client** envelope.
+Use each SDK's normal inbound envelope callback or poll dispatcher and branch on
+kind 28. Events are at-least-once: deduplicate durable mutations by
+`(channel_id, event_id)`. `presence.join`, `presence.leave`, `message.create`,
+`message.update`, and `message.remove` carry the shown type; `access.revoked`
+ends delivery for the recipient; `resync_required` carries a durable
+`watermark_event_id` and requires a `chat.history` acknowledgement. This is
+single-node delivery; another node's sockets are not yet recipients.
+
+`chat.moderate` is intentionally unavailable for direct and room targets. A
+group superadmin can tombstone any retained group message; an admin can
+tombstone a member's (or former member's) message but not one from a current
+admin or superadmin. The mutation uses the same membership epoch fence as
+send/history and writes a redacted durable audit record. Room moderation remains
+an operator-console action until trusted room authorities are introduced.
+
+Valid content is non-empty UTF-8 text up to 2,048 bytes with no control
+characters other than line breaks. Fixed-window limits are shared by nodes using
+the same database: send is 8/user, 12/user-channel, and 160/channel per 10 s;
+edit/delete are 4/user and 8/user-channel per minute. History and target access
+are also limited. A denial returns `CHAT_RATE_LIMITED` without revealing private
+channel state. Moderation is limited to 30/acting moderator and 60/channel per
+minute. Local presence and committed durable live fan-out ship; typing and
+cross-node delivery remain later work.
+
+## Wallet
+
+`wallet.balances({})` reads the caller's currency map and `wallet.ledger`
+reads the caller's newest-first ledger (`limit` optional). Clients cannot adjust
+balances; adjustment is trusted game-logic authority only.
+
+## Generic RPC call
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+// Send "groups.create" with UTF-8 JSON; await the correlated RPC response.
+RpcClient.CallRpc("groups.create", R"({"name":"Raiders"})");
+```
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+1. Call **Send RPC** with method `groups.create` and JSON `{"name":"Raiders"}`.
+2. Await the correlated response and branch on its status.
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+client.CallRpc("leaderboards.list", Encoding.UTF8.GetBytes("{}"));
+```
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+client.call_rpc("wallet.balances", "{}".to_utf8_buffer, on_result)
+```
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const response = await client.callRpc("chat.history", new TextEncoder.encode(JSON.stringify({
+  channel_id,
+  limit: 50,
+})));
+```
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+```rust
+let response = client.call_rpc("groups.list", br#"{"limit":50}"#).await?;
+```
+</TabItem>
+</Tabs>

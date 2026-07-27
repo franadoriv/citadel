@@ -1,0 +1,460 @@
+[
+  {
+    "name": "on_message",
+    "category": "message_hook",
+    "params": [
+      "kind:u16",
+      "handler:fn(ctx,body)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "on_join",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(ctx)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "on_leave",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(ctx)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "on_tick",
+    "category": "tick_hook",
+    "params": [
+      "handler:fn(dt:f64)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "on_rpc",
+    "category": "rpc_hook",
+    "params": [
+      "method:string",
+      "handler:fn(ctx,body)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "on_room_create",
+    "category": "room_hook",
+    "params": [
+      "handler:fn(ctx,params)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "on_room_join",
+    "category": "room_hook",
+    "params": [
+      "handler:fn(ctx,room_id)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "broadcast",
+    "category": "action",
+    "params": [
+      "kind:u16",
+      "body:bytes",
+      "unreliable:bool?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "send",
+    "category": "action",
+    "params": [
+      "session:u64",
+      "kind:u16",
+      "body:bytes",
+      "unreliable:bool?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "spawn_actor",
+    "category": "action",
+    "params": [
+      "opts:{archetype:u16?,x:f32?,y:f32?,z:f32?}"
+    ],
+    "returns": "object_id:u32",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "move_actor",
+    "category": "action",
+    "params": [
+      "object_id:u32",
+      "x:f32",
+      "y:f32",
+      "z:f32",
+      "vx:f32?",
+      "vy:f32?",
+      "vz:f32?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "despawn_actor",
+    "category": "action",
+    "params": [
+      "object_id:u32"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "set_physics",
+    "category": "physics",
+    "params": [
+      "object_id:u32",
+      "opts:{gravity:f32?,buoyancy:f32?,drag:f32?,radius:f32?,height:f32?,max_speed:f32?,shape:string?,enabled:bool?}"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "apply_impulse",
+    "category": "physics",
+    "params": [
+      "object_id:u32",
+      "ix:f32",
+      "iy:f32",
+      "iz:f32"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "set_move_intent",
+    "category": "physics",
+    "params": [
+      "object_id:u32",
+      "vx:f32",
+      "vy:f32",
+      "vz:f32"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "physics_state",
+    "category": "physics",
+    "params": [
+      "object_id:u32"
+    ],
+    "returns": "{grounded:bool,position:[f32;3],velocity:[f32;3]}?",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "map_info",
+    "category": "map",
+    "params": [
+      "name:string"
+    ],
+    "returns": "{bounds_min:[f32;3],bounds_max:[f32;3],vertex_count:usize,triangle_count:usize}?",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "raycast",
+    "category": "map",
+    "params": [
+      "origin:[f32;3]",
+      "direction:[f32;3]"
+    ],
+    "returns": "{point:[f32;3],normal:[f32;3],distance:f32,triangle_index:usize}?",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "sphere_overlap",
+    "category": "map",
+    "params": [
+      "centre:[f32;3]",
+      "radius:f32"
+    ],
+    "returns": "bool",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "ground_height",
+    "category": "map",
+    "params": [
+      "origin:[f32;3]",
+      "max_distance:f32"
+    ],
+    "returns": "{point:[f32;3],normal:[f32;3],distance:f32,triangle_index:usize}?",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "log",
+    "category": "log",
+    "params": [
+      "message:string",
+      "level:string?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "static_data.load_json",
+    "category": "static_data",
+    "params": [
+      "path:relative .json"
+    ],
+    "returns": "object|array",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "static_data.load_csv",
+    "category": "static_data",
+    "params": [
+      "path:relative .csv"
+    ],
+    "returns": "array<object>",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "friends.add",
+    "category": "domain",
+    "params": [
+      "user:string",
+      "other:string"
+    ],
+    "returns": "state:string",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "friends.remove",
+    "category": "domain",
+    "params": [
+      "user:string",
+      "other:string"
+    ],
+    "returns": "removed:bool",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "friends.block",
+    "category": "domain",
+    "params": [
+      "user:string",
+      "other:string"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "friends.list",
+    "category": "domain",
+    "params": [
+      "user:string"
+    ],
+    "returns": "rows:list<{user_id:string,state:string,updated_unix_ms:u64}>",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "notifications.send",
+    "category": "domain",
+    "params": [
+      "recipient:string",
+      "code:i32",
+      "subject:string",
+      "content_json:string",
+      "sender:string?",
+      "delivery_key:string?"
+    ],
+    "returns": "{id:string,code:i32,subject:string,content:json,sender:string?,created_at_unix_ms:u64,read_at_unix_ms:u64?}",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "notifications.list",
+    "category": "domain",
+    "params": [
+      "recipient:string",
+      "limit:usize?",
+      "cursor:string?"
+    ],
+    "returns": "{items:list<notification>,next_cursor:string?}",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "notifications.mark_read",
+    "category": "domain",
+    "params": [
+      "recipient:string",
+      "ids:list<string>"
+    ],
+    "returns": "read_ids:list<string>",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "groups.call",
+    "category": "domain",
+    "params": [
+      "actor:string",
+      "operation:create|list|get|update|delete|add_member|leave|kick|promote|demote|join|invite|approve_request|accept_invitation|cancel_admission|transfer_ownership",
+      "payload_json:string"
+    ],
+    "returns": "json",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "leaderboards.call",
+    "category": "domain",
+    "params": [
+      "actor:string",
+      "operation:list|records|submit",
+      "payload_json:string"
+    ],
+    "returns": "json",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "chat.call",
+    "category": "domain",
+    "params": [
+      "actor:string",
+      "operation:send|history|edit|delete|moderate",
+      "payload_json:string"
+    ],
+    "returns": "json",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "wallet.call",
+    "category": "domain",
+    "params": [
+      "actor:string",
+      "operation:balances|ledger|adjust",
+      "payload_json:string"
+    ],
+    "returns": "json",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "storage.read",
+    "category": "storage",
+    "params": [
+      "user:string",
+      "collection:string",
+      "key:string"
+    ],
+    "returns": "{value_json:string,version:string,read_permission:u8,write_permission:u8}?",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "storage.write",
+    "category": "storage",
+    "params": [
+      "user:string",
+      "collection:string",
+      "key:string",
+      "value_json:string",
+      "expected_version:string?",
+      "read_permission:u8?",
+      "write_permission:u8?"
+    ],
+    "returns": "{value_json:string,version:string,read_permission:u8,write_permission:u8}",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "storage.delete",
+    "category": "storage",
+    "params": [
+      "user:string",
+      "collection:string",
+      "key:string",
+      "expected_version:string?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "storage.index_query",
+    "category": "storage",
+    "params": [
+      "index_name:string",
+      "filters_json:string",
+      "limit:usize"
+    ],
+    "returns": "[{user_id:string?,collection:string,key:string,value_json:string,version:string,read_permission:u8,write_permission:u8}]",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "storage.register_index_filter",
+    "category": "storage",
+    "params": [
+      "index_name:string",
+      "callback:function"
+    ],
+    "returns": "nil",
+    "status": "shipped",
+    "since": "pre-1.0"
+  },
+  {
+    "name": "http.fetch",
+    "category": "http",
+    "params": [
+      "url:string",
+      "opts:table?"
+    ],
+    "returns": "response:table",
+    "status": "shipped",
+    "since": "pre-1.0"
+  }
+]

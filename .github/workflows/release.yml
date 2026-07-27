@@ -1,0 +1,133 @@
+name: release
+
+# Build the standalone Windows release packages and create a GitHub Release. A
+# release is cut by fast-forwarding develop to the long-lived release branch, or
+# through workflow_dispatch. Public ZIP downloads remain Windows-only until Apple
+# Developer ID and notarization credentials are available; native macOS package
+# targets are deliberately not run in CI yet.
+
+on:
+  push:
+    branches:
+      - release
+  workflow_dispatch:
+
+permissions:
+  contents: write
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # RecastNavigation needs MSVC; pin the known-compatible image.
+          - runner: windows-2022
+            target: windows-x86_64
+            platform: windows
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # macOS signing/notarization steps are intentionally disabled pending the
+      # six Apple secrets documented in docs/release-process.md. Do not publish
+      # unsigned macOS developer archives from this workflow.
+
+      - name: Package server and SDKs (Windows)
+        shell: pwsh
+        run: |
+          ./make.ps1 package-windows
+          ./make.ps1 package-clients-windows
+
+      # Re-enable native macOS matrix entries, Apple credential import,
+      # notarization profile setup, and this package step together once the
+      # required secrets are configured. Keeping them all disabled prevents a
+      # release from failing or publishing unsigned macOS ZIPs.
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: citadel-${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  godot-web:
+    name: Package Godot WebAssembly SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Godot 4.3 and Web export templates
+        run: |
+          curl -fsSL --retry 3 -o godot.zip https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip
+          unzip -q godot.zip -d "$RUNNER_TEMP/godot"
+          chmod +x "$RUNNER_TEMP/godot/Godot_v4.3-stable_linux.x86_64"
+          curl -fsSL --retry 3 -o templates.tpz https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.3.stable"
+          unzip -q templates.tpz -d "$RUNNER_TEMP/godot-templates"
+          mv "$RUNNER_TEMP/godot-templates/templates/"* "$HOME/.local/share/godot/export_templates/4.3.stable/"
+
+      - name: Package and validate Godot WebAssembly SDK
+        run: |
+          GODOT_BIN="$RUNNER_TEMP/godot/Godot_v4.3-stable_linux.x86_64" make package-client-godot-web
+          package="$(find dist -maxdepth 1 -name 'citadel-client-godot-web-v*.zip' -print -quit)"
+          test -n "$package"
+          python3 scripts/package_godot_web_artifact.py --verify-package "$package"
+
+      - name: Upload Godot WebAssembly artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: citadel-godot-web
+          path: dist/citadel-client-godot-web-v*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [package, godot-web]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: citadel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Read version and extract release notes
+        id: notes
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' Cargo.toml | head -1)"
+          if [[ -z "$version" ]]; then
+            echo "Could not read the Citadel version from Cargo.toml" >&2
+            exit 1
+          fi
+          awk -v version="$version" '
+            $0 ~ "^##[[:space:]]*\\[?" version "\\]?([[:space:]]|$|\\])" { found=1 }
+            found && NR > 1 && $0 ~ "^##[[:space:]]" && $0 !~ "^##[[:space:]]*\\[?" version "\\]?([[:space:]]|$|\\])" { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [[ ! -s RELEASE_NOTES.md ]]; then
+            printf 'Citadel v%s\n' "$version" > RELEASE_NOTES.md
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.notes.outputs.version }}
+          name: v${{ steps.notes.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          files: dist/*.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

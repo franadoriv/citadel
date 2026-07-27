@@ -1,0 +1,19 @@
+[package]
+name = "citadel-map"
+version = "0.1.0"
+edition = "2024"
+description = "Citadel `.map` (CMAP) level-geometry file format: metadata + world-space collision mesh, with a reserved, forward-compatible navmesh section."
+
+# Deliberately std-only: the format is a small, hand-rolled big-endian binary
+# codec with no need for serde/bytes/thiserror. Keeping the dependency set empty
+# makes the crate trivially portable to tools and future bakers.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

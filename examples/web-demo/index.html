@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Citadel Web Demo (WebSocket + Three.js)</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #0b0e14;
+        color: #e6e6e6;
+        overflow: hidden;
+      }
+      #ui {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 10;
+        background: rgba(20, 24, 33, 0.85);
+        padding: 12px 14px;
+        border-radius: 8px;
+        max-width: 360px;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      #ui input {
+        width: 220px;
+        background: #11151d;
+        color: #e6e6e6;
+        border: 1px solid #2a3140;
+        border-radius: 4px;
+        padding: 4px 6px;
+      }
+      #ui button {
+        background: #2a6df4;
+        color: white;
+        border: 0;
+        border-radius: 4px;
+        padding: 5px 10px;
+        cursor: pointer;
+      }
+      #status.ok {
+        color: #5bd66f;
+      }
+      #status.bad {
+        color: #f4685b;
+      }
+      .hint {
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <div><strong>Citadel Web Demo</strong></div>
+      <div>
+        <label for="wtUrl">WebTransport URL (preferred)</label><br />
+        <input id="wtUrl" type="text" value="https://127.0.0.1:7353/" />
+      </div>
+      <div>
+        <label for="wtHash">WT cert hash (base64, from server log)</label><br />
+        <input id="wtHash" type="text" placeholder="serverCertificateHashes (base64)" />
+      </div>
+      <div>
+        <label for="endpoint">WebSocket endpoint (fallback)</label><br />
+        <input id="endpoint" type="text" value="ws://127.0.0.1:7352/" />
+        <button id="connect">Connect</button>
+      </div>
+      <div>Transport: <span id="transport">-</span></div>
+      <div>Status: <span id="status" class="bad">disconnected</span></div>
+      <div>Sent: <span id="sent">0</span> · Peer updates: <span id="echoed">0</span></div>
+      <div>Peers: <span id="rtt">0</span></div>
+      <div class="hint">
+        Move with WASD / arrow keys or drag the mouse. The blue cube is you; each
+        green cube is another connected player, relayed by the server. The demo
+        tries WebTransport first (paste the cert hash the server logs), then
+        falls back to WebSocket. Open this page in a second tab/browser to see
+        another player move. No credentials are stored or sent.
+      </div>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

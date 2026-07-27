@@ -1,0 +1,21 @@
+# Native GDExtension binaries built into the Godot SDK (built, not committed).
+# The library is produced at package time (or a local build), never checked in.
+addons/**/bin/**/*.dll
+addons/**/bin/**/*.so
+addons/**/bin/**/*.dylib
+addons/**/bin/**/*.pdb
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# SCons build byproducts from native/ (produced at package/local build time).
+native/bin/
+*.obj
+*.os
+*.exp
+*.lib
+.sconsign.dblite
+
+# Per-developer Godot project state (never commit a full engine project here).
+.godot/

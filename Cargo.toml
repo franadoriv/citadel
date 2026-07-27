@@ -1,0 +1,149 @@
+[workspace]
+# The root `citadel` package is the server; additional crates (shared wire
+# format, client SDK, demos) live under `crates/`.
+members = ["crates/*"]
+
+[package]
+name = "citadel"
+# Bump this per milestone before pushing develop -> release; the release workflow
+# reads it and names the GitHub Release v{version}. Pre-1.0 while the API and
+# feature set are still stabilizing. See docs/release-process.md.
+version = "0.9.8"
+edition = "2024"
+
+[features]
+default = []
+runtime-python = ["dep:citadel-process-env", "dep:pyo3"]
+runtime-js = ["dep:rquickjs"]
+
+[dependencies]
+# Shared realtime wire format (envelope + codec), reused by clients and demos.
+citadel-wire = { path = "crates/citadel-wire" }
+citadel-map = { path = "crates/citadel-map" }
+citadel-nav = { path = "crates/citadel-nav" }
+citadel-physics = { path = "crates/citadel-physics" }
+# Async runtime. Feature-gated to what the skeleton needs today; expand as
+# networking and process management tasks land.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
+# HTTP server stack for health/admin/API routes ( wires the listener).
+axum = "0.7"
+# Bounded, Rust-owned outbound HTTP for trusted game scripts. TLS is
+# rustls-only and default features stay off so script requests never inherit an
+# ambient system proxy configuration.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Derive-based CLI parsing ( builds the actual command surface).
+clap = { version = "4", features = ["derive"] }
+# Serialization baseline for config, manifests, and JSON payloads.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# RFC 4180-compatible CSV decoding for bounded, operator-owned gameplay data.
+# A dedicated parser avoids ad-hoc quoting/UTF-8/schema handling in the runtime.
+csv = "1"
+toml = "0.8"
+# Typed library errors. `anyhow` is allowed only in the binary/bootstrap layer.
+thiserror = "2"
+anyhow = "1"
+# Object-safe async traits for the repository/service contracts.
+# The repositories are consumed behind `Arc<dyn ..>`, and native `async fn in
+# trait` is not dyn-compatible; `async-trait` boxes the returned futures
+# (`Pin<Box<dyn Future + Send>>`) so the same contracts stay object-safe and can
+# back both the in-memory reference impls and a future async sqlx/Postgres impl.
+async-trait = "0.1"
+# Structured logging and tracing.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Zero-copy byte buffers for transport framing.
+bytes = "1"
+# QUIC transport: unreliable datagrams + reliable streams + TLS 1.3.
+# `quinn` is the only path that reaches the browser via WebTransport while
+# serving low-latency action traffic; it bundles congestion control and TLS.
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# PEM parsing for the mTLS node-control plane. This keeps cluster certificates
+# operator-managed rather than generating an unsafe production identity.
+rustls-pemfile = "2"
+# Dev/test self-signed certificate generation for the QUIC endpoint.
+rcgen = "0.13"
+# WebSocket fallback transport for browsers without WebTransport
+# and UDP-blocked networks. Plain ws over tokio TCP; no TLS feature needed yet.
+tokio-tungstenite = "0.24"
+# Stream/Sink combinators used by the WebSocket message loop.
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# WebTransport browser transport: datagrams + streams over HTTP/3
+# over QUIC. Uses our exact quinn 0.11 / rustls 0.23 with no version churn
+# (see ). `ring` provider to match the rest of the stack.
+web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+# SHA-256 of the dev cert for the browser `serverCertificateHashes` flow.
+sha2 = "0.10"
+# CSPRNG for unguessable session tokens. `getrandom` pulls OS entropy
+# with no extra transitive weight (already in the tree); `base64` encodes the
+# random bytes into an opaque URL-safe token string.
+getrandom = "0.3"
+base64 = "0.22"
+# Password hashing for player email/password authentication. The
+# PHC string is stored with its Argon2id parameters and per-password salt.
+argon2 = "0.5"
+# Short cert validity windows for the WebTransport dev cert (browser requirement).
+time = "0.3"
+# Embedded Lua game-logic runtime. `lua54` + `vendored` compiles a
+# private Lua 5.4 from source (no system Lua, MSVC-friendly). `send` makes the
+# `Lua` state `Send` so a `Mutex<Lua>` is `Sync` and can live behind the shared
+# `Arc<Gateway>`; the VM is still driven single-threaded under that lock.
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+# Embedded CPython game-logic runtime. Kept optional so the default server build
+# does not link libpython or pull PyO3 unless `--features runtime-python` is set.
+pyo3 = { version = "0.29.0", optional = true, features = ["auto-initialize"] }
+# Embedded QuickJS game-logic runtime. Kept optional so the default server build
+# does not compile or link QuickJS unless `--features runtime-js` is set.
+rquickjs = { version = "0.12.1", optional = true, features = ["array-buffer", "loader", "parallel"] }
+# Tiny 2021-edition helper for early, single-threaded process environment setup.
+# Rust 2024 marks std::env mutation unsafe; the main crate forbids unsafe code.
+citadel-process-env = { path = "crates/citadel-process-env", optional = true }
+# Postgres persistence backend. Runtime-checked queries only
+# (`sqlx::query`, never the `query!` macro) so `cargo build`/`check.sh` never
+# need a live database. `tls-rustls-ring` reuses the same ring crypto backend as
+# the QUIC/rustls stack (no aws-lc-rs churn). `migrate` embeds the SQL migrations
+# via `sqlx::migrate!`; `json` decodes `jsonb` into `serde_json::Value`. No
+# rows are decoded with `sqlx::Row::try_get` so nothing is checked against a
+# database at build time. `macros` is enabled only for `sqlx::migrate!` (which
+# embeds the SQL files at compile time and needs no DB); the compile-time
+# `query!` macros are deliberately not used. Domain timestamps (Unix epoch
+# millis, a `u64`) are persisted as `bigint` columns, so no datetime/chrono
+# feature is needed and the millisecond round-trip is exact.
+# `sqlite` is a sibling backend: an embedded, single-file
+# `data.sqlite` powers the zero-infra self-hosted story behind the same
+# `Backend`/`UnitOfWork` seam. It reuses the exact same runtime-checked query
+# posture as Postgres (no `query!` macro), so the same storage contract tests run
+# against it — and because SQLite is embedded (no server), that run is un-gated
+# in `check.sh`. The bundled libsqlite3 (with JSON1) is compiled from source, so
+# there is no system SQLite dependency; JSON is stored as `TEXT` (no `jsonb`).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "sqlite",
+    "json",
+    "migrate",
+    "macros",
+] }
+
+[dev-dependencies]
+# URL parsing for the in-process WebTransport client used in integration tests.
+url = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

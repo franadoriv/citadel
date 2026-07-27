@@ -1,0 +1,15 @@
+[runtime]
+enabled = true
+language = "js"
+scripts_dir = "examples/js-game"
+deadline_ms = 100
+
+[transport.websocket]
+enabled = true
+bind = "127.0.0.1:7352"
+
+[transport.webtransport]
+enabled = false
+
+[transport.quic]
+enabled = false

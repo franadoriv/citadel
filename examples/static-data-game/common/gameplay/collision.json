@@ -1,0 +1,21 @@
+{
+  "characters": {
+    "knight": {
+      "hitbox": {
+        "radius_cm": 42,
+        "height_cm": 168
+      }
+    },
+    "balloon": {
+      "hitbox": {
+        "radius_cm": 28,
+        "height_cm": 64,
+        "offset_y_cm": 132
+      }
+    }
+  },
+  "rules": {
+    "melee_reach_cm": 110,
+    "collision_padding_cm": 4
+  }
+}

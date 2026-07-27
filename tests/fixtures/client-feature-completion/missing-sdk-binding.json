@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "released_sdk_targets": ["unreal", "unity"],
+  "operations": [
+    {
+      "id": "fixture.omitted-binding",
+      "backend": { "method": "GET", "path": "/v1/fixture" },
+      "reference": { "path": "tests/fixtures/client-feature-completion/reference.md", "anchor": "get-v1-fixture" },
+      "exclusions": {},
+      "bindings": {
+        "unreal": { "path": "tests/fixtures/client-feature-completion/reference.md", "symbol": "fixture_binding" }
+      }
+    }
+  ]
+}

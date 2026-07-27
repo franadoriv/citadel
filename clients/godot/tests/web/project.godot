@@ -1,0 +1,16 @@
+; Minimal Godot project used only to compile and export the browser SDK test.
+; The test copies ../citadel/ into this directory in CI so GDScript class names
+; are discovered under the project resource root.
+config_version=5
+
+[application]
+config/name="Citadel Godot Web SDK Test"
+run/main_scene="res://smoke.tscn"
+
+[display]
+window/size/viewport_width=64
+window/size/viewport_height=64
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"

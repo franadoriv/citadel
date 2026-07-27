@@ -1,0 +1,372 @@
+---
+title: Server-simulated physics bots
+description: Build a Balloon-Fight-style bot that falls, flaps, and floats — moved entirely by the server, no client required.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Let's build a bot that behaves like a Balloon Fight fighter: it drops out of the
+sky, bumps into the floor, flaps to gain height, and drifts back down like it's
+had one too many helium balloons. The catch? **This bot has no client.** Nobody's
+phone or PC is driving it. So the *server* has to move it — with real gravity,
+jumps, and collisions against your level — and then beam the result to every
+player.
+
+That's what Citadel's server-side physics is for. This guide walks you there one
+small step at a time. No prior physics-engine trauma required.
+
+:::note[Is this for me?]
+Only reach for this if the **server** needs to move a character — bots, NPCs,
+falling crates, roaming monsters. If your players move their own avatars, you
+don't need any of this, and turning it on costs you exactly nothing. Physics is
+opt-in and asleep until you attach a body. Card games, relax.
+:::
+
+## What you'll need first
+
+Three things, and you probably already have them if you've done the rooms guide:
+
+1. **A cooked `.map` file** with collision geometry — this is the floor and walls
+   your bot will actually stand on. (Cook one from the Unreal tool; the format is
+   engine-agnostic.) Without it, your bot has nothing to land on and will happily
+   fall forever. That's not a bug, that's the void.
+2. **A room that uses that map.** The bot inherits collision from its room's map.
+3. **Transform sync enabled** in your server config, so positions get replicated
+   to clients. (Same switch the moving-actors demo uses.)
+
+Everything below runs in your **server-side game script** — Lua, Python, or
+JavaScript. Pick your tab and it'll stick across the whole page.
+
+## Step 1 — Spawn the bot
+
+First we need an actor for the server to own. `spawn_actor` gives us one and
+hands back its id. We drop it in at `y = 200` — a couple of meters up — so we can
+watch gravity do its thing.
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+-- Positions are in centimeters. y = 200 means "start ~2 m off the ground".
+local bot = citadel.spawn_actor({ x = 0, y = 200, z = 0 })
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+# Positions are in centimeters. y = 200 means "start ~2 m off the ground".
+bot = citadel.spawn_actor({"x": 0, "y": 200, "z": 0})
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+// Positions are in centimeters. y = 200 means "start ~2 m off the ground".
+const bot = citadel.spawn_actor({ x: 0, y: 200, z: 0 });
+```
+
+  </TabItem>
+</Tabs>
+
+Right now it's a floating statue. It won't fall, because we haven't given it a
+body yet. Let's fix that.
+
+## Step 2 — Give it a body (this is where physics turns on)
+
+`set_physics` attaches a physics body and its personality. **This one call is the
+opt-in** — before it, the actor is a plain networked object; after it, the server
+simulates it every tick.
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+citadel.set_physics(bot, {
+  gravity   = 900,   -- pull-down strength. Earth is ~980, so this is a touch floaty.
+  buoyancy  = 300,   -- constant lift, like a small balloon fighting gravity.
+  drag      = 0.5,   -- air resistance, so it doesn't build up runaway speed.
+  radius    = 30,    -- how fat the bot is (capsule radius, in cm).
+  height    = 90,    -- how tall the bot is (~0.9 m).
+  max_speed = 600,   -- speed limit in cm/s (6 m/s), so nothing gets silly.
+  shape     = "capsule",  -- "capsule" (rounded, good for characters) or "aabb" (a box).
+})
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+citadel.set_physics(bot, {
+    "gravity": 900,    # pull-down strength. Earth is ~980, so this is a touch floaty.
+    "buoyancy": 300,   # constant lift, like a small balloon fighting gravity.
+    "drag": 0.5,       # air resistance, so it doesn't build up runaway speed.
+    "radius": 30,      # how fat the bot is (capsule radius, in cm).
+    "height": 90,      # how tall the bot is (~0.9 m).
+    "max_speed": 600,  # speed limit in cm/s (6 m/s), so nothing gets silly.
+    "shape": "capsule",  # "capsule" (rounded, good for characters) or "aabb" (a box).
+})
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+citadel.set_physics(bot, {
+  gravity: 900,    // pull-down strength. Earth is ~980, so this is a touch floaty.
+  buoyancy: 300,   // constant lift, like a small balloon fighting gravity.
+  drag: 0.5,       // air resistance, so it doesn't build up runaway speed.
+  radius: 30,      // how fat the bot is (capsule radius, in cm).
+  height: 90,      // how tall the bot is (~0.9 m).
+  max_speed: 600,  // speed limit in cm/s (6 m/s), so nothing gets silly.
+  shape: "capsule",  // "capsule" (rounded, good for characters) or "aabb" (a box).
+});
+```
+
+  </TabItem>
+</Tabs>
+
+If you stopped here and ran the server, the bot would now **fall and land on your
+map's floor.** That's already real collision — no more falling through the world.
+Congratulations, you have gravity.
+
+:::tip[The numbers are just a starting point]
+`gravity`, `buoyancy`, and `drag` are the whole "feel" of your game. Want a
+moon-jump vibe? Drop gravity. Want a lead brick? Crank it and set buoyancy to 0.
+Nudge them until it feels right — you can't break anything.
+:::
+
+## Step 3 — Make it flap (react to its own state)
+
+A Balloon Fight fighter flaps to stay airborne. To flap at the right moment, the
+bot needs to know what it's doing — is it on the ground? is it falling? That's
+what `physics_state` tells you. Then `apply_impulse` gives it a sudden shove
+(here, straight up on the Y axis) — that's your jump/flap.
+
+We check the state every server tick with `on_tick`:
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+citadel.on_tick(function(dt)
+  local state = citadel.physics_state(bot)
+  if not state then return end          -- no body (e.g. it was removed) → nothing to do
+
+  if state.grounded then
+    citadel.apply_impulse(bot, 0, 600, 0)   -- standing on floor → big hop
+  elseif state.velocity[2] < 0 then
+    citadel.apply_impulse(bot, 0, 120, 0)   -- falling → little flap to slow the drop
+  end
+end)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+@citadel.on_tick
+def tick(dt):
+    state = citadel.physics_state(bot)
+    if not state:            # no body (e.g. it was removed) → nothing to do
+        return
+
+    if state["grounded"]:
+        citadel.apply_impulse(bot, 0, 600, 0)   # standing on floor → big hop
+    elif state["velocity"][1] < 0:
+        citadel.apply_impulse(bot, 0, 120, 0)   # falling → little flap to slow the drop
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+citadel.on_tick((dt) => {
+  const state = citadel.physics_state(bot);
+  if (!state) return;          // no body (e.g. it was removed) → nothing to do
+
+  if (state.grounded) {
+    citadel.apply_impulse(bot, 0, 600, 0);   // standing on floor → big hop
+  } else if (state.velocity[1] < 0) {
+    citadel.apply_impulse(bot, 0, 120, 0);   // falling → little flap to slow the drop
+  }
+});
+```
+
+  </TabItem>
+</Tabs>
+
+Note `velocity` is `[x, y, z]`. **Y is up**, so `velocity[2]` in Lua (1-indexed)
+and `velocity[1]` in Python/JS (0-indexed) both mean "vertical speed". Negative =
+going down. Our bot flaps whenever it's sinking. Endless hover achieved.
+
+## Step 4 — Give it somewhere to go (steering)
+
+Right now the bot bounces in place. To make it *chase* something, use
+`set_move_intent`: it's the bot's "I'd like to walk that way" request. Physics
+handles the vertical stuff (gravity, flaps, landing); you handle the horizontal
+direction. They compose — the bot can pathfind while falling.
+
+Here we point it at a target position. The little bit of math is just "direction
+= where I want to be minus where I am, shrunk to a fixed speed":
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+local target = { x = 500, z = -200 }   -- wherever you want the bot to head
+local SPEED  = 400                     -- cm/s
+
+citadel.on_tick(function(dt)
+  local state = citadel.physics_state(bot)
+  if not state then return end
+
+  -- flap logic from Step 3
+  if state.grounded then
+    citadel.apply_impulse(bot, 0, 600, 0)
+  elseif state.velocity[2] < 0 then
+    citadel.apply_impulse(bot, 0, 120, 0)
+  end
+
+  -- steer horizontally toward the target
+  local px, pz = state.position[1], state.position[3]
+  local dx, dz = target.x - px, target.z - pz
+  local dist = math.sqrt(dx*dx + dz*dz)
+  if dist > 1 then
+    citadel.set_move_intent(bot, dx/dist * SPEED, 0, dz/dist * SPEED)
+  end
+end)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+import math
+
+target = {"x": 500, "z": -200}   # wherever you want the bot to head
+SPEED = 400                      # cm/s
+
+@citadel.on_tick
+def tick(dt):
+    state = citadel.physics_state(bot)
+    if not state:
+        return
+
+    # flap logic from Step 3
+    if state["grounded"]:
+        citadel.apply_impulse(bot, 0, 600, 0)
+    elif state["velocity"][1] < 0:
+        citadel.apply_impulse(bot, 0, 120, 0)
+
+    # steer horizontally toward the target
+    px, pz = state["position"][0], state["position"][2]
+    dx, dz = target["x"] - px, target["z"] - pz
+    dist = math.hypot(dx, dz)
+    if dist > 1:
+        citadel.set_move_intent(bot, dx/dist * SPEED, 0, dz/dist * SPEED)
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+const target = { x: 500, z: -200 };   // wherever you want the bot to head
+const SPEED = 400;                    // cm/s
+
+citadel.on_tick((dt) => {
+  const state = citadel.physics_state(bot);
+  if (!state) return;
+
+  // flap logic from Step 3
+  if (state.grounded) {
+    citadel.apply_impulse(bot, 0, 600, 0);
+  } else if (state.velocity[1] < 0) {
+    citadel.apply_impulse(bot, 0, 120, 0);
+  }
+
+  // steer horizontally toward the target
+  const [px, , pz] = state.position;
+  const dx = target.x - px, dz = target.z - pz;
+  const dist = Math.hypot(dx, dz);
+  if (dist > 1) {
+    citadel.set_move_intent(bot, (dx / dist) * SPEED, 0, (dz / dist) * SPEED);
+  }
+});
+```
+
+  </TabItem>
+</Tabs>
+
+`set_move_intent` only steers X and Z. It **never** overrides the Y axis, so your
+flap-and-float behavior stays intact while the bot walks around. Swap `target`
+for the nearest player's position and you've got a chaser.
+
+## Step 5 — Run it and watch
+
+Start your server, join with a client (or two), and watch the bot: it should drop
+in, land on the floor, immediately hop, and then flutter toward your target while
+never quite hitting the ground again. Every player sees the same motion, because
+the server is the single source of truth and replicates the bot's position like
+any other actor. You didn't touch a single line of client code. That's the whole
+point.
+
+## Cleaning up
+
+When the bot dies or the match ends, detach the body (or despawn the actor). A
+detached body puts the actor back on the free, zero-cost path — and
+`physics_state` will return `nil`/`None`/`null`, which your `on_tick` guard
+already handles.
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+citadel.set_physics(bot, { enabled = false })  -- body off; or citadel.despawn_actor(bot)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+citadel.set_physics(bot, {"enabled": False})  # body off; or citadel.despawn_actor(bot)
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+citadel.set_physics(bot, { enabled: false });  // body off; or citadel.despawn_actor(bot)
+```
+
+  </TabItem>
+</Tabs>
+
+## When it doesn't work (the honest troubleshooting bit)
+
+- **My bot falls forever.** There's no collision mesh under it. Check that its
+  room's map is a cooked `.map` *with* collision geometry, not an empty one. No
+  mesh = free fall by design (we don't invent a floor for you).
+- **`physics_state` returns nothing.** Either you never called `set_physics`, you
+  detached the body, or you're asking about an actor that isn't
+  `ServerSimulated`. Physics only touches server-owned actors — a client-owned
+  player avatar will politely ignore all of this.
+- **The bot jitters or rockets off.** Your impulses/`max_speed` are fighting each
+  other. Lower the impulse, add a little `drag`, or cap `max_speed`.
+- **Nothing moves at all.** Is transform sync enabled? Is `on_tick` actually
+  registered? A physics body still needs the sim loop running to be stepped.
+
+## The four functions, at a glance
+
+| Function | What it's for |
+| --- | --- |
+| `set_physics(id, opts)` | Attach/configure a body. `{ enabled = false }` or nil detaches it. |
+| `apply_impulse(id, x, y, z)` | A sudden shove. `+Y` = jump/flap; horizontal = knockback. |
+| `set_move_intent(id, x, y, z)` | "Walk this way." Steers horizontally; leaves gravity alone. |
+| `physics_state(id)` | Read `{ grounded, position, velocity }` to make decisions. |
+
+For exact signatures, parameter types, return shapes, and error behavior, see the
+per-method reference for your language: [Lua](/reference/server-sdk/lua-runtime/#set_physics),
+[Python](/reference/server-sdk/python-runtime/#set_physics), or
+[JavaScript](/reference/server-sdk/js-runtime/#set_physics).

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Citadel Three.js SDK starter</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; overflow: hidden; background: #0b0e14; color: #edf2ff; }
+      canvas { display: block; }
+      #hud {
+        position: fixed; top: 1rem; left: 1rem; max-width: 25rem;
+        padding: .8rem 1rem; border: 1px solid #35415d; border-radius: .5rem;
+        background: rgb(11 14 20 / 85%); line-height: 1.45;
+      }
+      #status { color: #e2a83b; }
+      #status.connected { color: #70d88b; }
+      code { color: #a8c7ff; }
+    </style>
+  </head>
+  <body>
+    <aside id="hud">
+      <strong>Citadel + Three.js</strong><br />
+      <span id="status">connecting…</span><br />
+      Move with <code>WASD</code> or arrow keys. Open this page in a second tab
+      to see an interpolated green peer. Blue is your immediately predicted
+      local player.
+    </aside>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

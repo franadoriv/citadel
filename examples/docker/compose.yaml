@@ -1,0 +1,22 @@
+services:
+  citadel:
+    # Build this tag locally from the Citadel checkout before starting Compose.
+    # Release CI does not publish or update a registry image.
+    image: "${CITADEL_IMAGE:-citadel:local}"
+    environment:
+      # Required: do not expose Citadel's built-in admin/password credentials.
+      CITADEL_CONSOLE_PASSWORD: "${CITADEL_CONSOLE_PASSWORD:?set CITADEL_CONSOLE_PASSWORD in .env}"
+    ports:
+      - "127.0.0.1:7350:7350/tcp" # HTTP, /health, /status, dashboard
+      - "127.0.0.1:7351:7351/udp" # native QUIC
+      - "127.0.0.1:7352:7352/tcp" # WebSocket
+      - "127.0.0.1:7353:7353/udp" # WebTransport / HTTP/3
+    volumes:
+      - ./citadel.toml:/citadel/config/citadel.toml:ro
+      - ./game:/citadel/game:ro
+      - ./maps:/citadel/maps:ro
+      - citadel-data:/citadel/data
+    stop_grace_period: 30s
+
+volumes:
+  citadel-data:

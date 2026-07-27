@@ -1,0 +1,259 @@
+---
+title: Query indexed storage from game logic
+description: Configure a storage index, decide which writes belong in it, and run safe equality queries from Lua, Python, or JavaScript.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Storage indexes let your **server game logic** find objects by a few declared
+JSON fields without exposing your database to players. This guide builds a
+small profile search: an operator declares the fields, the game script keeps
+draft profiles out of the index, and an RPC queries non-draft profiles by score.
+
+:::note[Who does what?]
+The **operator** declares indexes in `citadel.toml`. Game scripts can query a
+declared index and choose whether each write belongs in it, but cannot create an
+index or run arbitrary database queries. Clients call an RPC that *you* define;
+there is no generic client storage-search endpoint.
+:::
+
+## Before you start
+
+You need a Citadel server project with one shipped game-logic runtime:
+
+- Lua: `game/main.lua` (available in the default build).
+- Python: `game/main.py` in a build with `--features runtime-python`.
+- JavaScript: `game/main.js` in a build with `--features runtime-js`.
+
+This guide uses SQLite so it runs without a database service. PostgreSQL and
+CockroachDB use the same index declaration and observable behavior.
+
+## Step 1 — Declare the index as the operator
+
+Add this to `citadel.toml`. `fields` is the allow-list: only these top-level JSON
+fields can appear in a query. Do not add `key` here — the filter in the next step
+will use the `draft` key to demonstrate exclusion.
+
+```toml
+[database]
+url = "sqlite:citadel.db"
+
+[runtime]
+scripts_dir = "./game"
+# Set this only when you do not want entrypoint auto-detection.
+# language = "lua"
+
+[[storage.indexes]]
+name = "profiles_by_score"
+collection = "profiles"
+fields = ["score", "region"]
+```
+
+The name must be a unique ASCII identifier. Each field must be a unique
+top-level JSON identifier. A declaration may also set `key = "main"` when one
+object key should be indexed; omit it when several keys in the collection should
+be candidates.
+
+## Step 2 — Check the config and start Citadel
+
+From the directory containing `citadel.toml`, validate the declaration and then
+start the server:
+
+```bash
+cargo run -- check
+cargo run -- serve
+```
+
+Citadel validates the declaration during `check`. On startup it applies the
+embedded database migrations and creates the corresponding physical expression
+index for SQLite, PostgreSQL, or CockroachDB. The in-memory backend keeps the
+same query and permission behavior for local development.
+
+## Step 3 — Register the write-time filter
+
+Register filters once while the script initializes, before any RPC or message
+handler writes storage. The callback receives a candidate only when the write
+matches the configured collection (and configured `key`, if present). Return
+exactly `true` to include the object in the index or `false` to exclude it.
+
+This example excludes draft objects by key. For content-based rules, parse
+`value_json` with your runtime's JSON library and keep the callback free of
+external side effects.
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+citadel.register_storage_index_filter("profiles_by_score", function(candidate)
+  return candidate.key ~= "draft"
+end)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+def include_non_draft_profile(candidate):
+    return candidate["key"] != "draft"
+
+citadel.register_storage_index_filter(
+    "profiles_by_score", include_non_draft_profile)
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+citadel.register_storage_index_filter(
+  "profiles_by_score",
+  (candidate) => candidate.key !== "draft",
+);
+```
+
+  </TabItem>
+</Tabs>
+
+`false` does **not** delete the storage object; it removes that object's prior
+membership from this index. If the callback throws, exceeds the enclosing
+runtime deadline, or returns anything other than a boolean, Citadel rejects the
+entire write and keeps the prior object and index membership. Citadel does not
+retry callbacks automatically, so retry a failed write only when repeating your
+callback's effects is safe.
+
+## Step 4 — Write a profile
+
+Add this RPC below the registration in the same script. An authenticated caller
+writes its own `main` profile, which passes the filter and becomes queryable.
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+citadel.on_rpc("save_profile", function(ctx, body)
+  citadel.storage_write(
+    ctx.user_id,
+    "profiles",
+    "main",
+    '{"score":1200,"region":"eu"}',
+    nil,
+    1,
+    1
+  )
+  return "saved"
+end)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+@citadel.on_rpc("save_profile")
+def save_profile(ctx, body):
+    citadel.storage_write(
+        ctx.user_id,
+        "profiles",
+        "main",
+        '{"score": 1200, "region": "eu"}',
+        None,
+        1,
+        1,
+    )
+    return b"saved"
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+citadel.on_rpc("save_profile", (ctx, body) => {
+  citadel.storage_write(
+    ctx.user_id,
+    "profiles",
+    "main",
+    '{"score":1200,"region":"eu"}',
+    null,
+    1,
+    1,
+  );
+  return "saved";
+});
+```
+
+  </TabItem>
+</Tabs>
+
+The last two permission values make this example readable and writable by the
+owner. Index results still obey normal storage read permissions, so choose the
+permissions that fit the RPC you expose.
+
+## Step 5 — Query the declared fields
+
+Add this RPC to look up profiles with a score of `1200`. Filters are a JSON
+object of equality predicates. They may use declared fields only, their values
+may be strings, numbers, or booleans, and `limit` must be between `1` and `100`.
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Lua">
+
+```lua
+citadel.on_rpc("find_profiles_at_score", function(ctx, body)
+  local profiles = citadel.storage_index_query(
+    "profiles_by_score", '{"score":1200}', 25)
+  return profiles[1] and profiles[1].key or "none"
+end)
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+@citadel.on_rpc("find_profiles_at_score")
+def find_profiles_at_score(ctx, body):
+    profiles = citadel.storage_index_query(
+        "profiles_by_score", '{"score": 1200}', 25)
+    return (profiles[0]["key"] if profiles else "none").encode
+```
+
+  </TabItem>
+  <TabItem label="JavaScript">
+
+```js
+citadel.on_rpc("find_profiles_at_score", (ctx, body) => {
+  const profiles = citadel.storage_index_query(
+    "profiles_by_score", '{"score":1200}', 25);
+  return profiles.length ? profiles[0].key : "none";
+});
+```
+
+  </TabItem>
+</Tabs>
+
+The result is identity-ordered. Each object includes its owner (`user_id`, or
+`null` for a system object), `collection`, `key`, `value_json`, version, and
+permissions. Return a purpose-built response from your RPC rather than exposing
+the raw storage search to clients.
+
+## Step 6 — Check the behavior you expect
+
+Use this short checklist when testing your game:
+
+1. Write the `main` profile above. `find_profiles_at_score` returns `main`.
+2. Write an otherwise matching object with key `draft`. It persists normally,
+   but the query does not return it because the filter returned `false`.
+3. Change the filter to return `true` and write the draft object again. It now
+   becomes queryable; membership is updated with the storage write.
+4. Try an undeclared filter such as `{"rank": 1}` or a limit outside `1..100`.
+   Citadel rejects the query with a validation error before building SQL.
+
+If a query returns no objects, first confirm the declaration's `collection` and
+optional `key`, then check the callback decision and the object's read
+permission. If startup rejects the declaration, run `cargo run -- check` and
+compare the name and field identifiers with the rules in the configuration
+reference.
+
+## Learn more
+
+- [Storage index configuration reference](/reference/operations/configuration/#storage)
+- [Lua runtime API](/reference/server-sdk/lua-runtime/)
+- [Python runtime API](/reference/server-sdk/python-runtime/)
+- [JavaScript runtime API](/reference/server-sdk/js-runtime/)

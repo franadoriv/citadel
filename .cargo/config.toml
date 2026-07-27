@@ -1,0 +1,8 @@
+[env]
+# `recastnavigation-sys` first probes pkg-config. Citadel intentionally vendors
+# the C++ source so developers and CI do not need a system Recast installation.
+RECAST_VENDOR = { value = "true", force = true }
+# The installed MSVC toolchain is VS 2022; avoid cmake's future-generator probe
+# only for the Windows target. A global CMAKE_GENERATOR breaks Linux/macOS CMake.
+CMAKE_GENERATOR_x86_64_pc_windows_msvc = { value = "Visual Studio 17 2022", force = true }
+CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = true }

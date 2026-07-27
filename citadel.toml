@@ -1,0 +1,110 @@
+# Citadel standalone server configuration.
+#
+# This is the drop-and-run default: place this file next to `citadel(.exe)` and
+# start the server with no arguments. On first run the node creates its SQLite
+# database file and an empty `game/` folder, applies migrations, and starts
+# listening. Edit the values below and restart to change behavior (the `game/`
+# scripts hot-reload without a restart when `runtime.hot_reload = true`).
+#
+# Every key is optional and falls back to a built-in default; delete a section to
+# accept the defaults. Pass `--config <path>` to load a different file, or set
+# `CITADEL_*` environment variables to override individual values.
+
+[server]
+# Stable identifier for this node (shown on /status and in logs).
+node_id = "citadel-1"
+# Address other nodes/clients use to reach this node.
+public_addr = "127.0.0.1:7350"
+
+[http]
+# HTTP surface: health (/health), status (/status), and the admin console
+# (/dashboard). Bind to 0.0.0.0:7350 to accept connections from other machines.
+bind = "127.0.0.1:7350"
+
+[logging]
+# Log verbosity directive (e.g. "info", "debug", "citadel=trace") and output
+# format ("pretty" for humans, "json" for log aggregation).
+level = "info"
+format = "pretty"
+
+[database]
+# Persistence backend, selected by URL scheme:
+#   sqlite://<file>            -> embedded single-file SQLite (created on first run)
+#   postgres://user:pass@host/db -> PostgreSQL
+# Remove this key entirely to run non-durably on the in-memory backend.
+# The standalone default is a single `data.sqlite` file next to the binary.
+url = "sqlite://data.sqlite"
+# Connection pool size and timeouts (milliseconds).
+max_connections = 10
+connect_timeout_ms = 5000
+acquire_timeout_ms = 5000
+
+# Optional operator-declared storage indexes. Uncomment and customize one entry
+# per indexed storage collection; they are created safely at server startup.
+# [[storage.indexes]]
+# name = "profiles_by_score"
+# collection = "profiles"
+# fields = ["score", "region"]
+
+[runtime]
+# Embedded game-logic runtime. With language unset, Citadel autodetects one
+# entrypoint in scripts_dir: main.lua (Lua, shipped), main.py (planned), or
+# main.ts/main.js (planned). With no script present it falls back to the
+# built-in relay.
+enabled = true
+# Optional explicit language. Omit for autodetect. Supported value today: "lua".
+# language = "lua"
+# Runtime hosting model. Only embedded/trusted is implemented today.
+adapter = "embedded"
+tier = "trusted"
+# Folder holding your game scripts (created empty on first run). Drop a
+# `main.lua` here to add Lua game logic. See docs/features/embedded-lua-runtime.md.
+scripts_dir = "./game"
+# Per-invocation time budget for message/lifecycle handlers (milliseconds).
+deadline_ms = 100
+# Server game-loop rate in ticks per second (0 disables the `citadel.on_tick`
+# loop; no periodic task is spawned).
+tick_hz = 0
+# Live-reload `game/main.lua` on save without a restart. Reloads are failure-safe
+# (a broken edit is rejected and the previous script keeps serving). Convenient
+# for development; consider turning it off for a fixed production deployment.
+hot_reload = true
+hot_reload_poll_ms = 500
+
+# Realtime transports. Each is independently enabled and bound. QUIC is the
+# primary native transport, WebTransport serves browsers over HTTP/3, and
+# WebSocket is the broadest-compatibility fallback. All three are enabled here so
+# the standalone server accepts every supported client out of the box.
+[transport.quic]
+enabled = true
+bind = "127.0.0.1:7351"
+outbound_queue_capacity = 1024
+
+[transport.websocket]
+enabled = true
+bind = "127.0.0.1:7352"
+outbound_queue_capacity = 1024
+
+[transport.webtransport]
+enabled = true
+bind = "127.0.0.1:7353"
+outbound_queue_capacity = 1024
+
+# Authoritative transform synchronization. Required by Networked Actors (the
+# presence + replicated-spawn layer the Unreal SDK uses): the server owns each
+# object's transform and streams per-client delta snapshots. Enabling this is all
+# the server needs — presence is client-driven (your pawn calls AnnouncePresence).
+# The client renders remote players interpolated in the past with an adaptive
+# jitter buffer that self-tunes to the link (low latency on LAN, robust on WAN).
+#
+# send_rate_hz drives snapshots (60 = lowest latency; the client sizes its buffer
+# from it); sim_hz is the world tick (physics + server_tick). demo_movers /
+# player_slots are the built-in moving-cube demos, left OFF so object ids stay
+# free for your own Networked-Actor players.
+[transport.transform_sync]
+enabled = true
+send_rate_hz = 60
+sim_hz = 60
+budget = 0
+demo_movers = 0
+player_slots = 0

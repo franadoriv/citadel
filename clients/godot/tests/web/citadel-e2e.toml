@@ -1,0 +1,29 @@
+# Local-only Citadel configuration used by the real Godot Web browser check.
+# It intentionally enables only WebSocket and the built-in relay.
+
+[server]
+node_id = "godot-web-e2e"
+public_addr = "127.0.0.1:17530"
+
+[http]
+bind = "127.0.0.1:17530"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[runtime]
+enabled = false
+
+[transport.quic]
+enabled = false
+
+[transport.websocket]
+enabled = true
+bind = "127.0.0.1:17532"
+
+[transport.webtransport]
+enabled = false
+
+[transport.transform_sync]
+enabled = false

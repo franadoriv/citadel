@@ -1,0 +1,18 @@
+[package]
+name = "citadel-physics"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Deterministic kinematic character controller and static triangle-mesh broadphase for Citadel."
+
+[dependencies]
+citadel-map = { path = "../citadel-map" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

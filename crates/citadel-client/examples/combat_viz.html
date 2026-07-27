@@ -1,0 +1,979 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Citadel · Combat Benchmark (30 clientes)</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #0b0e14;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  #app { position: fixed; inset: 0; }
+  #hud, #events, #chat, #telemetry {
+    position: fixed;
+    background: rgba(12,16,24,.78);
+    border: 1px solid #1e2836;
+    border-radius: 8px;
+    color: #cdd6e4;
+    backdrop-filter: blur(6px);
+    text-shadow: 0 1px 2px #000;
+  }
+  #hud { top: 12px; left: 12px; width: 330px; padding: 12px 14px; font-size: 12px; line-height: 1.5; }
+  #hud h1 { margin: 0 0 6px; font-size: 13px; color: #7ee0c0; letter-spacing: 0; }
+  #hud .row { display: flex; justify-content: space-between; gap: 10px; }
+  #hud .k { color: #6b7a90; }
+  #hud .v { color: #e8eef7; }
+  #hud .hint { margin-top: 8px; color: #8390a3; font-size: 11px; }
+  #status { color: #f0b429; }
+
+  #events { top: 12px; right: 12px; width: 320px; max-height: 44vh; overflow: hidden; padding: 10px 12px; font-size: 11px; }
+  #events h2, #chat h2, #telemetry h2 { margin: 0 0 7px; font-size: 11px; font-weight: 700; color: #7ee0c0; letter-spacing: 0; }
+  #events div, #chat div { margin-bottom: 4px; line-height: 1.35; }
+
+  #chat { left: 12px; bottom: 12px; width: min(520px, calc(100vw - 24px)); max-height: 34vh; overflow: hidden; padding: 10px 12px; font-size: 12px; }
+  #chat .line { color: #d9e2ef; }
+  #chat .meta { color: #79879b; }
+
+  #telemetry { right: 12px; bottom: 12px; width: 430px; padding: 10px 12px; font-size: 11px; }
+  #telemetryStats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px; }
+  #telemetryStats .metric { min-width: 0; padding: 6px 7px; background: rgba(255,255,255,.035); border: 1px solid rgba(255,255,255,.055); border-radius: 6px; }
+  #telemetryStats .label { color: #78869a; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #telemetryStats .value { color: #e8eef7; font-size: 13px; line-height: 1.2; }
+  #telemetryGraph { height: 190px; border: 1px solid rgba(255,255,255,.06); border-radius: 6px; overflow: hidden; background: rgba(0,0,0,.18); }
+  #telemetryLegend { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 7px; color: #93a1b5; font-size: 10px; }
+  #telemetryLegend span::before { content: ""; display: inline-block; width: 8px; height: 2px; margin: 0 5px 3px 0; background: var(--c); }
+
+  @media (max-width: 980px) {
+    #events { display: none; }
+    #telemetry { width: min(430px, calc(100vw - 24px)); bottom: calc(34vh + 48px); }
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud">
+  <h1>CITADEL · COMBAT BENCHMARK</h1>
+  <div class="row"><span class="k">servidor</span><span class="v" id="url"></span></div>
+  <div class="row"><span class="k">clientes</span><span class="v" id="connected">0 / 0</span></div>
+  <div class="row"><span class="k">players vivos</span><span class="v" id="alive">0</span></div>
+  <div class="row"><span class="k">monstruos vivos</span><span class="v" id="monstersAlive">0</span></div>
+  <div class="row"><span class="k">estado</span><span class="v" id="status">iniciando...</span></div>
+  <div class="hint"><span id="botCountHint">30</span> WebSockets. Players simulados localmente; HP, monstruos, chat, daño y muertes vienen del Lua server. Obstaculos compartidos por cliente/servidor.</div>
+</div>
+<div id="events"><h2>EVENTOS</h2></div>
+<div id="chat"><h2>CHAT</h2><div class="meta">Esperando mensajes...</div></div>
+<div id="telemetry">
+  <h2>TELEMETRIA</h2>
+  <div id="telemetryStats">
+    <div class="metric"><div class="label">RTT Lua</div><div class="value" id="metricRtt">--</div></div>
+    <div class="metric"><div class="label">msgs/s</div><div class="value" id="metricMsgs">--</div></div>
+    <div class="metric"><div class="label">KB/s</div><div class="value" id="metricKbps">--</div></div>
+    <div class="metric"><div class="label">errores</div><div class="value" id="metricErrors">--</div></div>
+    <div class="metric"><div class="label">tick</div><div class="value" id="metricTick">--</div></div>
+    <div class="metric"><div class="label">hits/s</div><div class="value" id="metricHits">--</div></div>
+    <div class="metric"><div class="label">muertes/s</div><div class="value" id="metricDeaths">--</div></div>
+    <div class="metric"><div class="label">server</div><div class="value" id="metricServer">--</div></div>
+    <div class="metric"><div class="label">replica</div><div class="value" id="metricReplica">--</div></div>
+    <div class="metric"><div class="label">drift</div><div class="value" id="metricDrift">--</div></div>
+  </div>
+  <div id="telemetryGraph"></div>
+  <div id="telemetryLegend">
+    <span style="--c:#7ee0c0">RTT</span>
+    <span style="--c:#6da8ff">msgs/s</span>
+    <span style="--c:#f0b429">KB/s</span>
+    <span style="--c:#ff6b7a">errores/s</span>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import {
+  CitadelClient,
+  KIND_POSITION, KIND_PEER_POSITION,
+} from '../../../clients/js/src/index.js';
+
+const WS_URL = new URLSearchParams(location.search).get('url') || 'ws://127.0.0.1:7352/';
+const N_BOTS = Number(new URLSearchParams(location.search).get('bots') || 30);
+const ARENA = 46;
+const MAX_HP = 100;
+const MONSTER_MAX_HP = 180;
+const PLAYER_RADIUS = 1.8;
+
+const KIND_HIT = 100;
+const KIND_HEALTH = 101;
+const KIND_DEATH = 102;
+const KIND_RESPAWN = 103;
+const KIND_WELCOME = 104;
+const KIND_CHAT_SEND = 105;
+const KIND_CHAT_RECV = 106;
+const KIND_MONSTER_SPAWN = 107;
+const KIND_MONSTER_STATE = 108;
+const KIND_MONSTER_DEATH = 109;
+const KIND_MONSTER_RESPAWN = 110;
+const KIND_MONSTER_ATTACK = 111;
+const KIND_TELEMETRY = 112;
+const KIND_TELEMETRY_PING = 113;
+const KIND_TELEMETRY_PONG = 114;
+
+const OBSTACLES = [
+  { x: 0, z: 0, hx: 7, hz: 4 },
+  { x: -23, z: -12, hx: 4, hz: 10 },
+  { x: 23, z: 12, hx: 4, hz: 10 },
+  { x: -10, z: 25, hx: 9, hz: 3 },
+  { x: 12, z: -26, hx: 9, hz: 3 },
+];
+
+document.getElementById('url').textContent = WS_URL;
+document.getElementById('botCountHint').textContent = String(N_BOTS);
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const u64 = (p, off) => Number(new DataView(p.buffer, p.byteOffset, p.length).getBigUint64(off, false));
+const f32 = (p, off) => new DataView(p.buffer, p.byteOffset, p.length).getFloat32(off, false);
+const u8 = (p, off) => new DataView(p.buffer, p.byteOffset, p.length).getUint8(off);
+
+const BOT_NAMES = [
+  'TurboTaco', 'LagWizard', 'PixelFury', 'BugSlammer', 'ManaPanic',
+  'CritCache', 'NullPointer', 'SirBonk', 'PatchNotes', 'SpawnStorm',
+  'CacheMancer', 'FrameLord', 'ByteBrawler', 'Quaternion', 'StackSmash',
+  'LootLoop', 'PacketPunch', 'DramaMage', 'HotReload', 'VectorVictor',
+  'TinyTank', 'BossIntern', 'MutexMax', 'RubberDebug', 'HeapHero',
+  'PingPanic', 'RageCompiler', 'ShaderSnack', 'RollbackRon', 'DeltaDiva',
+  'ArenaJitter', 'QuestQueue', 'SyntaxSam', 'LatencyLuna', 'PotionPete',
+  'MeshMarta', 'ColliderKai', 'RespawnRita', 'DatagramDan', 'ComboCarmen',
+];
+
+const CHAT = {
+  idle: [
+    'Estoy midiendo latencia con mis sentimientos.',
+    'Este muro no estaba en mi plan de vida.',
+    'Pathfinding local: barato, terco, sorprendentemente digno.',
+    'Si me ven atorado, es investigacion de colisiones.',
+    'El servidor dice que estoy vivo; yo tengo dudas.',
+    'Hoy vine por benchmarks y snacks.',
+    'Mi estrategia es parecer ocupado.',
+    'Estoy respetando obstaculos por primera vez en mi carrera.',
+  ],
+  chase: [
+    'Voy por {target}; no cambiare de target cada microsegundo, lo prometo.',
+    '{target}, vuelve aca, es por ciencia.',
+    'Objetivo adquirido: {target}. Dignidad: pendiente.',
+    'Persiguiendo a {target} con steering artesanal.',
+    '{target}, tu hitbox tiene cita conmigo.',
+  ],
+  hit: [
+    'Bonk a {target} por {damage}.',
+    '{target} recibio {damage} de feedback constructivo.',
+    'Le mande a {target} un paquete confiable de {damage} danos.',
+    '{target}, eso fue una demo tecnica, no personal.',
+    'Ataque server-authoritative entregado a {target}.',
+  ],
+  low: [
+    'Estoy a {hp} HP y aun asi dando opiniones.',
+    '{hp} HP: suficiente para una mala decision mas.',
+    'Necesito un heal, un cafe o un rollback.',
+    'Estoy tecnicamente vivo, legalmente discutible.',
+  ],
+  kill: [
+    'GG {target}. Tu sacrificio mejora las metricas.',
+    '{target} fue optimizado fuera del runtime.',
+    'Confirmo baja de {target}.',
+    'Esa fue por la cobertura de tests, {target}.',
+  ],
+  death: [
+    'He muerto, pero mi websocket sigue en nuestros corazones.',
+    'Me fui del server para ahorrar ancho de banda.',
+    'Esto va directo a mi retrospectiva.',
+    'No perdi; fui garbage-collected.',
+  ],
+  respawn: [
+    'Respawn completo. Mis errores anteriores eran features.',
+    'Nueva vida, mismo pathfinding cuestionable.',
+    'Estoy de vuelta y esta vez lei el README.',
+    'Mi HP esta full; mi juicio no.',
+  ],
+};
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0e14);
+scene.fog = new THREE.Fog(0x0b0e14, 90, 210);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 500);
+let camAngle = 0.6, camDrag = false, lastX = 0;
+function placeCamera() {
+  const r = 102, h = 82;
+  camera.position.set(Math.sin(camAngle) * r, h, Math.cos(camAngle) * r);
+  camera.lookAt(0, 0, 0);
+}
+renderer.domElement.addEventListener('pointerdown', e => { camDrag = true; lastX = e.clientX; });
+addEventListener('pointerup', () => camDrag = false);
+addEventListener('pointermove', e => {
+  if (!camDrag) return;
+  camAngle -= (e.clientX - lastX) * 0.005;
+  lastX = e.clientX;
+});
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+scene.add(new THREE.HemisphereLight(0x9aa8c8, 0x0b0e14, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.55);
+sun.position.set(40, 82, 20); sun.castShadow = true;
+sun.shadow.camera.left = -75; sun.shadow.camera.right = 75;
+sun.shadow.camera.top = 75; sun.shadow.camera.bottom = -75;
+sun.shadow.mapSize.set(2048, 2048);
+scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(ARENA * 2 + 8, ARENA * 2 + 8),
+  new THREE.MeshStandardMaterial({ color: 0x121824, roughness: 1 })
+);
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+scene.add(ground);
+const grid = new THREE.GridHelper(ARENA * 2, 24, 0x243044, 0x1a2333);
+grid.position.y = 0.02; scene.add(grid);
+
+for (const o of OBSTACLES) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(o.hx * 2, 4.2, o.hz * 2),
+    new THREE.MeshStandardMaterial({ color: 0x334054, roughness: 0.8, metalness: 0.05 })
+  );
+  mesh.position.set(o.x, 2.1, o.z);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+}
+
+const telemetryEl = document.getElementById('telemetryGraph');
+const telemetryRenderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+telemetryRenderer.setPixelRatio(1);
+telemetryEl.appendChild(telemetryRenderer.domElement);
+const telemetryScene = new THREE.Scene();
+const telemetryCamera = new THREE.OrthographicCamera(0, 1, 1, 0, -1, 1);
+const TELEMETRY_SAMPLES = 96;
+const telemetryState = {
+  rttMs: 0,
+  pendingPingAt: 0,
+  nextPingAt: 0,
+  latest: null,
+  samples: [],
+};
+
+function metricText(id, value) {
+  document.getElementById(id).textContent = value;
+}
+
+function makeTelemetryLine(color) {
+  const points = new Float32Array(TELEMETRY_SAMPLES * 3);
+  for (let i = 0; i < TELEMETRY_SAMPLES; i++) {
+    points[i * 3] = i / (TELEMETRY_SAMPLES - 1);
+    points[i * 3 + 1] = 0.95;
+    points[i * 3 + 2] = 0;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(points, 3));
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color }));
+  telemetryScene.add(line);
+  return line;
+}
+
+const telemetryLines = {
+  rtt: makeTelemetryLine(0x7ee0c0),
+  msgs: makeTelemetryLine(0x6da8ff),
+  kbps: makeTelemetryLine(0xf0b429),
+  errors: makeTelemetryLine(0xff6b7a),
+};
+
+function addTelemetryGrid() {
+  const geo = new THREE.BufferGeometry();
+  const pts = [];
+  for (let i = 1; i < 4; i++) {
+    const y = i / 4;
+    pts.push(0, y, 0, 1, y, 0);
+  }
+  for (let i = 1; i < 6; i++) {
+    const x = i / 6;
+    pts.push(x, 0, 0, x, 1, 0);
+  }
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  telemetryScene.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x263142 })));
+}
+addTelemetryGrid();
+
+function decodeTelemetry(p) {
+  if (!p || p.length < 56) return null;
+  const dv = new DataView(p.buffer, p.byteOffset, p.length);
+  let off = 0;
+  const next = () => { const v = dv.getFloat32(off, false); off += 4; return v; };
+  return {
+    connected: next(),
+    playersAlive: next(),
+    monstersAlive: next(),
+    inMsgSec: next(),
+    outMsgSec: next(),
+    inKbps: next(),
+    outKbps: next(),
+    hitSec: next(),
+    monsterAttackSec: next(),
+    deathSec: next(),
+    chatSec: next(),
+    errorTotal: next(),
+    errorSec: next(),
+    tickMs: next(),
+  };
+}
+
+function pushTelemetry(sample) {
+  sample.rttMs = telemetryState.rttMs || 0;
+  telemetryState.latest = sample;
+  telemetryState.samples.push(sample);
+  while (telemetryState.samples.length > TELEMETRY_SAMPLES) telemetryState.samples.shift();
+  const msgs = sample.inMsgSec + sample.outMsgSec;
+  const kbps = sample.inKbps + sample.outKbps;
+  metricText('metricRtt', telemetryState.rttMs ? `${telemetryState.rttMs.toFixed(0)} ms` : '--');
+  metricText('metricMsgs', msgs.toFixed(0));
+  metricText('metricKbps', kbps.toFixed(1));
+  metricText('metricErrors', `${sample.errorTotal.toFixed(0)} / ${sample.errorSec.toFixed(1)}s`);
+  metricText('metricTick', `${sample.tickMs.toFixed(1)} ms`);
+  metricText('metricHits', sample.hitSec.toFixed(1));
+  metricText('metricDeaths', sample.deathSec.toFixed(1));
+  metricText('metricServer', `${sample.connected.toFixed(0)}c ${sample.monstersAlive.toFixed(0)}m`);
+}
+
+function renderTelemetry() {
+  const rect = telemetryEl.getBoundingClientRect();
+  const w = Math.max(1, Math.floor(rect.width));
+  const h = Math.max(1, Math.floor(rect.height));
+  if (telemetryRenderer.domElement.width !== w || telemetryRenderer.domElement.height !== h) {
+    telemetryRenderer.setSize(w, h, false);
+  }
+  const scales = {
+    rtt: 220,
+    msgs: 12000,
+    kbps: 900,
+    errors: 8,
+  };
+  const rows = {
+    rtt: [0.00, 0.24],
+    msgs: [0.25, 0.49],
+    kbps: [0.50, 0.74],
+    errors: [0.75, 0.99],
+  };
+  const values = {
+    rtt: s => s.rttMs || 0,
+    msgs: s => s.inMsgSec + s.outMsgSec,
+    kbps: s => s.inKbps + s.outKbps,
+    errors: s => s.errorSec,
+  };
+  for (const [key, line] of Object.entries(telemetryLines)) {
+    const attr = line.geometry.getAttribute('position');
+    const row = rows[key];
+    const rowTop = row[0], rowBottom = row[1];
+    const rowHeight = rowBottom - rowTop;
+    for (let i = 0; i < TELEMETRY_SAMPLES; i++) {
+      const sampleIndex = telemetryState.samples.length - TELEMETRY_SAMPLES + i;
+      const s = sampleIndex >= 0 ? telemetryState.samples[sampleIndex] : null;
+      const x = i / (TELEMETRY_SAMPLES - 1);
+      const normalized = s ? Math.max(0, Math.min(1, values[key](s) / scales[key])) : 0;
+      attr.array[i * 3] = x;
+      attr.array[i * 3 + 1] = rowBottom - normalized * rowHeight;
+      attr.array[i * 3 + 2] = 0;
+    }
+    attr.needsUpdate = true;
+  }
+  telemetryRenderer.render(telemetryScene, telemetryCamera);
+}
+
+function sendTelemetryPing(now) {
+  const monitor = clients[0];
+  if (!monitor?.sdk?.isOpen || !monitor.authed) return;
+  if (telemetryState.pendingPingAt && now - telemetryState.pendingPingAt < 3000) return;
+  if (now < telemetryState.nextPingAt) return;
+  const p = new Uint8Array(8);
+  new DataView(p.buffer).setFloat64(0, now, false);
+  telemetryState.pendingPingAt = now;
+  telemetryState.nextPingAt = now + 1000;
+  monitor.sdk.send(KIND_TELEMETRY_PING, p);
+}
+
+function makeHpBar(width = 3.4) {
+  const bar = new THREE.Group();
+  const bg = new THREE.Mesh(new THREE.PlaneGeometry(width, 0.5),
+    new THREE.MeshBasicMaterial({ color: 0x000000 }));
+  const fg = new THREE.Mesh(new THREE.PlaneGeometry(width - 0.2, 0.36),
+    new THREE.MeshBasicMaterial({ color: 0x36d17a }));
+  fg.position.z = 0.01;
+  bar.add(bg); bar.add(fg);
+  scene.add(bar);
+  return { bar, fg, width: width - 0.2 };
+}
+
+function makePlayerEntity(index, color) {
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(3, 3, 3),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.1 })
+  );
+  body.position.y = 1.5; body.castShadow = true; group.add(body);
+
+  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x0b0e14 });
+  for (const dx of [-0.7, 0.7]) {
+    const eye = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.2), eyeMat);
+    eye.position.set(dx, 1.9, 1.55); group.add(eye);
+  }
+
+  const pivot = new THREE.Group();
+  pivot.position.set(1.7, 1.5, 0.6);
+  const blade = new THREE.Mesh(
+    new THREE.BoxGeometry(0.28, 0.28, 4.2),
+    new THREE.MeshStandardMaterial({ color: 0xe8eef7, metalness: 0.7, roughness: 0.3 })
+  );
+  blade.position.z = 2.1; blade.castShadow = true;
+  const guard = new THREE.Mesh(
+    new THREE.BoxGeometry(1.4, 0.3, 0.3),
+    new THREE.MeshStandardMaterial({ color: 0x8a5a2b })
+  );
+  pivot.add(blade); pivot.add(guard); group.add(pivot);
+
+  const hpBar = makeHpBar(3.4);
+  scene.add(group);
+  const pos = randomFreePosition();
+  return {
+    kind: 'player', index, color, group, body, pivot, fg: hpBar.fg, bar: hpBar.bar,
+    barWidth: hpBar.width, baseColor: new THREE.Color(color),
+    x: pos.x, z: pos.z, heading: Math.random() * Math.PI * 2,
+    hp: MAX_HP, maxHp: MAX_HP, alive: true,
+    swingAt: -1, hitFlashAt: -1, deathAt: -1,
+    cooldown: Math.random() * 1.0,
+    targetKind: null, targetId: null, targetLockUntil: 0, nextChatAt: performance.now() + 1800 + Math.random() * 10000,
+  };
+}
+
+function makeMonsterEntity(monster) {
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(4.1, 4.1, 4.1),
+    new THREE.MeshStandardMaterial({ color: 0xb84b5a, roughness: 0.6, metalness: 0.05 })
+  );
+  body.position.y = 2.05; body.castShadow = true; group.add(body);
+  const hornMat = new THREE.MeshStandardMaterial({ color: 0xf0d48a, roughness: 0.45 });
+  for (const dx of [-1.1, 1.1]) {
+    const horn = new THREE.Mesh(new THREE.ConeGeometry(0.35, 1.4, 8), hornMat);
+    horn.position.set(dx, 4.45, 0.1);
+    horn.rotation.x = Math.PI;
+    horn.castShadow = true;
+    group.add(horn);
+  }
+  const hpBar = makeHpBar(4.2);
+  scene.add(group);
+  monster.group = group;
+  monster.body = body;
+  monster.fg = hpBar.fg;
+  monster.bar = hpBar.bar;
+  monster.barWidth = hpBar.width;
+  monster.baseColor = new THREE.Color(0xb84b5a);
+  monster.hitFlashAt = -1;
+  monster.deathAt = -1;
+}
+
+const clients = [];
+const byId = new Map();
+const monsters = new Map();
+const replicatedPeers = new Map();
+let connectedCount = 0;
+let nextGlobalChatAt = 0;
+let replicatedRxTotal = 0;
+const recentChat = new Map();
+const recentEvents = new Map();
+
+function randomFreePosition() {
+  for (let i = 0; i < 80; i++) {
+    const x = (Math.random() * 2 - 1) * ARENA * 0.82;
+    const z = (Math.random() * 2 - 1) * ARENA * 0.82;
+    if (!insideObstacle(x, z, PLAYER_RADIUS + 0.4)) return { x, z };
+  }
+  return { x: 0, z: ARENA * 0.75 };
+}
+
+function insideObstacle(x, z, radius = 0) {
+  return OBSTACLES.some(o =>
+    x >= o.x - o.hx - radius && x <= o.x + o.hx + radius &&
+    z >= o.z - o.hz - radius && z <= o.z + o.hz + radius
+  );
+}
+
+function lineBlocked(ax, az, bx, bz, radius = 0) {
+  for (let i = 1; i <= 7; i++) {
+    const t = i / 7;
+    if (insideObstacle(ax + (bx - ax) * t, az + (bz - az) * t, radius)) return true;
+  }
+  return false;
+}
+
+function obstacleSafeHeading(x, z, desired, speed, dt) {
+  const candidates = [0, 0.75, -0.75, 1.35, -1.35, Math.PI * 0.65, -Math.PI * 0.65];
+  let best = desired, bestScore = Infinity;
+  for (const offset of candidates) {
+    const h = desired + offset;
+    const nx = clamp(x + Math.sin(h) * speed * dt, -ARENA, ARENA);
+    const nz = clamp(z + Math.cos(h) * speed * dt, -ARENA, ARENA);
+    if (insideObstacle(nx, nz, PLAYER_RADIUS) || lineBlocked(x, z, nx, nz, PLAYER_RADIUS)) continue;
+    const score = Math.abs(offset) + (Math.abs(nx) > ARENA * 0.96 || Math.abs(nz) > ARENA * 0.96 ? 3 : 0);
+    if (score < bestScore) { bestScore = score; best = h; }
+  }
+  return best;
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function hue(i) { return new THREE.Color().setHSL(i / N_BOTS, 0.65, 0.55).getHex(); }
+function labelClient(client) { return client ? client.name : '???'; }
+function labelMonster(monster) { return monster ? `M${monster.index}` : '???'; }
+function entityLabel(kind, id) {
+  if (kind === 'monster') return labelMonster(monsters.get(id));
+  return labelClient(byId.get(id));
+}
+function labelAny(id) {
+  if (monsters.has(id)) return labelMonster(monsters.get(id));
+  return labelClient(byId.get(id));
+}
+function colorForId(id) {
+  const monster = monsters.get(id);
+  if (monster) return 'ff6b7a';
+  const client = byId.get(id);
+  return (client ? client.entity.color : 0xffffff).toString(16).padStart(6, '0');
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+function pick(list) { return list[Math.floor(Math.random() * list.length)]; }
+function renderTemplate(template, vars = {}) {
+  return template.replace(/\{(\w+)\}/g, (_, key) => String(vars[key] ?? ''));
+}
+function recentlySeen(map, key, ttlMs) {
+  const now = performance.now();
+  for (const [seenKey, seenAt] of map) if (now - seenAt > ttlMs) map.delete(seenKey);
+  if (map.has(key)) return true;
+  map.set(key, now);
+  return false;
+}
+
+function makeReplicatedGhost(id) {
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(2.15, 2.65, 28),
+    new THREE.MeshBasicMaterial({ color: 0x7ee0c0, transparent: true, opacity: 0.42, side: THREE.DoubleSide })
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.16;
+  scene.add(ring);
+  return { id, x: 0, z: 0, seenAt: 0, ring };
+}
+
+function observeReplicatedPosition(sender, x, z) {
+  if (!sender || sender === clients[0]?.id) return;
+  let ghost = replicatedPeers.get(sender);
+  if (!ghost) {
+    ghost = makeReplicatedGhost(sender);
+    replicatedPeers.set(sender, ghost);
+  }
+  ghost.x = x;
+  ghost.z = z;
+  ghost.seenAt = performance.now();
+  ghost.ring.position.set(x, 0.16, z);
+  ghost.ring.visible = true;
+  replicatedRxTotal++;
+}
+
+function updateReplicationDiagnostics(now) {
+  let fresh = 0;
+  let drift = 0;
+  for (const ghost of replicatedPeers.values()) {
+    const age = now - ghost.seenAt;
+    const c = byId.get(ghost.id);
+    const visible = Boolean(c?.entity.alive) && age < 1200;
+    ghost.ring.visible = visible;
+    if (!visible) continue;
+    fresh++;
+    drift += Math.sqrt(dist2(ghost.x, ghost.z, c.entity.x, c.entity.z));
+  }
+  const expected = Math.max(0, connectedCount - 1);
+  const avgDrift = fresh > 0 ? drift / fresh : 0;
+  metricText('metricReplica', `${fresh}/${expected}`);
+  metricText('metricDrift', `${avgDrift.toFixed(1)}u`);
+}
+
+function pushEvent(html) {
+  const feed = document.getElementById('events');
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  feed.insertBefore(div, feed.children[1] || null);
+  while (feed.children.length > 20) feed.removeChild(feed.lastChild);
+}
+
+function pushChat(html) {
+  const feed = document.getElementById('chat');
+  const firstMeta = feed.querySelector('.meta');
+  if (firstMeta) firstMeta.remove();
+  const div = document.createElement('div');
+  div.className = 'line';
+  div.innerHTML = html;
+  feed.insertBefore(div, feed.children[1] || null);
+  while (feed.children.length > 14) feed.removeChild(feed.lastChild);
+}
+
+for (let i = 0; i < N_BOTS; i++) {
+  const client = {
+    index: i,
+    name: BOT_NAMES[i % BOT_NAMES.length],
+    sdk: null,
+    id: null,
+    authed: false,
+    entity: makePlayerEntity(i, hue(i)),
+  };
+  clients.push(client);
+  connect(client);
+}
+
+async function connect(client) {
+  try {
+    const sdk = await CitadelClient.connect(WS_URL);
+    client.sdk = sdk;
+    registerHandlers(client, sdk);
+    await sdk.handshakeGuest();
+    client.authed = true; connectedCount++; updateHud();
+  } catch (err) {
+    setStatus('error de conexion en ' + WS_URL + ' (' + err.message + ')');
+  }
+}
+
+function registerHandlers(client, sdk) {
+  sdk.on(KIND_WELCOME, (p) => {
+    client.id = u64(p, 0);
+    byId.set(client.id, client);
+  });
+  sdk.on(KIND_HEALTH, (p) => {
+    const who = u64(p, 0), hp = f32(p, 8);
+    const c = byId.get(who); if (!c) return;
+    if (hp < c.entity.hp) c.entity.hitFlashAt = performance.now();
+    c.entity.hp = hp;
+    if (client.id === who && hp > 0 && hp <= 35 && Math.random() < 0.20) {
+      maybeChat(client, 'low', null, { hp: Math.max(1, Math.round(hp)) });
+    }
+  });
+  sdk.on(KIND_DEATH, (p) => {
+    const victim = u64(p, 0), killer = u64(p, 8);
+    const v = byId.get(victim);
+    if (v) { v.entity.deathAt = performance.now(); v.entity.alive = false; }
+    if (!recentlySeen(recentEvents, `ko:${killer}:${victim}`, 1000)) {
+      pushEvent(`<b style="color:#${colorForId(killer)}">${labelAny(killer)}</b> KO <b style="color:#${colorForId(victim)}">${labelAny(victim)}</b>`);
+    }
+    if (client.id === killer && Math.random() < 0.35) maybeChat(client, 'kill', { kind: 'player', id: victim });
+    else if (client.id === victim && Math.random() < 0.40) maybeChat(client, 'death');
+  });
+  sdk.on(KIND_RESPAWN, (p) => {
+    const respawnId = u64(p, 0);
+    const c = byId.get(respawnId); if (!c) return;
+    c.entity.alive = true; c.entity.deathAt = -1; c.entity.hp = MAX_HP;
+    if (client.id === respawnId && !recentlySeen(recentEvents, `player-respawn-owner:${respawnId}`, 500)) {
+      const pos = randomFreePosition();
+      c.entity.x = pos.x;
+      c.entity.z = pos.z;
+      c.entity.targetKind = null;
+      c.entity.targetId = null;
+      c.entity.targetLockUntil = 0;
+      sendPosition(client);
+      if (Math.random() < 0.30) maybeChat(client, 'respawn');
+    }
+  });
+  sdk.on(KIND_CHAT_RECV, (p) => showChat(u64(p, 0), dec.decode(p.slice(8))));
+  sdk.on(KIND_MONSTER_SPAWN, (p) => upsertMonster(p, false));
+  sdk.on(KIND_MONSTER_STATE, (p) => upsertMonster(p, true));
+  sdk.on(KIND_MONSTER_DEATH, (p) => {
+    const id = u64(p, 0), killer = u64(p, 8);
+    const m = monsters.get(id);
+    if (m) { m.alive = false; m.hp = 0; m.deathAt = performance.now(); }
+    if (!recentlySeen(recentEvents, `monster:${id}:${killer}`, 1000)) {
+      pushEvent(`<b style="color:#${colorForId(killer)}">${labelAny(killer)}</b> elimino a <b style="color:#ff6b7a">${labelMonster(m)}</b>`);
+    }
+  });
+  sdk.on(KIND_MONSTER_RESPAWN, (p) => {
+    const id = u64(p, 0), x = f32(p, 8), z = f32(p, 12);
+    const m = monsters.get(id);
+    if (!m) return;
+    m.x = x; m.z = z; m.targetX = x; m.targetZ = z; m.hp = MONSTER_MAX_HP; m.alive = true; m.deathAt = -1;
+    if (!recentlySeen(recentEvents, `monster-respawn:${id}`, 1000)) {
+      pushEvent(`<b style="color:#ff6b7a">${labelMonster(m)}</b> respawn`);
+    }
+  });
+  sdk.on(KIND_MONSTER_ATTACK, (p) => {
+    const monsterId = u64(p, 0), targetId = u64(p, 8), damage = f32(p, 16);
+    const m = monsters.get(monsterId);
+    if (m) m.attackAt = performance.now();
+    if (!recentlySeen(recentEvents, `ma:${monsterId}:${targetId}:${Math.round(performance.now() / 600)}`, 800)) {
+      pushEvent(`<b style="color:#ff6b7a">${labelMonster(m)}</b> golpeo a <b style="color:#${colorForId(targetId)}">${labelAny(targetId)}</b> por ${Math.round(damage)}`);
+    }
+  });
+  if (client.index === 0) {
+    sdk.on(KIND_PEER_POSITION, (p) => {
+      if (!p || p.length < 16) return;
+      observeReplicatedPosition(u64(p, 0), f32(p, 8), f32(p, 12));
+    });
+    sdk.on(KIND_TELEMETRY, (p) => {
+      const sample = decodeTelemetry(p);
+      if (sample) pushTelemetry(sample);
+    });
+    sdk.on(KIND_TELEMETRY_PONG, (p) => {
+      if (!p || p.length < 8) return;
+      const sentAt = new DataView(p.buffer, p.byteOffset, p.length).getFloat64(0, false);
+      telemetryState.rttMs = Math.max(0, performance.now() - sentAt);
+      telemetryState.pendingPingAt = 0;
+    });
+  }
+}
+
+function upsertMonster(p, isState) {
+  const id = u64(p, 0);
+  const x = f32(p, 8), z = f32(p, 12), hp = f32(p, 16), maxHp = f32(p, 20);
+  const alive = isState ? u8(p, 24) === 1 : true;
+  let m = monsters.get(id);
+  if (!m) {
+    m = { kind: 'monster', id, index: monsters.size + 1, x, z, targetX: x, targetZ: z, hp, maxHp, alive, attackAt: -1, deathAt: -1 };
+    monsters.set(id, m);
+    makeMonsterEntity(m);
+  }
+  if (hp < m.hp) m.hitFlashAt = performance.now();
+  m.targetX = x; m.targetZ = z; m.hp = hp; m.maxHp = maxHp; m.alive = alive;
+  if (alive) m.deathAt = -1;
+  updateHud();
+}
+
+function sendHit(client, targetId, damage) {
+  if (!client.sdk?.isOpen || !client.authed) return;
+  const p = new Uint8Array(12);
+  const dv = new DataView(p.buffer);
+  dv.setBigUint64(0, BigInt(targetId), false);
+  dv.setFloat32(8, damage, false);
+  client.sdk.send(KIND_HIT, p);
+}
+
+function sendChat(client, text) {
+  if (!client.sdk?.isOpen || !client.authed || !text) return;
+  client.sdk.send(KIND_CHAT_SEND, enc.encode(text.slice(0, 180)));
+}
+
+function maybeChat(client, category, target = null, extra = {}) {
+  const now = performance.now();
+  if (!client || !client.id || (!client.entity.alive && category !== 'death')) return false;
+  if (now < client.entity.nextChatAt || now < nextGlobalChatAt) return false;
+  const text = renderTemplate(pick(CHAT[category]), {
+    me: labelClient(client),
+    target: target ? entityLabel(target.kind, target.id) : '',
+    damage: extra.damage ?? '',
+    hp: extra.hp ?? '',
+  });
+  sendChat(client, text);
+  client.entity.nextChatAt = now + 6500 + Math.random() * 13000;
+  nextGlobalChatAt = now + 850 + Math.random() * 1800;
+  return true;
+}
+
+function showChat(sender, text) {
+  const key = `${sender}:${text}`;
+  if (recentlySeen(recentChat, key, 3000)) return;
+  pushChat(`<b style="color:#${colorForId(sender)}">${labelAny(sender)}</b>: ${escapeHtml(text)}`);
+}
+
+function sendPosition(client) {
+  if (!client.sdk?.isOpen || !client.authed) return;
+  const p = new Uint8Array(8);
+  const dv = new DataView(p.buffer);
+  dv.setFloat32(0, client.entity.x, false);
+  dv.setFloat32(4, client.entity.z, false);
+  client.sdk.send(KIND_POSITION, p);
+}
+
+function setStatus(s) { document.getElementById('status').textContent = s; }
+function updateHud() {
+  document.getElementById('connected').textContent = `${connectedCount} / ${N_BOTS}`;
+  document.getElementById('alive').textContent = String(clients.filter(c => c.id && c.entity.alive).length);
+  document.getElementById('monstersAlive').textContent = `${Array.from(monsters.values()).filter(m => m.alive).length} / ${monsters.size}`;
+  if (connectedCount === N_BOTS) setStatus('en combate');
+  else if (connectedCount > 0) setStatus('conectando...');
+}
+
+function currentTarget(client, now) {
+  const e = client.entity;
+  if (e.targetKind && now < e.targetLockUntil) {
+    if (e.targetKind === 'monster') {
+      const m = monsters.get(e.targetId);
+      if (m && m.alive) return { kind: 'monster', id: m.id, x: m.x, z: m.z };
+    } else {
+      const c = byId.get(e.targetId);
+      if (c && c !== client && c.entity.alive) return { kind: 'player', id: c.id, x: c.entity.x, z: c.entity.z };
+    }
+  }
+
+  let best = null, bestD = Infinity;
+  for (const m of monsters.values()) {
+    if (!m.alive) continue;
+    const d = dist2(e.x, e.z, m.x, m.z);
+    if (d < bestD) { bestD = d; best = { kind: 'monster', id: m.id, x: m.x, z: m.z }; }
+  }
+  if (!best || bestD > 28 * 28) {
+    for (const c of clients) {
+      if (c === client || !c.id || !c.entity.alive) continue;
+      const d = dist2(e.x, e.z, c.entity.x, c.entity.z);
+      if (d < bestD) { bestD = d; best = { kind: 'player', id: c.id, x: c.entity.x, z: c.entity.z }; }
+    }
+  }
+
+  if (best) {
+    e.targetKind = best.kind;
+    e.targetId = best.id;
+    e.targetLockUntil = now + 2200 + Math.random() * 1400;
+  }
+  return best;
+}
+
+function dist2(ax, az, bx, bz) {
+  const dx = bx - ax, dz = bz - az;
+  return dx * dx + dz * dz;
+}
+
+const SPEED = 13;
+const ATTACK_RANGE = 10.5;
+const ATTACK_CD = 1.05;
+const SWING_MS = 260;
+const DEATH_MS = 520;
+const clock = new THREE.Clock();
+let posTimer = 0;
+
+function renderHp(entity, maxHp, y) {
+  const frac = Math.max(0, Math.min(1, entity.hp / maxHp));
+  entity.fg.scale.x = Math.max(0.001, frac);
+  entity.fg.position.x = -entity.barWidth * 0.5 * (1 - frac);
+  entity.fg.material.color.setHSL(0.33 * frac, 0.7, 0.5);
+  entity.bar.position.set(entity.x, y, entity.z);
+  entity.bar.quaternion.copy(camera.quaternion);
+}
+
+function tick() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const now = performance.now();
+
+  for (const client of clients) {
+    const e = client.entity;
+    if (e.alive && client.id) {
+      const target = currentTarget(client, now);
+      let desired = e.heading;
+      let dist = Infinity;
+      if (target) {
+        desired = Math.atan2(target.x - e.x, target.z - e.z);
+        dist = Math.sqrt(dist2(e.x, e.z, target.x, target.z));
+      }
+      desired += (Math.random() - 0.5) * 0.28;
+      desired = obstacleSafeHeading(e.x, e.z, desired, SPEED, dt);
+      let d = desired - e.heading;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      e.heading += d * Math.min(1, dt * 3.3);
+
+      const advance = (target && dist < ATTACK_RANGE * 0.75) ? 0.12 : 1;
+      let nx = clamp(e.x + Math.sin(e.heading) * SPEED * advance * dt, -ARENA, ARENA);
+      let nz = clamp(e.z + Math.cos(e.heading) * SPEED * advance * dt, -ARENA, ARENA);
+      if (!insideObstacle(nx, nz, PLAYER_RADIUS)) {
+        e.x = nx; e.z = nz;
+      } else {
+        e.heading += Math.PI * 0.55;
+      }
+      if (e.x <= -ARENA || e.x >= ARENA) e.heading = -e.heading + Math.PI;
+      if (e.z <= -ARENA || e.z >= ARENA) e.heading = -e.heading;
+
+      e.cooldown -= dt;
+      if (target && dist <= ATTACK_RANGE && e.cooldown <= 0) {
+        e.cooldown = ATTACK_CD;
+        e.swingAt = now;
+        const damage = target.kind === 'monster' ? 22 + Math.random() * 18 : 18 + Math.random() * 16;
+        sendHit(client, target.id, damage);
+        if (Math.random() < 0.26) maybeChat(client, 'hit', target, { damage: Math.round(damage) });
+      } else if (target && dist > ATTACK_RANGE * 1.4 && Math.random() < dt * 0.018) {
+        maybeChat(client, 'chase', target);
+      } else if (Math.random() < dt * 0.010) {
+        maybeChat(client, 'idle');
+      }
+    }
+
+    e.group.position.set(e.x, 0, e.z);
+    e.group.rotation.y = e.heading;
+    const st = e.swingAt >= 0 ? (now - e.swingAt) / SWING_MS : 2;
+    e.pivot.rotation.y = (st >= 0 && st <= 1) ? -0.7 + Math.sin(st * Math.PI) * 2.1 : -0.5;
+    if (st > 1) e.swingAt = -1;
+    renderHp(e, MAX_HP, 5.2);
+
+    const flash = e.hitFlashAt >= 0 ? (now - e.hitFlashAt) / 180 : 2;
+    const dprog = e.deathAt >= 0 ? (now - e.deathAt) / DEATH_MS : 2;
+    if (!e.alive || dprog <= 1) {
+      const k = Math.min(1, dprog < 0 ? 0 : dprog);
+      e.body.rotation.z = k * Math.PI * 0.45;
+      e.body.material.color.copy(e.baseColor).multiplyScalar(0.25);
+      e.pivot.visible = false;
+    } else {
+      e.body.rotation.z = 0;
+      e.pivot.visible = true;
+      if (flash <= 1) e.body.material.color.setRGB(1, 0.35 + 0.4 * flash, 0.35 + 0.4 * flash);
+      else e.body.material.color.copy(e.baseColor);
+    }
+  }
+
+  for (const m of monsters.values()) {
+    if (!m.group) continue;
+    m.x += (m.targetX - m.x) * Math.min(1, dt * 10);
+    m.z += (m.targetZ - m.z) * Math.min(1, dt * 10);
+    m.group.position.set(m.x, 0, m.z);
+    m.group.rotation.y += dt * (m.alive ? 0.8 : 0.1);
+    renderHp(m, m.maxHp || MONSTER_MAX_HP, 6.3);
+    const flash = m.hitFlashAt >= 0 ? (now - m.hitFlashAt) / 180 : 2;
+    if (!m.alive) {
+      m.body.material.color.copy(m.baseColor).multiplyScalar(0.22);
+      m.group.scale.y = 0.35;
+      m.bar.visible = false;
+    } else {
+      m.group.scale.y = 1;
+      m.bar.visible = true;
+      if (flash <= 1) m.body.material.color.setRGB(1, 0.25 + 0.3 * flash, 0.28 + 0.3 * flash);
+      else m.body.material.color.copy(m.baseColor);
+    }
+  }
+
+  posTimer -= dt;
+  if (posTimer <= 0) {
+    posTimer = 0.1;
+    for (const c of clients) if (c.authed) sendPosition(c);
+  }
+  sendTelemetryPing(now);
+
+  updateReplicationDiagnostics(now);
+  updateHud();
+  placeCamera();
+  renderer.render(scene, camera);
+  renderTelemetry();
+  requestAnimationFrame(tick);
+}
+
+placeCamera();
+tick();
+</script>
+</body>
+</html>

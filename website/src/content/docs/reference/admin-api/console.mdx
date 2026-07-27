@@ -1,0 +1,527 @@
+---
+title: Admin console & console API
+description: The /dashboard operator console, its [console] login, roles, and the /console/v1 JSON API.
+---
+
+Citadel ships a self-contained admin console at **`/dashboard`** — a single
+HTML document served by the node itself (no build step, no CDN, works
+offline). **Every sidebar section is live**: the SPA signs in against
+`/console/v1/login`, drives the operator-only **console API** under
+**`/console/v1`** for accounts, groups, chat, notifications, storage,
+leaderboards, matches, purchases, configuration, runtime, audit logs, and the
+read-only Database Explorer, and
+its **Status** section renders live node gauges from the public `/status`
+endpoint (no login required for that data source).
+
+The console API is an operator surface, separate from the game-client API:
+different credentials, different roles, and no participation in the client SDK
+contract.
+
+## Login and roles
+
+Operators authenticate with the static credentials from the
+[`[console]` config section](/reference/operations/configuration/#console):
+
+```
+POST /console/v1/login
+{ "username": "admin", "password": "password" }
+
+200 OK
+{ "token": "<opaque hex>", "role": "admin", "expires_in_sec": 3600 }
+```
+
+Send the token on every other console route:
+
+```
+GET /console/v1/me
+Authorization: Bearer <token>
+
+200 OK
+{ "username": "admin", "role": "admin" }
+```
+
+Two roles exist:
+
+| Role | Granted by | Access |
+| --- | --- | --- |
+| `admin` | `console.password` | Read everything, perform mutations. |
+| `viewer` | `console.viewer_password` (optional) | Read-only; mutations return `403 forbidden`. |
+
+Failure behavior is deliberately uniform: a wrong username, wrong password,
+missing header, malformed header, unknown token, and expired token all return
+the same `401 authentication_failed` — the boundary is not a credential
+oracle. Tokens live in process memory and expire after
+`console.token_expiry_sec` (default one hour); a node restart logs every
+operator out.
+
+:::caution[Change the default credentials]
+The out-of-the-box credentials are `admin` / `password` so the drop-and-run
+flow works immediately. The startup banner warns until you change them. Set
+`[console] password` in `citadel.toml` (or `CITADEL_CONSOLE_PASSWORD`) before
+exposing a node beyond localhost.
+:::
+
+## Route map
+
+| Route | Method | Auth | Purpose |
+| --- | --- | --- | --- |
+| `/dashboard` | GET | none | The console single-page app (public shell; data requires login). |
+| `/status` | GET | none | Public machine-readable node status (Status section data source). |
+| `/console/v1/login` | POST | none | Exchange credentials for a bearer token. |
+| `/console/v1/me` | GET | bearer | The authenticated operator identity. |
+| `/console/v1/config` | GET | bearer | Effective node configuration, secrets redacted (live — see below). |
+| `/console/v1/audit` | GET | bearer | Console action audit trail (live — see below). |
+| `/console/v1/storage` | GET | bearer | Storage object browser (live — see below). |
+| `/console/v1/database` | GET | bearer | Read-only database explorer (live — see [Database Explorer](/reference/admin-api/database-explorer/)). |
+| `/console/v1/matches` | GET | bearer | Live rooms/matches introspection (live — see below). |
+| `/console/v1/runtime` | GET | bearer | Runtime introspection + RPC caller (live — see below). |
+| `/console/v1/accounts` | GET | bearer | Account administration (live — see below). |
+| `/console/v1/groups` | GET | bearer | Groups administration (live — see below). |
+| `/console/v1/chat` | GET | bearer | Chat channel moderation (live — see below). |
+| `/console/v1/notifications` | GET | bearer | Notification review/composer (live — see below). |
+| `/console/v1/leaderboards` | GET | bearer | Leaderboard administration (live — see below). |
+| `/console/v1/purchases` | GET | bearer | Validated purchase records (live — see below). |
+| `/console/v1/subscriptions` | GET | bearer | Subscription records (live — see below). |
+
+A section whose backend has not landed yet answers
+`501 { "code": "not_implemented" }` — authenticated and routed, never a `404` —
+so the SPA treats every section uniformly. Section documentation is added to
+this page as each backend ships.
+
+## Configuration browser
+
+`GET /console/v1/config` returns the node's **effective** resolved
+configuration (defaults + file + env + flags) as grouped, dotted key/value
+pairs, plus `node_id`, `version`, and the selected `backend`:
+
+```json
+{
+  "node_id": "dev-1", "version": "0.5.1", "backend": "sqlite",
+  "groups": [
+    { "name": "transport",
+      "entries": [ { "key": "quic.bind", "value": "127.0.0.1:7353" } ] }
+  ]
+}
+```
+
+Redaction is explicit and tested: `console.password` and
+`console.viewer_password` render as `<redacted>`, and `database.url` keeps its
+host/database shape with any `user:password@` credentials stripped. New config
+fields appear in the browser automatically; new *secret* fields must be added
+to the redaction list in the same change.
+
+## Storage browser
+
+Operator-scope administration of the collection/key/user storage engine,
+against the node's real persistence backend (in-memory, SQLite, or Postgres).
+Console operations run with runtime authority — object permissions do not
+apply; the bearer token and role are the gate. Ownership is addressed with an
+optional `user_id` query parameter (absent = the system owner).
+
+| Route | Method | Role | Purpose |
+| --- | --- | --- | --- |
+| `/console/v1/storage` | GET | any | Every collection with its total object count. |
+| `/console/v1/storage/{collection}?user_id&limit&cursor` | GET | any | Paged object summaries (key, owner, version, permission codes — no values). `limit` defaults to 50, capped at 200; `cursor` resumes a page. |
+| `/console/v1/storage/{collection}/{key}?user_id` | GET | any | One full object: value, version, permission codes. `404` when absent. |
+| `/console/v1/storage/{collection}/{key}?user_id` | PUT | admin | Create/overwrite. Body: `{ "value": {…}, "read_permission": 0-2, "write_permission": 0-1, "version": "<token>" }` — permissions default to owner-private; `version` makes the write conditional (`409` on mismatch). Audited as `storage.write`. |
+| `/console/v1/storage/{collection}/{key}?user_id&version` | DELETE | admin | Delete (idempotent; optional `version` precondition). Audited as `storage.delete`. |
+
+Values are JSON objects (up to 512 KiB through the console). Permission codes
+mirror Nakama's numbering: read `0` none / `1` owner / `2` public; write `0`
+none / `1` owner.
+
+## Accounts
+
+Operator-scope account administration over the node's real identity
+repositories (in-memory, SQLite, or Postgres) — the same accounts device/custom
+auth creates:
+
+| Route | Method | Role | Purpose |
+| --- | --- | --- | --- |
+| `/console/v1/accounts?filter&limit&offset` | GET | any | Paged listing, username-ordered. `filter` is a substring match over id and username. Includes `disabled` and `tombstoned` accounts. |
+| `/console/v1/accounts` | POST | admin | Create an account: `{ "username", "display_name"?, "metadata"? }`. Audited as `accounts.create`. |
+| `/console/v1/accounts/{id}` | GET | any | Detail: profile, state, timestamps, metadata, and every linked credential (`device`/`custom` + external id). |
+| `/console/v1/accounts/{id}` | PUT | admin | Edit `username` / `display_name` (`""` clears) / `metadata`. Audited as `accounts.update`. |
+| `/console/v1/accounts/{id}/ban` | POST | admin | Disable the account **and revoke its sessions** — live tokens stop working and re-login is rejected with the uniform 401. Audited as `accounts.ban`. |
+| `/console/v1/accounts/{id}/unban` | POST | admin | Re-enable a banned account. Audited as `accounts.unban`. |
+| `/console/v1/accounts/{id}` | DELETE | admin | Logical delete: tombstone (never authenticatable), unlink every credential, revoke sessions. Audited as `accounts.delete`. |
+| `/console/v1/accounts/{id}/export` | GET | any | The full account as JSON (profile + metadata + identities). |
+
+Bans use the account lifecycle (`active` → `disabled`) already enforced by the
+authentication service, so a banned player is rejected with the same generic
+`401` as an unknown credential — the boundary stays oracle-free.
+
+### Wallet & friends panels
+
+Each account carries a virtual-currency wallet and a friends list (in-process
+stores — a restart clears them; recorded technical debt):
+
+| Route | Method | Role | Purpose |
+| --- | --- | --- | --- |
+| `/console/v1/accounts/{id}/wallet` | GET | any | Currency-ordered balances + newest-first ledger (last 100 entries). |
+| `/console/v1/accounts/{id}/wallet` | POST | admin | Credit/debit: `{ "currency", "delta", "reason"? }`. Balances never go negative — an overdraft is a `409` and appends nothing. Audited as `accounts.wallet.adjust`. |
+| `/console/v1/accounts/{id}/friends` | GET | any | Relations: `invited_sent`, `invited_received`, `friend`, `blocked`. |
+| `/console/v1/accounts/{id}/friends` | POST | admin | Invite/accept for the account: `{ "user_id" }` — a matching add from the other side completes a mutual `friend`. Audited as `accounts.friends.add`. |
+| `/console/v1/accounts/{id}/friends/{other}` | DELETE | admin | Remove the relation (both sides; also unblocks). Audited as `accounts.friends.remove`. |
+
+Both panels `404` for accounts that do not exist.
+
+## Matches (live rooms)
+
+Point-in-time snapshots of the realtime gateway's room registry — the same
+rooms clients create with `join_or_create`:
+
+- `GET /console/v1/matches?filter&limit` — every live room, id-ordered:
+  `{ id, name, map, mode, players, max_players, open }`, plus an optional
+  `matchmaker` telemetry object when realtime is attached. It contains only
+  aggregate `queued_tickets`, evaluation count/duration, formed-match/ticket,
+  cancelled-ticket, and expired-ticket totals — never ticket properties, IDs, or
+  player identities. `filter` is a
+  substring match over name/map/mode; `limit` defaults to 100 (cap 500). The
+  response carries `realtime_attached: false` with zero rooms when no realtime
+  transport is running.
+- `GET /console/v1/matches/{id}` — one room plus its member roll:
+  `members: [{ participant, user_id }]`, where `user_id` is present for
+  participants that authenticated their socket and `null` for guests. `404`
+  for an unknown id.
+
+Snapshots are read-only copies; polling the console never blocks the realtime
+hot path.
+
+## API Explorer / Runtime
+
+`GET /console/v1/runtime` reports the embedded Lua runtime's state and what
+the loaded script registered:
+
+```json
+{
+  "enabled": true,
+  "configured_language": "lua",
+  "selected_language": "lua",
+  "selection_source": "explicit",
+  "entrypoint": "./game/main.lua",
+  "adapter": "embedded",
+  "tier": "trusted",
+  "attached": true,
+  "tick_hz": 20,
+  "script": {
+    "source": "./game/main.lua", "reloadable": true, "deadline_ms": 100,
+    "rpcs": ["ping"], "message_kinds": [1], "hooks": ["on_join", "on_tick"]
+  }
+}
+```
+
+`attached: false` (with no `script`) means no script is loaded — the node is
+running the built-in relay — or the realtime transports have not started.
+
+The language fields show whether `[runtime] language` was explicit or
+autodetected, the selected entrypoint path, and the adapter/tier currently in
+use (`embedded` / `trusted` today).
+
+**RPC caller** (admin, audited as `runtime.rpc`):
+
+```
+POST /console/v1/runtime/rpc/ping
+Authorization: Bearer <token>
+{ "payload": "" }
+
+200 OK
+{ "ok": true, "reply": "pong" }
+```
+
+The call runs through the exact isolated, deadline-bounded path game traffic
+uses, with no participant bound (`ctx.sender = 0`, `ctx.user_id = nil`).
+Failures (unknown method, handler error, timeout) return `ok: false` with the
+same short generic message a game client would see. The reply is rendered as
+UTF-8 text (lossy for binary replies).
+
+## Groups
+
+Operator administration of player groups (clans/guilds): unique name,
+description, an open/closed flag, an optional member cap, and a three-tier
+role ladder — `member` -> `admin` -> `superadmin`. A group always keeps at
+least one `superadmin`; demoting or kicking the last one is rejected with
+`409`. Any role may read; mutations require `admin` and are audited.
+
+| Route | Method | Role | Purpose |
+| --- | --- | --- | --- |
+| `/console/v1/groups?filter&limit&offset` | GET | any | Paged group summaries: `{ id, name, description, open, max_size, member_count, created_at_unix_ms }`. `filter` is a substring match over the name; `limit` defaults to 50 (cap 200). Returns `{ items, total }`. |
+| `/console/v1/groups` | POST | admin | Create a group. Body: `{ "name", "description"?, "open"?, "max_size"?, "creator_user_id"? }` — `open` defaults `true`, `max_size` defaults `0` (unlimited), `creator_user_id` defaults to the operator's username and becomes the founding `superadmin`. `409` on a duplicate name. Audited as `groups.create`. |
+| `/console/v1/groups/{id}` | GET | any | One group plus its member roll: `members: [{ user_id, role, joined_at_unix_ms }]`. `404` for an unknown id. |
+| `/console/v1/groups/{id}` | PUT | admin | Patch `description`/`open`/`max_size` (each optional; absent fields are unchanged). Audited as `groups.update`. |
+| `/console/v1/groups/{id}` | DELETE | admin | Delete the group and its membership. Audited as `groups.delete`. |
+| `/console/v1/groups/{id}/members` | POST | admin | Add a `member`. Body: `{ "user_id" }`. `409` if already a member or the group is at `max_size`. Audited as `groups.member.add`. |
+| `/console/v1/groups/{id}/members/{user_id}/promote` | POST | admin | `member` → `admin` → `superadmin`. `409` if already `superadmin`. Audited as `groups.member.promote`. |
+| `/console/v1/groups/{id}/members/{user_id}/demote` | POST | admin | `superadmin` → `admin` → `member`. `409` if already `member`, or if the target is the group's last `superadmin`. Audited as `groups.member.demote`. |
+| `/console/v1/groups/{id}/members/{user_id}/kick` | POST | admin | Remove a member outright. `409` if the target is the group's last `superadmin`. Audited as `groups.member.kick`. |
+
+Groups are an **in-process, in-memory store**: like the audit trail, there is
+no persistence yet, so **a node restart clears every group**. This is a
+recorded shortcut tracked in the technical-debt log alongside the other
+domain services introduced for the admin console (chat, notifications,
+leaderboards, wallet/friends, purchases).
+## Chat
+
+**Scope note:** this section is a channel/history and moderation model only.
+It does not deliver messages in real time over the socket — realtime chat
+wire delivery is future work. Until
+then, the console's `POST` route is the producer, so the channel/history
+model is exercisable end to end before wire delivery lands. History is kept
+in an in-process, per-channel bounded ring (default 1000 messages) — **a node
+restart clears it**, same as Groups/Notifications/Leaderboards/Purchases (see
+the technical-debt log).
+
+A channel is created implicitly by its first appended message, with a type of
+`room`, `group`, or `direct`. The type is fixed at creation and later appends
+to the same channel ignore any `channel_type` in the body.
+
+| Route | Method | Role | Purpose |
+| --- | --- | --- | --- |
+| `/console/v1/chat?filter&limit` | GET | any | Every channel, most-recently-active first: `{ channel, channel_type, messages, last_activity_unix_ms }`. `filter` is a case-sensitive substring match on the channel id; `limit` defaults to 100 (cap 500). Answers `200` with no query params. |
+| `/console/v1/chat/{channel}/messages` | POST | admin | Console-side message producer. Body: `{ "sender": "…", "content": "…", "channel_type": "room" }` (`channel_type` optional, defaults to `room`, ignored if the channel already exists). Creates the channel on first use. Audited as `chat.message.append`. |
+| `/console/v1/chat/{channel}/messages?limit&before` | GET | any | Paged history, newest first. `limit` defaults to 50 (cap 200); `before` resumes a page (pass the previous page's oldest returned `id`). |
+| `/console/v1/chat/{channel}/messages/{id}` | DELETE | admin | Tombstone a message: `content` is blanked and `deleted` becomes `true`, but the row (and its id) stays in history. Idempotent; unknown channel or message id is `404`. Audited as `chat.message.delete`. |
+
+```json
+GET /console/v1/chat/lobby/messages
+{
+  "channel": "lobby",
+  "items": [
+    { "id": 2, "sender": "bob", "content": "hi alice",
+      "created_at_unix_ms": 1751791000123, "deleted": false },
+    { "id": 1, "sender": "alice", "content": "hello world",
+      "created_at_unix_ms": 1751791000000, "deleted": false }
+  ]
+}
+```
+
+## Notifications
+
+A targeting-or-broadcast composer over an in-process notification store: send
+a message to one user by id, or broadcast it to everyone, and browse/delete
+what has been sent. Both roles may list; sending and deleting are admin-only
+and audited.
+
+```
+GET /console/v1/notifications?user_id=u-1&limit=50&before=42
+Authorization: Bearer <token>
+
+200 OK
+{
+  "items": [
+    { "id": 43, "user_id": "u-1", "subject": "welcome",
+      "content": { "level": 1 }, "code": 0,
+      "created_at_unix_ms": 1751791000000, "read": false }
+  ],
+  "total": 1
+}
+```
+
+| Query param | Meaning |
+| --- | --- |
+| `user_id` | Restrict to that user's own targeted notifications plus every broadcast. Absent lists everything (the operator-wide view). |
+| `limit` | Page size, newest-first. Default `50`, capped at `200`. |
+| `before` | Resume cursor: only notifications strictly older than this id. |
+
+Send (admin, audited as `notifications.send`):
+
+```
+POST /console/v1/notifications
+Authorization: Bearer <token>
+{ "user_id": "u-1", "subject": "welcome", "content": { "level": 1 }, "code": 0 }
+
+201 Created
+{ "id": 43, "user_id": "u-1", "subject": "welcome",
+  "content": { "level": 1 }, "code": 0,
+  "created_at_unix_ms": 1751791000000, "read": false }
+```
+
+Omit `user_id` to broadcast to every account. `subject` must be non-empty
+(`400` otherwise); `content` defaults to `{}` and must be a JSON object;
+`code` defaults to `0`.
+
+Delete (admin, audited as `notifications.delete`):
+
+```
+DELETE /console/v1/notifications/{id}
+Authorization: Bearer <token>
+
+204 No Content
+```
+
+`404` for an unknown id.
+
+**Known limitations:** no realtime push yet — a recipient only sees a
+notification by polling this route, there is no delivery over the realtime
+socket when they are online. The store is in-memory: a **node restart clears
+it**. Both are recorded technical debt pending the notifications persistence
+and delivery follow-up.
+## Leaderboards
+
+An in-process leaderboards store: definitions (id, sort order, operator,
+optional reset schedule) plus one record per user per board. The console is
+also the record producer today — there is no player-facing leaderboard API
+yet — so ranking is exercisable end to end from the console alone.
+
+| Route | Method | Role | Purpose |
+| --- | --- | --- | --- |
+| `/console/v1/leaderboards` | GET | any | Every leaderboard, id-ordered: `{ id, sort, operator, reset_schedule, records }` (`records` is the current record count). |
+| `/console/v1/leaderboards` | POST | admin | Create a board. Body: `{ "id": "...", "sort": "asc"\|"desc", "operator": "best"\|"set"\|"incr", "reset_schedule": "..." }` — `sort` defaults to `desc`, `operator` defaults to `best`. `409` on a duplicate id. Audited as `leaderboards.create`. |
+| `/console/v1/leaderboards/{id}` | DELETE | admin | Delete a board and every one of its records. `404` if unknown. Audited as `leaderboards.delete`. |
+| `/console/v1/leaderboards/{id}/records` | POST | admin | Submit a score. Body: `{ "user_id": "...", "score": 0, "subscore": 0, "metadata": {} }` — `subscore` defaults to `0`, `metadata` must be a JSON object when present. Audited as `leaderboards.record.submit`. |
+| `/console/v1/leaderboards/{id}/records?limit&offset` | GET | any | A ranked page: `{ board, items: [{ rank, user_id, score, subscore, metadata, updated_at_unix_ms, submissions }], total }`. `limit` defaults to 50 (cap 500); `offset` is a rank offset (`0` starts at rank `1`). |
+| `/console/v1/leaderboards/{id}/records/{user_id}` | DELETE | admin | Delete one user's record. `404` if unknown. Audited as `leaderboards.record.delete`. |
+
+**Ranking.** Records are ordered by `(score, subscore)` in the direction
+`sort` prefers — ascending for `asc`, descending for `desc` — then by
+`user_id` ascending as a final, deterministic tie-break. Rank `1` is always
+the best record.
+
+**Operators** decide how a new submission combines with a user's existing
+record:
+
+- `set` unconditionally overwrites score, subscore, and metadata.
+- `incr` adds the submitted score and subscore to the existing totals
+  (initializing at zero on a user's first submission) and replaces metadata.
+- `best` keeps whichever of the existing and submitted `(score, subscore)`
+  pair is better for the board's `sort`: lower is better for `asc` (a tied
+  score prefers the **lower** subscore), higher is better for `desc` (a tied
+  score prefers the **higher** subscore) — the same direction that governs
+  ranking, so the record that would rank highest wins either way. A losing
+  submission still counts toward `submissions` but leaves the stored score and
+  metadata untouched.
+
+```
+POST /console/v1/leaderboards
+{ "id": "points" }
+
+201 Created
+{ "id": "points", "sort": "desc", "operator": "best", "reset_schedule": null, "records": 0 }
+
+POST /console/v1/leaderboards/points/records
+{ "user_id": "u-1", "score": 90 }
+
+200 OK
+{ "user_id": "u-1", "score": 90, "subscore": 0, "metadata": null,
+  "updated_at_unix_ms": 1751792000000, "submissions": 1 }
+
+GET /console/v1/leaderboards/points/records
+
+200 OK
+{ "board": "points", "total": 1,
+  "items": [ { "rank": 1, "user_id": "u-1", "score": 90, "subscore": 0,
+               "metadata": null, "updated_at_unix_ms": 1751792000000,
+               "submissions": 1 } ] }
+```
+
+### Known limitations
+
+- **In-memory only.** Boards and records live in process memory; a node
+  restart clears every leaderboard. Durable persistence is tracked in
+  `docs/architecture/technical-debt.md`.
+- **`reset_schedule` is stored, not executed.** The string round-trips through
+  create/list responses but Citadel does not parse or run it — no board ever
+  resets automatically yet.
+
+## Purchases & Subscriptions
+
+Validated in-app purchase records behind a pluggable receipt-validator seam.
+Today the node ships the **deterministic dev validator**: the "receipt" is a
+JSON document `{ "transaction_id", "product_id",
+"subscription_expiry_unix_ms"? }`, validated with no network calls — honest
+for prototyping and tests. Real App Store / Google Play validators are a
+recorded follow-up (they need outbound HTTPS and store credentials).
+
+| Route | Method | Role | Purpose |
+| --- | --- | --- | --- |
+| `/console/v1/purchases?user_id&limit` | GET | any | Newest-first validated purchases: transaction id, user, product, store, SHA-256 receipt fingerprint, validation time. |
+| `/console/v1/purchases` | POST | admin | Validate + record a receipt: `{ "user_id", "store": "apple"\|"google"\|"huawei"\|"custom", "receipt": "…" }`. A replayed transaction id is a `409`; a malformed receipt is a `400`. Audited as `purchases.validate`. |
+| `/console/v1/purchases/{transaction_id}` | GET | any | One purchase; `404` when unknown. |
+| `/console/v1/subscriptions?user_id&limit` | GET | any | Subscription rows with `active`/`expired` derived against the read-time clock. |
+
+The raw receipt is **never stored** — only its SHA-256 digest — and records
+are in-process (a restart clears them; recorded technical debt).
+
+## Audit Logs
+
+Every console mutation — and every login attempt — is recorded in an audit
+trail: time, actor, role, action, target, and a sanitized detail line (never
+passwords, tokens, or raw payloads). Read it newest-first:
+
+```
+GET /console/v1/audit?limit=100&actor=admin&action=storage
+Authorization: Bearer <token>
+
+200 OK
+{
+  "entries": [
+    { "time_unix_ms": 1751791000000, "actor": "admin", "role": "admin",
+      "action": "console.login", "target": "console",
+      "details": "login succeeded (admin)" }
+  ],
+  "retained": 1,
+  "capacity": 1024
+}
+```
+
+| Query param | Meaning |
+| --- | --- |
+| `limit` | Page size, newest-first. Default `100`, capped at `500`. |
+| `actor` | Exact actor (username) match. |
+| `action` | Action **prefix** match — `storage` matches `storage.write`. |
+
+Actions are dotted verbs: `console.login`, `console.login_failed`, and one
+verb per mutation as sections land (e.g. `storage.write`, `accounts.ban`).
+Both roles may read the trail; unknown query parameters are rejected with
+`400`.
+
+The trail is a bounded in-process ring (1024 entries): older entries are
+evicted, and a **node restart clears it**. Durable audit persistence is a
+known limitation tracked in the technical-debt log.
+
+## Errors
+
+Console errors use the shared JSON error shape:
+
+```json
+{ "code": "authentication_failed", "message": "authentication failed" }
+```
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_request` | Malformed body or parameters. |
+| `401` | `authentication_failed` | Missing/invalid credentials or token (uniform). |
+| `403` | `forbidden` | A `viewer` attempted a mutation. |
+| `501` | `not_implemented` | Section backend not landed yet. |
+
+## Test coverage
+
+The login flow, role assignment, bearer guard, uniform 401 behavior, stub
+routing, and the public reachability of `/status`, `/health`, and
+`/dashboard` are covered by `tests/console_api_auth.rs`; token issue/expiry/
+revocation and the constant-time credential comparison are unit-tested in
+`src/services/console.rs`. The Groups section's full membership lifecycle
+(create, list/filter, detail, add/promote/demote/kick, the last-superadmin
+guard, update, delete, the viewer-403 boundary, and the audit trail) is
+covered by `tests/console_groups.rs`; role-ladder and store invariants are
+unit-tested in `src/services/groups.rs`. Chat channel/history bounds,
+tombstone semantics, paging, and the moderation endpoints are covered by unit
+tests in `src/services/chat.rs` and `src/http/console_api/chat.rs`, plus the
+end-to-end integration test `tests/console_chat.rs`.
+Notifications (send/list/delete, targeting vs
+broadcast visibility, role gating, audit trail) are covered end-to-end by
+`tests/console_notifications.rs`, with store semantics (ordering, eviction,
+validation) unit-tested in `src/services/notifications.rs`.
+Leaderboard operator semantics (`best`/`set`/
+`incr` under both sort orders), ranking with ties, and duplicate-id/not-found
+errors are unit-tested in `src/services/leaderboards.rs`; the full console
+lifecycle (create, submit, rank, delete, viewer 403s, audit) is covered by
+`tests/console_leaderboards.rs`.
+
+## Known limitations
+
+- Console tokens are in-process: restarts log operators out (by design), and
+  in a future multi-node cluster a token is only valid on the node that issued
+  it.
+- There is no lockout/rate-limit on login attempts yet; run nodes behind a
+  trusted network boundary until that lands.

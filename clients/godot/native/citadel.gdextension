@@ -1,0 +1,13 @@
+[configuration]
+entry_symbol = "citadel_library_init"
+compatibility_minimum = "4.3"
+
+[libraries]
+windows.debug.x86_64 = "res://addons/citadel/bin/citadel_godot.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/citadel/bin/citadel_godot.windows.template_release.x86_64.dll"
+linux.debug.x86_64 = "res://addons/citadel/bin/libcitadel_godot.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://addons/citadel/bin/libcitadel_godot.linux.template_release.x86_64.so"
+macos.debug.arm64 = "res://addons/citadel/bin/libcitadel_godot.macos.template_debug.arm64.dylib"
+macos.release.arm64 = "res://addons/citadel/bin/libcitadel_godot.macos.template_release.arm64.dylib"
+macos.debug.x86_64 = "res://addons/citadel/bin/libcitadel_godot.macos.template_debug.x86_64.dylib"
+macos.release.x86_64 = "res://addons/citadel/bin/libcitadel_godot.macos.template_release.x86_64.dylib"

@@ -1,0 +1,993 @@
+---
+title: JavaScript runtime reference
+description: Per-function reference for the capped embedded QuickJS game-logic runtime, the citadel host API, execution budgets, hot reload, and runtime caveats.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## HTTP host API
+
+### `citadel.http.fetch(url, opts = {})`
+
+Performs one bounded outbound request through Citadel's Rust-owned HTTP client.
+`opts` accepts `method` (default `"GET"`), `headers` (a string map), and `body`
+(a UTF-8 string). It returns `{ status: number, body: Uint8Array }`.
+
+The call waits synchronously for its response. Citadel retains ownership of DNS,
+TLS, and the socket: it enforces a 5-second deadline, a 64 KiB request-body
+limit, and a 1 MiB response-body limit; redirects and environment/system proxies
+are disabled. Invalid input, a size limit, timeout, or network failure throws.
+
+```js
+const response = citadel.http.fetch("https://inventory.example/v1/stock", {
+  headers: { authorization: `Bearer ${token}` },
+});
+if (response.status !== 200) throw new Error("inventory unavailable");
+```
+
+## Storage host API
+
+JavaScript exposes trusted-tier user-owned storage:
+`citadel.storage_read(user, collection, key)`, `citadel.storage_write(user,
+collection, key, valueJson, expectedVersion, readPermission, writePermission)`,
+and `citadel.storage_delete(user, collection, key, expectedVersion)`.
+
+Reads return `null` when absent or an object with `value_json`, `version`,
+`read_permission`, and `write_permission`. `valueJson` must encode a JSON
+object. Omit `expectedVersion` for an upsert, use `""` for create-only, or pass
+a returned version for compare-and-set. Permission codes are read `0|1|2` and
+write `0|1`. Errors are `storage validation: ...`, `storage conflict`, or
+`storage operation failed`.
+
+### `citadel.storage_index_query(indexName, filtersJson, limit = 50)`
+
+Runs a bounded equality query against an operator-declared storage index.
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `indexName` | `string` | A configured `[[storage.indexes]]` name. |
+| `filtersJson` | `string` | A JSON object. Keys must be declared index fields and values must be strings, numbers, or booleans. |
+| `limit` | `number` | Result cap from `1` through `100`; defaults to `50`. |
+
+**Returns:** an identity-ordered array. Each item has `user_id` (`null` for
+system objects), `collection`, `key`, `value_json`, `version`,
+`read_permission`, and `write_permission`.
+
+**Errors:** unknown indexes, invalid JSON/object shape, undeclared fields,
+non-scalar values, and invalid limits throw an error beginning `storage
+validation:`. Backend failures throw `storage operation failed`.
+
+```js
+citadel.on_rpc("find_players_at_score", (ctx, body) => {
+  const players = citadel.storage_index_query(
+    "profiles_by_score", '{"score":1200}', 25);
+  return players.length ? players[0].user_id : "none";
+});
+```
+
+Indexes are static operator configuration; scripts cannot create indexes or send
+arbitrary database queries. See [storage indexes in configuration](/reference/operations/configuration/#storage).
+
+### `citadel.register_storage_index_filter(indexName, callback)`
+
+Registers one write-time filter for an operator-configured index. Call it once
+during script initialization.
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `indexName` | `string` | A configured `[[storage.indexes]]` name. |
+| `callback` | function | Receives a candidate object; returns exactly `true` to include or `false` to exclude. |
+
+The object has `index_name`, `user_id`, `collection`, `key`, `value_json`,
+`expected_version`, `read_permission`, and `write_permission`. It runs only
+before a matching `citadel.storage_write`. `false` removes previous membership
+without deleting the object; a throw, deadline, or non-boolean return rejects
+the write and preserves the prior object/membership state. Citadel does not
+retry callbacks automatically; the script explicitly retries a write only when
+repeating its callback side effects is safe.
+
+**Returns:** the callback.
+
+```js
+citadel.register_storage_index_filter("profiles_by_score", (candidate) =>
+  candidate.key !== "draft" && candidate.value_json.includes('"published":true'));
+```
+
+Citadel can embed QuickJS in the node process and route realtime traffic to
+`game/main.js` through the same `Runtime` trait used by Lua and Python. JavaScript
+support is compiled only when the server is built with `--features runtime-js`;
+default builds do not compile or link QuickJS.
+
+For `[runtime]` config keys, see
+[Configuration reference](/reference/operations/configuration/#runtime). This
+page documents the JavaScript-visible `citadel` global.
+
+## Match-scoped messages
+
+When a participant belongs to a room, its `on_message` handler receives the
+numeric `ctx.room_id`. Any `citadel.broadcast` emitted by that invocation is
+delivered only to that room's current members; direct `citadel.send` remains
+explicitly targeted. The regular JavaScript `onTick(dt)` remains the
+server-wide tick in this release. Use `ctx.room_id` to key per-match message
+state.
+
+:::note[Capped QuickJS mode]
+This runtime is Citadel's capped/safe JavaScript mode: ES2020-style JavaScript
+and static local ESM modules inside QuickJS, no npm, no Node APIs, no worker
+threads, and no TypeScript transpilation. The future full-power JavaScript mode
+is supervised Node and is not part of this adapter.
+:::
+
+## Enable JavaScript
+
+```toml
+[runtime]
+enabled = true
+language = "js"
+adapter = "embedded"
+tier = "trusted"
+scripts_dir = "./game"
+deadline_ms = 100
+hot_reload = true
+```
+
+Run a JavaScript-enabled build:
+
+```bash
+cargo run --features runtime-js
+```
+
+Use `language = "javascript"` if you prefer the long name. The entrypoint is
+always `main.js`.
+
+## Quick Example
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="JavaScript">
+
+```js
+citadel.on_message(1, (ctx, body) => {
+  citadel.log(`echo from ${ctx.sender_id}`);
+  citadel.broadcast(1, body);
+});
+
+citadel.on_rpc("ping", => citadel.Reply.ok("pong"));
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python
+import citadel
+
+@citadel.on_message(1)
+def echo(ctx, body):
+    citadel.log(f"echo from {ctx.sender}")
+    citadel.broadcast(1, body)
+
+@citadel.on_rpc("ping")
+def ping(ctx, body):
+    return citadel.Reply.ok(b"pong")
+```
+
+  </TabItem>
+  <TabItem label="Lua">
+
+```lua
+citadel.on_message(1, function(ctx, body)
+  citadel.log("echo from " .. ctx.sender)
+  citadel.broadcast(1, body)
+end)
+
+citadel.on_rpc("ping", function(ctx, body)
+  return "pong"
+end)
+```
+
+  </TabItem>
+</Tabs>
+
+JavaScript registration is imperative:
+
+```js
+function handle(ctx, body) {
+  citadel.broadcast(2, body);
+}
+
+citadel.on_message(2, handle);
+```
+
+## Local ESM modules
+
+`main.js` and local game files support native static ESM `import` and `export`.
+Citadel resolves module specifiers from `[runtime] scripts_dir` (normally
+`game/`), not from the server's working directory or a Node package registry.
+
+```text
+game/
+├── main.js
+└── systems/
+    └── combat.js
+```
+
+```js
+// game/main.js
+import { damage } from "./systems/combat.js";
+
+citadel.on_message(1, (ctx) => {
+  citadel.broadcast(2, String(damage(ctx.sender)), false);
+});
+```
+
+```js
+// game/systems/combat.js
+export function damage(sender) {
+  return Number(sender % 100n) + 10;
+}
+```
+
+Only `/`-separated relative `.js` specifiers beginning with `./` or `../` are
+accepted. A `../` import may move to a parent game subdirectory but cannot
+escape the canonical scripts root. Absolute paths, backslashes, bare package
+names (`"lodash"`, `"std"`, `"node:fs"`), import attributes, CommonJS
+`require`, native `.dll`/`.so` modules, npm resolution, and TypeScript remain
+unsupported. ESM modules execute in strict mode; declare variables explicitly.
+
+The QuickJS module cache evaluates each module once per VM and implements the
+normal ESM cycle semantics. For an end-to-end layout covering all runtimes, see
+[organize multi-file game logic](/guides/organize-game-server-logic/).
+
+---
+
+## citadel.on_message
+
+Register a handler for inbound realtime messages of a wire `kind`.
+
+```js
+citadel.on_message(kind, handler)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `kind` | `number` (`u16`) | yes | Wire message kind. Re-registering replaces the previous handler. |
+| `handler` | `(ctx, body: Uint8Array) => void` | yes | Handler to store. |
+
+**Returns:** the handler function.
+
+**Errors:** registration validates that the handler is a function. Exceptions or
+deadlines inside the handler are isolated server-side and return no outbound
+commands.
+
+```js
+citadel.on_message(1, (_ctx, body) => {
+  citadel.broadcast(1, body, false);
+});
+```
+
+---
+
+## citadel.on_rpc
+
+Register a named request/response RPC handler.
+
+```js
+citadel.on_rpc(method, handler)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `method` | `string` | yes | RPC method name. |
+| `handler` | `(ctx, body: Uint8Array) => Reply \| Uint8Array \| string` | yes | Handler to store. |
+
+**Returns:** the handler function.
+
+**Errors:** an unknown method returns `RpcOutcome::Err`. Handler exceptions,
+deadline interrupts, and invalid replies are logged and returned as a short RPC
+error. Outbound commands attempted by an RPC handler are discarded.
+
+```js
+citadel.on_rpc("profile.get", (ctx) => {
+  if (!ctx.user_id) {
+    return citadel.Reply.err("authentication required");
+  }
+  return citadel.Reply.ok("{}");
+});
+```
+
+---
+
+## citadel.Reply
+
+Create explicit RPC responses.
+
+```js
+citadel.Reply.ok(body = new Uint8Array)
+citadel.Reply.err(message)
+```
+
+| Function | Parameters | Meaning |
+| --- | --- | --- |
+| `Reply.ok` | `Uint8Array \| ArrayBuffer \| Array<number> \| string` | Successful RPC body. Strings are UTF-8 encoded. |
+| `Reply.err` | `string` | Short error returned to the caller. |
+
+RPC handlers may also return bytes or strings directly; direct returns are
+treated as successful replies.
+
+---
+
+## citadel.on_join
+
+Register the lifecycle handler run when a participant connects.
+
+```js
+citadel.on_join(handler)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | `(ctx) => void` | yes | Only one join handler exists at a time. |
+
+Errors are isolated like `on_message`; the join itself is not blocked by a
+script failure.
+
+```js
+citadel.on_join((ctx) => {
+  citadel.send(ctx.sender, 1, "welcome");
+});
+```
+
+---
+
+## citadel.on_leave
+
+Register the lifecycle handler run when a participant disconnects.
+
+```js
+citadel.on_leave(handler)
+```
+
+The signature and failure behavior match `on_join`.
+
+```js
+citadel.on_leave((ctx) => {
+  citadel.broadcast(2, `${ctx.sender_id} left`);
+});
+```
+
+---
+
+## citadel.on_tick
+
+Register the periodic game-loop handler.
+
+```js
+citadel.on_tick(handler)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | `(dt: number) => void` | yes | Receives elapsed seconds as a number. |
+
+The tick loop starts only when `[runtime] tick_hz > 0` and a handler is
+registered.
+
+```js
+let elapsed = 0;
+
+citadel.on_tick((dt) => {
+  elapsed += dt;
+  if (elapsed >= 1) {
+    citadel.broadcast(3, "tick");
+    elapsed = 0;
+  }
+});
+```
+
+---
+
+## citadel.on_room_create
+
+Register the room-label decision hook.
+
+```js
+citadel.on_room_create(handler)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | `(ctx, params: Uint8Array) => object \| string \| null` | yes | Receives the raw create params as bytes. |
+
+Return `null` or `undefined` for the gateway default, a string for the `map`, or
+an object with `map`, optional `mode`, optional `max_players` or `maxPlayers`,
+and optional `open`.
+
+```js
+citadel.on_room_create( => ({
+  map: "arena_01",
+  mode: "ffa",
+  max_players: 8,
+  open: true,
+}));
+```
+
+---
+
+## citadel.on_room_join
+
+Register the admission hook for room joins.
+
+```js
+citadel.on_room_join(handler)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | `(ctx, roomId: BigInt) => boolean` | yes | Return `true` to admit, `false` to reject. |
+
+With no handler, joins are admitted. If the handler errors or times out, the
+join is rejected fail-closed.
+
+```js
+citadel.on_room_join((_ctx, roomId) => roomId === 7n);
+```
+
+---
+
+## citadel.broadcast
+
+Queue a message to every connected participant except the sender currently being
+handled.
+
+```js
+citadel.broadcast(kind, body, unreliable = false)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `kind` | `number` (`u16`) | yes | Wire message kind. |
+| `body` | `Uint8Array \| ArrayBuffer \| Array<number> \| string` | yes | Payload, capped at 64 KiB per call. |
+| `unreliable` | `boolean` | no | Prefer datagram delivery when the transport supports it. |
+
+Returns nothing. Calls made from RPC and room hooks are discarded because those
+hooks communicate through their return values.
+
+---
+
+## citadel.send
+
+Queue a message to one participant.
+
+```js
+citadel.send(session, kind, body, unreliable = false)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `session` | `number \| bigint \| string` (`u64`) | yes | Target participant id, usually `ctx.sender`. |
+| `kind` | `number` (`u16`) | yes | Wire message kind. |
+| `body` | `Uint8Array \| ArrayBuffer \| Array<number> \| string` | yes | Payload, capped at 64 KiB per call. |
+| `unreliable` | `boolean` | no | Prefer datagram delivery when available. |
+
+---
+
+## Physics host API
+
+Physics is opt-in for server-simulated actors while transform sync is enabled.
+Dimensions are centimetres, velocity is cm/s, and acceleration is cm/s². The
+three write calls queue gateway commands; `physics_state` reads live state.
+
+### citadel.set_physics
+
+```js
+citadel.set_physics(objectId, opts = null)
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `objectId` | `number` (`u32`) | Server-simulated actor to configure. |
+| `opts` | object or `null` | Optional `gravity`, `buoyancy`, `drag`, `radius`, `height`, `max_speed`, `shape` (`"capsule"` or `"aabb"`), and `enabled`. |
+
+**Returns:** `undefined`. Pass `null` or `{ enabled: false }` to detach the
+body.
+
+**Errors:** a non-object value, invalid field type, or unknown shape throws;
+commands from that handler are discarded. Non-server actors are ignored by the
+hub.
+
+### citadel.apply_impulse
+
+```js
+citadel.apply_impulse(objectId, ix, iy, iz)
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `objectId` | `number` (`u32`) | Bodied server actor. |
+| `ix`, `iy`, `iz` | `number` | Instantaneous velocity delta in cm/s; positive Y jumps/flaps. |
+
+**Returns:** `undefined`.
+
+**Errors:** invalid numeric values throw. An actor without a body is a no-op.
+
+### citadel.set_move_intent
+
+```js
+citadel.set_move_intent(objectId, vx, vy, vz)
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `objectId` | `number` (`u32`) | Bodied server actor. |
+| `vx`, `vy`, `vz` | `number` | Desired velocity in cm/s; X/Z are blended by physics and Y remains physics-led. |
+
+**Returns:** `undefined`.
+
+**Errors:** invalid numeric values throw. No body means no movement change.
+
+### citadel.physics_state
+
+```js
+citadel.physics_state(objectId) // -> { grounded, position, velocity } | null
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `objectId` | `number` (`u32`) | Actor whose authoritative body state to inspect. |
+
+**Returns:** `{ grounded: boolean, position: [x, y, z], velocity: [x, y, z] }`
+or `null` when transform sync/no hub is unavailable or the actor has no body.
+
+**Errors:** invalid object ids throw. The read queues no command.
+
+### Balloon-Fight bot
+
+```js
+const bot = citadel.spawn_actor({ x: 0, y: 200, z: 0 });
+citadel.set_physics(bot, { gravity: 900, buoyancy: 300, drag: 0.5,
+  radius: 30, height: 90, shape: "capsule" });
+
+citadel.on_tick((dt) => {
+  const state = citadel.physics_state(bot);
+  if (state && state.grounded) {
+    citadel.apply_impulse(bot, 0, 600, 0);
+  } else if (state && state.velocity[1] < 0) {
+    citadel.apply_impulse(bot, 0, 120, 0);
+  }
+  citadel.set_move_intent(bot, 180, 0, 0);
+});
+```
+
+---
+
+## citadel.map_info
+
+```js
+citadel.map_info(name) // -> object | null
+```
+
+Returns the loaded CMAP's `bounds_min`, `bounds_max`, `vertex_count`, and
+`triangle_count`, or `null` when no cooked map has that name. Coordinates are
+Unreal world units (cm).
+
+```js
+const level = citadel.map_info("Lvl_ThirdPerson");
+if (level) citadel.log(`loaded ${level.triangle_count} collision triangles`);
+```
+
+---
+
+## citadel.raycast
+
+```js
+citadel.raycast(origin, direction) // -> { point, normal, distance, triangle_index } | null
+```
+
+Casts the finite segment `origin + direction` against the active room map, in
+cm. Each argument is a three-number array. The result is `null` if there is no
+active map or no hit; otherwise `point` and unit `normal` are arrays and
+`distance` is in cm. Non-finite or non-three-element vectors return `null`.
+
+```js
+const hit = citadel.raycast([0, 200, 0], [0, -500, 0]);
+if (hit) citadel.log(`floor at ${hit.point[1].toFixed(1)} cm`);
+```
+
+## citadel.sphere_overlap
+
+```js
+citadel.sphere_overlap(centre, radius) // -> boolean
+```
+
+Returns whether a sphere intersects any active-map collision triangle. `centre`
+is a three-number array and `radius` is a finite non-negative value. It returns
+`false` without an active map or for invalid parameters.
+
+```js
+if (citadel.sphere_overlap([100, 50, 100], 30)) {
+  citadel.log("spawn position is blocked", "warn");
+}
+```
+
+## citadel.ground_height
+
+```js
+citadel.ground_height(origin, maxDistance) // -> { point, normal, distance, triangle_index } | null
+```
+
+Finds the closest upward-facing collision surface below `origin` within
+`maxDistance` cm. The returned hit uses the same fields as `citadel.raycast`.
+It returns `null` with no active map, no walkable surface, or invalid input.
+
+```js
+const ground = citadel.ground_height([0, 500, 0], 1000);
+if (ground) citadel.log(`ground y = ${ground.point[1].toFixed(1)}`);
+```
+
+## citadel.spawn_actor
+
+Queue a server-owned actor spawn and return the allocated object id.
+
+```js
+citadel.spawn_actor({ archetype, x, y, z }) -> number
+```
+
+Accepted fields are `archetype`, `x`, `y`, and `z`. Missing numeric fields
+default to `0`.
+
+```js
+const actorId = citadel.spawn_actor({ archetype: 3, x: 1, y: 2, z: 3 });
+```
+
+---
+
+## citadel.move_actor
+
+Queue an authoritative actor transform update.
+
+```js
+citadel.move_actor(objectId, x, y, z, vx = 0, vy = 0, vz = 0)
+```
+
+The JavaScript adapter emits the same `OutboundCommand::MoveActor` shape as Lua:
+position plus velocity, with identity rotation.
+
+---
+
+## citadel.despawn_actor
+
+Queue a server-owned actor despawn.
+
+```js
+citadel.despawn_actor(objectId)
+```
+
+---
+
+## citadel.log
+
+Emit a script log through Citadel tracing.
+
+```js
+citadel.log(message, level = "info")
+```
+
+Unknown levels fall back to `info`. Logging never raises a Citadel runtime
+error. `console.log`, `console.info`, `console.warn`, `console.error`, and
+`console.debug` are mapped to `citadel.log`.
+
+---
+
+## citadel.static_data.load_json
+
+Load one operator-owned JSON object or array during `main.js` initialization.
+
+```js
+citadel.static_data.load_json(path) // -> object | array
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `path` | `string` | yes | A non-empty relative `.json` path below `[runtime] static_data_dir`, such as `"gameplay/collision.json"`. Use `/` separators only. |
+
+**Returns:** a fresh ordinary JavaScript object or array with parsed JSON values.
+
+**Errors:** throws `Error` beginning `static data access denied`, `static data
+file not found`, `static data file exceeds configured size limit`, `invalid JSON
+static data`, or `static data schema invalid`. Absolute/drive paths, `.`/`..`,
+backslashes, escaped symlinks, missing files, and non-JSON extensions are
+rejected. It also throws access denied when `static_data_dir` is unset.
+
+```js
+const collision = citadel.static_data.load_json("gameplay/collision.json");
+const knightRadius = collision.characters.knight.radius_cm;
+```
+
+---
+
+## citadel.static_data.load_csv
+
+Load one operator-owned CSV table during `main.js` initialization.
+
+```js
+citadel.static_data.load_csv(path) // -> Array<object>
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `path` | `string` | yes | A non-empty relative `.csv` path below `[runtime] static_data_dir`, such as `"gameplay/attacks.csv"`. It has the same containment and size rules as `load_json`. |
+
+**Returns:** a fresh array of header-keyed objects. Cells spelled `true`/`false`
+become booleans and finite numeric cells become numbers; other cells remain
+strings.
+
+**Errors:** malformed/invalid UTF-8 CSV or uneven rows throw `invalid CSV static
+data`; empty, missing, or duplicate headers throw `static data schema invalid`.
+The same access, missing-file, and size-limit errors as `load_json` apply.
+
+```js
+const attacks = citadel.static_data.load_csv("gameplay/attacks.csv");
+const slashDamage = attacks.find((row) => row.id === "slash").damage;
+```
+
+Only top-level initialization can add a cache entry. Later calls may return an
+already-cached value, but a cache miss is denied, so message and tick handlers
+cannot cause static-data disk I/O. Each successful hot reload rebuilds the
+QuickJS VM and parsed catalog atomically; a bad replacement leaves the previous
+VM and catalog live. See [shared static gameplay data](/guides/static-game-data/)
+for the ordered configuration and deployment workflow.
+
+---
+
+## citadel.friends.add
+
+Add a friend or accept a pending friend request between two users.
+
+```js
+citadel.friends_add(user, other) -> string
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `string` | yes | The acting user id (usually `ctx.user_id` in the trusted tier). |
+| `other` | `string` | yes | The other user id to befriend. |
+
+**Returns:** a state token (`"invited_sent"`, `"invited_received"`, `"friend"`, or `"blocked"`).
+
+**Errors:** returns an error string if the operation fails (e.g., database error,
+user not found). The error is already sanitized and safe to log.
+
+:::caution[Current limitation]
+The JavaScript adapter does not yet support the friends host functions due to
+limitations in the rquickjs binding. Calling `citadel.friends_add` will throw
+an error "friends host not available". This is a known gap tracked in
+and will be implemented when the binding supports better function registration.
+:::
+
+```js
+citadel.on_rpc("befriend", (ctx, body) => {
+  const state = citadel.friends_add(ctx.user_id, body);
+  return citadel.Reply.ok(state);
+});
+```
+
+---
+
+## citadel.friends.remove
+
+Remove any relation (friend or block) between two users, both directions.
+
+```js
+citadel.friends_remove(user, other) -> boolean
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `string` | yes | The acting user id (usually `ctx.user_id`). |
+| `other` | `string` | yes | The other user id. |
+
+**Returns:** `true` if a relation existed and was removed, `false` if no relation existed.
+
+**Errors:** returns an error string if the operation fails.
+
+:::caution[Current limitation]
+Not implemented in JavaScript runtime yet (see `friends.add` note above).
+:::
+
+---
+
+## citadel.friends.block
+
+Block another user from the acting user's side.
+
+```js
+citadel.friends_block(user, other) -> void
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `string` | yes | The acting user id (usually `ctx.user_id`). |
+| `other` | `string` | yes | The user id to block. |
+
+**Errors:** returns an error string if the operation fails.
+
+:::caution[Current limitation]
+Not implemented in JavaScript runtime yet (see `friends.add` note above).
+:::
+
+---
+
+## citadel.friends.list
+
+List all relations for a user, sorted by other-user id.
+
+```js
+citadel.friends_list(user) -> Array<{user_id, state, updated_unix_ms}>
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `string` | yes | The user id to fetch relations for. |
+
+**Returns:** an array of relation objects, each containing:
+  - `user_id` (string): the other user id
+  - `state` (string): relation state token
+  - `updated_unix_ms` (bigint): last update timestamp
+
+**Errors:** returns an error string if the operation fails.
+
+:::caution[Current limitation]
+Not implemented in JavaScript runtime yet (see `friends.add` note above).
+:::
+
+```js
+citadel.on_rpc("friends.list", (ctx) => {
+  const rows = citadel.friends_list(ctx.user_id);
+  return citadel.Reply.ok(JSON.stringify(rows));
+});
+```
+
+---
+
+## ctx Shapes
+
+| Hook | `ctx` fields |
+| --- | --- |
+| `on_message` | `sender`, `sender_id`, `sender_number`, `kind`, `user_id` |
+| `on_join` / `on_leave` | `sender`, `sender_id`, `sender_number`, `user_id` |
+| `on_rpc` | `sender`, `sender_id`, `sender_number`, `method`, `user_id` |
+| `on_room_create` | same as RPC, with `method == "room.create"` |
+| `on_room_join` | same as RPC plus `room_id`, `room_id_text`, `room_id_number` |
+| `on_tick` | no `ctx`; receives `dt` directly |
+
+`ctx.sender` and `ctx.room_id` are `BigInt` values so `u64` ids remain exact.
+Use `ctx.sender_id` / `ctx.room_id_text` when you need a string and
+`ctx.sender_number` / `ctx.room_id_number` only when you know the id fits safely
+inside JavaScript's 53-bit integer range.
+
+```js
+function u64be(value) {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, BigInt(value), false);
+  return out;
+}
+
+citadel.on_message(1, (ctx, body) => {
+  const tagged = new Uint8Array(8 + body.length);
+  tagged.set(u64be(ctx.sender), 0);
+  tagged.set(body, 8);
+  citadel.broadcast(2, tagged, true);
+});
+```
+
+---
+
+## Execution Budgets
+
+JavaScript uses the same configured budgets as the runtime trait:
+
+| Limit | Value | Notes |
+| --- | --- | --- |
+| Handler deadline | `runtime.deadline_ms`, default 100 ms | Applies to messages, lifecycle, RPC, and room hooks. |
+| Tick deadline | `runtime.tick_deadline_ms` or auto-derived | Applies per tick. |
+| Load/reload deadline | 5 seconds | Bounds top-level `main.js` registration work. |
+| Max outbound commands | 1024 per invocation | Extra commands are dropped. |
+| Max body size | 64 KiB per `broadcast`/`send` | Oversized bodies raise a script error. |
+| Max total outbound bytes | 1 MiB per invocation | Extra messages are dropped. |
+| QuickJS heap cap | 64 MiB per runtime | Set through QuickJS memory limits. |
+| QuickJS stack cap | 512 KiB per runtime | Set through QuickJS stack limits. |
+
+Citadel uses QuickJS interrupt handling to stop runaway JavaScript. A timed-out
+message/lifecycle/tick handler returns no outbound commands. A timed-out RPC
+returns `RPC handler timed out`; room create falls back to the gateway default,
+and room join rejects fail-closed.
+
+---
+
+## Hot Reload
+
+With `[runtime] hot_reload = true`, Citadel watches `<scripts_dir>/main.js` and
+every successfully loaded local ESM dependency. Reload is failure-safe: the
+node reads and builds a fresh QuickJS runtime, requires at least one registered
+handler, and swaps it in atomically under the runtime lock. A missing file,
+syntax error, top-level exception, timeout, handlerless script, or broken
+import is rejected and the previous JavaScript runtime keeps serving.
+
+JavaScript globals and the ESM module cache reset on each successful reload.
+Capped QuickJS mode provides only the scoped static ESM loader; it does not
+provide CommonJS `require`, npm package loading, Node built-ins, native modules,
+or TypeScript transpilation.
+
+---
+
+## Console Introspection
+
+The console runtime endpoints report JavaScript the same way they report Lua and
+Python: registered RPC method names, message kinds, hook names, reloadability,
+source path, and the active deadline. See
+[Admin console & console API](/reference/admin-api/console/) for endpoint
+authentication and response shape.
+
+---
+
+## Player notifications
+
+| Function | Signature | Returns / errors |
+| --- | --- | --- |
+| `citadel.notifications_send` | `(recipient, code, subject, contentJson, sender?, deliveryKey?)` | committed notification object; validation errors throw `Error`. |
+| `citadel.notifications_list` | `(recipient, limit?, cursor?)` | `{ items, next_cursor }`, newest first. |
+| `citadel.notifications_mark_read` | `(recipient, ids)` | `{ read_ids }`; repeated calls are idempotent. |
+
+```js
+const n = citadel.notifications_send("player-42", 7, "Reward", '{"coins":10}', "server", "reward:round-1");
+const page = citadel.notifications_list("player-42", 50);
+const changed = citadel.notifications_mark_read("player-42", [n.id]);
+```
+
+Persistence precedes a best-effort local `KIND_NOTIFICATION` live delivery.
+Clients deduplicate by `id` and reconcile through `notifications.list`.
+
+## Domain feature calls
+
+### Secure `citadel.chat_call`
+
+`citadel.chat_call(actor, operation, payload)` uses the same secure chat schema
+as player RPCs. `actor` is an explicit trusted-runtime identity and is still
+checked against current friendship or group membership; it is never accepted as
+a JSON `sender`. For `send`, pass
+`{target:{kind:"direct",other_user_id:"player-b"},content:"hi"}`. For
+`history`, pass the same target with optional `limit` and `before_id`. Group
+targets use `group_id`; room targets are unavailable to this bridge because only
+the realtime gateway owns current room presence. Raw `channel` and
+`channel_type` fields fail with `CHAT_PROTOCOL_UPGRADE_REQUIRED`. `operation`
+may be `edit` (`id` plus `content`) or `delete` (`id`): both retain the explicit
+actor, canonical target fence, author time window, revision/event semantics, and
+durable shared rate limits used by player RPCs. `moderate` accepts a group target
+and `id` only; it applies the same group role hierarchy as player RPCs, fences
+membership, and writes a redacted durable audit record. Direct and room
+moderation targets are rejected.
+
+`citadel.groups_call(actor, operation, payload)`,
+`citadel.leaderboards_call(...)`, `citadel.chat_call(...)`, and
+`citadel.wallet_call(...)` take a JavaScript payload object and return decoded
+JSON, throwing `Error` on invalid input/service failure. The operation schemas
+match game-client RPCs. Only trusted code may call wallet `adjust`.
+
+### `citadel.groups_call`
+
+**Signature:** `citadel.groups_call(actor, operation, payload) -> object`.
+`payload` is a JavaScript object. Invalid fields, an unknown operation,
+insufficient role, a conflicting admission, or a full group throws `Error`.
+
+| Operation | Payload | Return |
+| --- | --- | --- |
+| `join` | `{ group_id: number }` | `{ state: "joined", group }` for open groups or `{ state: "requested", admission }` for closed groups. |
+| `invite` | `{ group_id: number, user_id: string }` | `{ state: "invited", admission }`; requires admin/superadmin. |
+| `approve_request` | `{ group_id: number, user_id: string }` | Updated group; requires admin/superadmin and a pending request. |
+| `accept_invitation` | `{ group_id: number }` | Updated group for the invited actor. |
+| `cancel_admission` | `{ group_id: number }` | `{}`; repeat cancellation is safe. |
+| `transfer_ownership` | `{ group_id: number, user_id: string }` | Updated group; only current superadmin may transfer to an existing member. |
+
+```js
+const pending = citadel.groups_call("owner", "invite", { group_id: 7, user_id: "player-42" });
+const group = citadel.groups_call("player-42", "accept_invitation", { group_id: 7 });
+```

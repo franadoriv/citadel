@@ -1,0 +1,30 @@
+# Throwaway single-node CockroachDB for the  compatibility matrix.
+#
+# CockroachDB speaks the PostgreSQL wire protocol, so Citadel's existing Postgres
+# backend (sqlx) connects to it through the same driver. This fixture brings up a
+# single insecure node so the gated CRDB contract tests
+# (tests/cockroachdb_compatibility.rs) and manual validation can run locally.
+#
+# Usage:
+#   docker compose -f docker-compose.crdb.yml up -d
+#   # create the database once the node is live:
+#   docker compose -f docker-compose.crdb.yml exec crdb \
+#     cockroach sql --insecure -e "CREATE DATABASE IF NOT EXISTS citadel;"
+#   CITADEL_TEST_COCKROACH_URL="postgres://root@localhost:26257/citadel?sslmode=disable" \
+#     cargo test --test cockroachdb_compatibility
+#   docker compose -f docker-compose.crdb.yml down -v
+#
+# This file is intentionally separate from any shared docker-compose.yml so it can
+# be brought up and torn down independently of the rest of the stack.
+services:
+  crdb:
+    image: cockroachdb/cockroach:latest
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257" # SQL / PostgreSQL wire protocol
+      - "8080:8080"   # Admin UI
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "-e", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

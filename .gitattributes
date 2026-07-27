@@ -1,0 +1,19 @@
+# Normalize all text files to LF in the repository and on checkout,
+# on every platform. This prevents Windows line-ending noise where files
+# show as modified with no real content change.
+* text=auto eol=lf
+
+# Native Windows scripts must keep CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary files: never apply EOL or text conversion.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary

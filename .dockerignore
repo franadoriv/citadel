@@ -1,0 +1,22 @@
+# Deny every path by default. The release builder only needs the Rust workspace,
+# SQL migrations compiled into the binary, and the image's default TOML. This
+# keeps local build products, game projects, databases, credentials, docs, and
+# editor state out of the build context by construction.
+**
+
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!src/
+!src/**
+!crates/
+!crates/**
+!migrations/
+!migrations/**
+!migrations-crdb/
+!migrations-crdb/**
+!migrations-sqlite/
+!migrations-sqlite/**
+!examples/
+!examples/docker/
+!examples/docker/citadel.toml

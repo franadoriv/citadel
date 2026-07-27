@@ -1,0 +1,112 @@
+---
+title: Player notifications
+description: Durable per-player inbox RPCs and the live notification stream.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Player notifications are a durable, recipient-scoped inbox. They are separate
+from the operator console notification feed. A game client reads or acknowledges
+its own inbox with reserved RPC methods; authoritative server game logic creates
+notifications through the server-runtime API.
+
+`KIND_NOTIFICATION` (`27`) is a reliable server-to-client UTF-8 JSON envelope
+containing a committed notification. It is best-effort and **at least once**:
+deduplicate by `id`, then use `notifications.list` after reconnect or a gap. A
+full local queue can drop the live copy without losing the durable inbox item.
+
+## `notifications.list`
+
+```
+notifications.list({ "limit": 50, "cursor": "optional opaque cursor" })
+```
+
+Returns `status=0` and JSON `{ "notifications": [Notification], "cursor": string|null }`.
+Items are newest first. `limit` is clamped to 1–100; omit it for 50. Guests
+receive `"authentication required"`; malformed JSON receives `"invalid JSON body"`.
+
+## `notifications.mark_read`
+
+```
+notifications.mark_read({ "ids": ["notification-id"] })
+```
+
+Returns `status=0` and `{ "read_ids": [string] }`. It only changes the caller's
+items and is idempotent: missing or already-read ids are omitted. The client
+cannot mark another player's inbox item read.
+
+## Notification JSON
+
+```json
+{
+  "id": "opaque-stable-id",
+  "code": 7,
+  "subject": "Daily reward",
+  "content": { "coins": 10 },
+  "sender": "server",
+  "created_at_unix_ms": 1730000000000,
+  "read_at_unix_ms": null
+}
+```
+
+## Calling and consuming the stream
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+// Send generic RPC "notifications.list"; decode its correlated response.
+// Bind UCitadelClientSubsystem::OnNotificationReceived to receive raw JSON
+// from KIND_NOTIFICATION and deduplicate it by its `id` field.
+```
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+1. Send generic RPC method `notifications.list` with JSON `{"limit":50}`.
+2. Decode the correlated RPC response and save its opaque `cursor`.
+3. Bind **On Notification Received**; parse the JSON payload and ignore IDs
+   already represented in the local inbox.
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+// Call generic RPC "notifications.list" with UTF-8 JSON.
+// On inbound CitadelProtocol.KindNotification (27), parse its UTF-8 JSON and
+// deduplicate on notification.id; refresh with notifications.list on reconnect.
+```
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+client.call_rpc("notifications.list", JSON.stringify({"limit": 50}).to_utf8_buffer, on_page)
+# Match CitadelProtocol.KIND_NOTIFICATION in the inbound frame handler, parse
+# the JSON, and deduplicate it by `id`.
+```
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+import { KIND_NOTIFICATION } from "@citadel/client"; // source import until npm publication resumes
+client.on(KIND_NOTIFICATION, (body) => addIfNew(JSON.parse(new TextDecoder.decode(body))));
+const page = JSON.parse(new TextDecoder.decode(await client.callRpc(
+  "notifications.list", new TextEncoder.encode(JSON.stringify({ limit: 50 }))
+)));
+```
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+```rust
+let page = client.call_rpc("notifications.list", br#"{"limit":50}"#).await?;
+// Poll normal realtime envelopes too; KIND_NOTIFICATION (27) is UTF-8 JSON.
+// Keep seen IDs and reconcile with the returned page after reconnect.
+```
+</TabItem>
+</Tabs>
+
+## Delivery guarantees and limits
+
+- A notification is committed before its live envelope is attempted.
+- Reusing the same producer `(recipient, delivery_key)` is idempotent and does
+  not produce another live envelope.
+- Delivery is local-node only in this release. Cross-node forwarding, campaigns,
+  external push, deletion, and retention are not implemented.

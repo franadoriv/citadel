@@ -1,0 +1,38 @@
+{
+  "name": "@citadel/client",
+  "version": "0.1.0",
+  "description": "Citadel realtime client SDK for the browser and Node (WebSocket).",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.js"
+    },
+    "./protocol": "./src/protocol.js",
+    "./envelope": "./src/envelope.js",
+    "./client": "./src/client.js"
+  },
+  "files": [
+    "src/",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "citadel",
+    "game-server",
+    "realtime",
+    "websocket",
+    "multiplayer"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}

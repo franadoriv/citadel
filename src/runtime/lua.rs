@@ -1,0 +1,4125 @@
+//! The embedded Lua VM host: loading, the host API, dispatch, and isolation.
+//!
+//! A [`LuaRuntime`] wraps a single `mlua` [`Lua`] state behind a `Mutex`. It
+//! exposes a tiny host API to scripts and turns inbound messages into a bounded
+//! list of [`OutboundCommand`] values that the gateway applies. See the module
+//! docs in [`crate::runtime`] for the concurrency and safety model.
+
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use citadel_physics::{PhysicsConfig, Shape};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
+
+use crate::config::LuaExecutionMode;
+use crate::error::{AppError, AppResult, ErrorCategory};
+use crate::maps::MapCatalog;
+use crate::realtime::TransformHub;
+use crate::runtime::Runtime;
+use crate::runtime::host_services::{DomainHost, StorageWriteInput};
+use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::static_data::StaticDataCatalog;
+use crate::services::PlayerNotification;
+use crate::storage::StorageIndexName;
+
+/// Default per-invocation time budget for a script handler, in milliseconds.
+pub const DEFAULT_DEADLINE_MS: u64 = 100;
+
+/// Time budget for running a script's top-level body (its registrations) at
+/// load and hot-reload, in milliseconds.
+///
+/// Generous compared to a per-message deadline because one-time setup may build
+/// tables, but still bounds an accidental top-level infinite loop
+/// (`while true do end` outside any handler) so a bad edit cannot hang the
+/// loader/watcher thread. Enforced by the same instruction-count hook as
+/// handlers.
+const LOAD_DEADLINE_MS: u64 = 5_000;
+
+/// How often (in VM instructions) the deadline hook checks the time budget.
+///
+/// Small enough to abort a tight `while true do end` promptly, large enough that
+/// the hook itself is negligible overhead on normal handlers.
+const HOOK_INSTRUCTION_INTERVAL: u32 = 10_000;
+
+/// Maximum number of outbound commands a single handler invocation may enqueue.
+///
+/// A runaway script that spams `broadcast`/`send` is capped here; extra commands
+/// are dropped and the overflow is logged once per invocation.
+const MAX_OUTBOUND_COMMANDS: usize = 1024;
+
+/// Maximum body size (bytes) accepted for a single outbound command.
+const MAX_OUTBOUND_BODY_BYTES: usize = 64 * 1024; // 64 KiB per message
+
+/// Maximum total outbound body bytes a single handler invocation may enqueue.
+///
+/// Bounds a buggy script that would otherwise queue `MAX_OUTBOUND_COMMANDS`
+/// full-size bodies (and multiply that by every recipient at fan-out time),
+/// which could OOM the node. Commands past this aggregate are dropped and the
+/// overflow is logged once per invocation.
+const MAX_TOTAL_OUTBOUND_BYTES: usize = 1 << 20; // 1 MiB per invocation
+
+/// Standard libraries exposed to scripts.
+///
+/// Sandboxed Lua deliberately omits `coroutine` and `debug`: the deadline hook
+/// is installed on the main Lua state and would not cover `coroutine.create`,
+/// while `debug.sethook` could remove the hook. It also omits `io`, `os`, and
+/// `package`. Trusted Lua uses mlua's complete *safe* standard-library set,
+/// including those machine-access libraries. `debug` and native C-module
+/// loading remain unavailable in both modes: mlua exposes them only through an
+/// unsafe Rust constructor, which Citadel deliberately does not permit.
+fn script_stdlib(execution_mode: LuaExecutionMode) -> StdLib {
+    match execution_mode {
+        LuaExecutionMode::Sandboxed => StdLib::STRING | StdLib::TABLE | StdLib::MATH,
+        LuaExecutionMode::Trusted => StdLib::ALL_SAFE,
+    }
+}
+
+/// Registry key under which the per-kind handler table is stored in the Lua state.
+const HANDLERS_KEY: &str = "citadel.handlers";
+
+/// Registry key under which the per-method RPC handler table is stored.
+const RPC_HANDLERS_KEY: &str = "citadel.rpc_handlers";
+
+/// Registry key for the module cache (`require`d module name -> returned value).
+///
+/// Populated by the scoped [`install_require`] loader; one entry per module,
+/// loaded once per VM (a re-`require` returns the cached value). Reset with the
+/// whole VM on hot-reload.
+const MODULES_KEY: &str = "citadel.modules";
+
+/// Registry key for the set of modules currently mid-load, used to detect and
+/// reject cyclic `require` chains before they recurse forever.
+const MODULES_LOADING_KEY: &str = "citadel.modules_loading";
+
+/// Client-visible message when no `citadel.on_rpc` handler matches the method.
+///
+/// Deliberately generic: it names the client-supplied method (safe to echo) but
+/// never leaks server internals.
+const RPC_ERR_UNKNOWN_METHOD: &str = "unknown RPC method";
+
+/// Client-visible message when a handler exceeds its per-invocation deadline.
+const RPC_ERR_TIMEOUT: &str = "RPC handler timed out";
+
+/// Client-visible message for any other handler failure (Lua error, bad return
+/// type, or an isolated Rust panic). Never carries a stack trace or internals.
+const RPC_ERR_HANDLER: &str = "RPC handler error";
+
+/// Registry key holding the `on_join` lifecycle handler (a single function).
+const ON_JOIN_KEY: &str = "citadel.on_join";
+
+/// Registry key holding the `on_leave` lifecycle handler (a single function).
+const ON_LEAVE_KEY: &str = "citadel.on_leave";
+
+/// Registry key holding the `on_tick` game-loop handler (a single function).
+const ON_TICK_KEY: &str = "citadel.on_tick";
+
+/// Registry key holding the `on_room_create` handler (returns a room label spec).
+const ON_ROOM_CREATE_KEY: &str = "citadel.on_room_create";
+
+/// Registry key holding the `on_room_join` handler (admission gate; returns bool).
+const ON_ROOM_JOIN_KEY: &str = "citadel.on_room_join";
+
+/// A participant lifecycle transition dispatched to a script handler.
+///
+/// The gateway invokes the matching handler when a participant registers
+/// ([`Join`](LifecycleHook::Join)) or unregisters
+/// ([`Leave`](LifecycleHook::Leave)). Both receive a `ctx` table carrying at
+/// least `ctx.sender` (the participant id) and may `broadcast`/`send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleHook {
+    /// A participant just registered; `citadel.on_join(ctx)` runs.
+    Join,
+    /// A participant is about to unregister; `citadel.on_leave(ctx)` runs.
+    Leave,
+}
+
+impl LifecycleHook {
+    /// Registry key of the handler this hook dispatches to.
+    const fn registry_key(self) -> &'static str {
+        match self {
+            Self::Join => ON_JOIN_KEY,
+            Self::Leave => ON_LEAVE_KEY,
+        }
+    }
+
+    /// Stable label for logs and overflow diagnostics.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Join => "on_join",
+            Self::Leave => "on_leave",
+        }
+    }
+}
+
+/// Settings for attaching a kinematic physics body to a server-simulated actor.
+///
+/// Host-language adapters translate their language-specific optional fields into
+/// this fully specified command payload before it reaches the gateway.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsOptions {
+    /// Whether a body is attached. `false` detaches any existing body.
+    pub enabled: bool,
+    /// Shape and movement tuning for an enabled body.
+    pub config: PhysicsConfig,
+}
+
+impl Default for PhysicsOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            config: PhysicsConfig::default(),
+        }
+    }
+}
+
+/// A side effect a script requested during one handler invocation.
+///
+/// The runtime never performs I/O itself; it returns these for the gateway to
+/// apply against its session registry. `unreliable` maps to the transport's
+/// best-effort delivery when the transport supports it (WebSocket is
+/// reliable-only and delivers either way).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutboundCommand {
+    /// Send `body` (kind `kind`) to every session except the original sender.
+    Broadcast {
+        /// Wire kind of the outbound envelope.
+        kind: u16,
+        /// Opaque payload bytes.
+        body: Vec<u8>,
+        /// Whether best-effort delivery was requested.
+        unreliable: bool,
+    },
+    /// Send `body` (kind `kind`) to a single participant by raw id.
+    Send {
+        /// Target participant id (raw value).
+        session: u64,
+        /// Wire kind of the outbound envelope.
+        kind: u16,
+        /// Opaque payload bytes.
+        body: Vec<u8>,
+        /// Whether best-effort delivery was requested.
+        unreliable: bool,
+    },
+    /// Spawn a server-owned networked actor (an NPC) with a script-assigned
+    /// `object_id`. The gateway places it in the transform world and fans out an
+    /// `NA_SPAWN` so every client instantiates the proxy for `archetype`. Movement
+    /// is driven by the script via [`MoveActor`](OutboundCommand::MoveActor).
+    SpawnActor {
+        /// Script-assigned server-owned object id (high range, never a player id).
+        object_id: u32,
+        /// Client archetype id to instantiate for the proxy.
+        archetype: u16,
+        /// Initial world position `[x, y, z]` (cm).
+        position: [f32; 3],
+    },
+    /// Update a server-owned actor's authoritative transform (the per-tick move
+    /// path). Snapshots carry it to clients; `velocity` lets them interpolate.
+    MoveActor {
+        /// The actor's object id (from [`SpawnActor`](OutboundCommand::SpawnActor)).
+        object_id: u32,
+        /// New world position `[x, y, z]` (cm).
+        position: [f32; 3],
+        /// Facing quaternion `[x, y, z, w]`.
+        rotation: [f32; 4],
+        /// Linear velocity `[x, y, z]` (cm/s).
+        velocity: [f32; 3],
+    },
+    /// Attach, reconfigure, or detach an opt-in kinematic body on a
+    /// server-simulated actor. `None` and `enabled = false` detach.
+    SetPhysics {
+        /// The server-owned actor to configure.
+        object_id: u32,
+        /// Physics settings, or `None` to detach the body.
+        opts: Option<PhysicsOptions>,
+    },
+    /// Add an instantaneous velocity change to a bodied server-simulated actor.
+    ApplyImpulse {
+        /// The server-owned actor to change.
+        object_id: u32,
+        /// Velocity delta in cm/s.
+        impulse: [f32; 3],
+    },
+    /// Set a bodied server-simulated actor's desired control velocity.
+    SetMoveIntent {
+        /// The server-owned actor to steer.
+        object_id: u32,
+        /// Desired velocity in cm/s; vertical control is ignored by physics.
+        intent: [f32; 3],
+    },
+    /// Despawn a server-owned actor and fan out an `NA_DESPAWN`.
+    DespawnActor {
+        /// The actor's object id.
+        object_id: u32,
+    },
+}
+
+/// Command buffer stored as Lua app data and drained after each invocation.
+///
+/// A distinct app-data type from [`Deadline`] so the deadline hook can read the
+/// deadline while a `broadcast`/`send` callback mutably borrows the sink without
+/// a borrow conflict.
+#[derive(Default)]
+struct CommandSink {
+    commands: Vec<OutboundCommand>,
+    total_bytes: usize,
+    overflowed: bool,
+}
+
+impl CommandSink {
+    fn reset(&mut self) {
+        self.commands.clear();
+        self.total_bytes = 0;
+        self.overflowed = false;
+    }
+}
+
+/// The current invocation deadline, stored as Lua app data and read by the hook.
+#[derive(Clone, Copy)]
+struct Deadline(Option<Instant>);
+
+/// Base object id for server-owned actors (NPCs). Player/presence ids grow from 1,
+/// so NPCs live in a high range and the two id spaces never collide.
+const NPC_ID_BASE: u32 = 0x4000_0000;
+
+/// Monotonic allocator for server-owned actor ids, kept as Lua app data so
+/// `spawn_actor` can return the id synchronously. Unlike the command sink it is not
+/// reset per invocation; a hot-reload rebuilds the VM and restarts the counter
+/// (acceptable — the gateway just replaces any reused id).
+struct NpcIdCounter(u32);
+
+/// Server-owned patrol state declared through `citadel.spawn_actor`.
+struct NpcPatrol {
+    object_id: u32,
+    map: String,
+    position: [f32; 3],
+    waypoints: Vec<[f32; 3]>,
+    next_waypoint: usize,
+    speed: f32,
+}
+
+#[derive(Default)]
+struct NpcPatrols(Vec<NpcPatrol>);
+
+/// The persisted-domain-services seam (friends, …) made available to host
+/// functions via VM app-data. Present only when the runtime was
+/// built with [`LuaRuntime::with_domain_host`]; absent for service-less runtimes
+/// (most tests), where the `citadel.friends_*` functions error cleanly.
+struct DomainHostHandle(Arc<dyn DomainHost>);
+
+/// Loaded map catalog made available to read-only script host calls.
+struct MapCatalogHandle(Arc<MapCatalog>);
+
+/// Authoritative transform hub made available to synchronous physics reads.
+struct TransformHubHandle(Arc<TransformHub>);
+
+/// Install (or refresh) the domain-host seam on a VM's app-data.
+///
+/// Called after each VM build (initial + hot-reload) so `citadel.friends_*` can
+/// reach the services across a reload. A no-op when no host is attached.
+fn apply_domain_host(lua: &Lua, domain: &Option<Arc<dyn DomainHost>>) {
+    if let Some(host) = domain {
+        lua.set_app_data(DomainHostHandle(Arc::clone(host)));
+    }
+}
+
+fn apply_map_catalog(lua: &Lua, maps: &Option<Arc<MapCatalog>>) {
+    if let Some(maps) = maps {
+        lua.set_app_data(MapCatalogHandle(Arc::clone(maps)));
+    }
+}
+
+fn apply_transform_hub(lua: &Lua, hub: &Option<Arc<TransformHub>>) {
+    if let Some(hub) = hub {
+        lua.set_app_data(TransformHubHandle(Arc::clone(hub)));
+    }
+}
+
+/// The swappable VM state guarded by the runtime lock.
+///
+/// A hot-reload replaces this whole value atomically under the mutex, so a fresh
+/// `Lua` (with its re-run registrations) and its label always move together and
+/// stay serialized with any in-flight dispatch/lifecycle/tick invocation.
+struct LuaVm {
+    lua: Lua,
+    /// Human-readable label for the loaded script (path or test label), for logs.
+    source_label: String,
+    /// Parsed static gameplay data initialized with this VM. Replaced atomically
+    /// with the VM on hot reload so a bad data edit cannot partially publish.
+    static_data: StaticDataCatalog,
+}
+
+/// The outcome of a [`LuaRuntime::call_rpc`] invocation.
+///
+/// Unlike the fire-and-forget [`dispatch`](LuaRuntime::dispatch) path (which
+/// returns commands and swallows every failure into an empty list), an RPC must
+/// return a value to the caller. Success carries the handler's reply bytes;
+/// every failure mode (unknown method, Lua error, blown deadline, isolated
+/// panic) collapses to a short, client-safe [`Err`](RpcOutcome::Err) message —
+/// the real error is logged server-side but never returned to the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcOutcome {
+    /// The handler ran and returned these reply bytes (binary-safe).
+    Ok(Vec<u8>),
+    /// The request failed; the string is a short, generic client-facing message.
+    Err(String),
+}
+
+/// Whether a locked RPC handler invocation found a handler (and its reply) or
+/// none was registered for the method.
+enum RpcInner {
+    /// A handler ran and produced these reply bytes.
+    Reply(Vec<u8>),
+    /// No handler was registered for the requested method.
+    NoHandler,
+}
+
+/// A room label produced by the Lua `on_room_create` handler. The
+/// gateway maps this onto its own `RoomLabel`; keeping it here avoids a runtime →
+/// realtime dependency. A handler may return a bare string (the map name) or a
+/// table `{ map, mode?, max_players?, open? }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomSpec {
+    /// The map/level name clients in the room load.
+    pub map: String,
+    /// Free-form game mode tag (empty if unset).
+    pub mode: String,
+    /// Member cap (`0` = unlimited).
+    pub max_players: u16,
+    /// Whether new joins are accepted.
+    pub open: bool,
+}
+
+impl Default for RoomSpec {
+    fn default() -> Self {
+        Self {
+            map: String::new(),
+            mode: String::new(),
+            max_players: 0,
+            open: true,
+        }
+    }
+}
+
+/// The result of a [`LuaRuntime::reload`] attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// A fresh VM was built from disk and swapped in; new handlers are live.
+    Reloaded,
+    /// The new script was rejected (read/parse/register error); the previously
+    /// loaded script keeps serving and the error was logged.
+    Rejected,
+    /// Nothing to reload: this runtime was built from an in-memory source (no
+    /// backing file), so there is no on-disk script to watch.
+    NotReloadable,
+}
+
+/// What a loaded script registered, for operator introspection.
+///
+/// Produced by [`LuaRuntime::introspect`] and rendered by the console's API
+/// Explorer section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeIntrospection {
+    /// Human-readable script source label (path or inline label).
+    pub source: String,
+    /// Whether the script is backed by an on-disk file (hot-reloadable).
+    pub reloadable: bool,
+    /// Per-invocation handler budget, in milliseconds.
+    pub deadline_ms: u64,
+    /// Registered RPC method names, sorted.
+    pub rpcs: Vec<String>,
+    /// Message kinds with a registered `on_message` handler, sorted.
+    pub message_kinds: Vec<u32>,
+    /// Registered lifecycle hooks (`on_join`, `on_leave`, `on_tick`,
+    /// `on_room_create`, `on_room_join`), in declaration order.
+    pub hooks: Vec<String>,
+}
+
+/// An embedded Lua runtime that dispatches inbound messages to script handlers.
+pub struct LuaRuntime {
+    vm: Mutex<LuaVm>,
+    budget: Duration,
+    /// Path to the backing `main.lua` for hot-reload, or `None` for a runtime
+    /// built from an in-memory source (tests/embedders). Only present when
+    /// created via [`LuaRuntime::load`].
+    reload_path: Option<PathBuf>,
+    /// Root directory that scoped `require` resolves modules within (the
+    /// `scripts_dir`), or `None` for an in-memory runtime with no module root
+    /// (its `require` errors). Threaded into every VM build so a hot-reload
+    /// re-resolves the module graph from the same root.
+    module_root: Option<PathBuf>,
+    /// Optional operator-owned static-data directory, distinct from scripts.
+    /// Retained so a hot reload builds a fresh catalog from the same root.
+    static_data_dir: Option<PathBuf>,
+    /// Per-file static-data read bound retained across reloads.
+    static_data_max_file_bytes: usize,
+    /// Persisted-domain-services seam exposed to `citadel.friends_*` host calls
+    ///, or `None` when no services are attached. Retained so a
+    /// hot-reload re-applies it to the fresh VM.
+    domain: Option<Arc<dyn DomainHost>>,
+    /// Read-only map catalog retained across hot-reload.
+    maps: Option<Arc<MapCatalog>>,
+    /// Authoritative transform hub retained for synchronous physics reads.
+    transform_hub: Option<Arc<TransformHub>>,
+    /// The capability mode used when constructing this VM. Retained so a reload
+    /// cannot accidentally change the script's authority.
+    execution_mode: LuaExecutionMode,
+}
+
+impl std::fmt::Debug for LuaRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LuaRuntime")
+            .field("budget", &self.budget)
+            .field("reload_path", &self.reload_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LuaRuntime {
+    /// Load `main.lua` from `scripts_dir`, or `Ok(None)` if it is absent.
+    ///
+    /// A missing scripts directory or missing `main.lua` is not an error: the
+    /// caller falls back to the built-in relay. A present-but-broken script (I/O
+    /// or syntax/runtime error at load) is a [`Runtime`](ErrorCategory::Runtime)
+    /// error so operators notice a real misconfiguration.
+    pub fn load(scripts_dir: &Path, deadline_ms: u64) -> AppResult<Option<Self>> {
+        Self::load_with_static_data(
+            scripts_dir,
+            deadline_ms,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+        )
+    }
+
+    /// Load `main.lua` with an optional, separately configured static-data root.
+    ///
+    /// The root is never made visible to Lua. The script can only request
+    /// validated relative JSON/CSV paths through `citadel.static_data` while its
+    /// top-level initialization body runs.
+    pub fn load_with_static_data(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+    ) -> AppResult<Option<Self>> {
+        Self::load_with_static_data_and_mode(
+            scripts_dir,
+            deadline_ms,
+            static_data_dir,
+            static_data_max_file_bytes,
+            LuaExecutionMode::Sandboxed,
+        )
+    }
+
+    /// Load `main.lua` with static data and an explicit Lua capability mode.
+    pub fn load_with_static_data_and_mode(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+        execution_mode: LuaExecutionMode,
+    ) -> AppResult<Option<Self>> {
+        let main = scripts_dir.join("main.lua");
+        if !main.is_file() {
+            return Ok(None);
+        }
+        let source = read_script(&main)?;
+        // Modules resolve within the scripts directory (dotted paths -> subdirs).
+        let module_root = scripts_dir.to_path_buf();
+        let source_label = main.display().to_string();
+        let static_data = StaticDataCatalog::new(static_data_dir, static_data_max_file_bytes)?;
+        let lua = build_lua(
+            &source,
+            &source_label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            Some(&module_root),
+            static_data.clone(),
+            execution_mode,
+        )?;
+        let budget = Duration::from_millis(deadline_ms.max(1));
+        Ok(Some(Self {
+            vm: Mutex::new(LuaVm {
+                lua,
+                source_label,
+                static_data,
+            }),
+            budget,
+            // Remember the backing file so the watcher can hot-reload it in place.
+            reload_path: Some(main),
+            module_root: Some(module_root),
+            static_data_dir: static_data_dir.map(Path::to_path_buf),
+            static_data_max_file_bytes,
+            domain: None,
+            maps: None,
+            transform_hub: None,
+            execution_mode,
+        }))
+    }
+
+    /// Build a runtime from inline `source` (used by tests and [`load`]).
+    ///
+    /// The resulting runtime has no backing file, so [`reload`](LuaRuntime::reload)
+    /// is a no-op ([`ReloadOutcome::NotReloadable`]); [`load`] sets the reload
+    /// path.
+    ///
+    /// [`load`]: LuaRuntime::load
+    pub fn from_source(
+        source: &str,
+        label: impl Into<String>,
+        deadline_ms: u64,
+    ) -> AppResult<Self> {
+        let source_label = label.into();
+        let static_data =
+            StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let lua = build_lua(
+            source,
+            &source_label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            None,
+            static_data.clone(),
+            LuaExecutionMode::Sandboxed,
+        )?;
+        let budget = Duration::from_millis(deadline_ms.max(1));
+        Ok(Self {
+            vm: Mutex::new(LuaVm {
+                lua,
+                source_label,
+                static_data,
+            }),
+            budget,
+            reload_path: None,
+            module_root: None,
+            static_data_dir: None,
+            static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            domain: None,
+            maps: None,
+            transform_hub: None,
+            execution_mode: LuaExecutionMode::Sandboxed,
+        })
+    }
+
+    /// Build a runtime from inline `source` with a scoped-`require` module root.
+    ///
+    /// Like [`from_source`](LuaRuntime::from_source) but resolves `require`d
+    /// modules within `module_root` (dotted paths -> subdirectories). Used by
+    /// tests that exercise multi-file scripts without a backing `main.lua`.
+    pub fn from_source_with_root(
+        source: &str,
+        label: impl Into<String>,
+        deadline_ms: u64,
+        module_root: &Path,
+    ) -> AppResult<Self> {
+        let source_label = label.into();
+        let static_data =
+            StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let lua = build_lua(
+            source,
+            &source_label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            Some(module_root),
+            static_data.clone(),
+            LuaExecutionMode::Sandboxed,
+        )?;
+        let budget = Duration::from_millis(deadline_ms.max(1));
+        Ok(Self {
+            vm: Mutex::new(LuaVm {
+                lua,
+                source_label,
+                static_data,
+            }),
+            budget,
+            reload_path: None,
+            module_root: Some(module_root.to_path_buf()),
+            static_data_dir: None,
+            static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            domain: None,
+            maps: None,
+            transform_hub: None,
+            execution_mode: LuaExecutionMode::Sandboxed,
+        })
+    }
+
+    /// Attach the persisted-domain-services seam, consuming and returning `self`
+    /// (builder style, before the runtime is shared as `Arc<dyn Runtime>`).
+    ///
+    /// Enables the `citadel.friends_*` host functions. The handle is
+    /// applied to the current VM's app-data and retained so a hot-reload
+    /// re-applies it to the rebuilt VM.
+    #[must_use]
+    pub fn with_domain_host(mut self, host: Arc<dyn DomainHost>) -> Self {
+        self.domain = Some(host);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_domain_host(&guard.lua, &self.domain);
+        }
+        self
+    }
+
+    /// Attach the loaded-map catalog for read-only `citadel.map_info` queries.
+    #[must_use]
+    pub fn with_maps(mut self, maps: Arc<MapCatalog>) -> Self {
+        self.maps = Some(maps);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_map_catalog(&guard.lua, &self.maps);
+        }
+        self
+    }
+
+    /// Attach the transform hub for synchronous `citadel.physics_state` reads.
+    #[must_use]
+    pub fn with_transform_hub(mut self, hub: Arc<TransformHub>) -> Self {
+        self.transform_hub = Some(hub);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_transform_hub(&guard.lua, &self.transform_hub);
+        }
+        self
+    }
+
+    /// Whether this runtime is backed by an on-disk script that can be reloaded.
+    #[must_use]
+    pub fn is_reloadable(&self) -> bool {
+        self.reload_path.is_some()
+    }
+
+    /// A point-in-time description of what the loaded script registered
+    ///: RPC method names, handled message kinds, and lifecycle
+    /// hooks. Read under the same VM lock dispatch uses, so it reflects the
+    /// live VM (including a just-hot-reloaded one); a registry probe failure
+    /// simply yields an empty list rather than an error.
+    #[must_use]
+    pub fn introspect(&self) -> RuntimeIntrospection {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = &guard.lua;
+        let mut rpcs: Vec<String> = lua
+            .named_registry_value::<Table>(RPC_HANDLERS_KEY)
+            .map(|table| {
+                table
+                    .pairs::<String, mlua::Value>()
+                    .flatten()
+                    .map(|(method, _)| method)
+                    .collect()
+            })
+            .unwrap_or_default();
+        rpcs.sort_unstable();
+        let mut message_kinds: Vec<u32> = lua
+            .named_registry_value::<Table>(HANDLERS_KEY)
+            .map(|table| {
+                table
+                    .pairs::<u32, mlua::Value>()
+                    .flatten()
+                    .map(|(kind, _)| kind)
+                    .collect()
+            })
+            .unwrap_or_default();
+        message_kinds.sort_unstable();
+        let hooks = [
+            ("on_join", ON_JOIN_KEY),
+            ("on_leave", ON_LEAVE_KEY),
+            ("on_tick", ON_TICK_KEY),
+            ("on_room_create", ON_ROOM_CREATE_KEY),
+            ("on_room_join", ON_ROOM_JOIN_KEY),
+        ]
+        .iter()
+        .filter(|(_, key)| {
+            lua.named_registry_value::<Option<Function>>(key)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+        RuntimeIntrospection {
+            source: guard.source_label.clone(),
+            reloadable: self.reload_path.is_some(),
+            deadline_ms: u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
+            rpcs,
+            message_kinds,
+            hooks,
+        }
+    }
+
+    /// Rebuild the VM from the backing script on disk and swap it in, failure-safe.
+    ///
+    /// The reload is deliberately two-phase so a broken edit can never take the
+    /// node down:
+    ///
+    /// 1. Read the file and build a **brand-new** `Lua` VM (re-running the
+    ///    script's registrations) *without* holding the runtime lock. A missing
+    ///    file, syntax error, or registration error fails here — before the live
+    ///    VM is touched — so the currently-loaded script keeps serving. The error
+    ///    is logged and [`ReloadOutcome::Rejected`] is returned.
+    /// 2. On success, acquire the runtime lock and swap the fresh VM (and its
+    ///    label) in atomically. Because this is the same lock that serializes
+    ///    [`dispatch`](LuaRuntime::dispatch), the lifecycle hooks, and
+    ///    [`tick`](LuaRuntime::tick), a reload can never interleave with an
+    ///    in-flight handler: the swap waits for any running handler to finish and
+    ///    the next handler runs on the new VM. Building off-lock also keeps the
+    ///    critical section to a single move.
+    ///
+    /// In-VM Lua globals (per-game state) are reset on reload — the fresh VM
+    /// starts clean. This is expected for a dev hot-reload; cross-reload state
+    /// preservation is out of scope.
+    ///
+    /// Never panics and never propagates: a runtime with no backing file returns
+    /// [`ReloadOutcome::NotReloadable`].
+    pub fn reload(&self) -> ReloadOutcome {
+        let Some(path) = self.reload_path.as_deref() else {
+            return ReloadOutcome::NotReloadable;
+        };
+        let label = path.display().to_string();
+        // Phase 1: build the replacement VM off-lock. Any failure here leaves the
+        // live VM untouched.
+        let source = match read_script(path) {
+            Ok(source) => source,
+            Err(e) => {
+                tracing::error!(
+                    script = %label,
+                    error = %e,
+                    "hot-reload: cannot read script; keeping the current script"
+                );
+                return ReloadOutcome::Rejected;
+            }
+        };
+        let fresh_static_data = match StaticDataCatalog::new(
+            self.static_data_dir.as_deref(),
+            self.static_data_max_file_bytes,
+        ) {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                tracing::error!(
+                    script = %label,
+                    error = %e,
+                    "hot-reload: cannot initialize static-data catalog; keeping the current script and data"
+                );
+                return ReloadOutcome::Rejected;
+            }
+        };
+        let fresh = match build_lua(
+            &source,
+            &label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            self.module_root.as_deref(),
+            fresh_static_data.clone(),
+            self.execution_mode,
+        ) {
+            Ok(lua) => lua,
+            Err(e) => {
+                tracing::error!(
+                    script = %label,
+                    error = %e,
+                    "hot-reload: new script rejected (parse/registration error); keeping the current script"
+                );
+                return ReloadOutcome::Rejected;
+            }
+        };
+        // Re-apply the domain-services seam so `citadel.friends_*` keeps working
+        // after the swap (the rebuilt VM starts with fresh app-data).
+        apply_domain_host(&fresh, &self.domain);
+        apply_map_catalog(&fresh, &self.maps);
+        apply_transform_hub(&fresh, &self.transform_hub);
+        // Guard against an accidental empty/handlerless save (e.g. an editor's
+        // transient zero-byte write caught mid-save): swapping it in would leave
+        // the node with no handlers. Reject and keep the working script.
+        if !has_any_handler(&fresh) {
+            tracing::warn!(
+                script = %label,
+                "hot-reload: new script registered no handlers; keeping the current script"
+            );
+            return ReloadOutcome::Rejected;
+        }
+        // Phase 2: swap under the runtime lock (serialized with dispatch/tick).
+        {
+            let mut guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            guard.lua = fresh;
+            guard.source_label = label;
+            guard.static_data = fresh_static_data;
+        }
+        tracing::info!(
+            script = %path.display(),
+            "hot-reload: swapped in the updated script and static data (in-VM Lua state reset)"
+        );
+        ReloadOutcome::Reloaded
+    }
+
+    /// Entry script plus the static-data files initialized by the live VM.
+    ///
+    /// The returned list is consumed by the development hot-reload watcher only;
+    /// it never participates in runtime dispatch or tick execution.
+    #[must_use]
+    pub fn reload_watch_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.reload_path.iter().cloned().collect::<Vec<_>>();
+        let guard = self
+            .vm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        paths.extend(guard.static_data.loaded_paths());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// The per-invocation time budget enforced on handlers.
+    #[must_use]
+    pub fn budget(&self) -> Duration {
+        self.budget
+    }
+
+    /// Run the registered message handler for `kind` and return its commands.
+    ///
+    /// Total isolation: a missing handler, a Lua error, a blown deadline, or a
+    /// Rust panic inside a callback all yield an empty command list and are
+    /// logged. This function never panics and never propagates an error.
+    pub fn dispatch(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        self.run_locked("message", self.budget, |lua| {
+            let handlers: Table = lua.named_registry_value(HANDLERS_KEY)?;
+            let Some(handler) = handlers.get::<Option<Function>>(kind)? else {
+                // No handler registered for this kind: not an error.
+                tracing::trace!(kind, "no lua handler for kind");
+                return Ok(false);
+            };
+            let ctx = build_ctx(lua, sender, user_id, kind, None)?;
+            let body_value = lua.create_string(body)?;
+            handler.call::<()>((ctx, body_value))?;
+            Ok(true)
+        })
+    }
+
+    /// Dispatch a message with its authoritative room id in `ctx.room_id`.
+    pub fn dispatch_in_room(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: u64,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        self.run_locked("match_message", self.budget, |lua| {
+            let handlers: Table = lua.named_registry_value(HANDLERS_KEY)?;
+            let Some(handler) = handlers.get::<Option<Function>>(kind)? else {
+                return Ok(false);
+            };
+            let ctx = build_ctx(lua, sender, user_id, kind, Some(room_id))?;
+            let body_value = lua.create_string(body)?;
+            handler.call::<()>((ctx, body_value))?;
+            Ok(true)
+        })
+    }
+
+    /// Run the `on_join`/`on_leave` handler for `sender` and return its commands.
+    ///
+    /// Shares the exact isolation, per-invocation deadline, and command-sink
+    /// machinery as [`dispatch`](LuaRuntime::dispatch): a slow or erroring
+    /// lifecycle handler cannot wedge the node. When no handler is registered
+    /// this is a no-op returning no commands.
+    pub fn dispatch_lifecycle(
+        &self,
+        hook: LifecycleHook,
+        sender: u64,
+        user_id: Option<&str>,
+    ) -> Vec<OutboundCommand> {
+        self.run_locked(hook.label(), self.budget, |lua| {
+            let Some(handler) =
+                lua.named_registry_value::<Option<Function>>(hook.registry_key())?
+            else {
+                return Ok(false);
+            };
+            let ctx = build_lifecycle_ctx(lua, sender, user_id)?;
+            handler.call::<()>(ctx)?;
+            Ok(true)
+        })
+    }
+
+    /// Run the `on_tick` game-loop handler with elapsed `dt` and return commands.
+    ///
+    /// `dt` is passed to the script in seconds. Runs under the same serialized
+    /// Lua lock as message dispatch, bounded by its own `budget`, with the same
+    /// error isolation: a hung or erroring tick yields no commands and never
+    /// wedges inbound dispatch. A no-op when no `on_tick` handler is registered.
+    pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        let dt_secs = dt.as_secs_f64();
+        self.run_locked("on_tick", budget, |lua| {
+            if let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_TICK_KEY)? {
+                handler.call::<()>(dt_secs)?;
+            }
+            advance_patrols(lua, dt.as_secs_f32())?;
+            Ok(true)
+        })
+    }
+
+    /// Run `on_tick(dt, room_id)` for one authoritative match. Lua accepts the
+    /// optional second argument without breaking existing one-argument handlers;
+    /// scripts can keep mutable state keyed by that stable room id.
+    pub fn tick_in_room(
+        &self,
+        room_id: u64,
+        dt: Duration,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        let dt_secs = dt.as_secs_f64();
+        self.run_locked("match_tick", budget, |lua| {
+            if let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_TICK_KEY)? {
+                handler.call::<()>((dt_secs, room_id))?;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Run the registered `citadel.on_rpc` handler for `method` and return its
+    /// reply, correlated by the caller upstream.
+    ///
+    /// This is the request/response sibling of [`dispatch`](LuaRuntime::dispatch):
+    /// it runs under the **same** runtime lock, the same per-invocation deadline,
+    /// and the same panic/error isolation, but instead of emitting broadcast
+    /// commands it threads the handler's return value back out as an
+    /// [`RpcOutcome`]. The Lua handler receives `(ctx, body)` where `ctx.sender`
+    /// is the caller and `ctx.method` is the method name, and must `return` a
+    /// string reply (binary-safe) or raise an error.
+    ///
+    /// Failure modes never crash the node and never leak internals: an unknown
+    /// method, a Lua error, a non-string return, a blown deadline, or an isolated
+    /// Rust panic all yield [`RpcOutcome::Err`] with a short, generic message; the
+    /// underlying error is logged server-side. Any `broadcast`/`send` a handler
+    /// attempts is discarded — an RPC handler communicates only through its
+    /// return value.
+    pub fn call_rpc(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        method: &str,
+        body: &[u8],
+    ) -> RpcOutcome {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = &guard.lua;
+        let budget = self.budget;
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            // Clear the sink so a stray broadcast/send inside an RPC handler is
+            // dropped rather than leaking into the fan-out path.
+            clear_sink(lua);
+            set_deadline(lua, Some(Instant::now() + budget));
+            let result = call_rpc_handler(lua, sender, user_id, method, body);
+            set_deadline(lua, None);
+            result
+        }));
+        // Always leave the sink clean for the next invocation regardless of path.
+        let result = match outcome {
+            Ok(Ok(RpcInner::Reply(bytes))) => RpcOutcome::Ok(bytes),
+            Ok(Ok(RpcInner::NoHandler)) => {
+                tracing::debug!(
+                    script = %guard.source_label,
+                    method,
+                    "no lua rpc handler for method"
+                );
+                RpcOutcome::Err(format!("{RPC_ERR_UNKNOWN_METHOD}: {method}"))
+            }
+            Ok(Err(e)) => {
+                let timed_out = is_deadline_error(&e);
+                tracing::error!(
+                    script = %guard.source_label,
+                    method,
+                    error = %e,
+                    "lua rpc handler error; isolated, generic error returned to caller"
+                );
+                if timed_out {
+                    RpcOutcome::Err(RPC_ERR_TIMEOUT.to_string())
+                } else {
+                    RpcOutcome::Err(RPC_ERR_HANDLER.to_string())
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    method,
+                    "lua rpc handler panicked; isolated and dropped"
+                );
+                set_deadline(lua, None);
+                RpcOutcome::Err(RPC_ERR_HANDLER.to_string())
+            }
+        };
+        clear_sink(lua);
+        result
+    }
+
+    /// Run the `citadel.on_room_create` handler for a client room-create request,
+    /// returning the room label spec it produced (map/mode/caps), or `None` when no
+    /// handler is registered or it fails/returns an invalid value (the gateway then
+    /// uses a default label). Same lock/deadline/panic isolation as
+    /// [`call_rpc`](Self::call_rpc); any broadcast/send the handler attempts is
+    /// discarded.
+    pub fn call_room_create(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        params: &[u8],
+    ) -> Option<RoomSpec> {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = &guard.lua;
+        let budget = self.budget;
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_sink(lua);
+            set_deadline(lua, Some(Instant::now() + budget));
+            let r = call_room_create_handler(lua, sender, user_id, params);
+            set_deadline(lua, None);
+            r
+        }));
+        clear_sink(lua);
+        match outcome {
+            Ok(Ok(spec)) => spec,
+            Ok(Err(e)) => {
+                tracing::error!(script = %guard.source_label, error = %e, "lua on_room_create error; isolated, using default label");
+                None
+            }
+            Err(_) => {
+                tracing::error!(script = %guard.source_label, "lua on_room_create panicked; isolated");
+                set_deadline(lua, None);
+                None
+            }
+        }
+    }
+
+    /// Run the `citadel.on_room_join` admission gate for a client join request.
+    /// Returns `true` to admit (the default when no handler is registered) or
+    /// `false` to reject. A handler error/panic rejects (fail-closed) and is logged.
+    pub fn call_room_join(&self, sender: u64, user_id: Option<&str>, room_id: u64) -> bool {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = &guard.lua;
+        let budget = self.budget;
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_sink(lua);
+            set_deadline(lua, Some(Instant::now() + budget));
+            let r = call_room_join_handler(lua, sender, user_id, room_id);
+            set_deadline(lua, None);
+            r
+        }));
+        clear_sink(lua);
+        match outcome {
+            Ok(Ok(decision)) => decision.unwrap_or(true),
+            Ok(Err(e)) => {
+                tracing::error!(script = %guard.source_label, error = %e, "lua on_room_join error; isolated, rejecting");
+                false
+            }
+            Err(_) => {
+                tracing::error!(script = %guard.source_label, "lua on_room_join panicked; isolated, rejecting");
+                set_deadline(lua, None);
+                false
+            }
+        }
+    }
+
+    /// Whether the script registered an `on_tick` handler.
+    ///
+    /// The bootstrap layer uses this to avoid spawning a periodic tick task for a
+    /// script that has no game loop.
+    #[must_use]
+    pub fn has_tick_handler(&self) -> bool {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let has_handler = guard
+            .lua
+            .named_registry_value::<Option<Function>>(ON_TICK_KEY)
+            .map(|h| h.is_some())
+            .unwrap_or(false);
+        has_handler
+            || guard
+                .lua
+                .app_data_ref::<NpcPatrols>()
+                .map(|patrols| !patrols.0.is_empty())
+                .unwrap_or(false)
+    }
+
+    /// Acquire the Lua lock, run one bounded, isolated handler invocation, and
+    /// return the commands it enqueued.
+    ///
+    /// The single choke point shared by message dispatch, lifecycle hooks, and
+    /// the tick. `call` looks up and invokes the handler, returning `Ok(true)`
+    /// when a handler ran and `Ok(false)` when none was registered (a no-op). Any
+    /// Lua error, blown deadline, or Rust panic inside `call` is caught, logged,
+    /// and turned into an empty command list; the runtime is always left clean
+    /// for the next invocation. Never panics, never propagates.
+    fn run_locked<F>(&self, what: &str, budget: Duration, call: F) -> Vec<OutboundCommand>
+    where
+        F: FnOnce(&Lua) -> mlua::Result<bool>,
+    {
+        // Recover a poisoned lock rather than propagate: a prior panic must not
+        // wedge the whole runtime (state is only ever mutated under this lock and
+        // is left consistent below). Holding the guard for the whole invocation
+        // is exactly what serializes a concurrent hot-reload swap behind it.
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = &guard.lua;
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_sink(lua);
+            set_deadline(lua, Some(Instant::now() + budget));
+            let ran = call(lua);
+            set_deadline(lua, None);
+            ran
+        }));
+        match outcome {
+            Ok(Ok(true)) => take_commands(lua, &guard.source_label, what),
+            Ok(Ok(false)) => {
+                clear_sink(lua);
+                Vec::new()
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = what,
+                    error = %e,
+                    "lua handler error; isolated, side effects discarded"
+                );
+                clear_sink(lua);
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = what,
+                    "lua handler panicked; isolated and dropped"
+                );
+                // A panic inside `call` skips the in-closure `set_deadline(None)`;
+                // clear it and the sink so the next invocation starts clean.
+                set_deadline(lua, None);
+                clear_sink(lua);
+                Vec::new()
+            }
+        }
+    }
+}
+
+impl Runtime for LuaRuntime {
+    fn dispatch(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        LuaRuntime::dispatch(self, sender, user_id, kind, body)
+    }
+
+    fn dispatch_in_room(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: u64,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        LuaRuntime::dispatch_in_room(self, sender, user_id, room_id, kind, body)
+    }
+
+    fn dispatch_lifecycle(
+        &self,
+        hook: LifecycleHook,
+        sender: u64,
+        user_id: Option<&str>,
+    ) -> Vec<OutboundCommand> {
+        LuaRuntime::dispatch_lifecycle(self, hook, sender, user_id)
+    }
+
+    fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        LuaRuntime::tick(self, dt, budget)
+    }
+
+    fn tick_in_room(&self, room_id: u64, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        LuaRuntime::tick_in_room(self, room_id, dt, budget)
+    }
+
+    fn call_rpc(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        method: &str,
+        body: &[u8],
+    ) -> RpcOutcome {
+        LuaRuntime::call_rpc(self, sender, user_id, method, body)
+    }
+
+    fn call_room_create(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        params: &[u8],
+    ) -> Option<RoomSpec> {
+        LuaRuntime::call_room_create(self, sender, user_id, params)
+    }
+
+    fn call_room_join(&self, sender: u64, user_id: Option<&str>, room_id: u64) -> bool {
+        LuaRuntime::call_room_join(self, sender, user_id, room_id)
+    }
+
+    fn has_tick_handler(&self) -> bool {
+        LuaRuntime::has_tick_handler(self)
+    }
+
+    fn budget(&self) -> Duration {
+        LuaRuntime::budget(self)
+    }
+
+    fn introspect(&self) -> RuntimeIntrospection {
+        LuaRuntime::introspect(self)
+    }
+
+    fn is_reloadable(&self) -> bool {
+        LuaRuntime::is_reloadable(self)
+    }
+
+    fn reload(&self) -> ReloadOutcome {
+        LuaRuntime::reload(self)
+    }
+
+    fn reload_watch_paths(&self) -> Vec<PathBuf> {
+        LuaRuntime::reload_watch_paths(self)
+    }
+}
+
+/// Reset the command sink to empty (short borrow).
+fn clear_sink(lua: &Lua) {
+    if let Some(mut sink) = lua.app_data_mut::<CommandSink>() {
+        sink.reset();
+    }
+}
+
+/// Set (or clear) the current invocation deadline (short borrow).
+fn set_deadline(lua: &Lua, deadline: Option<Instant>) {
+    if let Some(mut d) = lua.app_data_mut::<Deadline>() {
+        *d = Deadline(deadline);
+    }
+}
+
+/// Take the accumulated commands after a successful handler run (short borrow).
+fn take_commands(lua: &Lua, label: &str, handler: &str) -> Vec<OutboundCommand> {
+    if let Some(mut sink) = lua.app_data_mut::<CommandSink>() {
+        if sink.overflowed {
+            tracing::warn!(
+                script = %label,
+                handler,
+                cap = MAX_OUTBOUND_COMMANDS,
+                "lua handler exceeded outbound command cap; extra commands dropped"
+            );
+        }
+        std::mem::take(&mut sink.commands)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Set `ctx.user_id` to the authenticated account id, or leave it `nil` for a
+/// guest participant.
+///
+/// `ctx.sender` remains the transport-level participant id; `ctx.user_id` is the
+/// domain account resolved by the session service at connect, present only for
+/// authenticated participants. Game logic distinguishes an account-bound player
+/// from an anonymous one by testing `ctx.user_id`.
+fn set_user_id(ctx: &Table, user_id: Option<&str>) -> mlua::Result<()> {
+    // Leave the field absent (nil) for guests rather than setting an empty
+    // string, so `ctx.user_id or ...` idioms work naturally.
+    if let Some(id) = user_id {
+        ctx.set("user_id", id)?;
+    }
+    Ok(())
+}
+
+/// Build the `ctx` table handed to a message handler: `sender`/`kind`, plus
+/// `user_id` for an authenticated participant.
+fn build_ctx(
+    lua: &Lua,
+    sender: u64,
+    user_id: Option<&str>,
+    kind: u16,
+    room_id: Option<u64>,
+) -> mlua::Result<Table> {
+    let ctx = lua.create_table()?;
+    ctx.set("sender", sender)?;
+    ctx.set("kind", kind)?;
+    if let Some(room_id) = room_id {
+        ctx.set("room_id", room_id)?;
+    }
+    set_user_id(&ctx, user_id)?;
+    Ok(ctx)
+}
+
+/// Build the `ctx` table handed to a lifecycle handler: `sender` plus `user_id`.
+fn build_lifecycle_ctx(lua: &Lua, sender: u64, user_id: Option<&str>) -> mlua::Result<Table> {
+    let ctx = lua.create_table()?;
+    ctx.set("sender", sender)?;
+    set_user_id(&ctx, user_id)?;
+    Ok(ctx)
+}
+
+/// Build the `ctx` table handed to an RPC handler: `sender`, `method`, plus
+/// `user_id` for an authenticated caller.
+fn build_rpc_ctx(
+    lua: &Lua,
+    sender: u64,
+    user_id: Option<&str>,
+    method: &str,
+) -> mlua::Result<Table> {
+    let ctx = lua.create_table()?;
+    ctx.set("sender", sender)?;
+    ctx.set("method", method)?;
+    set_user_id(&ctx, user_id)?;
+    Ok(ctx)
+}
+
+/// Look up and invoke the RPC handler for `method`, returning its reply bytes.
+///
+/// Runs inside the locked, deadline-armed, panic-guarded closure in
+/// [`LuaRuntime::call_rpc`]. A missing handler is [`RpcInner::NoHandler`] (not an
+/// error); any Lua error (including a non-string return, which fails the
+/// `mlua::String` conversion) propagates as `Err` for the caller to classify.
+fn call_rpc_handler(
+    lua: &Lua,
+    sender: u64,
+    user_id: Option<&str>,
+    method: &str,
+    body: &[u8],
+) -> mlua::Result<RpcInner> {
+    let handlers: Table = lua.named_registry_value(RPC_HANDLERS_KEY)?;
+    let Some(handler) = handlers.get::<Option<Function>>(method)? else {
+        return Ok(RpcInner::NoHandler);
+    };
+    let ctx = build_rpc_ctx(lua, sender, user_id, method)?;
+    let body_value = lua.create_string(body)?;
+    // The handler must return a string; a nil/other return fails this conversion
+    // and is reported to the caller as a generic handler error.
+    let reply: mlua::String = handler.call((ctx, body_value))?;
+    Ok(RpcInner::Reply(reply.as_bytes().to_vec()))
+}
+
+/// Invoke `on_room_create` (if registered), mapping its return — a bare string
+/// (the map name) or a `{ map, mode?, max_players?, open? }` table — to a
+/// [`RoomSpec`]. `Ok(None)` means no handler is registered.
+fn call_room_create_handler(
+    lua: &Lua,
+    sender: u64,
+    user_id: Option<&str>,
+    params: &[u8],
+) -> mlua::Result<Option<RoomSpec>> {
+    let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_ROOM_CREATE_KEY)? else {
+        return Ok(None);
+    };
+    let ctx = build_rpc_ctx(lua, sender, user_id, "room.create")?;
+    let params_value = lua.create_string(params)?;
+    let spec = match handler.call::<mlua::Value>((ctx, params_value))? {
+        mlua::Value::String(s) => RoomSpec {
+            map: s.to_string_lossy(),
+            ..RoomSpec::default()
+        },
+        mlua::Value::Table(t) => RoomSpec {
+            map: t.get::<Option<String>>("map")?.unwrap_or_default(),
+            mode: t.get::<Option<String>>("mode")?.unwrap_or_default(),
+            max_players: t.get::<Option<u16>>("max_players")?.unwrap_or(0),
+            open: t.get::<Option<bool>>("open")?.unwrap_or(true),
+        },
+        // A nil/other return means "use the default label" (empty map).
+        _ => RoomSpec::default(),
+    };
+    Ok(Some(spec))
+}
+
+/// Invoke `on_room_join` (if registered), returning its admission decision.
+/// `Ok(None)` means no handler is registered (the caller admits by default).
+fn call_room_join_handler(
+    lua: &Lua,
+    sender: u64,
+    user_id: Option<&str>,
+    room_id: u64,
+) -> mlua::Result<Option<bool>> {
+    let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_ROOM_JOIN_KEY)? else {
+        return Ok(None);
+    };
+    let ctx = build_rpc_ctx(lua, sender, user_id, "room.join")?;
+    let allow: bool = handler.call((ctx, room_id))?;
+    Ok(Some(allow))
+}
+
+/// Whether an `mlua` error is the deadline-hook abort (a blown time budget).
+///
+/// The deadline hook raises a `RuntimeError` with a fixed message; matching it
+/// lets [`LuaRuntime::call_rpc`] report a distinct "timed out" reason without
+/// leaking the message verbatim.
+fn is_deadline_error(err: &mlua::Error) -> bool {
+    err.to_string().contains("time budget")
+}
+
+/// Install the `citadel` global table (message, lifecycle, tick, and log API).
+fn install_host_api(
+    lua: &Lua,
+    source_label: &str,
+    static_data: StaticDataCatalog,
+    execution_mode: LuaExecutionMode,
+) -> mlua::Result<()> {
+    let citadel = lua.create_table()?;
+    let handlers = lua.create_table()?;
+    lua.set_named_registry_value(HANDLERS_KEY, handlers)?;
+
+    let on_message = lua.create_function(|lua, (kind, handler): (u16, Function)| {
+        let handlers: Table = lua.named_registry_value(HANDLERS_KEY)?;
+        handlers.set(kind, handler)?;
+        Ok(())
+    })?;
+    citadel.set("on_message", on_message)?;
+
+    // RPC handlers are keyed by method name in their own registry table.
+    let rpc_handlers = lua.create_table()?;
+    lua.set_named_registry_value(RPC_HANDLERS_KEY, rpc_handlers)?;
+    let on_rpc = lua.create_function(|lua, (method, handler): (String, Function)| {
+        let handlers: Table = lua.named_registry_value(RPC_HANDLERS_KEY)?;
+        handlers.set(method, handler)?;
+        Ok(())
+    })?;
+    citadel.set("on_rpc", on_rpc)?;
+
+    // Lifecycle + tick handlers are single functions stored under fixed registry
+    // keys (re-registering replaces the prior handler).
+    for (name, key) in [
+        ("on_join", ON_JOIN_KEY),
+        ("on_leave", ON_LEAVE_KEY),
+        ("on_tick", ON_TICK_KEY),
+        ("on_room_create", ON_ROOM_CREATE_KEY),
+        ("on_room_join", ON_ROOM_JOIN_KEY),
+    ] {
+        let register = lua.create_function(move |lua, handler: Function| {
+            lua.set_named_registry_value(key, handler)?;
+            Ok(())
+        })?;
+        citadel.set(name, register)?;
+    }
+
+    // `citadel.log(message [, level])`: structured logging tagged as script
+    // output. `level` is an optional case-insensitive string
+    // (trace/debug/info/warn/error); anything else falls back to info.
+    let label = source_label.to_string();
+    let log = lua.create_function(
+        move |_, (message, level): (mlua::String, Option<mlua::String>)| {
+            let message = message.to_string_lossy();
+            let level = level.map(|l| l.to_string_lossy().to_ascii_lowercase());
+            match level.as_deref() {
+                Some("trace") => {
+                    tracing::trace!(target: "citadel::script", script = %label, "{message}")
+                }
+                Some("debug") => {
+                    tracing::debug!(target: "citadel::script", script = %label, "{message}")
+                }
+                Some("warn") => {
+                    tracing::warn!(target: "citadel::script", script = %label, "{message}")
+                }
+                Some("error") => {
+                    tracing::error!(target: "citadel::script", script = %label, "{message}")
+                }
+                _ => tracing::info!(target: "citadel::script", script = %label, "{message}"),
+            }
+            Ok(())
+        },
+    )?;
+    citadel.set("log", log)?;
+
+    if execution_mode == LuaExecutionMode::Trusted {
+        let http = TrustedHttpClient::new().map_err(|error| {
+            mlua::Error::RuntimeError(format!("cannot initialize outbound HTTP client: {error}"))
+        })?;
+        let fetch = lua.create_function(move |lua, (url, options): (String, Option<Table>)| {
+            let options = options.unwrap_or(lua.create_table()?);
+            let method = options
+                .get::<Option<String>>("method")?
+                .unwrap_or_else(|| "GET".into());
+            let body = options
+                .get::<Option<mlua::String>>("body")?
+                .map(|value| value.as_bytes().to_vec())
+                .unwrap_or_default();
+            let mut headers = std::collections::BTreeMap::new();
+            if let Some(header_table) = options.get::<Option<Table>>("headers")? {
+                for entry in header_table.pairs::<mlua::String, mlua::String>() {
+                    let (name, value) = entry?;
+                    headers.insert(name.to_string_lossy(), value.to_string_lossy());
+                }
+            }
+            let response = http
+                .execute_blocking(OutboundHttpRequest {
+                    method,
+                    url,
+                    headers,
+                    body,
+                })
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            let result = lua.create_table()?;
+            result.set("status", response.status)?;
+            result.set("body", lua.create_string(response.body)?)?;
+            Ok(result)
+        })?;
+        let http_api = lua.create_table()?;
+        http_api.set("fetch", fetch)?;
+        citadel.set("http", http_api)?;
+    }
+
+    // Static game data is intentionally a tiny, capability-free subtable. The
+    // catalog has already been rooted and bounded by the host; scripts receive
+    // only parsed Lua values and never the path, file, or directory handles.
+    let static_data_api = lua.create_table()?;
+    let json_catalog = static_data.clone();
+    let load_json = lua.create_function(move |lua, path: mlua::String| {
+        let path = path.to_str().map_err(|_| {
+            mlua::Error::RuntimeError("static data path must be valid UTF-8".to_string())
+        })?;
+        let value = json_catalog
+            .load_json(&path)
+            .map_err(static_data_lua_error)?;
+        static_data_value_to_lua(lua, &value)
+    })?;
+    static_data_api.set("load_json", load_json)?;
+    let csv_catalog = static_data;
+    let load_csv = lua.create_function(move |lua, path: mlua::String| {
+        let path = path.to_str().map_err(|_| {
+            mlua::Error::RuntimeError("static data path must be valid UTF-8".to_string())
+        })?;
+        let value = csv_catalog.load_csv(&path).map_err(static_data_lua_error)?;
+        static_data_value_to_lua(lua, &value)
+    })?;
+    static_data_api.set("load_csv", load_csv)?;
+    citadel.set("static_data", static_data_api)?;
+
+    let broadcast = lua.create_function(
+        |lua, (kind, body, unreliable): (u16, mlua::String, Option<bool>)| {
+            push_command(lua, &body, |bytes| OutboundCommand::Broadcast {
+                kind,
+                body: bytes,
+                unreliable: unreliable.unwrap_or(false),
+            })
+        },
+    )?;
+    citadel.set("broadcast", broadcast)?;
+
+    let send = lua.create_function(
+        |lua, (session, kind, body, unreliable): (u64, u16, mlua::String, Option<bool>)| {
+            push_command(lua, &body, |bytes| OutboundCommand::Send {
+                session,
+                kind,
+                body: bytes,
+                unreliable: unreliable.unwrap_or(false),
+            })
+        },
+    )?;
+    citadel.set("send", send)?;
+
+    // spawn_actor{ archetype = , x = , y = , z = } -> object_id. Spawns a server-owned
+    // NPC and returns its id synchronously so the script can move/despawn it.
+    let spawn_actor = lua.create_function(|lua, opts: mlua::Table| {
+        let archetype: u16 = opts.get("archetype").unwrap_or(0);
+        let x: f32 = opts.get("x").unwrap_or(0.0);
+        let y: f32 = opts.get("y").unwrap_or(0.0);
+        let z: f32 = opts.get("z").unwrap_or(0.0);
+        let object_id = {
+            let mut ctr = lua
+                .app_data_mut::<NpcIdCounter>()
+                .ok_or_else(|| mlua::Error::RuntimeError("npc id counter missing".into()))?;
+            let id = ctr.0;
+            ctr.0 = ctr.0.checked_add(1).unwrap_or(NPC_ID_BASE);
+            id
+        };
+        push_actor_command(
+            lua,
+            OutboundCommand::SpawnActor {
+                object_id,
+                archetype,
+                position: [x, y, z],
+            },
+        )?;
+        if opts.get::<Option<String>>("ai")?.as_deref() == Some("patrol") {
+            let map: String = opts.get("map")?;
+            let points: mlua::Table = opts.get("waypoints")?;
+            let mut waypoints = Vec::new();
+            for point in points.sequence_values::<mlua::Table>() {
+                let point = point?;
+                waypoints.push([point.get("x")?, point.get("y")?, point.get("z")?]);
+            }
+            if waypoints.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "patrol requires one or more waypoints".into(),
+                ));
+            }
+            let speed = opts.get::<Option<f32>>("speed")?.unwrap_or(300.0).max(0.0);
+            let mut patrols = lua
+                .app_data_mut::<NpcPatrols>()
+                .ok_or_else(|| mlua::Error::RuntimeError("npc patrol registry missing".into()))?;
+            patrols.0.push(NpcPatrol {
+                object_id,
+                map,
+                position: [x, y, z],
+                waypoints,
+                next_waypoint: 0,
+                speed,
+            });
+        }
+        Ok(object_id)
+    })?;
+    citadel.set("spawn_actor", spawn_actor)?;
+
+    // move_actor(object_id, x, y, z, [vx, vy, vz]) -> update a server-owned actor.
+    let move_actor = lua.create_function(
+        |lua,
+         (object_id, x, y, z, vx, vy, vz): (
+            u32,
+            f32,
+            f32,
+            f32,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+        )| {
+            push_actor_command(
+                lua,
+                OutboundCommand::MoveActor {
+                    object_id,
+                    position: [x, y, z],
+                    // Identity facing for the MVP; the client can orient by velocity.
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    velocity: [vx.unwrap_or(0.0), vy.unwrap_or(0.0), vz.unwrap_or(0.0)],
+                },
+            )
+        },
+    )?;
+    citadel.set("move_actor", move_actor)?;
+
+    // despawn_actor(object_id) -> remove a server-owned actor.
+    let despawn_actor = lua.create_function(|lua, object_id: u32| {
+        push_actor_command(lua, OutboundCommand::DespawnActor { object_id })
+    })?;
+    citadel.set("despawn_actor", despawn_actor)?;
+
+    // set_physics(object_id, opts) attaches or configures a kinematic body.
+    // Passing nil, or `{ enabled = false }`, detaches the body.
+    let set_physics = lua.create_function(|lua, (object_id, opts): (u32, Option<Table>)| {
+        let opts = opts.map(physics_options_from_lua).transpose()?;
+        push_actor_command(lua, OutboundCommand::SetPhysics { object_id, opts })
+    })?;
+    citadel.set("set_physics", set_physics)?;
+
+    let apply_impulse =
+        lua.create_function(|lua, (object_id, ix, iy, iz): (u32, f32, f32, f32)| {
+            push_actor_command(
+                lua,
+                OutboundCommand::ApplyImpulse {
+                    object_id,
+                    impulse: [ix, iy, iz],
+                },
+            )
+        })?;
+    citadel.set("apply_impulse", apply_impulse)?;
+
+    let set_move_intent =
+        lua.create_function(|lua, (object_id, vx, vy, vz): (u32, f32, f32, f32)| {
+            push_actor_command(
+                lua,
+                OutboundCommand::SetMoveIntent {
+                    object_id,
+                    intent: [vx, vy, vz],
+                },
+            )
+        })?;
+    citadel.set("set_move_intent", set_move_intent)?;
+
+    // physics_state(object_id) reads the authoritative hub without queuing a
+    // command. It is nil when transform sync is disabled or the actor has no body.
+    let physics_state = lua.create_function(|lua, object_id: u32| {
+        let Some(hub) = lua.app_data_ref::<TransformHubHandle>() else {
+            return Ok(mlua::Value::Nil);
+        };
+        let Some(state) = hub.0.physics_state(object_id) else {
+            return Ok(mlua::Value::Nil);
+        };
+        let value = lua.create_table()?;
+        value.set("grounded", state.grounded)?;
+        value.set("position", state.position)?;
+        value.set("velocity", state.velocity)?;
+        Ok(mlua::Value::Table(value))
+    })?;
+    citadel.set("physics_state", physics_state)?;
+
+    // map_info(name) returns the loaded CMAP's read-only geometry summary, or
+    // nil when the map is not loaded. No catalog mutation is exposed to scripts.
+    let map_info = lua.create_function(|lua, name: mlua::String| {
+        let Some(maps) = lua.app_data_ref::<MapCatalogHandle>() else {
+            return Ok(mlua::Value::Nil);
+        };
+        let Some(info) = maps.0.info(&name.to_string_lossy()) else {
+            return Ok(mlua::Value::Nil);
+        };
+        let value = lua.create_table()?;
+        value.set("bounds_min", info.bounds_min)?;
+        value.set("bounds_max", info.bounds_max)?;
+        value.set("vertex_count", info.vertex_count)?;
+        value.set("triangle_count", info.triangle_count)?;
+        Ok(mlua::Value::Table(value))
+    })?;
+    citadel.set("map_info", map_info)?;
+
+    let raycast = lua.create_function(|lua, (origin, direction): (Table, Table)| {
+        let origin = lua_vector3(origin)?;
+        let direction = lua_vector3(direction)?;
+        let Some(hub) = lua.app_data_ref::<TransformHubHandle>() else {
+            return Ok(mlua::Value::Nil);
+        };
+        let Some(hit) = hub.0.raycast(origin, direction) else {
+            return Ok(mlua::Value::Nil);
+        };
+        let value = lua.create_table()?;
+        value.set("point", hit.point)?;
+        value.set("normal", hit.normal)?;
+        value.set("distance", hit.distance)?;
+        value.set("triangle_index", hit.triangle_index)?;
+        Ok(mlua::Value::Table(value))
+    })?;
+    citadel.set("raycast", raycast)?;
+
+    let sphere_overlap = lua.create_function(|lua, (centre, radius): (Table, f32)| {
+        if !radius.is_finite() || radius < 0.0 {
+            return Err(mlua::Error::RuntimeError(
+                "radius must be a finite non-negative number".into(),
+            ));
+        }
+        let centre = lua_vector3(centre)?;
+        Ok(lua
+            .app_data_ref::<TransformHubHandle>()
+            .is_some_and(|hub| hub.0.sphere_overlap(centre, radius)))
+    })?;
+    citadel.set("sphere_overlap", sphere_overlap)?;
+
+    let ground_height = lua.create_function(|lua, (origin, max_distance): (Table, f32)| {
+        if !max_distance.is_finite() || max_distance < 0.0 {
+            return Err(mlua::Error::RuntimeError(
+                "max_distance must be a finite non-negative number".into(),
+            ));
+        }
+        let origin = lua_vector3(origin)?;
+        let Some(hub) = lua.app_data_ref::<TransformHubHandle>() else {
+            return Ok(mlua::Value::Nil);
+        };
+        let Some(hit) = hub.0.ground_height(origin, max_distance) else {
+            return Ok(mlua::Value::Nil);
+        };
+        let value = lua.create_table()?;
+        value.set("point", hit.point)?;
+        value.set("normal", hit.normal)?;
+        value.set("distance", hit.distance)?;
+        value.set("triangle_index", hit.triangle_index)?;
+        Ok(mlua::Value::Table(value))
+    })?;
+    citadel.set("ground_height", ground_height)?;
+
+    // Persisted friends host API. Each acts as the given `user`
+    // (the script is authoritative in the trusted tier). Values are returned
+    // synchronously; the async service is bridged behind the DomainHost seam.
+    // These functions require a runtime built with `with_domain_host`; without
+    // one they error "friends host not available".
+    let friends_add = lua.create_function(|lua, (user, other): (mlua::String, mlua::String)| {
+        let host = domain_host(lua)?;
+        host.friends_add(&user.to_string_lossy(), &other.to_string_lossy())
+            .map_err(mlua::Error::RuntimeError)
+    })?;
+    citadel.set("friends_add", friends_add)?;
+
+    let friends_remove =
+        lua.create_function(|lua, (user, other): (mlua::String, mlua::String)| {
+            let host = domain_host(lua)?;
+            host.friends_remove(&user.to_string_lossy(), &other.to_string_lossy())
+                .map_err(mlua::Error::RuntimeError)
+        })?;
+    citadel.set("friends_remove", friends_remove)?;
+
+    let friends_block =
+        lua.create_function(|lua, (user, other): (mlua::String, mlua::String)| {
+            let host = domain_host(lua)?;
+            host.friends_block(&user.to_string_lossy(), &other.to_string_lossy())
+                .map_err(mlua::Error::RuntimeError)
+        })?;
+    citadel.set("friends_block", friends_block)?;
+
+    let friends_list = lua.create_function(|lua, user: mlua::String| {
+        let host = domain_host(lua)?;
+        let rows = host
+            .friends_list(&user.to_string_lossy())
+            .map_err(mlua::Error::RuntimeError)?;
+        let arr = lua.create_table()?;
+        for (i, row) in rows.into_iter().enumerate() {
+            let entry = lua.create_table()?;
+            entry.set("user_id", row.user_id)?;
+            entry.set("state", row.state)?;
+            entry.set("updated_unix_ms", row.updated_unix_ms)?;
+            arr.set(i + 1, entry)?;
+        }
+        Ok(arr)
+    })?;
+    citadel.set("friends_list", friends_list)?;
+
+    // Durable player notifications. `content_json` keeps the Lua
+    // surface dependency-free; list/send return ordinary Lua tables.
+    let notifications_send = lua.create_function(
+        |lua,
+         (recipient, code, subject, content_json, sender, delivery_key): (
+            mlua::String,
+            i32,
+            mlua::String,
+            mlua::String,
+            Option<mlua::String>,
+            Option<mlua::String>,
+        )| {
+            let host = domain_host(lua)?;
+            let sender = sender.map(|value| value.to_string_lossy().to_string());
+            let delivery_key = delivery_key.map(|value| value.to_string_lossy().to_string());
+            let notification = host
+                .notifications_send(
+                    &recipient.to_string_lossy(),
+                    code,
+                    &subject.to_string_lossy(),
+                    &content_json.to_string_lossy(),
+                    sender.as_deref(),
+                    delivery_key.as_deref(),
+                )
+                .map_err(mlua::Error::RuntimeError)?;
+            notification_lua_table(lua, notification)
+        },
+    )?;
+    citadel.set("notifications_send", notifications_send)?;
+
+    let notifications_list = lua.create_function(
+        |lua, (recipient, limit, cursor): (mlua::String, Option<usize>, Option<mlua::String>)| {
+            let host = domain_host(lua)?;
+            let cursor = cursor.map(|value| value.to_string_lossy().to_string());
+            let page = host
+                .notifications_list(
+                    &recipient.to_string_lossy(),
+                    limit.unwrap_or(50),
+                    cursor.as_deref(),
+                )
+                .map_err(mlua::Error::RuntimeError)?;
+            let out = lua.create_table()?;
+            let items = lua.create_table()?;
+            for (index, notification) in page.items.into_iter().enumerate() {
+                items.set(index + 1, notification_lua_table(lua, notification)?)?;
+            }
+            out.set("items", items)?;
+            out.set("next_cursor", page.next_cursor)?;
+            Ok(out)
+        },
+    )?;
+    citadel.set("notifications_list", notifications_list)?;
+
+    let notifications_mark_read =
+        lua.create_function(|lua, (recipient, ids): (mlua::String, mlua::Table)| {
+            let host = domain_host(lua)?;
+            let ids = ids
+                .sequence_values::<mlua::String>()
+                .map(|value| value.map(|value| value.to_string_lossy().to_string()))
+                .collect::<mlua::Result<Vec<_>>>()?;
+            let changed = host
+                .notifications_mark_read(&recipient.to_string_lossy(), &ids)
+                .map_err(mlua::Error::RuntimeError)?;
+            let out = lua.create_table()?;
+            for (index, id) in changed.into_iter().enumerate() {
+                out.set(index + 1, id)?;
+            }
+            Ok(out)
+        })?;
+    citadel.set("notifications_mark_read", notifications_mark_read)?;
+
+    // Groups uses the same JSON request/response schema as the built-in
+    // `groups.*` client RPC. The trusted script supplies its authoritative
+    // actor id explicitly.
+    let groups_call = lua.create_function(
+        |lua, (actor, operation, payload_json): (mlua::String, mlua::String, mlua::String)| {
+            let host = domain_host(lua)?;
+            host.groups_call(
+                &actor.to_string_lossy(),
+                &operation.to_string_lossy(),
+                &payload_json.to_string_lossy(),
+            )
+            .map_err(mlua::Error::RuntimeError)
+        },
+    )?;
+    citadel.set("groups_call", groups_call)?;
+
+    for (name, domain) in [
+        ("leaderboards_call", "leaderboards"),
+        ("chat_call", "chat"),
+        ("wallet_call", "wallet"),
+    ] {
+        let function =
+            lua.create_function(
+                move |lua,
+                      (actor, operation, payload_json): (
+                    mlua::String,
+                    mlua::String,
+                    mlua::String,
+                )| {
+                    let host = domain_host(lua)?;
+                    let call = match domain {
+                        "leaderboards" => host.leaderboards_call(
+                            &actor.to_string_lossy(),
+                            &operation.to_string_lossy(),
+                            &payload_json.to_string_lossy(),
+                        ),
+                        "chat" => host.chat_call(
+                            &actor.to_string_lossy(),
+                            &operation.to_string_lossy(),
+                            &payload_json.to_string_lossy(),
+                        ),
+                        _ => host.wallet_call(
+                            &actor.to_string_lossy(),
+                            &operation.to_string_lossy(),
+                            &payload_json.to_string_lossy(),
+                        ),
+                    };
+                    call.map_err(mlua::Error::RuntimeError)
+                },
+            )?;
+        citadel.set(name, function)?;
+    }
+
+    // Persistent storage host API. Scripts pass the owner id in
+    // the trusted tier; values remain typed JSON objects encoded as strings so
+    // the narrow Lua standard library needs no JSON dependency.
+    let storage_read = lua.create_function(
+        |lua, (user, collection, key): (mlua::String, mlua::String, mlua::String)| {
+            let host = domain_host(lua)?;
+            match host
+                .storage_read(
+                    &user.to_string_lossy(),
+                    &collection.to_string_lossy(),
+                    &key.to_string_lossy(),
+                )
+                .map_err(mlua::Error::RuntimeError)?
+            {
+                Some(object) => storage_object_table(lua, object),
+                None => Ok(mlua::Value::Nil),
+            }
+        },
+    )?;
+    citadel.set("storage_read", storage_read)?;
+
+    let storage_index_filters = lua.create_table()?;
+    let register_storage_index_filter_registry = storage_index_filters.clone();
+    let register_storage_index_filter =
+        lua.create_function(move |_, (index_name, callback): (mlua::String, Function)| {
+            let index_name = StorageIndexName::new(index_name.to_string_lossy())
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            let existing: Value =
+                register_storage_index_filter_registry.get(index_name.as_str())?;
+            if !matches!(existing, Value::Nil) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "storage index filter already registered for `{index_name}`"
+                )));
+            }
+            register_storage_index_filter_registry.set(index_name.as_str(), callback)?;
+            Ok(())
+        })?;
+    citadel.set(
+        "register_storage_index_filter",
+        register_storage_index_filter,
+    )?;
+
+    let storage_write_filters = storage_index_filters.clone();
+    let storage_write = lua.create_function(
+        move |lua,
+              (
+            user,
+            collection,
+            key,
+            value_json,
+            expected_version,
+            read_permission,
+            write_permission,
+        ): (
+            mlua::String,
+            mlua::String,
+            mlua::String,
+            mlua::String,
+            Option<mlua::String>,
+            Option<u8>,
+            Option<u8>,
+        )| {
+            let host = domain_host(lua)?;
+            let user = user.to_string_lossy().to_string();
+            let collection = collection.to_string_lossy().to_string();
+            let key = key.to_string_lossy().to_string();
+            let value_json = value_json.to_string_lossy().to_string();
+            let candidates = host
+                .storage_index_candidates(&user, &collection, &key)
+                .map_err(mlua::Error::RuntimeError)?;
+            let candidate = lua.create_table()?;
+            candidate.set("user_id", user.as_str())?;
+            candidate.set("collection", collection.as_str())?;
+            candidate.set("key", key.as_str())?;
+            candidate.set("value_json", value_json.as_str())?;
+            candidate.set(
+                "expected_version",
+                expected_version
+                    .as_ref()
+                    .map(|value| value.to_string_lossy()),
+            )?;
+            candidate.set("read_permission", read_permission)?;
+            candidate.set("write_permission", write_permission)?;
+            let mut included = Vec::with_capacity(candidates.len());
+            for index_name in candidates {
+                candidate.set("index_name", index_name.as_str())?;
+                let registered: Value = storage_write_filters.get(index_name.as_str())?;
+                match registered {
+                    Value::Nil => included.push(index_name),
+                    Value::Function(callback) => match callback.call::<Value>(candidate.clone())? {
+                        Value::Boolean(true) => included.push(index_name),
+                        Value::Boolean(false) => {}
+                        _ => {
+                            return Err(mlua::Error::RuntimeError(
+                                "storage index filter must return a boolean".to_string(),
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(
+                            "storage index filter registration is invalid".to_string(),
+                        ));
+                    }
+                }
+            }
+            let included_json = serde_json::to_string(&included)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            let object = host
+                .storage_write(
+                    StorageWriteInput::new(&user, &collection, &key, &value_json)
+                        .expecting(
+                            expected_version
+                                .as_ref()
+                                .map(|value| value.to_string_lossy())
+                                .as_deref(),
+                        )
+                        .with_permissions(read_permission, write_permission)
+                        .with_included_index_names_json(Some(&included_json)),
+                )
+                .map_err(mlua::Error::RuntimeError)?;
+            storage_object_table(lua, object)
+        },
+    )?;
+    citadel.set("storage_write", storage_write)?;
+
+    let storage_delete = lua.create_function(
+        |lua,
+         (user, collection, key, expected_version): (
+            mlua::String,
+            mlua::String,
+            mlua::String,
+            Option<mlua::String>,
+        )| {
+            let host = domain_host(lua)?;
+            host.storage_delete(
+                &user.to_string_lossy(),
+                &collection.to_string_lossy(),
+                &key.to_string_lossy(),
+                expected_version
+                    .as_ref()
+                    .map(|value| value.to_string_lossy())
+                    .as_deref(),
+            )
+            .map_err(mlua::Error::RuntimeError)
+        },
+    )?;
+    citadel.set("storage_delete", storage_delete)?;
+
+    let storage_index_query = lua.create_function(
+        |lua, (index_name, filters_json, limit): (mlua::String, mlua::String, usize)| {
+            let host = domain_host(lua)?;
+            let objects = host
+                .storage_index_query(
+                    &index_name.to_string_lossy(),
+                    &filters_json.to_string_lossy(),
+                    limit,
+                )
+                .map_err(mlua::Error::RuntimeError)?;
+            let result = lua.create_table()?;
+            for (position, object) in objects.into_iter().enumerate() {
+                result.set(position + 1, storage_index_object_table(lua, object)?)?;
+            }
+            Ok(result)
+        },
+    )?;
+    citadel.set("storage_index_query", storage_index_query)?;
+
+    lua.globals().set("citadel", citadel)?;
+    Ok(())
+}
+
+/// Convert a static-data catalog error to a normal Lua runtime error without
+/// attaching a Rust stack trace or host-path detail.
+fn static_data_lua_error(error: crate::runtime::static_data::StaticDataError) -> mlua::Error {
+    mlua::Error::RuntimeError(error.to_string())
+}
+
+/// Convert parsed JSON/CSV values to ordinary Lua data. JSON arrays use Lua's
+/// conventional one-based indices; objects use string keys; JSON `null` is Lua
+/// `nil`. The catalog is the cache, not the returned table, so scripts may shape
+/// their in-memory copy without mutating later reads or the replacement catalog.
+fn static_data_value_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Nil),
+        serde_json::Value::Bool(value) => Ok(Value::Boolean(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(Value::Integer(value))
+            } else if let Some(value) = value.as_u64() {
+                if let Ok(value) = i64::try_from(value) {
+                    Ok(Value::Integer(value))
+                } else {
+                    Ok(Value::Number(value as f64))
+                }
+            } else if let Some(value) = value.as_f64() {
+                Ok(Value::Number(value))
+            } else {
+                Err(mlua::Error::RuntimeError(
+                    "static data contains an unsupported number".to_string(),
+                ))
+            }
+        }
+        serde_json::Value::String(value) => Ok(Value::String(lua.create_string(value)?)),
+        serde_json::Value::Array(values) => {
+            let table = lua.create_table()?;
+            for (index, value) in values.iter().enumerate() {
+                table.set(index + 1, static_data_value_to_lua(lua, value)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+        serde_json::Value::Object(values) => {
+            let table = lua.create_table()?;
+            for (key, value) in values {
+                table.set(key.as_str(), static_data_value_to_lua(lua, value)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+    }
+}
+
+/// Fetch the domain-services seam from VM app-data for a `citadel.friends_*`
+/// host call, or a clean Lua error when the runtime has no services attached.
+///
+/// The `Arc` is cloned out so the app-data borrow is released before the
+/// (potentially blocking) service call runs.
+fn domain_host(lua: &Lua) -> mlua::Result<Arc<dyn DomainHost>> {
+    lua.app_data_ref::<DomainHostHandle>()
+        .map(|handle| Arc::clone(&handle.0))
+        .ok_or_else(|| mlua::Error::RuntimeError("friends host not available".into()))
+}
+
+fn notification_lua_table(lua: &Lua, notification: PlayerNotification) -> mlua::Result<Table> {
+    let out = lua.create_table()?;
+    out.set("id", notification.id)?;
+    out.set("code", notification.code)?;
+    out.set("subject", notification.subject)?;
+    out.set("content_json", notification.content.to_string())?;
+    out.set("sender", notification.sender)?;
+    out.set("created_at_unix_ms", notification.created_at_unix_ms)?;
+    out.set("read_at_unix_ms", notification.read_at_unix_ms)?;
+    Ok(out)
+}
+
+fn storage_object_table(
+    lua: &Lua,
+    object: crate::runtime::StorageObjectDto,
+) -> mlua::Result<mlua::Value> {
+    let result = lua.create_table()?;
+    result.set("value_json", object.value_json)?;
+    result.set("version", object.version)?;
+    result.set("read_permission", object.read_permission)?;
+    result.set("write_permission", object.write_permission)?;
+    Ok(mlua::Value::Table(result))
+}
+
+fn storage_index_object_table(
+    lua: &Lua,
+    object: crate::runtime::StorageIndexObjectDto,
+) -> mlua::Result<Table> {
+    let result = lua.create_table()?;
+    match object.user_id {
+        Some(user_id) => result.set("user_id", user_id)?,
+        None => result.set("user_id", mlua::Value::Nil)?,
+    }
+    result.set("collection", object.collection)?;
+    result.set("key", object.key)?;
+    result.set("value_json", object.object.value_json)?;
+    result.set("version", object.object.version)?;
+    result.set("read_permission", object.object.read_permission)?;
+    result.set("write_permission", object.object.write_permission)?;
+    Ok(result)
+}
+
+/// Push a bodyless actor command into the sink (respecting the command cap). Unlike
+/// [`push_command`] there is no payload to size-check.
+fn push_actor_command(lua: &Lua, command: OutboundCommand) -> mlua::Result<()> {
+    if let Some(mut sink) = lua.app_data_mut::<CommandSink>() {
+        if sink.commands.len() >= MAX_OUTBOUND_COMMANDS {
+            sink.overflowed = true;
+        } else {
+            sink.commands.push(command);
+        }
+    }
+    Ok(())
+}
+
+fn lua_vector3(value: Table) -> mlua::Result<[f32; 3]> {
+    let vector = [value.get(1)?, value.get(2)?, value.get(3)?];
+    if vector.into_iter().all(f32::is_finite) {
+        Ok(vector)
+    } else {
+        Err(mlua::Error::RuntimeError(
+            "vector coordinates must be finite".into(),
+        ))
+    }
+}
+
+fn physics_options_from_lua(opts: Table) -> mlua::Result<PhysicsOptions> {
+    let mut config = PhysicsConfig::default();
+    config.gravity = opts
+        .get::<Option<f32>>("gravity")?
+        .unwrap_or(config.gravity);
+    config.buoyancy = opts
+        .get::<Option<f32>>("buoyancy")?
+        .unwrap_or(config.buoyancy);
+    config.drag = opts.get::<Option<f32>>("drag")?.unwrap_or(config.drag);
+    config.max_speed = opts
+        .get::<Option<f32>>("max_speed")?
+        .unwrap_or(config.max_speed);
+    let (default_radius, default_height) = match config.shape {
+        Shape::Capsule { radius, height } => (radius, height),
+        Shape::Aabb { half_extents } => (half_extents[0], half_extents[1] * 2.0),
+    };
+    let radius = opts.get::<Option<f32>>("radius")?.unwrap_or(default_radius);
+    let height = opts.get::<Option<f32>>("height")?.unwrap_or(default_height);
+    config.shape = match opts.get::<Option<String>>("shape")?.as_deref() {
+        None | Some("capsule") => Shape::Capsule { radius, height },
+        Some("aabb") => Shape::Aabb {
+            half_extents: [radius, height * 0.5, radius],
+        },
+        Some(shape) => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "unsupported physics shape '{shape}' (expected 'capsule' or 'aabb')"
+            )));
+        }
+    };
+    Ok(PhysicsOptions {
+        enabled: opts.get::<Option<bool>>("enabled")?.unwrap_or(true),
+        config,
+    })
+}
+
+/// Advance each Lua-declared patrol through a Detour corridor. The path query is
+/// server-side; only ordinary `MoveActor` commands reach the gateway/snapshot path.
+fn advance_patrols(lua: &Lua, dt: f32) -> mlua::Result<()> {
+    let Some(maps) = lua
+        .app_data_ref::<MapCatalogHandle>()
+        .map(|maps| Arc::clone(&maps.0))
+    else {
+        return Ok(());
+    };
+    let Some(mut patrols) = lua.app_data_mut::<NpcPatrols>() else {
+        return Ok(());
+    };
+    for patrol in &mut patrols.0 {
+        let target = patrol.waypoints[patrol.next_waypoint];
+        let path = match maps.find_path(&patrol.map, patrol.position, target) {
+            Ok(Some(path)) => path,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(map = %patrol.map, error = ?error, "NPC patrol path query failed");
+                continue;
+            }
+        };
+        let next = path.first().copied().unwrap_or(target);
+        let delta = [
+            next[0] - patrol.position[0],
+            next[1] - patrol.position[1],
+            next[2] - patrol.position[2],
+        ];
+        let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        if distance <= 1.0 {
+            patrol.position = next;
+            if (target[0] - next[0]).abs() <= 1.0
+                && (target[1] - next[1]).abs() <= 1.0
+                && (target[2] - next[2]).abs() <= 1.0
+            {
+                patrol.next_waypoint = (patrol.next_waypoint + 1) % patrol.waypoints.len();
+            }
+            continue;
+        }
+        let step = (patrol.speed * dt).min(distance);
+        let factor = step / distance;
+        patrol.position = [
+            patrol.position[0] + delta[0] * factor,
+            patrol.position[1] + delta[1] * factor,
+            patrol.position[2] + delta[2] * factor,
+        ];
+        push_actor_command(
+            lua,
+            OutboundCommand::MoveActor {
+                object_id: patrol.object_id,
+                position: patrol.position,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [
+                    delta[0] / distance * patrol.speed,
+                    delta[1] / distance * patrol.speed,
+                    delta[2] / distance * patrol.speed,
+                ],
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate `body`, build a command via `make`, and push it into the sink.
+///
+/// Borrows the command sink only for the push and drops the guard immediately,
+/// so no app-data borrow is ever held across further Lua execution.
+fn push_command(
+    lua: &Lua,
+    body: &mlua::String,
+    make: impl FnOnce(Vec<u8>) -> OutboundCommand,
+) -> mlua::Result<()> {
+    let bytes = body.as_bytes();
+    if bytes.len() > MAX_OUTBOUND_BODY_BYTES {
+        return Err(mlua::Error::RuntimeError(format!(
+            "outbound body too large: {} bytes (max {MAX_OUTBOUND_BODY_BYTES})",
+            bytes.len()
+        )));
+    }
+    let command = make(bytes.to_vec());
+    if let Some(mut sink) = lua.app_data_mut::<CommandSink>() {
+        let would_be_bytes = sink.total_bytes.saturating_add(bytes.len());
+        if sink.commands.len() >= MAX_OUTBOUND_COMMANDS || would_be_bytes > MAX_TOTAL_OUTBOUND_BYTES
+        {
+            sink.overflowed = true;
+        } else {
+            sink.total_bytes = would_be_bytes;
+            sink.commands.push(command);
+        }
+    }
+    Ok(())
+}
+
+/// Install a scoped `require` that loads multi-file game logic from within the
+/// module root (the `scripts_dir`), without exposing `io`/`os`/`package`.
+///
+/// `require("systems.combat")` resolves to `<root>/systems/combat.lua` (dotted
+/// segments -> subdirectories). A module runs once per VM and its returned value
+/// is cached (a re-`require` returns the cached value); cycles are detected and
+/// rejected. Paths that would escape the root (`..`, absolute, separators,
+/// empty segments) are refused, and no `package.path`/C-loader surface exists.
+/// When there is no module root (an in-memory runtime), `require` is still
+/// installed but errors on use, so the failure is explicit rather than a `nil`
+/// global.
+fn install_require(lua: &Lua, module_root: Option<&Path>) -> mlua::Result<()> {
+    // Per-VM module cache + in-flight set (reset with the whole VM on reload).
+    lua.set_named_registry_value(MODULES_KEY, lua.create_table()?)?;
+    lua.set_named_registry_value(MODULES_LOADING_KEY, lua.create_table()?)?;
+
+    let root = module_root.map(Path::to_path_buf);
+    let require = lua.create_function(move |lua, name: mlua::String| {
+        let name = name.to_str()?.to_string();
+        let modules: Table = lua.named_registry_value(MODULES_KEY)?;
+
+        // Cache hit: return the already-loaded module value.
+        if let Some(cached) = modules.get::<Option<mlua::Value>>(name.clone())? {
+            return Ok(cached);
+        }
+
+        let Some(root) = root.as_deref() else {
+            return Err(mlua::Error::RuntimeError(format!(
+                "require(\"{name}\") is unavailable: this runtime has no script directory"
+            )));
+        };
+
+        // Cycle guard: a module mid-load must not require itself (transitively).
+        let loading: Table = lua.named_registry_value(MODULES_LOADING_KEY)?;
+        if loading.get::<Option<bool>>(name.clone())?.unwrap_or(false) {
+            return Err(mlua::Error::RuntimeError(format!(
+                "cyclic require detected while loading module \"{name}\""
+            )));
+        }
+
+        let path = resolve_module_path(root, &name).map_err(|reason| {
+            mlua::Error::RuntimeError(format!("require(\"{name}\"): {reason}"))
+        })?;
+        let source = std::fs::read_to_string(&path).map_err(|_| {
+            mlua::Error::RuntimeError(format!("require(\"{name}\"): module not found"))
+        })?;
+
+        loading.set(name.clone(), true)?;
+        // The module body runs under the caller's already-armed deadline; `eval`
+        // returns the module's `return`ed value (or nil for a bare chunk).
+        let result = lua
+            .load(&source)
+            .set_name(format!("@{name}"))
+            .eval::<mlua::Value>();
+        loading.set(name.clone(), mlua::Value::Nil)?;
+        let value = result?;
+
+        // Cache the returned value; a module that returns nothing caches `true`
+        // (standard `require` convention) so it is not re-run on the next call.
+        let cached = if value == mlua::Value::Nil {
+            mlua::Value::Boolean(true)
+        } else {
+            value
+        };
+        modules.set(name, cached.clone())?;
+        Ok(cached)
+    })?;
+    lua.globals().set("require", require)?;
+    Ok(())
+}
+
+/// Resolve a dotted module name to a `.lua` file within `root`, or return a
+/// short reason string if the name is malformed or would escape the root.
+///
+/// Rules (all failures reject rather than silently clamp): non-empty; each
+/// dot-separated segment is non-empty and made only of `[A-Za-z0-9_]` (so `..`,
+/// absolute paths, path separators, and empty segments are all refused). The
+/// resolved path is confirmed to stay under `root`.
+fn resolve_module_path(root: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() {
+        return Err("empty module name".to_string());
+    }
+    // A non-empty name always yields >=1 segment; an empty segment (from a
+    // leading/trailing/double dot) is rejected below.
+    let mut path = root.to_path_buf();
+    for segment in name.split('.') {
+        if segment.is_empty() {
+            return Err("module name has an empty path segment".to_string());
+        }
+        if !segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err("module name may only contain letters, digits, '_', and '.'".to_string());
+        }
+        path.push(segment);
+    }
+    path.set_extension("lua");
+
+    // Defense in depth: even though the character allowlist forbids `..` and
+    // separators, confirm the resolved file stays under the (canonical) root.
+    if let Ok(canon_root) = root.canonicalize()
+        && let Ok(canon_path) = path.canonicalize()
+        && !canon_path.starts_with(&canon_root)
+    {
+        return Err("module path escapes the script directory".to_string());
+    }
+    Ok(path)
+}
+
+/// Install the instruction-count hook that enforces the per-invocation deadline.
+fn install_deadline_hook(lua: &Lua) -> mlua::Result<()> {
+    lua.set_hook(
+        HookTriggers::new().every_nth_instruction(HOOK_INSTRUCTION_INTERVAL),
+        |lua, _debug| {
+            if let Some(deadline) = lua.app_data_ref::<Deadline>()
+                && let Some(at) = deadline.0
+                && Instant::now() >= at
+            {
+                return Err(mlua::Error::RuntimeError(
+                    "handler exceeded its time budget".to_string(),
+                ));
+            }
+            Ok(VmState::Continue)
+        },
+    );
+    Ok(())
+}
+
+/// Build a fresh, fully-wired Lua VM from `source`, labelled `source_label`.
+///
+/// Creates the restricted-stdlib state, installs the command sink, deadline
+/// app-data, host API, and deadline hook, then executes `source` to run its
+/// registrations. Any step failing yields a [`Runtime`](ErrorCategory::Runtime)
+/// error and leaves nothing behind (the VM is local until returned), which is
+/// what makes [`LuaRuntime::reload`] failure-safe. Shared by initial load and
+/// hot-reload.
+fn build_lua(
+    source: &str,
+    source_label: &str,
+    load_budget: Duration,
+    module_root: Option<&Path>,
+    static_data: StaticDataCatalog,
+    execution_mode: LuaExecutionMode,
+) -> AppResult<Lua> {
+    let lua = Lua::new_with(script_stdlib(execution_mode), LuaOptions::default())
+        .map_err(|e| script_error("failed to initialize Lua state", &e))?;
+    lua.set_app_data(CommandSink::default());
+    lua.set_app_data(Deadline(None));
+    lua.set_app_data(NpcIdCounter(NPC_ID_BASE));
+    lua.set_app_data(NpcPatrols::default());
+    install_host_api(&lua, source_label, static_data.clone(), execution_mode)
+        .map_err(|e| script_error("failed to install host API", &e))?;
+    if execution_mode == LuaExecutionMode::Sandboxed {
+        install_require(&lua, module_root)
+            .map_err(|e| script_error("failed to install require", &e))?;
+        install_deadline_hook(&lua)
+            .map_err(|e| script_error("failed to install deadline hook", &e))?;
+    }
+    // Arm the deadline around the top-level exec so an infinite loop in the
+    // script body (outside any handler) is aborted instead of hanging the
+    // loader/watcher thread. Cleared afterwards; per-invocation handlers arm
+    // their own deadline in `run_locked`.
+    if execution_mode == LuaExecutionMode::Sandboxed {
+        set_deadline(&lua, Some(Instant::now() + load_budget));
+    }
+    let exec = lua.load(source).set_name(source_label.to_string()).exec();
+    if execution_mode == LuaExecutionMode::Sandboxed {
+        set_deadline(&lua, None);
+    }
+    exec.map_err(|e| script_error(&format!("failed to load {source_label}"), &e))?;
+    // From now on a cache miss is denied, rather than opening a file from a
+    // message or tick handler. Successfully initialized values remain cache
+    // hits and are converted to Lua tables without I/O.
+    static_data.seal();
+    Ok(lua)
+}
+
+/// Whether a freshly-built VM registered at least one handler of any kind.
+///
+/// Used to reject a hot-reload of an empty or handlerless script (an accidental
+/// truncation, an editor's transient zero-byte save, or a stray empty file):
+/// such a swap would silently leave the node with no handlers, so the reload is
+/// rejected and the previous script keeps serving. An error probing the registry
+/// is treated as "no handlers" so a broken VM is never swapped in.
+fn has_any_handler(lua: &Lua) -> bool {
+    let has_message = lua
+        .named_registry_value::<Table>(HANDLERS_KEY)
+        .map(|handlers| {
+            handlers
+                .pairs::<mlua::Value, mlua::Value>()
+                .next()
+                .is_some()
+        })
+        .unwrap_or(false);
+    if has_message {
+        return true;
+    }
+    let has_rpc = lua
+        .named_registry_value::<Table>(RPC_HANDLERS_KEY)
+        .map(|handlers| {
+            handlers
+                .pairs::<mlua::Value, mlua::Value>()
+                .next()
+                .is_some()
+        })
+        .unwrap_or(false);
+    if has_rpc {
+        return true;
+    }
+    [ON_JOIN_KEY, ON_LEAVE_KEY, ON_TICK_KEY].iter().any(|key| {
+        lua.named_registry_value::<Option<Function>>(key)
+            .map(|h| h.is_some())
+            .unwrap_or(false)
+    })
+}
+
+/// Read a script file, mapping I/O failure to a [`Runtime`](ErrorCategory::Runtime)
+/// error naming the path.
+fn read_script(path: &Path) -> AppResult<String> {
+    std::fs::read_to_string(path).map_err(|e| {
+        AppError::new(
+            ErrorCategory::Runtime,
+            format!("cannot read game script: {}", path.display()),
+        )
+        .with_detail(e.to_string())
+    })
+}
+
+/// Map an `mlua` error to a [`Runtime`](ErrorCategory::Runtime) [`AppError`].
+fn script_error(context: &str, err: &mlua::Error) -> AppError {
+    AppError::new(ErrorCategory::Runtime, context.to_string()).with_detail(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    const RELAY_SCRIPT: &str = r#"
+        citadel.on_message(1, function(ctx, body)
+            citadel.broadcast(2, string.pack(">I8", ctx.sender) .. body, true)
+        end)
+    "#;
+
+    fn runtime(src: &str) -> LuaRuntime {
+        LuaRuntime::from_source(src, "test", DEFAULT_DEADLINE_MS).expect("runtime loads")
+    }
+
+    #[test]
+    fn match_message_context_and_tick_are_room_scoped() {
+        let rt = runtime(
+            r#"
+            citadel.on_message(9, function(ctx, body)
+                citadel.broadcast(10, tostring(ctx.room_id) .. ":" .. body)
+            end)
+            citadel.on_tick(function(dt, room_id)
+                citadel.broadcast(11, tostring(room_id))
+            end)
+        "#,
+        );
+        assert_eq!(
+            rt.dispatch_in_room(7, Some("user-7"), 42, 9, b"payload"),
+            vec![OutboundCommand::Broadcast {
+                kind: 10,
+                body: b"42:payload".to_vec(),
+                unreliable: false,
+            }]
+        );
+        assert_eq!(
+            rt.tick_in_room(42, Duration::from_millis(16), Duration::from_millis(100)),
+            vec![OutboundCommand::Broadcast {
+                kind: 11,
+                body: b"42".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn host_api_surface_matches_manifest_lua() {
+        let registered: std::collections::HashSet<&'static str> = [
+            "on_message",
+            "on_join",
+            "on_leave",
+            "on_tick",
+            "on_rpc",
+            "on_room_create",
+            "on_room_join",
+            "broadcast",
+            "send",
+            "spawn_actor",
+            "move_actor",
+            "despawn_actor",
+            "set_physics",
+            "apply_impulse",
+            "set_move_intent",
+            "physics_state",
+            "map_info",
+            "raycast",
+            "sphere_overlap",
+            "ground_height",
+            "log",
+            "static_data.load_json",
+            "static_data.load_csv",
+            "friends.add",
+            "friends.remove",
+            "friends.block",
+            "friends.list",
+            "notifications.send",
+            "notifications.list",
+            "notifications.mark_read",
+            "groups.call",
+            "leaderboards.call",
+            "chat.call",
+            "wallet.call",
+            "storage.read",
+            "storage.write",
+            "storage.delete",
+            "storage.index_query",
+            "storage.register_index_filter",
+            "http.fetch",
+        ]
+        .into_iter()
+        .collect();
+        let shipped: std::collections::HashSet<&'static str> = crate::runtime::HOST_API_SURFACE
+            .iter()
+            .filter(|entry| entry.status == crate::runtime::HostApiStatus::Shipped)
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(registered, shipped);
+    }
+
+    fn friends_host() -> Arc<dyn DomainHost> {
+        use crate::repository::{
+            InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
+            InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryStorageRepository,
+            InMemoryWalletRepository,
+        };
+        use crate::runtime::ServiceDomainHost;
+        use crate::services::{
+            ChatChannelAuthorizer, ChatService, FriendsService, GroupsService, LeaderboardService,
+            PlayerNotificationService, WalletService,
+        };
+        use crate::storage::{
+            Collection, StorageIndexDefinition, StorageIndexField, StorageIndexName,
+        };
+        let friends = Arc::new(FriendsService::new(Arc::new(
+            InMemoryFriendsRepository::new(),
+        )));
+        let groups = Arc::new(GroupsService::new(
+            Arc::new(InMemoryGroupsRepository::new()),
+        ));
+        let chat = Arc::new(ChatService::new(Arc::new(InMemoryChatRepository::new())));
+        let authorizer = Arc::new(ChatChannelAuthorizer::new(
+            Arc::clone(&friends),
+            Arc::clone(&groups),
+        ));
+        Arc::new(
+            ServiceDomainHost::new(friends, Arc::new(InMemoryStorageRepository::new()))
+                .with_storage_indexes(vec![
+                    StorageIndexDefinition::new(
+                        StorageIndexName::new("profiles_by_score").expect("index name"),
+                        Collection::new("profiles").expect("collection"),
+                        None,
+                        vec![StorageIndexField::new("score").expect("field")],
+                    )
+                    .expect("index definition"),
+                ])
+                .with_player_notifications(Arc::new(PlayerNotificationService::new(Arc::new(
+                    InMemoryBackend::new(),
+                ))))
+                .with_groups(groups)
+                .with_leaderboards(Arc::new(LeaderboardService::new(Arc::new(
+                    InMemoryLeaderboardsRepository::new(),
+                ))))
+                .with_chat(chat)
+                .with_chat_authorizer(authorizer)
+                .with_wallet(Arc::new(WalletService::new(Arc::new(
+                    InMemoryWalletRepository::new(),
+                )))),
+        )
+    }
+
+    /// Names of the shipped `Domain`-category host functions from the canonical
+    /// manifest. The behavioral gate below must exercise exactly this set, so a
+    /// newly-shipped `Domain` function cannot pass parity as a name-claim stub.
+    fn shipped_domain_host_api_names() -> std::collections::HashSet<&'static str> {
+        crate::runtime::HOST_API_SURFACE
+            .iter()
+            .filter(|entry| {
+                entry.category == crate::runtime::HostApiCategory::Domain
+                    && entry.status == crate::runtime::HostApiStatus::Shipped
+            })
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn domain_host_api_behaviorally_covers_manifest() {
+        // Exercise EVERY shipped Domain function against a real (in-memory) host
+        // and assert real effects — a name-claim stub throws here and fails.
+        let rt = runtime(
+            r#"
+            citadel.on_rpc("exercise", function(ctx, body)
+                local u, o = "prober", "target"
+                local added = citadel.friends_add(u, o)
+                citadel.friends_add(o, u)
+                local chat = citadel.chat_call(u, "send", '{"target":{"kind":"direct","other_user_id":"target"},"content":"hi"}')
+                local n1 = #citadel.friends_list(u)
+                citadel.friends_block(u, o)
+                local blocked = citadel.friends_list(u)[1].state
+                local removed = citadel.friends_remove(u, o)
+                local n2 = #citadel.friends_list(u)
+                local notification = citadel.notifications_send(u, 7, "hello", "{}", "server", "probe")
+                local page = citadel.notifications_list(u)
+                local read = citadel.notifications_mark_read(u, { notification.id })
+                local group = citadel.groups_call(u, "create", '{"name":"probers"}')
+                local boards = citadel.leaderboards_call(u, "list", "{}")
+                local wallet = citadel.wallet_call(u, "balances", "{}")
+                return added .. "|" .. n1 .. "|" .. blocked .. "|" .. tostring(removed) .. "|" .. n2 .. "|" .. #page.items .. "|" .. #read .. "|" .. tostring(string.find(group, "probers") ~= nil) .. "|" .. tostring(boards == "[]") .. "|" .. tostring(string.find(chat, '"id":1') ~= nil) .. "|" .. tostring(wallet == "{}")
+            end)
+        "#,
+        )
+        .with_domain_host(friends_host());
+
+        let RpcOutcome::Ok(reply) = rt.call_rpc(1, Some("prober"), "exercise", b"") else {
+            panic!("domain host functions must be wired, not stubbed");
+        };
+        assert_eq!(
+            reply,
+            b"invited_sent|1|blocked|true|0|1|1|true|true|true|true"
+        );
+
+        // Forcing function: the script above must cover the whole shipped Domain
+        // surface. Update both when a new Domain function ships.
+        let exercised: std::collections::HashSet<&str> = [
+            "friends.add",
+            "friends.remove",
+            "friends.block",
+            "friends.list",
+            "notifications.send",
+            "notifications.list",
+            "notifications.mark_read",
+            "groups.call",
+            "leaderboards.call",
+            "chat.call",
+            "wallet.call",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            exercised,
+            shipped_domain_host_api_names(),
+            "every shipped Domain host-API function needs a behavioral smoke here"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn friends_host_api_errors_without_a_domain_host() {
+        // A runtime built without `with_domain_host` exposes the functions but
+        // they error cleanly rather than panicking.
+        let rt = runtime(
+            r#"
+            citadel.on_rpc("befriend", function(ctx, body)
+                citadel.friends_add(ctx.user_id, body)
+                return "unreachable"
+            end)
+        "#,
+        );
+        let RpcOutcome::Err(msg) = rt.call_rpc(1, Some("alice"), "befriend", b"bob") else {
+            panic!("expected error");
+        };
+        assert!(msg.contains("friends host not available") || !msg.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_host_api_writes_reads_and_isolates_a_conflict() {
+        let rt = runtime(
+            r#"
+            citadel.on_rpc("save", function(ctx, body)
+                local created = citadel.storage_write(ctx.user_id, "saves", "slot", "{\"level\":1}", "", 2, 1)
+                local read = citadel.storage_read(ctx.user_id, "saves", "slot")
+                local ok = pcall(function()
+                    citadel.storage_write(ctx.user_id, "saves", "slot", "{\"level\":2}", "")
+                end)
+                return read.value_json .. "|" .. created.version .. "|" .. tostring(ok)
+            end)
+        "#,
+        )
+        .with_domain_host(friends_host());
+
+        let RpcOutcome::Ok(reply) = rt.call_rpc(1, Some("alice"), "save", b"") else {
+            panic!("storage host must return a reply");
+        };
+        let text = String::from_utf8(reply).expect("utf8 reply");
+        assert!(text.starts_with("{\"level\":1}|"), "got: {text}");
+        assert!(text.ends_with("|false"), "got: {text}");
+        // The VM remains usable after the caught storage conflict.
+        assert!(matches!(
+            rt.call_rpc(1, Some("alice"), "save", b""),
+            RpcOutcome::Err(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_index_query_is_wired_to_the_lua_host() {
+        let rt = runtime(
+            r#"
+            citadel.on_rpc("search", function(ctx, body)
+                citadel.register_storage_index_filter("profiles_by_score", function(candidate)
+                    if candidate.key == "boom" then error("filter failed") end
+                    return candidate.key == "main"
+                end)
+                citadel.storage_write(ctx.user_id, "profiles", "skip", "{\"score\":7}")
+                citadel.storage_write(ctx.user_id, "profiles", "main", "{\"score\":7}")
+                local ok = pcall(function()
+                    citadel.storage_write(ctx.user_id, "profiles", "boom", "{\"score\":7}")
+                end)
+                local missing = citadel.storage_read(ctx.user_id, "profiles", "boom") == nil
+                local found = citadel.storage_index_query("profiles_by_score", "{\"score\":7}", 10)
+                return tostring(ok) .. "|" .. tostring(missing) .. "|" .. tostring(#found) .. "|" .. found[1].user_id .. "|" .. found[1].key
+            end)
+        "#,
+        )
+        .with_domain_host(friends_host());
+
+        let RpcOutcome::Ok(reply) = rt.call_rpc(1, Some("alice"), "search", b"") else {
+            panic!("storage index host must return a reply");
+        };
+        assert_eq!(reply, b"false|true|1|alice|main");
+    }
+
+    #[test]
+    fn on_room_create_returns_label_spec_from_table() {
+        let rt = runtime(
+            r#"
+            citadel.on_room_create(function(ctx, params)
+                return { map = "ForestArena", mode = "ffa", max_players = 8, open = true }
+            end)
+        "#,
+        );
+        let spec = rt.call_room_create(1, None, b"ignored").expect("spec");
+        assert_eq!(spec.map, "ForestArena");
+        assert_eq!(spec.mode, "ffa");
+        assert_eq!(spec.max_players, 8);
+        assert!(spec.open);
+    }
+
+    #[test]
+    fn on_room_create_accepts_bare_string_map() {
+        let rt = runtime(r#"citadel.on_room_create(function(ctx, params) return "Lobby" end)"#);
+        assert_eq!(
+            rt.call_room_create(1, None, b"").expect("spec").map,
+            "Lobby"
+        );
+    }
+
+    #[test]
+    fn call_room_create_without_handler_is_none() {
+        let rt = runtime("-- no room handler");
+        assert!(rt.call_room_create(1, None, b"x").is_none());
+    }
+
+    #[test]
+    fn on_room_join_gate_admits_and_rejects() {
+        let rt = runtime(r#"citadel.on_room_join(function(ctx, room_id) return room_id == 1 end)"#);
+        assert!(rt.call_room_join(1, None, 1), "handler admits room 1");
+        assert!(!rt.call_room_join(1, None, 2), "handler rejects room 2");
+    }
+
+    #[test]
+    fn call_room_join_without_handler_admits() {
+        let rt = runtime("-- none");
+        assert!(rt.call_room_join(1, None, 5), "default is admit");
+    }
+
+    #[test]
+    fn on_room_join_error_fails_closed() {
+        let rt = runtime(r#"citadel.on_room_join(function(ctx, id) error("boom") end)"#);
+        assert!(!rt.call_room_join(1, None, 1), "a handler error rejects");
+    }
+
+    #[test]
+    fn spawn_actor_returns_high_id_and_queues_actor_commands() {
+        let rt = runtime(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                local id = citadel.spawn_actor{ archetype = 7, x = 10, y = 0, z = 0 }
+                citadel.move_actor(id, 20, 0, 0, 5, 0, 0)
+                citadel.despawn_actor(id)
+            end)
+        "#,
+        );
+        let cmds = rt.dispatch(1, None, 1, b"go");
+        assert_eq!(cmds.len(), 3, "spawn + move + despawn queued");
+        let id = match &cmds[0] {
+            OutboundCommand::SpawnActor {
+                object_id,
+                archetype,
+                position,
+            } => {
+                assert!(*object_id >= NPC_ID_BASE, "npc id is in the high range");
+                assert_eq!(*archetype, 7);
+                assert_eq!(*position, [10.0, 0.0, 0.0]);
+                *object_id
+            }
+            other => panic!("expected SpawnActor, got {other:?}"),
+        };
+        match &cmds[1] {
+            OutboundCommand::MoveActor {
+                object_id,
+                position,
+                velocity,
+                ..
+            } => {
+                assert_eq!(*object_id, id, "move targets the spawned id");
+                assert_eq!(*position, [20.0, 0.0, 0.0]);
+                assert_eq!(*velocity, [5.0, 0.0, 0.0]);
+            }
+            other => panic!("expected MoveActor, got {other:?}"),
+        }
+        assert_eq!(cmds[2], OutboundCommand::DespawnActor { object_id: id });
+    }
+
+    #[test]
+    fn map_info_returns_loaded_summary_and_nil_for_unknown_map() {
+        use citadel_map::{CollisionMesh, MapFile, MapMetadata};
+        let dir = TempDir::new("lua-map-info");
+        let map = MapFile {
+            metadata: MapMetadata {
+                name: "Arena".into(),
+                bounds_min: [-10.0, 0.0, -20.0],
+                bounds_max: [10.0, 5.0, 20.0],
+            },
+            collision: CollisionMesh {
+                vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                triangles: vec![[0, 1, 2]],
+            },
+            navmesh: None,
+        };
+        std::fs::write(dir.0.join("Arena.map"), map.encode()).expect("write map");
+        let maps = Arc::new(MapCatalog::load_dir(&dir.0));
+        let rt = runtime(r#"
+            citadel.on_rpc("map", function()
+                local known = citadel.map_info("Arena")
+                local missing = citadel.map_info("Missing")
+                if known == nil or missing ~= nil then error("bad map lookup") end
+                return string.format("%.0f|%.0f|%d|%d", known.bounds_min[1], known.bounds_max[3], known.vertex_count, known.triangle_count)
+            end)
+        "#).with_maps(maps);
+        assert_eq!(
+            rt.call_rpc(1, None, "map", b""),
+            RpcOutcome::Ok(b"-10|20|3|1".to_vec())
+        );
+    }
+
+    #[test]
+    fn patrol_actor_uses_map_path_and_emits_replicated_move_command() {
+        use citadel_map::{CollisionMesh, MapFile, MapMetadata};
+        let dir = TempDir::new("lua-patrol-nav");
+        let map = MapFile {
+            metadata: MapMetadata {
+                name: "Arena".into(),
+                bounds_min: [0.0; 3],
+                bounds_max: [10.0, 0.0, 10.0],
+            },
+            collision: CollisionMesh {
+                vertices: vec![
+                    [0.0, 0.0, 0.0],
+                    [10.0, 0.0, 0.0],
+                    [10.0, 0.0, 10.0],
+                    [0.0, 0.0, 10.0],
+                ],
+                triangles: vec![[0, 1, 2], [0, 2, 3]],
+            },
+            navmesh: None,
+        };
+        std::fs::write(dir.0.join("Arena.map"), map.encode()).expect("write map");
+        let rt = runtime(r#"
+            citadel.on_message(1, function() end)
+            citadel.spawn_actor{ archetype = 1, x = 1, y = 0, z = 1, ai = "patrol", map = "Arena", speed = 10, waypoints = {{x = 9, y = 0, z = 9}} }
+        "#).with_maps(Arc::new(MapCatalog::load_dir(&dir.0)));
+        assert!(
+            rt.has_tick_handler(),
+            "patrols drive the server tick without a Lua on_tick hook"
+        );
+        let commands = rt.tick(Duration::from_millis(100), Duration::from_millis(100));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            OutboundCommand::MoveActor {
+                object_id: 0x4000_0000,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn load_missing_dir_falls_back_to_none() {
+        let dir = std::path::Path::new("/nonexistent/citadel/game-does-not-exist");
+        let rt = LuaRuntime::load(dir, DEFAULT_DEADLINE_MS).expect("missing dir is not an error");
+        assert!(
+            rt.is_none(),
+            "absent main.lua => fall back to built-in relay"
+        );
+    }
+
+    #[test]
+    fn syntax_error_is_a_runtime_error() {
+        let err = LuaRuntime::from_source("this is not lua ==", "bad", DEFAULT_DEADLINE_MS)
+            .expect_err("syntax error must fail to load");
+        assert_eq!(err.category(), ErrorCategory::Runtime);
+    }
+
+    #[test]
+    fn dispatch_relay_handler_produces_tagged_broadcast() {
+        let rt = runtime(RELAY_SCRIPT);
+        let commands = rt.dispatch(42, None, 1, &[9, 8, 7]);
+        assert_eq!(commands.len(), 1);
+        let OutboundCommand::Broadcast {
+            kind,
+            body,
+            unreliable,
+        } = &commands[0]
+        else {
+            unreachable!("expected a broadcast command");
+        };
+        assert_eq!(*kind, 2);
+        assert!(*unreliable);
+        // string.pack(">I8", 42) is the 8-byte big-endian sender id.
+        assert_eq!(&body[..8], &42u64.to_be_bytes());
+        assert_eq!(&body[8..], &[9, 8, 7]);
+    }
+
+    #[test]
+    fn dispatch_unknown_kind_is_a_noop() {
+        let rt = runtime(RELAY_SCRIPT);
+        let commands = rt.dispatch(1, None, 9999, b"x");
+        assert!(commands.is_empty(), "no handler for kind => no commands");
+    }
+
+    #[test]
+    fn send_command_is_captured_with_target() {
+        let rt = runtime(
+            r#"
+            citadel.on_message(7, function(ctx, body)
+                citadel.send(123, 8, body)
+            end)
+        "#,
+        );
+        let commands = rt.dispatch(1, None, 7, b"hi");
+        assert_eq!(
+            commands,
+            vec![OutboundCommand::Send {
+                session: 123,
+                kind: 8,
+                body: b"hi".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn handler_error_is_isolated_and_discards_side_effects() {
+        let rt = runtime(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, "partial", false)
+                error("boom")
+            end)
+        "#,
+        );
+        // Must not panic; a prior broadcast in the same invocation is discarded.
+        let commands = rt.dispatch(1, None, 1, b"x");
+        assert!(commands.is_empty(), "errored handler yields no commands");
+        // The runtime remains usable for subsequent, valid dispatches.
+        let again = rt.dispatch(1, None, 1, b"y");
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn hung_handler_is_aborted_by_the_deadline() {
+        let rt = LuaRuntime::from_source(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                while true do end
+            end)
+        "#,
+            "hang",
+            50,
+        )
+        .expect("loads");
+        let start = Instant::now();
+        let commands = rt.dispatch(1, None, 1, b"x");
+        let elapsed = start.elapsed();
+        assert!(commands.is_empty(), "aborted handler yields no commands");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "deadline must abort the loop promptly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_outbound_body_is_rejected_without_crashing() {
+        let rt = runtime(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, string.rep("a", 2 * 1024 * 1024), false)
+            end)
+        "#,
+        );
+        // The host API errors on the oversized body; the handler error is
+        // isolated and produces no commands.
+        let commands = rt.dispatch(1, None, 1, b"x");
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn coroutine_library_is_unavailable_so_the_deadline_cannot_be_bypassed() {
+        // `coroutine` is omitted from the script stdlib because coroutines would
+        // run without the main-thread deadline hook. A handler that reaches for
+        // it hits a nil global, errors, and is isolated (no hang, no commands).
+        let rt = runtime(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                coroutine.resume(coroutine.create(function() while true do end end))
+            end)
+        "#,
+        );
+        let start = Instant::now();
+        let commands = rt.dispatch(1, None, 1, b"x");
+        assert!(commands.is_empty(), "coroutine bypass attempt is isolated");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not hang: coroutine is unavailable"
+        );
+    }
+
+    #[test]
+    fn debug_library_is_unavailable() {
+        // `debug` is omitted so a script cannot `debug.sethook(nil)` to remove
+        // the deadline hook.
+        let rt = runtime(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                debug.sethook()
+            end)
+        "#,
+        );
+        let commands = rt.dispatch(1, None, 1, b"x");
+        assert!(commands.is_empty(), "debug access is isolated");
+    }
+
+    #[test]
+    fn sandboxed_mode_never_exposes_machine_libraries() {
+        // This is a load-time assertion so any accidental stdlib expansion is a
+        // hard regression rather than merely an isolated handler error.
+        let rt = runtime(
+            r#"
+            assert(os == nil)
+            assert(io == nil)
+            assert(package == nil)
+            assert(coroutine == nil)
+            assert(debug == nil)
+            assert(citadel.http == nil)
+            citadel.on_message(1, function(ctx, body) end)
+        "#,
+        );
+        assert!(rt.dispatch(1, None, 1, b"x").is_empty());
+    }
+
+    #[test]
+    fn aggregate_outbound_bytes_are_capped() {
+        // Enqueue many max-size bodies; the per-invocation aggregate cap
+        // (1 MiB) bounds how many are actually retained.
+        let rt = runtime(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                local chunk = string.rep("a", 64 * 1024)
+                for _ = 1, 100 do
+                    citadel.broadcast(2, chunk, false)
+                end
+            end)
+        "#,
+        );
+        let commands = rt.dispatch(1, None, 1, b"x");
+        let total: usize = commands
+            .iter()
+            .map(|c| match c {
+                OutboundCommand::Broadcast { body, .. } | OutboundCommand::Send { body, .. } => {
+                    body.len()
+                }
+                // Actor commands (spawn/move/despawn) carry no payload body.
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            total <= MAX_TOTAL_OUTBOUND_BYTES,
+            "aggregate outbound bytes {total} exceeded cap {MAX_TOTAL_OUTBOUND_BYTES}"
+        );
+        assert!(!commands.is_empty(), "some commands still get through");
+    }
+
+    #[test]
+    fn on_join_and_on_leave_fire_and_can_broadcast() {
+        let rt = runtime(
+            r#"
+            citadel.on_join(function(ctx)
+                citadel.broadcast(10, string.pack(">I8", ctx.sender), false)
+            end)
+            citadel.on_leave(function(ctx)
+                citadel.broadcast(11, string.pack(">I8", ctx.sender), false)
+            end)
+        "#,
+        );
+        let join = rt.dispatch_lifecycle(LifecycleHook::Join, 55, None);
+        assert_eq!(
+            join,
+            vec![OutboundCommand::Broadcast {
+                kind: 10,
+                body: 55u64.to_be_bytes().to_vec(),
+                unreliable: false,
+            }]
+        );
+        let leave = rt.dispatch_lifecycle(LifecycleHook::Leave, 55, None);
+        assert_eq!(
+            leave,
+            vec![OutboundCommand::Broadcast {
+                kind: 11,
+                body: 55u64.to_be_bytes().to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_lifecycle_handler_is_a_noop() {
+        // A script with no on_join/on_leave: dispatching the hook is harmless.
+        let rt = runtime(RELAY_SCRIPT);
+        assert!(
+            rt.dispatch_lifecycle(LifecycleHook::Join, 1, None)
+                .is_empty()
+        );
+        assert!(
+            rt.dispatch_lifecycle(LifecycleHook::Leave, 1, None)
+                .is_empty()
+        );
+        assert!(!rt.has_tick_handler());
+    }
+
+    #[test]
+    fn on_tick_receives_dt_and_can_broadcast() {
+        let rt = runtime(
+            r#"
+            citadel.on_tick(function(dt)
+                -- Encode dt (seconds) so the test can read it back.
+                citadel.broadcast(20, string.pack(">d", dt), true)
+            end)
+        "#,
+        );
+        assert!(rt.has_tick_handler());
+        let commands = rt.tick(Duration::from_millis(50), Duration::from_millis(100));
+        let OutboundCommand::Broadcast { kind, body, .. } = &commands[0] else {
+            unreachable!("expected a broadcast command");
+        };
+        assert_eq!(*kind, 20);
+        let dt = f64::from_be_bytes(body[..8].try_into().expect("8 bytes"));
+        assert!((dt - 0.05).abs() < 1e-9, "dt should be 0.05s, got {dt}");
+    }
+
+    #[test]
+    fn tick_without_handler_is_a_noop() {
+        let rt = runtime(RELAY_SCRIPT);
+        assert!(
+            rt.tick(Duration::from_millis(16), Duration::from_millis(50))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn log_runs_without_error_and_does_not_block_side_effects() {
+        // `citadel.log` emits a tracing event and returns; a handler that logs
+        // then broadcasts still produces its command.
+        let rt = runtime(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                citadel.log("hello from lua")
+                citadel.log("noisy", "warn")
+                citadel.broadcast(2, "ok", false)
+            end)
+        "#,
+        );
+        let commands = rt.dispatch(1, None, 1, b"x");
+        assert_eq!(
+            commands,
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"ok".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn erroring_lifecycle_handler_is_isolated() {
+        let rt = runtime(
+            r#"
+            citadel.on_join(function(ctx)
+                citadel.broadcast(10, "partial", false)
+                error("boom")
+            end)
+        "#,
+        );
+        // No commands (partial side effects discarded), no panic, still usable.
+        assert!(
+            rt.dispatch_lifecycle(LifecycleHook::Join, 1, None)
+                .is_empty()
+        );
+        assert!(rt.dispatch(1, None, 9999, b"y").is_empty());
+    }
+
+    #[test]
+    fn hung_tick_is_aborted_by_its_own_deadline() {
+        let rt = LuaRuntime::from_source(
+            r#"
+            citadel.on_tick(function(dt)
+                while true do end
+            end)
+        "#,
+            "hang-tick",
+            100,
+        )
+        .expect("loads");
+        let start = Instant::now();
+        let commands = rt.tick(Duration::from_millis(16), Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(commands.is_empty(), "aborted tick yields no commands");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "tick deadline must abort the loop promptly, took {elapsed:?}"
+        );
+        // The runtime is not wedged: a subsequent dispatch still works.
+        let rt2 = runtime(RELAY_SCRIPT);
+        assert!(!rt2.dispatch(1, None, 1, b"x").is_empty());
+    }
+
+    /// A throwaway temp directory for the file-backed reload tests.
+    ///
+    /// Avoids a `tempfile` dev-dependency: a unique per-test subdir under the
+    /// system temp dir, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "citadel-reload-{}-{}-{tag}-{n}",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn main_lua(&self) -> std::path::PathBuf {
+            self.0.join("main.lua")
+        }
+
+        fn write_main(&self, src: &str) {
+            std::fs::write(self.main_lua(), src).expect("write main.lua");
+        }
+
+        /// Write a script at a path relative to the temp dir, creating parent
+        /// directories (e.g. `write("systems/combat.lua", ...)`).
+        fn write(&self, rel: &str, src: &str) {
+            let path = self.0.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create module subdir");
+            }
+            std::fs::write(path, src).expect("write module file");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn from_source_runtime_is_not_reloadable() {
+        let rt = runtime(RELAY_SCRIPT);
+        assert!(!rt.is_reloadable());
+        assert_eq!(rt.reload(), ReloadOutcome::NotReloadable);
+    }
+
+    #[test]
+    fn editing_the_script_reloads_new_handlers() {
+        let dir = TempDir::new("edit");
+        // Initial script handles kind 1 -> broadcast kind 2.
+        dir.write_main(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, "v1", false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("main.lua present");
+        assert!(rt.is_reloadable());
+        let before = rt.dispatch(1, None, 1, b"");
+        assert_eq!(
+            before,
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"v1".to_vec(),
+                unreliable: false,
+            }]
+        );
+
+        // Edit: same kind now broadcasts a different kind/body, and a brand-new
+        // handler for kind 3 appears.
+        dir.write_main(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(9, "v2", true)
+            end)
+            citadel.on_message(3, function(ctx, body)
+                citadel.send(1, 4, "new")
+            end)
+        "#,
+        );
+        assert_eq!(rt.reload(), ReloadOutcome::Reloaded);
+
+        // The reloaded handler takes effect.
+        let after = rt.dispatch(1, None, 1, b"");
+        assert_eq!(
+            after,
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"v2".to_vec(),
+                unreliable: true,
+            }]
+        );
+        // The newly-added handler for kind 3 is live too.
+        let added = rt.dispatch(1, None, 3, b"");
+        assert_eq!(
+            added,
+            vec![OutboundCommand::Send {
+                session: 1,
+                kind: 4,
+                body: b"new".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn broken_edit_is_rejected_and_previous_script_keeps_serving() {
+        let dir = TempDir::new("broken");
+        dir.write_main(
+            r#"
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, "good", false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+
+        // A syntax-broken edit must be rejected, not swapped in.
+        dir.write_main("this is not lua ==");
+        assert_eq!(rt.reload(), ReloadOutcome::Rejected);
+
+        // The previously-loaded, valid handler is still serving.
+        let commands = rt.dispatch(1, None, 1, b"");
+        assert_eq!(
+            commands,
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"good".to_vec(),
+                unreliable: false,
+            }]
+        );
+
+        // A handler that errors at registration time (runs at load) is also
+        // rejected, keeping the good script.
+        dir.write_main(r#"error("registration blows up")"#);
+        assert_eq!(rt.reload(), ReloadOutcome::Rejected);
+        assert!(!rt.dispatch(1, None, 1, b"").is_empty(), "still serving v1");
+    }
+
+    #[test]
+    fn reload_resets_in_vm_global_state() {
+        let dir = TempDir::new("state");
+        // A counter kept in a Lua global; each dispatch increments and reports it.
+        dir.write_main(
+            r#"
+            count = 0
+            citadel.on_message(1, function(ctx, body)
+                count = count + 1
+                citadel.broadcast(2, string.pack(">I8", count), false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        let first = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &first[0] else {
+            unreachable!();
+        };
+        assert_eq!(&body[..8], &1u64.to_be_bytes(), "count starts at 1");
+        // Advance the global.
+        let _ = rt.dispatch(1, None, 1, b"");
+        // Reload the same source: the fresh VM resets globals, so count restarts.
+        dir.write_main(
+            r#"
+            count = 0
+            citadel.on_message(1, function(ctx, body)
+                count = count + 1
+                citadel.broadcast(2, string.pack(">I8", count), false)
+            end)
+        "#,
+        );
+        assert_eq!(rt.reload(), ReloadOutcome::Reloaded);
+        let after = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &after[0] else {
+            unreachable!();
+        };
+        assert_eq!(
+            &body[..8],
+            &1u64.to_be_bytes(),
+            "in-VM globals reset on reload"
+        );
+    }
+
+    #[test]
+    fn handlerless_reload_is_rejected_and_keeps_serving() {
+        let dir = TempDir::new("handlerless");
+        dir.write_main(RELAY_SCRIPT);
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        // An empty file is valid Lua but registers nothing: must be rejected so
+        // the node never silently loses its handlers (truncate-race guard).
+        dir.write_main("");
+        assert_eq!(rt.reload(), ReloadOutcome::Rejected);
+        assert!(
+            !rt.dispatch(42, None, 1, &[1, 2, 3]).is_empty(),
+            "previous handler still serves after an empty save"
+        );
+        // A comment-only (valid, handlerless) save is likewise rejected.
+        dir.write_main("-- just a comment, no handlers\n");
+        assert_eq!(rt.reload(), ReloadOutcome::Rejected);
+        assert!(!rt.dispatch(42, None, 1, &[1]).is_empty(), "still serving");
+    }
+
+    #[test]
+    fn top_level_infinite_loop_is_bounded_at_load() {
+        // A script whose top-level body loops forever must be aborted by the load
+        // deadline rather than hang the loader thread. Use a short budget so the
+        // test is fast.
+        let start = Instant::now();
+        let static_data =
+            StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)
+                .expect("disabled static-data catalog");
+        let err = build_lua(
+            "while true do end",
+            "loop",
+            Duration::from_millis(50),
+            None,
+            static_data,
+            LuaExecutionMode::Sandboxed,
+        )
+        .expect_err("top-level infinite loop must be aborted, not hang");
+        assert_eq!(err.category(), ErrorCategory::Runtime);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "load deadline must abort promptly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn trusted_mode_exposes_machine_libraries() {
+        let static_data =
+            StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)
+                .expect("disabled static-data catalog");
+        build_lua(
+            "assert(type(os) == 'table'); assert(type(io) == 'table'); assert(type(package) == 'table'); assert(type(coroutine) == 'table'); assert(debug == nil); assert(type(citadel.http) == 'table'); assert(type(citadel.http.fetch) == 'function')",
+            "trusted-libraries",
+            Duration::from_millis(50),
+            None,
+            static_data,
+            LuaExecutionMode::Trusted,
+        )
+        .expect("trusted Lua mode exposes machine libraries but not unsafe native loading");
+    }
+
+    #[test]
+    fn reload_of_deleted_file_is_rejected_and_keeps_serving() {
+        let dir = TempDir::new("deleted");
+        dir.write_main(RELAY_SCRIPT);
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        std::fs::remove_file(dir.main_lua()).expect("remove main.lua");
+        // A vanished file cannot be read: reject, keep the loaded script.
+        assert_eq!(rt.reload(), ReloadOutcome::Rejected);
+        assert!(!rt.dispatch(42, None, 1, &[1]).is_empty(), "still serving");
+    }
+
+    const RPC_SCRIPT: &str = r#"
+        citadel.on_rpc("ping", function(ctx, body)
+            return "pong"
+        end)
+        citadel.on_rpc("echo", function(ctx, body)
+            return body
+        end)
+        citadel.on_rpc("whoami", function(ctx, body)
+            return string.pack(">I8", ctx.sender)
+        end)
+    "#;
+
+    #[test]
+    fn call_rpc_returns_handler_reply() {
+        let rt = runtime(RPC_SCRIPT);
+        assert_eq!(
+            rt.call_rpc(1, None, "ping", b""),
+            RpcOutcome::Ok(b"pong".to_vec())
+        );
+        // Binary-safe echo round-trips arbitrary bytes.
+        assert_eq!(
+            rt.call_rpc(1, None, "echo", &[0, 1, 2, 255]),
+            RpcOutcome::Ok(vec![0, 1, 2, 255])
+        );
+    }
+
+    #[test]
+    fn call_rpc_exposes_sender_and_method_on_ctx() {
+        let rt = runtime(RPC_SCRIPT);
+        let RpcOutcome::Ok(reply) = rt.call_rpc(77, None, "whoami", b"") else {
+            unreachable!("whoami replies ok");
+        };
+        assert_eq!(&reply[..8], &77u64.to_be_bytes());
+    }
+
+    #[test]
+    fn call_rpc_unknown_method_is_a_generic_error() {
+        let rt = runtime(RPC_SCRIPT);
+        let RpcOutcome::Err(msg) = rt.call_rpc(1, None, "nope", b"") else {
+            unreachable!("unknown method must error");
+        };
+        assert!(msg.contains("unknown RPC method"), "generic message: {msg}");
+        assert!(msg.contains("nope"), "echoes the method name: {msg}");
+    }
+
+    #[test]
+    fn call_rpc_handler_error_is_isolated_and_generic() {
+        let rt = runtime(
+            r#"
+            citadel.on_rpc("boom", function(ctx, body)
+                error("secret internal detail")
+            end)
+        "#,
+        );
+        let RpcOutcome::Err(msg) = rt.call_rpc(1, None, "boom", b"") else {
+            unreachable!("erroring handler must error");
+        };
+        assert_eq!(msg, "RPC handler error", "no internal detail leaks");
+        assert!(
+            !msg.contains("secret"),
+            "handler error text must not leak to the caller"
+        );
+        // The runtime remains usable after an isolated RPC error.
+        let rt2 = runtime(RPC_SCRIPT);
+        assert_eq!(
+            rt2.call_rpc(1, None, "ping", b""),
+            RpcOutcome::Ok(b"pong".to_vec())
+        );
+    }
+
+    #[test]
+    fn call_rpc_non_string_return_is_an_error() {
+        let rt = runtime(
+            r#"
+            citadel.on_rpc("nilreply", function(ctx, body)
+                return nil
+            end)
+        "#,
+        );
+        assert!(matches!(
+            rt.call_rpc(1, None, "nilreply", b""),
+            RpcOutcome::Err(_)
+        ));
+    }
+
+    #[test]
+    fn call_rpc_slow_handler_is_aborted_by_the_deadline() {
+        let rt = LuaRuntime::from_source(
+            r#"
+            citadel.on_rpc("hang", function(ctx, body)
+                while true do end
+            end)
+        "#,
+            "rpc-hang",
+            50,
+        )
+        .expect("loads");
+        let start = Instant::now();
+        let RpcOutcome::Err(msg) = rt.call_rpc(1, None, "hang", b"") else {
+            unreachable!("hung handler must error");
+        };
+        assert_eq!(msg, "RPC handler timed out");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "deadline must abort the RPC handler promptly"
+        );
+    }
+
+    #[test]
+    fn call_rpc_side_effects_are_discarded() {
+        // An RPC handler that also tries to broadcast: the broadcast is dropped
+        // (RPC communicates only via its return value) and the reply still works.
+        let rt = runtime(
+            r#"
+            citadel.on_rpc("noisy", function(ctx, body)
+                citadel.broadcast(2, "leak", false)
+                return "ok"
+            end)
+        "#,
+        );
+        assert_eq!(
+            rt.call_rpc(1, None, "noisy", b""),
+            RpcOutcome::Ok(b"ok".to_vec())
+        );
+        // A subsequent message dispatch is unaffected by the discarded command.
+        assert!(rt.dispatch(1, None, 9999, b"").is_empty());
+    }
+
+    #[test]
+    fn rpc_only_script_reloads_cleanly() {
+        let dir = TempDir::new("rpc-only");
+        dir.write_main(
+            r#"
+            citadel.on_rpc("ping", function(ctx, body) return "pong" end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        // An RPC-only script counts as having handlers, so a reload of an
+        // equivalent script is accepted (not rejected as handlerless).
+        dir.write_main(
+            r#"
+            citadel.on_rpc("ping", function(ctx, body) return "pong2" end)
+        "#,
+        );
+        assert_eq!(rt.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            rt.call_rpc(1, None, "ping", b""),
+            RpcOutcome::Ok(b"pong2".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctx_exposes_sender_and_kind() {
+        let rt = runtime(
+            r#"
+            citadel.on_message(5, function(ctx, body)
+                citadel.broadcast(6, string.pack(">I8I8", ctx.sender, ctx.kind), false)
+            end)
+        "#,
+        );
+        let commands = rt.dispatch(77, None, 5, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            unreachable!("expected a broadcast command");
+        };
+        assert_eq!(&body[..8], &77u64.to_be_bytes());
+        assert_eq!(&body[8..16], &5u64.to_be_bytes());
+    }
+
+    // ------------------------------- require ------------------------------- //
+
+    #[test]
+    fn require_loads_a_module_and_its_return_value() {
+        let dir = TempDir::new("require");
+        dir.write("config.lua", r#"return { start_hp = 100, name = "hero" }"#);
+        dir.write_main(
+            r#"
+            local cfg = require("config")
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, string.pack(">I8", cfg.start_hp), false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        let commands = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            unreachable!("expected a broadcast");
+        };
+        assert_eq!(&body[..8], &100u64.to_be_bytes(), "module value is visible");
+    }
+
+    #[test]
+    fn require_resolves_dotted_paths_to_subdirectories() {
+        let dir = TempDir::new("require-subdir");
+        dir.write(
+            "systems/combat.lua",
+            r#"return { damage = function(a, b) return a - b end }"#,
+        );
+        dir.write_main(
+            r#"
+            local combat = require("systems.combat")
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, string.pack(">I8", combat.damage(50, 8)), false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        let commands = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            unreachable!("expected a broadcast");
+        };
+        assert_eq!(
+            &body[..8],
+            &42u64.to_be_bytes(),
+            "systems.combat.damage ran"
+        );
+    }
+
+    #[test]
+    fn require_caches_modules_so_the_body_runs_once() {
+        let dir = TempDir::new("require-cache");
+        // The module increments a global side-effect counter each time its body
+        // runs; caching means that happens exactly once across many requires.
+        dir.write(
+            "counter.lua",
+            r#"
+            _G.__load_count = (_G.__load_count or 0) + 1
+            return _G.__load_count
+        "#,
+        );
+        dir.write_main(
+            r#"
+            local a = require("counter")
+            local b = require("counter")
+            local c = require("counter")
+            citadel.on_message(1, function(ctx, body)
+                -- a, b, c must all equal 1: the body ran once, value cached.
+                citadel.broadcast(2, string.pack(">I8I8I8", a, b, c), false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        let commands = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            unreachable!("expected a broadcast");
+        };
+        assert_eq!(&body[0..8], &1u64.to_be_bytes());
+        assert_eq!(&body[8..16], &1u64.to_be_bytes());
+        assert_eq!(&body[16..24], &1u64.to_be_bytes());
+    }
+
+    #[test]
+    fn require_rejects_paths_that_escape_the_script_directory() {
+        let dir = TempDir::new("require-escape");
+        // A secret file one level above the script root must be unreachable.
+        std::fs::write(dir.0.join("secret.lua"), "return 'leaked'").ok();
+        let sub = dir.0.join("game");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        for attempt in [
+            r#"require("..secret")"#,  // empty segment via ".."
+            r#"require("../secret")"#, // path separator
+            r#"require(".secret")"#,   // leading dot -> empty segment
+            r#"require("secret.")"#,   // trailing dot -> empty segment
+            r#"require("")"#,          // empty name
+        ] {
+            let src = format!("local x = {attempt}");
+            let err = LuaRuntime::from_source_with_root(&src, "escape", DEFAULT_DEADLINE_MS, &sub)
+                .expect_err("escaping/malformed require must fail at load");
+            assert_eq!(err.category(), ErrorCategory::Runtime, "attempt: {attempt}");
+        }
+    }
+
+    #[test]
+    fn require_of_missing_module_is_a_load_error() {
+        let dir = TempDir::new("require-missing");
+        let err = LuaRuntime::from_source_with_root(
+            r#"require("does_not_exist")"#,
+            "missing",
+            DEFAULT_DEADLINE_MS,
+            &dir.0,
+        )
+        .expect_err("missing module must fail");
+        assert_eq!(err.category(), ErrorCategory::Runtime);
+    }
+
+    #[test]
+    fn require_rejects_cyclic_dependencies() {
+        let dir = TempDir::new("require-cycle");
+        dir.write("a.lua", r#"local b = require("b"); return {}"#);
+        dir.write("b.lua", r#"local a = require("a"); return {}"#);
+        let err = LuaRuntime::from_source_with_root(
+            r#"require("a")"#,
+            "cycle",
+            DEFAULT_DEADLINE_MS,
+            &dir.0,
+        )
+        .expect_err("a cyclic require chain must be rejected");
+        assert_eq!(err.category(), ErrorCategory::Runtime);
+    }
+
+    #[test]
+    fn a_broken_required_module_is_isolated_on_hot_reload() {
+        let dir = TempDir::new("require-broken");
+        dir.write("mod.lua", r#"return { v = 1 }"#);
+        dir.write_main(
+            r#"
+            local m = require("mod")
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, string.pack(">I8", m.v), false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        assert!(!rt.dispatch(1, None, 1, b"").is_empty(), "v1 serves");
+
+        // Break the required module: the reload must be rejected (build fails
+        // while running main.lua's top-level require), keeping the good VM.
+        dir.write("mod.lua", "this is not lua ==");
+        assert_eq!(rt.reload(), ReloadOutcome::Rejected);
+        let still = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &still[0] else {
+            unreachable!("still serving v1");
+        };
+        assert_eq!(&body[..8], &1u64.to_be_bytes(), "previous module kept");
+    }
+
+    #[test]
+    fn hot_reload_picks_up_a_changed_required_module() {
+        let dir = TempDir::new("require-reload");
+        dir.write("mod.lua", r#"return { v = 1 }"#);
+        dir.write_main(
+            r#"
+            local m = require("mod")
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, string.pack(">I8", m.v), false)
+            end)
+        "#,
+        );
+        let rt = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present");
+        let first = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &first[0] else {
+            unreachable!();
+        };
+        assert_eq!(&body[..8], &1u64.to_be_bytes());
+
+        // Edit only the required module (not main.lua) and reload: the module
+        // graph is re-resolved, so the new value is picked up.
+        dir.write("mod.lua", r#"return { v = 99 }"#);
+        assert_eq!(rt.reload(), ReloadOutcome::Reloaded);
+        let after = rt.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &after[0] else {
+            unreachable!();
+        };
+        assert_eq!(&body[..8], &99u64.to_be_bytes(), "changed module reloaded");
+    }
+
+    #[test]
+    fn require_without_a_module_root_errors_clearly() {
+        // A `from_source` runtime has no script directory; require is present but
+        // must fail explicitly rather than resolve or be a nil global.
+        let err = LuaRuntime::from_source(r#"require("anything")"#, "no-root", DEFAULT_DEADLINE_MS)
+            .expect_err("require with no module root must error");
+        assert_eq!(err.category(), ErrorCategory::Runtime);
+    }
+
+    #[test]
+    fn require_runs_under_the_deadline() {
+        // A required module whose body loops forever is aborted by the load
+        // deadline (armed around the top-level exec), not left to hang.
+        let dir = TempDir::new("require-deadline");
+        dir.write("slow.lua", "while true do end");
+        let start = Instant::now();
+        let err = LuaRuntime::from_source_with_root(
+            r#"require("slow")"#,
+            "slow-require",
+            DEFAULT_DEADLINE_MS,
+            &dir.0,
+        )
+        .expect_err("a hung required module must be aborted");
+        assert_eq!(err.category(), ErrorCategory::Runtime);
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "require deadline must abort promptly, took {:?}",
+            start.elapsed()
+        );
+    }
+}

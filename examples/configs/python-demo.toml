@@ -1,0 +1,34 @@
+# Live web-demo config for the embedded PYTHON runtime (/0257).
+#
+# Runs the sample Python game (examples/python-game/main.py) — the Python port
+# of the Lua sample — behind all three realtime transports on localhost, so the
+# Three.js web demo (examples/web-demo) works against it UNCHANGED: move a cube,
+# watch peers move as the Python game relays positions. Open the page in two
+# tabs to see two players interact — identical to the Lua experience.
+#
+# Requires a Python-enabled build:
+#   cargo run --features runtime-python -- --config examples/configs/python-demo.toml
+# (or a bundled `bin-server-python` staging). Local development only.
+
+[transport.quic]
+enabled = true
+bind = "127.0.0.1:7351"
+
+[transport.websocket]
+enabled = true
+bind = "127.0.0.1:7352"
+
+[transport.webtransport]
+enabled = true
+bind = "127.0.0.1:7353"
+
+[runtime]
+# Load the Python sample game and select the embedded Python runtime explicitly.
+scripts_dir = "examples/python-game"
+language = "python"
+
+# Live-edit game logic: edit examples/python-game/main.py and the running node
+# reloads it without a restart (failure-safe; module globals reset on reload).
+# Development convenience only; keep it off in production.
+hot_reload = true
+hot_reload_poll_ms = 500

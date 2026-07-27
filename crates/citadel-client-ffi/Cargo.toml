@@ -1,0 +1,48 @@
+[package]
+name = "citadel-client-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "C ABI over citadel-client for native engines (Unity/Unreal/Godot)."
+
+# Produce a Rust lib (for in-crate tests), plus the dynamic/static libraries that
+# native engines load.
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# The Rust SDK this crate exposes over a C ABI.
+citadel-client = { path = "../citadel-client" }
+citadel-wire = { path = "../citadel-wire" }
+# The tested snapshot reconstruction runtime is owned by the server library.
+# Re-export it through this narrow C ABI so native engines never fork the
+# codec/interpolation/reconciliation contract.
+citadel = { path = "../.." }
+# Background runtime for the async client, driven behind a poll-based C API.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[build-dependencies]
+# Generates the C header (include/citadel_client.h) from the extern "C" surface.
+cbindgen = "0.29"
+
+[dev-dependencies]
+# Round-trip tests run against an in-process Citadel server. Also gives the
+# contract-manifest generator the canonical HTTP auth route consts.
+citadel = { path = "../.." }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# The contract-manifest generator/stale-guard test emits crates/citadel-wire/
+# contract.json from the canonical Rust consts.
+serde_json = "1"
+
+# NOTE: unlike the rest of the workspace, this crate does NOT set
+# `unsafe_code = "forbid"`: the C ABI boundary requires unsafe (raw pointers,
+# extern "C"). The exception is isolated to this crate and audited. We still deny unsafe ops outside an
+# explicit unsafe block and keep the other clippy lints strict.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"

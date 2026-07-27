@@ -1,0 +1,24 @@
+# Tracked demo config used by the Makefile demo targets.
+# Enables all three realtime transports on localhost so the web demo
+# (WebSocket / WebTransport) and the native demo-client (QUIC) share one
+# gateway/room. Local development only — do not deploy.
+
+[transport.quic]
+enabled = true
+bind = "127.0.0.1:7351"
+
+[transport.websocket]
+enabled = true
+bind = "127.0.0.1:7352"
+
+[transport.webtransport]
+enabled = true
+bind = "127.0.0.1:7353"
+
+# Live-edit game logic: edit game/main.lua and the running node reloads it
+# without a restart. Reloads are failure-safe (a broken edit is rejected and the
+# previous script keeps serving) and in-VM Lua globals reset on each reload.
+# Development convenience only; keep it off in production.
+[runtime]
+hot_reload = true
+hot_reload_poll_ms = 500

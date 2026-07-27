@@ -1,0 +1,25 @@
+# Unreal build artifacts — never committed (SDK source only; see README.md and
+# docs/architecture/client-sdk-layout.md). Patterns are unanchored so they also
+# match under the drop-in plugin at Plugin/Citadel/. The gated UE 5.8 compile
+# check (ue-plugin-build.sh) generates a scratch host project + these dirs.
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.uebuild/
+
+# Generated/scratch host projects used only to compile-verify the plugin.
+*.uproject
+!*.uplugin
+
+# Any native library staged into the plugin at package time (built, not committed).
+*.dll
+*.dylib
+*.so
+*.lib
+*.pdb
+*.a
+
+# Bundled FFI lib + canonical header staged into the plugin by bundle-ffi.sh (dev)
+# or the release package (CI). Generated, never committed — run bundle-ffi.sh.
+Plugin/Citadel/Source/CitadelClient/ThirdParty/

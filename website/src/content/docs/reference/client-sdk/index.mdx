@@ -1,0 +1,39 @@
+---
+title: Client SDK API reference
+description: API reference for Citadel game-client SDKs and client-facing realtime modules.
+---
+
+Client SDK pages document the APIs a game client can call or bind to. Examples on
+these pages should use synchronized engine tabs for every shipped client target:
+Unreal C++, Unreal Blueprint, Unity C#, Godot GDScript, Rust
+(`citadel-client`), and JavaScript/Web when the surface exists there.
+
+:::note[Current shipped targets]
+Citadel ships Unreal, Unity, Godot, Rust, and a WebSocket JavaScript SDK today.
+JavaScript examples appear for connection, authentication, generic RPC, and
+notification streams; binary engine helpers remain engine-specific.
+:::
+
+## SDK bindings
+
+From a repository checkout, use `make bin-client-<engine>` to stage the
+copy-into-project package under `bin/clients/<engine>/`; see
+[Make targets](/reference/operations/make-targets/#bin-client-engine-and-bin-clients).
+JavaScript is currently staged from source rather than installed from npm.
+For a visual browser-game integration, begin with the runnable
+[`@citadel/client` + Three.js starter](/guides/web-client/); the SDK itself
+remains renderer-neutral.
+
+- [Rust SDK](/reference/client-sdk/rust-sdk/)
+- [C ABI](/reference/client-sdk/c-abi/)
+
+## Modules
+
+- [Authentication](/reference/client-sdk/authentication/)
+- [Rooms](/reference/client-sdk/rooms/)
+- [Matchmaker](/reference/client-sdk/matchmaker/)
+- [Maps](/reference/client-sdk/maps/)
+- [Transform sync](/reference/client-sdk/transform-sync/)
+- [Networked actors](/reference/client-sdk/networked-actors/)
+- [NetworkPeer property replication](/reference/client-sdk/networkpeer-replication/)
+- [Player notifications](/reference/client-sdk/notifications/)

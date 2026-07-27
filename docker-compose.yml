@@ -1,0 +1,28 @@
+# Citadel local dev/test database fixtures.
+#
+# Postgres is the durable multi-node backend Citadel targets; this brings up a
+# throwaway instance for running the repository contract tests against a real
+# Postgres (they otherwise run only against the in-memory + embedded SQLite
+# backends). CockroachDB (pg-wire compatible) has its own fixture in
+# docker-compose.crdb.yml.
+#
+#   export CITADEL_POSTGRES_PASSWORD=<choose-a-local-password>
+#   docker compose up -d postgres
+#   DATABASE_URL=postgres://citadel:${CITADEL_POSTGRES_PASSWORD}@localhost:5432/citadel \
+#     CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 cargo test --test <contract_test>
+#   docker compose down
+services:
+  postgres:
+    image: postgres:16
+    container_name: citadel-postgres
+    environment:
+      POSTGRES_USER: citadel
+      POSTGRES_PASSWORD: "${CITADEL_POSTGRES_PASSWORD:?set CITADEL_POSTGRES_PASSWORD for local Postgres}"
+      POSTGRES_DB: citadel
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U citadel -d citadel"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

@@ -1,0 +1,996 @@
+---
+title: Python runtime reference
+description: Per-function reference for the embedded CPython game-logic runtime, the citadel host API, execution budgets, hot reload, and packaging notes.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## HTTP host API
+
+### `citadel.http.fetch(url, opts=None)`
+
+Performs one bounded outbound request through Citadel's Rust-owned HTTP client.
+`opts` accepts `method` (default `"GET"`), `headers` (a `dict[str, str]`), and
+`body` (`bytes` or `str`). It returns `{"status": int, "body": bytes}`.
+
+The call waits synchronously for its response. Citadel retains ownership of DNS,
+TLS, and the socket: it enforces a 5-second deadline, a 64 KiB request-body
+limit, and a 1 MiB response-body limit; redirects and environment/system proxies
+are disabled. Invalid input, a size limit, timeout, or network failure raises
+`RuntimeError`.
+
+```python
+response = citadel.http.fetch("https://inventory.example/v1/stock", {
+    "headers": {"authorization": f"Bearer {token}"},
+})
+if response["status"] != 200:
+    raise RuntimeError("inventory unavailable")
+```
+
+## Storage host API
+
+Python exposes trusted-tier user-owned storage: `citadel.storage_read(user,
+collection, key)`, `citadel.storage_write(user, collection, key, value_json,
+expected_version=None, read_permission=None, write_permission=None)`, and
+`citadel.storage_delete(user, collection, key, expected_version=None)`.
+
+Reads return `None` when absent or a dict with `value_json`, `version`,
+`read_permission`, and `write_permission`. `value_json` must encode a JSON
+object. Omit `expected_version` for an upsert, use `""` for create-only, or pass
+a returned version for compare-and-set. Read permissions accept `0|1|2`; write
+permissions accept `0|1`. Errors are clean `RuntimeError` messages: `storage
+validation: ...`, `storage conflict`, or `storage operation failed`.
+
+### `citadel.storage_index_query(index_name, filters_json, limit=50)`
+
+Runs a bounded equality query against an operator-declared storage index.
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `index_name` | `str` | A configured `[[storage.indexes]]` name. |
+| `filters_json` | `str` | A JSON object. Keys must be declared index fields and values must be strings, numbers, or booleans. |
+| `limit` | `int` | Result cap from `1` through `100`; defaults to `50`. |
+
+**Returns:** `list[dict]`, identity-ordered. Each dict has `user_id` (`None` for
+system objects), `collection`, `key`, `value_json`, `version`,
+`read_permission`, and `write_permission`.
+
+**Errors:** unknown indexes, invalid JSON/object shape, undeclared fields,
+non-scalar values, and invalid limits raise `RuntimeError` beginning `storage
+validation:`. Backend failures are reported as `storage operation failed`.
+
+```python
+@citadel.on_rpc("find_players_at_score")
+def find_players_at_score(ctx, body):
+    players = citadel.storage_index_query(
+        "profiles_by_score", '{"score": 1200}', 25)
+    return (players[0]["user_id"] if players else "none").encode
+```
+
+Indexes are static operator configuration; scripts cannot create indexes or send
+arbitrary database queries. See [storage indexes in configuration](/reference/operations/configuration/#storage).
+
+### `citadel.register_storage_index_filter(index_name, callback)`
+
+Registers one write-time filter for an operator-configured index. Call it once
+during script initialization.
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `index_name` | `str` | A configured `[[storage.indexes]]` name. |
+| `callback` | callable | Receives a candidate `dict`; returns exactly `True` to include or `False` to exclude. |
+
+The dict has `index_name`, `user_id`, `collection`, `key`, `value_json`,
+`expected_version`, `read_permission`, and `write_permission`. It runs only
+before a matching `citadel.storage_write`. `False` removes previous membership
+without deleting the object; an exception, deadline, or non-boolean return
+rejects the write and preserves the prior object/membership state. Citadel does
+not retry callbacks automatically; the script explicitly retries a write only
+when repeating its callback side effects is safe.
+
+**Returns:** the callback, which makes decorator-style setup convenient.
+
+```python
+def include_published(candidate):
+    return candidate["key"] != "draft" and '"published":true' in candidate["value_json"]
+
+citadel.register_storage_index_filter("profiles_by_score", include_published)
+```
+
+Citadel can embed CPython in the node process and route realtime traffic to
+`game/main.py` through the same `Runtime` trait used by Lua. Python support is
+compiled only when the server is built with `--features runtime-python`; default
+builds do not pull PyO3 or link libpython.
+
+For `[runtime]` config keys, see
+[Configuration reference](/reference/operations/configuration/#runtime). This
+page documents the Python-visible `citadel` module.
+
+## Match-scoped messages
+
+When a participant belongs to a room, its `on_message` handler receives the
+numeric `ctx.room_id`. Any `citadel.broadcast` emitted by that invocation is
+delivered only to that room's current members; direct `citadel.send` remains
+explicitly targeted. The regular Python `on_tick(dt)` remains the server-wide
+tick in this release. Use `ctx.room_id` to key per-match message state.
+
+:::note[Trusted-tier runtime]
+Python runs inside the server process. Use it for code owned by the operator of
+the server. Multi-tenant or third-party code belongs in the future hardened WASM
+tier.
+:::
+
+## Enable Python
+
+```toml
+[runtime]
+enabled = true
+language = "python"
+adapter = "embedded"
+tier = "trusted"
+scripts_dir = "./game"
+deadline_ms = 100
+hot_reload = true
+```
+
+Run a Python-enabled build:
+
+```bash
+cargo run --features runtime-python
+```
+
+Local builds use the CPython installation selected by PyO3. Set `PYO3_PYTHON`
+when more than one Python is installed. Release artifacts that enable
+`runtime-python` must ship with a matching dynamic CPython runtime and standard
+library; the default Citadel executable stays lean by omitting this feature.
+Use `make bin-server-python` for local bundled staging, or
+`make package-windows-python` for the zipped Windows Python artifact.
+
+## Quick Example
+
+<Tabs syncKey="runtime-lang">
+  <TabItem label="Python">
+
+```python
+import citadel
+
+@citadel.on_message(1)
+def echo(ctx, body):
+    citadel.log(f"echo from {ctx.sender}")
+    citadel.broadcast(1, body)
+
+@citadel.on_rpc("ping")
+def ping(ctx, body):
+    return citadel.Reply.ok(b"pong")
+```
+
+  </TabItem>
+  <TabItem label="Lua">
+
+```lua
+citadel.on_message(1, function(ctx, body)
+  citadel.log("echo from " .. ctx.sender)
+  citadel.broadcast(1, body)
+end)
+
+citadel.on_rpc("ping", function(ctx, body)
+  return "pong"
+end)
+```
+
+  </TabItem>
+</Tabs>
+
+Decorator registration is preferred, and imperative registration is also
+supported:
+
+```python
+def handle(ctx, body):
+    citadel.broadcast(2, body)
+
+citadel.on_message(2, handle)
+```
+
+---
+
+## citadel.on_message
+
+Register a handler for inbound realtime messages of a wire `kind`.
+
+```python
+citadel.on_message(kind, handler=None)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `kind` | `int` (`u16`) | yes | Wire message kind. Re-registering replaces the previous handler. |
+| `handler` | callable `(ctx, body) -> None` | no | Handler to store. Omit it when using decorator style. |
+
+**Returns:** the handler function.
+
+**Errors:** registration validates that the handler is callable. Exceptions or
+deadlines inside the handler are isolated server-side and return no outbound
+commands.
+
+```python
+@citadel.on_message(1)
+def chat(ctx, body):
+    citadel.broadcast(1, body, unreliable=False)
+```
+
+---
+
+## citadel.on_rpc
+
+Register a named request/response RPC handler.
+
+```python
+citadel.on_rpc(method, handler=None)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `method` | `str` | yes | RPC method name. |
+| `handler` | callable `(ctx, body) -> Reply \| bytes \| str` | no | Handler to store. Omit it for decorator style. |
+
+**Returns:** the handler function.
+
+**Errors:** an unknown method returns `RpcOutcome::Err`. Handler exceptions,
+deadline interrupts, and invalid replies are logged and returned as a short RPC
+error. Outbound commands attempted by an RPC handler are discarded.
+
+```python
+@citadel.on_rpc("profile.get")
+def get_profile(ctx, body):
+    if not ctx.user_id:
+        return citadel.Reply.err("authentication required")
+    return citadel.Reply.ok(b"{}")
+```
+
+---
+
+## citadel.Reply
+
+Create explicit RPC responses.
+
+```python
+citadel.Reply.ok(body=b"")
+citadel.Reply.err(message)
+```
+
+| Function | Parameters | Meaning |
+| --- | --- | --- |
+| `Reply.ok` | `body: bytes \| bytearray \| memoryview \| str` | Successful RPC body. Strings are UTF-8 encoded. |
+| `Reply.err` | `message: str` | Short error returned to the caller. |
+
+RPC handlers may also return bytes or strings directly; direct returns are
+treated as successful replies.
+
+---
+
+## citadel.on_join
+
+Register the lifecycle handler run when a participant connects.
+
+```python
+citadel.on_join(handler=None)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | callable `(ctx) -> None` | no | Only one join handler exists at a time. |
+
+Errors are isolated like `on_message`; the join itself is not blocked by a
+script failure.
+
+```python
+@citadel.on_join
+def joined(ctx):
+    citadel.send(ctx.sender, 1, b"welcome")
+```
+
+---
+
+## citadel.on_leave
+
+Register the lifecycle handler run when a participant disconnects.
+
+```python
+citadel.on_leave(handler=None)
+```
+
+The signature and failure behavior match `on_join`.
+
+```python
+@citadel.on_leave
+def left(ctx):
+    citadel.broadcast(2, f"{ctx.sender} left")
+```
+
+---
+
+## citadel.on_tick
+
+Register the periodic game-loop handler.
+
+```python
+citadel.on_tick(handler=None)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | callable `(dt) -> None` | no | Receives elapsed seconds as a float. |
+
+The tick loop starts only when `[runtime] tick_hz > 0` and a handler is
+registered.
+
+```python
+elapsed = 0.0
+
+@citadel.on_tick
+def tick(dt):
+    global elapsed
+    elapsed += dt
+    if elapsed >= 1.0:
+        citadel.broadcast(3, b"tick")
+        elapsed = 0.0
+```
+
+---
+
+## citadel.on_room_create
+
+Register the room-label decision hook.
+
+```python
+citadel.on_room_create(handler=None)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | callable `(ctx, params) -> dict \| str \| None` | no | Receives the raw create params as bytes. |
+
+Return `None` for the gateway default, a string for the `map`, or a dict with
+`map`, optional `mode`, optional `max_players`, and optional `open`.
+
+```python
+@citadel.on_room_create
+def create(ctx, params):
+    return {"map": "arena_01", "mode": "ffa", "max_players": 8, "open": True}
+```
+
+---
+
+## citadel.on_room_join
+
+Register the admission hook for room joins.
+
+```python
+citadel.on_room_join(handler=None)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `handler` | callable `(ctx, room_id) -> bool` | no | Return `True` to admit, `False` to reject. |
+
+With no handler, joins are admitted. If the handler errors or times out, the
+join is rejected fail-closed.
+
+```python
+@citadel.on_room_join
+def join(ctx, room_id):
+    return room_id == 7
+```
+
+---
+
+## citadel.broadcast
+
+Queue a message to every connected participant except the sender currently being
+handled.
+
+```python
+citadel.broadcast(kind, body, unreliable=False)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `kind` | `int` (`u16`) | yes | Wire message kind. |
+| `body` | bytes-like or `str` | yes | Payload, capped at 64 KiB per call. |
+| `unreliable` | `bool` | no | Prefer datagram delivery when the transport supports it. |
+
+Returns nothing. Calls made from RPC and room hooks are discarded because those
+hooks communicate through their return values.
+
+---
+
+## citadel.send
+
+Queue a message to one participant.
+
+```python
+citadel.send(session, kind, body, unreliable=False)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `session` | `int` (`u64`) | yes | Target participant id, usually `ctx.sender`. |
+| `kind` | `int` (`u16`) | yes | Wire message kind. |
+| `body` | bytes-like or `str` | yes | Payload, capped at 64 KiB per call. |
+| `unreliable` | `bool` | no | Prefer datagram delivery when available. |
+
+---
+
+## Physics host API
+
+Physics is opt-in for server-simulated actors while transform sync is enabled.
+Dimensions are centimetres, velocity is cm/s, and acceleration is cm/s². The
+three write calls queue gateway commands; `physics_state` reads live state.
+
+### citadel.set_physics
+
+```python
+citadel.set_physics(object_id: int, opts: dict | None = None) -> None
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `object_id` | `int` (`u32`) | Server-simulated actor to configure. |
+| `opts` | `dict | None` | Optional `gravity`, `buoyancy`, `drag`, `radius`, `height`, `max_speed`, `shape` (`"capsule"` or `"aabb"`), and `enabled`. |
+
+**Returns:** `None`. Pass `None` or `{"enabled": False}` to detach the body.
+
+**Errors:** a non-mapping options value, invalid field type, or unknown shape
+raises `RuntimeError`; commands from that handler are discarded. Non-server
+actors are ignored by the hub.
+
+### citadel.apply_impulse
+
+```python
+citadel.apply_impulse(object_id: int, ix: float, iy: float, iz: float) -> None
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `object_id` | `int` (`u32`) | Bodied server actor. |
+| `ix`, `iy`, `iz` | `float` | Instantaneous velocity delta in cm/s; positive Y jumps/flaps. |
+
+**Returns:** `None`.
+
+**Errors:** invalid numeric values raise Python exceptions. An actor without a
+body is a no-op.
+
+### citadel.set_move_intent
+
+```python
+citadel.set_move_intent(object_id: int, vx: float, vy: float, vz: float) -> None
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `object_id` | `int` (`u32`) | Bodied server actor. |
+| `vx`, `vy`, `vz` | `float` | Desired velocity in cm/s; X/Z are blended by physics and Y remains physics-led. |
+
+**Returns:** `None`.
+
+**Errors:** invalid numeric values raise Python exceptions. No body means no
+movement change.
+
+### citadel.physics_state
+
+```python
+citadel.physics_state(object_id: int) -> dict | None
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `object_id` | `int` (`u32`) | Actor whose authoritative body state to inspect. |
+
+**Returns:** `{"grounded": bool, "position": [x, y, z], "velocity": [x, y, z]}`
+or `None` when transform sync/no hub is unavailable or the actor has no body.
+
+**Errors:** invalid object ids raise Python exceptions. The read queues no
+command.
+
+### Balloon-Fight bot
+
+```python
+import citadel
+
+bot = citadel.spawn_actor({"x": 0, "y": 200, "z": 0})
+citadel.set_physics(bot, {"gravity": 900, "buoyancy": 300, "drag": 0.5,
+                          "radius": 30, "height": 90, "shape": "capsule"})
+
+@citadel.on_tick
+def balloon_fight_tick(dt):
+    state = citadel.physics_state(bot)
+    if state and state["grounded"]:
+        citadel.apply_impulse(bot, 0, 600, 0)
+    elif state and state["velocity"][1] < 0:
+        citadel.apply_impulse(bot, 0, 120, 0)
+    citadel.set_move_intent(bot, 180, 0, 0)
+```
+
+---
+
+## citadel.map_info
+
+```python
+citadel.map_info(name: str) -> dict | None
+```
+
+Returns the loaded CMAP's `bounds_min`, `bounds_max`, `vertex_count`, and
+`triangle_count`, or `None` when no cooked map has that name. Coordinates are
+Unreal world units (cm).
+
+```python
+level = citadel.map_info("Lvl_ThirdPerson")
+if level:
+    citadel.log(f"loaded {level['triangle_count']} collision triangles")
+```
+
+---
+
+## citadel.raycast
+
+```python
+citadel.raycast(origin: tuple[float, float, float], direction: tuple[float, float, float]) -> dict | None
+```
+
+Casts the finite segment `origin + direction` against the active room map, in
+cm. The result has `point`, unit `normal`, `distance`, and `triangle_index`, or
+is `None` if transform sync has no active map or the segment misses. Each vector
+must contain exactly three finite values.
+
+```python
+hit = citadel.raycast((0, 200, 0), (0, -500, 0))
+if hit:
+    citadel.log(f"floor at {hit['point'][1]:.1f} cm")
+```
+
+## citadel.sphere_overlap
+
+```python
+citadel.sphere_overlap(centre: tuple[float, float, float], radius: float) -> bool
+```
+
+Returns whether a sphere overlaps any triangle in the active room map. It
+returns `False` when there is no active map. `radius` must be finite and
+non-negative; invalid parameters raise `RuntimeError`.
+
+```python
+if citadel.sphere_overlap((100, 50, 100), 30):
+    citadel.log("spawn position is blocked", "warn")
+```
+
+## citadel.ground_height
+
+```python
+citadel.ground_height(origin: tuple[float, float, float], max_distance: float) -> dict | None
+```
+
+Finds the nearest upward-facing surface below `origin`, within `max_distance`
+cm. The hit shape matches `citadel.raycast`; no walkable hit returns `None`.
+`max_distance` must be finite and non-negative.
+
+```python
+ground = citadel.ground_height((0, 500, 0), 1000)
+if ground:
+    citadel.log(f"ground y = {ground['point'][1]:.1f}")
+```
+
+## citadel.spawn_actor
+
+Queue a server-owned actor spawn and return the allocated object id.
+
+```python
+citadel.spawn_actor(opts=None, **kwargs) -> int
+```
+
+Accepted fields are `archetype`, `x`, `y`, and `z`. Missing numeric fields
+default to `0`.
+
+```python
+actor_id = citadel.spawn_actor({"archetype": 3, "x": 1, "y": 2, "z": 3})
+```
+
+---
+
+## citadel.move_actor
+
+Queue an authoritative actor transform update.
+
+```python
+citadel.move_actor(object_id, x, y, z, vx=0.0, vy=0.0, vz=0.0)
+```
+
+The Python adapter emits the same `OutboundCommand::MoveActor` shape as Lua:
+position plus velocity, with identity rotation.
+
+---
+
+## citadel.despawn_actor
+
+Queue a server-owned actor despawn.
+
+```python
+citadel.despawn_actor(object_id)
+```
+
+---
+
+## citadel.log
+
+Emit a script log through Python's `logging.getLogger("citadel.script")`.
+
+```python
+citadel.log(message, level="info")
+```
+
+Unknown levels fall back to `info`. Logging never raises a Citadel runtime
+error.
+
+---
+
+## citadel.static_data.load_json
+
+Load one operator-owned JSON object or array during `main.py` initialization.
+
+```python
+citadel.static_data.load_json(path: str) -> dict | list
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `path` | `str` | yes | A non-empty relative `.json` path below `[runtime] static_data_dir`, such as `"gameplay/collision.json"`. Use `/` separators only. |
+
+**Returns:** a fresh ordinary Python `dict` or `list`, with nested JSON values
+converted to their normal Python equivalents.
+
+**Errors:** raises `RuntimeError` beginning `static data access denied`,
+`static data file not found`, `static data file exceeds configured size limit`,
+`invalid JSON static data`, or `static data schema invalid`. Absolute/drive
+paths, `.`/`..`, backslashes, escaped symlinks, missing files, and non-JSON
+extensions are rejected. It also raises access denied when `static_data_dir` is
+unset.
+
+```python
+import citadel
+
+collision = citadel.static_data.load_json("gameplay/collision.json")
+knight_radius = collision["characters"]["knight"]["radius_cm"]
+```
+
+---
+
+## citadel.static_data.load_csv
+
+Load one operator-owned CSV table during `main.py` initialization.
+
+```python
+citadel.static_data.load_csv(path: str) -> list[dict]
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `path` | `str` | yes | A non-empty relative `.csv` path below `[runtime] static_data_dir`, such as `"gameplay/attacks.csv"`. It has the same containment and size rules as `load_json`. |
+
+**Returns:** a fresh `list[dict]`, one header-keyed dict per CSV row. Cells
+spelled `true`/`false` become booleans and finite numeric cells become numbers;
+other cells remain strings.
+
+**Errors:** malformed/invalid UTF-8 CSV or uneven rows raise `invalid CSV static
+data`; empty, missing, or duplicate headers raise `static data schema invalid`.
+The same access, missing-file, and size-limit errors as `load_json` apply.
+
+```python
+attacks = citadel.static_data.load_csv("gameplay/attacks.csv")
+slash_damage = next(row["damage"] for row in attacks if row["id"] == "slash")
+```
+
+Only top-level initialization can add a cache entry. Later calls may return an
+already-cached value, but a cache miss is denied, so message and tick handlers
+cannot cause static-data disk I/O. Each successful hot reload rebuilds the Python
+VM and parsed catalog atomically; a bad replacement leaves the previous VM and
+catalog live. See [shared static gameplay data](/guides/static-game-data/) for
+the ordered configuration and deployment workflow.
+
+---
+
+## citadel.friends_add
+
+Invite another user or accept their pending invite. Returns the new state token.
+
+```python
+state = citadel.friends_add(user, other)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `str` | yes | The acting user ID. In the trusted tier, the script explicitly provides the acting user. |
+| `other` | `str` | yes | The other user ID to befriend. |
+
+**Returns:** `str` — the new state token for `user`'s side of the relation
+(`invited_sent`, `invited_received`, `friend`, or `blocked`).
+
+**Errors:** raises a `RuntimeError` if the domain host is not available or the
+backend returns an error.
+
+```python
+@citadel.on_rpc("befriend")
+def befriend(ctx, body):
+    other_id = body.decode
+    state = citadel.friends_add(ctx.user_id, other_id)
+    citadel.log(f"befriended {other_id}, state is {state}")
+    return citadel.Reply.ok
+```
+
+---
+
+## citadel.friends_remove
+
+Remove any relation between two users in both directions.
+
+```python
+removed = citadel.friends_remove(user, other)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `str` | yes | The acting user ID. |
+| `other` | `str` | yes | The other user ID to unfriend. |
+
+**Returns:** `bool` — `True` if a relation was removed, `False` if none existed.
+
+**Errors:** raises a `RuntimeError` if the domain host is not available or the
+backend returns an error.
+
+```python
+@citadel.on_rpc("unfriend")
+def unfriend(ctx, body):
+    other_id = body.decode
+    was_removed = citadel.friends_remove(ctx.user_id, other_id)
+    if was_removed:
+        citadel.log(f"unfriended {other_id}")
+    return citadel.Reply.ok
+```
+
+---
+
+## citadel.friends_block
+
+Block another user from `user`'s side.
+
+```python
+citadel.friends_block(user, other)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `str` | yes | The acting user ID. |
+| `other` | `str` | yes | The other user ID to block. |
+
+**Returns:** nothing.
+
+**Errors:** raises a `RuntimeError` if the domain host is not available or the
+backend returns an error.
+
+```python
+@citadel.on_rpc("block")
+def block(ctx, body):
+    other_id = body.decode
+    citadel.friends_block(ctx.user_id, other_id)
+    citadel.log(f"blocked {other_id}")
+    return citadel.Reply.ok
+```
+
+---
+
+## citadel.friends_list
+
+List all relations for a user, ordered by other user ID.
+
+```python
+rows = citadel.friends_list(user)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user` | `str` | yes | The user ID to query. |
+
+**Returns:** `list[dict]` — each row is a dict with:
+  - `user_id` (str): the other account ID
+  - `state` (str): relation state (`invited_sent`, `invited_received`, `friend`, `blocked`)
+  - `updated_unix_ms` (int): when the relation last changed, in milliseconds since Unix epoch
+
+**Errors:** raises a `RuntimeError` if the domain host is not available or the
+backend returns an error.
+
+```python
+@citadel.on_rpc("friends.list")
+def list_friends(ctx, body):
+    rows = citadel.friends_list(ctx.user_id)
+    # Count friends vs. pending invites
+    friends = [r for r in rows if r["state"] == "friend"]
+    pending = [r for r in rows if r["state"] in ("invited_sent", "invited_received")]
+    citadel.log(f"User has {len(friends)} friends and {len(pending)} pending invites")
+    return citadel.Reply.ok
+```
+
+---
+
+## ctx Shapes
+
+| Hook | `ctx` fields |
+| --- | --- |
+| `on_message` | `sender`, `kind`, `user_id` |
+| `on_join` / `on_leave` | `sender`, `user_id` |
+| `on_rpc` | `sender`, `method`, `user_id` |
+| `on_room_create` | same as RPC, with `method == "room.create"` |
+| `on_room_join` | same as RPC plus `room_id` |
+| `on_tick` | no `ctx`; receives `dt` directly |
+
+`ctx` fields are available as attributes and by key:
+
+```python
+ctx.sender == ctx["sender"]
+ctx.get("user_id", "guest")
+```
+
+---
+
+## Execution Budgets
+
+Python uses the same configured budgets as the runtime trait:
+
+| Limit | Value | Notes |
+| --- | --- | --- |
+| Handler deadline | `runtime.deadline_ms`, default 100 ms | Applies to messages, lifecycle, RPC, and room hooks. |
+| Tick deadline | `runtime.tick_deadline_ms` or auto-derived | Applies per tick. |
+| Load/reload deadline | 5 seconds | Bounds top-level `main.py` registration work. |
+| Max outbound commands | 1024 per invocation | Extra commands are dropped. |
+| Max body size | 64 KiB per `broadcast`/`send` | Oversized bodies raise a script error. |
+| Max total outbound bytes | 1 MiB per invocation | Extra messages are dropped. |
+
+CPython has no instruction-count hook. Citadel arms a Python trace deadline and
+a watchdog thread that requests an interpreter interrupt when the budget expires.
+Pure Python runaway loops are bounded by this path. Native extensions or C calls
+that hold the GIL indefinitely may evade in-process interruption; keep that code
+out of hot handlers, move it to worker processes, or implement the heavy path in
+Rust.
+
+The GIL also means CPU-bound Python handlers do not execute in parallel inside
+one process. Use multiprocessing, C extensions that release the GIL, external
+workers, or Rust for CPU-heavy simulation.
+
+---
+
+## Import local game modules
+
+Citadel adds `[runtime] scripts_dir` (normally `game/`) to `sys.path` before
+executing `main.py`. Use ordinary Python imports to separate game logic into
+files beneath that directory:
+
+```text
+game/
+├── main.py
+└── systems/
+    ├── __init__.py
+    └── combat.py
+```
+
+```python
+# game/main.py
+import citadel
+from systems.combat import apply_damage
+
+@citadel.on_message(1)
+def on_damage(ctx, body):
+    apply_damage(ctx, 10)
+```
+
+```python
+# game/systems/combat.py
+def apply_damage(ctx, amount):
+    print(f"damage={amount} sender={ctx.sender}")
+```
+
+This is trusted CPython, so normal Python import behavior—including the
+standard library and packages installed for the server—is available. It is not
+a filesystem sandbox; run only code you operate. For the Lua equivalent and
+the operational reload workflow, see
+[organize multi-file game logic](/guides/organize-game-server-logic/).
+
+---
+
+## Hot Reload
+
+With `[runtime] hot_reload = true`, Citadel watches `<scripts_dir>/main.py`.
+Reload is failure-safe: the node reads and builds a fresh Python module,
+requires at least one registered handler, and swaps it in atomically under the
+runtime lock. A missing file, syntax error, top-level exception, timeout, or
+handlerless script is rejected and the previous Python runtime keeps serving.
+
+Python module globals reset on each successful reload. The script directory is
+added to `sys.path`, and modules loaded from that directory are evicted before
+the fresh `main.py` is executed so local imports pick up edits.
+
+The watcher observes `main.py`, not each imported module. Changing a dependency
+is applied on the next reload, but does not currently trigger one by itself;
+touch `main.py`, use the operator reload control, or restart the server.
+
+---
+
+## Console Introspection
+
+The console runtime endpoints report Python the same way they report Lua:
+registered RPC method names, message kinds, hook names, reloadability, source
+path, and the active deadline. See
+[Admin console & console API](/reference/admin-api/console/) for endpoint
+authentication and response shape.
+
+---
+
+## Player notifications
+
+| Function | Signature | Returns / errors |
+| --- | --- | --- |
+| `citadel.notifications_send` | `(recipient, code, subject, content_json, sender=None, delivery_key=None)` | committed notification dict; invalid JSON or service validation raises `RuntimeError`. |
+| `citadel.notifications_list` | `(recipient, limit=50, cursor=None)` | `{ "items": [...], "next_cursor": str|None }`. |
+| `citadel.notifications_mark_read` | `(recipient, ids)` | list of IDs newly marked read; repeated IDs are safe. |
+
+```python
+n = citadel.notifications_send("player-42", 7, "Reward", '{"coins":10}', "server", "reward:round-1")
+page = citadel.notifications_list("player-42")
+changed = citadel.notifications_mark_read("player-42", [n["id"]])
+```
+
+The durable row commits before a local `KIND_NOTIFICATION` live attempt. Clients
+deduplicate by `id` and repair an offline/full-queue gap with the inbox page.
+
+## Domain feature calls
+
+### Secure `citadel.chat_call`
+
+`citadel.chat_call(actor, operation, payload_json)` uses the same secure chat
+schema as player RPCs. `actor` is an explicit trusted-runtime identity and is
+still checked against current friendship or group membership; it is never
+accepted as a JSON `sender`. For `send`, pass
+`{"target":{"kind":"direct","other_user_id":"player-b"},"content":"hi"}`.
+For `history`, pass the same target with optional `limit` and `before_id`.
+Group targets use `group_id`; room targets are unavailable to this bridge because
+only the realtime gateway owns current room presence. Raw `channel` and
+`channel_type` fields fail with `CHAT_PROTOCOL_UPGRADE_REQUIRED`. `operation`
+may be `edit` (`id` plus `content`) or `delete` (`id`): both retain the explicit
+actor, canonical target fence, author time window, revision/event semantics, and
+durable shared rate limits used by player RPCs. `moderate` accepts a group target
+and `id` only; it applies the same group role hierarchy as player RPCs, fences
+membership, and writes a redacted durable audit record. Direct and room
+moderation targets are rejected.
+
+`citadel.groups_call(actor, operation, payload_json)`,
+`citadel.leaderboards_call(...)`, `citadel.chat_call(...)`, and
+`citadel.wallet_call(...)` return decoded Python JSON values and raise
+`RuntimeError` on validation/service failures. Operation names/payloads match
+the game-client RPC reference. Trusted `wallet_call(..., "adjust", ...)` may
+change a balance; that authority is not available to a client.
+
+### `citadel.groups_call`
+
+**Signature:** `citadel.groups_call(actor, operation, payload_json) -> object`.
+`payload_json` is a JSON string; invalid JSON, unknown operations, invalid
+state, capacity, or role failures raise `RuntimeError`.
+
+| Operation | Payload | Return |
+| --- | --- | --- |
+| `join` | `{ "group_id": int }` | `{ "state":"joined", "group":… }` for open groups, or `{ "state":"requested", "admission":… }` for closed groups. |
+| `invite` | `{ "group_id": int, "user_id": str }` | `{ "state":"invited", "admission":… }`; caller must be admin/superadmin. |
+| `approve_request` | `{ "group_id": int, "user_id": str }` | Updated group; caller must be admin/superadmin and a request must exist. |
+| `accept_invitation` | `{ "group_id": int }` | Updated group; caller must hold the pending invitation. |
+| `cancel_admission` | `{ "group_id": int }` | `{}`; cancelling again is idempotent. |
+| `transfer_ownership` | `{ "group_id": int, "user_id": str }` | Updated group; only its current superadmin may transfer to an existing member. |
+
+```python
+pending = citadel.groups_call("owner", "invite", '{"group_id":7,"user_id":"player-42"}')
+group = citadel.groups_call("player-42", "accept_invitation", '{"group_id":7}')
+```

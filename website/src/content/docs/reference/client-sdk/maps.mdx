@@ -1,0 +1,175 @@
+---
+title: Maps (cook level geometry → server)
+description: Export a level's static collision geometry to a Citadel `.map` (CMAP) file with the in-editor cook tool, drop it into the server's maps directory, and let a room resolve it by name. This geometry is what the server uses for authoritative collision and navmesh baking.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A **Citadel map** is a small binary file (`.map`, CMAP format) that carries one
+level's **static collision geometry** in world space. The server loads every map in
+its [`maps_dir`](./configuration) at startup and indexes it by file name; when a
+[room](./rooms) is created, the room's server-chosen `map` name resolves to a loaded
+map. That geometry is the input the server uses for authoritative collision and — in
+a later phase — its own baked navmesh, so server-driven
+[networked actors](./networked-actors) (NPCs) can path around the real level.
+
+:::note[Why the server needs geometry]
+The client renders the level; the *server* still needs to know where the walls and
+floor are to make authoritative decisions. Citadel does **not** export the engine's
+navmesh (Unreal's is a proprietary Detour blob and not portable) — it exports raw
+**collision triangles** and bakes its own navigation data. Geometry export is
+engine-agnostic; only the per-engine extraction step differs.
+:::
+
+## Pipeline
+
+```
+Unreal editor: Tools → Citadel → Cook Map Data
+   → writes  MyLevel.map  (world-space collision triangles)
+   → drop into  <server>/maps/            (config: runtime.maps_dir)
+   → server loads it at startup, indexed as "MyLevel"
+   → room's  on_room_create → { map = "MyLevel" }  resolves to it
+```
+
+The map **name** the server matches is the `.map` file's stem (`MyLevel.map` →
+`MyLevel`), so it must equal the name your `on_room_create` hook returns.
+
+## Cook a `.map` from your level
+
+The cook tools ship as **editor-only** tools (they are never compiled into a
+packaged client). Each engine re-bakes its own static scene geometry into the
+engine-agnostic CMAP format.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+The tool is a menu action, not code. With the Citadel plugin enabled:
+
+1. Open the level you want to cook.
+2. **Tools → Citadel → Cook Map Data**.
+3. In the **Save As…** dialog, pick a location and name. The default file name is
+   the level's name (e.g. `Lvl_ThirdPerson.map`) — keep it matching the `map` your
+   `on_room_create` returns.
+4. A notification reports the exported vertex/triangle counts and the output path.
+
+The tool scans every **static, collidable** `StaticMeshComponent` in the level
+(including instanced meshes) and Unreal Landscape collision-heightfield tiles,
+transforms them to world space, and writes one combined triangle mesh. Landscape
+visibility holes are omitted and its alternate collision-cell diagonal is retained.
+The exporter reads collision rather than render topology, so Merge Actors remains an
+optional artist workflow rather than a requirement. Components with collision
+disabled are skipped; a level with no static collision reports "nothing to export".
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+Same tool — it is a top-level editor menu action, so there is no Blueprint graph:
+
+1. Open the level.
+2. **Tools → Citadel → Cook Map Data**.
+3. **Save As…** with a name matching your room's `map` (default = level name).
+4. Read the exported vert/tri counts in the confirmation toast.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+Copy `clients/unity/Editor/CitadelCmapExporter.cs` under your project's
+`Assets/Citadel/Editor/`, then select **Tools → Citadel → Export CMAP Map…**.
+It exports static `MeshCollider` sources and static `Terrain` heightfields to
+one CMAP collision mesh. Terrain holes are omitted; source vertices are welded
+at a fixed `0.001` world-unit tolerance and degenerate triangles are dropped.
+Sources are processed in stable scene order. The tool rejects singular source
+transforms, non-finite world vertices, and maps over its 10-million-triangle
+safety cap rather than emitting a partial file; it reports normalization counts
+in the Unity Console.
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+The Godot SDK contains an editor plugin at
+`addons/citadel_map_exporter/`. Copy it under your project's `res://addons/`,
+enable **Citadel Map Exporter** in **Project → Project Settings → Plugins**, then:
+
+1. Open the saved 3D level scene.
+2. Select **Tools → Citadel → Export CMAP Map…**.
+3. Choose a `.map` output path and keep its filename matching the `map` your
+   `on_room_create` returns.
+4. Copy the result into the server's `maps_dir` and restart the server.
+
+The exporter combines `MeshInstance3D` nodes under `StaticBody3D` into a
+world-space triangle mesh. To include a mesh outside a static body, set its
+`citadel_export_collision` metadata to `true`; set it to `false` to exclude an
+otherwise included mesh. A terrain addon can opt in by implementing
+`citadel_cmap_terrain` and returning the documented collision-height grid
+(`width`, `depth`, `heights`, `size`, optional byte-per-cell `holes`). The
+exporter welds at `0.001` units, rejects non-finite data and maps over 10
+million triangles, and prints normalization counts in the Godot Output panel.
+Dynamic bodies, CSG, render-only terrain displacement, and procedural meshes
+are not collected automatically.
+
+</TabItem>
+</Tabs>
+
+## Install the map on the server
+
+Copy the cooked file into the server's maps directory — by default `./maps`
+relative to the working directory ([`runtime.maps_dir`](./configuration)). The
+directory is created on first run if absent.
+
+```
+<server working dir>/
+  citadel.toml
+  game/main.lua
+  maps/
+    Lvl_ThirdPerson.map      ← the cooked file
+```
+
+At startup the server scans this directory, decodes each `.map`, and logs what it
+loaded:
+
+```
+map catalog loaded loaded=1
+loaded map map=Lvl_ThirdPerson verts=… tris=…
+```
+
+Malformed or unreadable files are skipped with a warning — a bad map never stops the
+server. When a room resolves a `map` name with no matching file, the server warns and
+lists the maps it *does* have (catches typos and uncooked levels).
+
+Trusted server logic can inspect a loaded map without receiving its raw geometry:
+`citadel.map_info(name)` returns its bounds and collision vertex/triangle counts,
+or `nil` (Lua), `None` (Python), or `null` (JavaScript) when it is not loaded.
+
+## File format (CMAP)
+
+`.map` is a small, versioned, section-framed **big-endian** binary format
+(implemented by the `citadel-map` crate). A reader skips sections it does not
+understand, so future data (e.g. baked navigation) can be added without breaking
+older servers.
+
+| Part | Contents |
+| ---- | -------- |
+| Header | magic `CMAP` + `format_version` (u32) |
+| `METADATA` section | level name (u16-len UTF-8) + world-space AABB (`bounds_min`/`bounds_max`, f32×3 each) |
+| `COLLISION` section | vertex count (u32) + vertices (f32×3) + triangle count (u32) + triangles (u32×3 indices) |
+| `NAVMESH` section | optional server-baked Detour tile, guarded by Detour version and polygon-reference width |
+
+Coordinates remain in the source engine's world units. Configure the server-side
+actors and transform-sync values in the same convention as the exported level so
+server-driven NPC positions line up with the cooked geometry with no conversion.
+
+## Known limitations
+
+- **Terrain-aware exporter workflow.** Unity exports built-in Terrain, Unreal
+  exports Landscape collision heightfields, and Godot supports explicit terrain
+  providers. Terrain uses collision-height samples and holes, not trees,
+  grass/details, material displacement, or runtime deformation. The `.map`
+  format itself is engine-agnostic.
+- **Static collision only.** Unreal exports static meshes and Landscape collision
+  heightfields, but not BSP/geometry brushes, skeletal meshes, or procedural
+  collision. Godot exports static-body `MeshInstance3D` nodes (or explicitly
+  tagged meshes) plus an explicit terrain provider, not CSG or dynamic-body
+  collision.
+- **Navigation is static and server-side.** Detour bakes/query uses the cooked
+  collision mesh. Dynamic obstacles, off-mesh links, and server-side
+  player-collision validation remain future work.

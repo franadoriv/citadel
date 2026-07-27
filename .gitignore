@@ -1,0 +1,49 @@
+/target
+
+# Release packaging output (make package-windows / .\make.ps1 package-windows).
+# The staged layout and the zip are build artifacts; CI publishes them.
+/dist
+
+# Local runnable staging, produced by the bin-* make target family
+# (make bin-server / bin-benchmark / bin-client-<engine> / bin-clients /
+# bin-all, or the matching .\make.ps1 targets). bin/server/ = citadel.exe +
+# citadel.toml + scripts/main.lua + empty maps/; bin/benchmark/ = the combat
+# benchmark package; bin/clients/<engine>/ = copy-into-project client SDKs.
+# All build artifacts, never committed.
+/bin
+
+# Created at runtime by the server when run from the repo root (the shipped
+# citadel.toml's [runtime] maps_dir defaults to ./maps). Not committed.
+/maps
+
+# Local environment and secrets.
+.env
+.env.*
+!.env.example
+
+# Local dev server config files (e.g. transport demos). Not committed.
+/demo.toml
+/web-demo.toml
+/wt.toml
+/quic.toml
+
+# SQLite database files created at runtime by the standalone server (the shipped
+# citadel.toml defaults to sqlite://data.sqlite). The tracked config and the
+# game/ scripts are committed; the local database file is not.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Native plugin binaries built into the Unity SDK (built, not committed).
+clients/unity/Plugins/**/*.dll
+clients/unity/Plugins/**/*.so
+clients/unity/Plugins/**/*.dylib
+clients/unity/Plugins/**/*.pdb
+clients/unity-quic-demo/Assets/Plugins/**/*.dll
+clients/unity-quic-demo/Assets/Plugins/**/*.so
+clients/unity-quic-demo/Assets/Plugins/**/*.dylib
+clients/unity-quic-demo/Assets/Plugins/**/*.pdb
+
+# Python bytecode cache (embedded runtime scripts)
+__pycache__/
+*.pyc

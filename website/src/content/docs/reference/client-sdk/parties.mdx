@@ -1,0 +1,159 @@
+---
+title: Parties
+description: Authenticated local party management and atomic matchmaker tickets through generic RPC.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Parties are authenticated, local account groups used to queue an indivisible
+matchmaker ticket. A party has one leader and up to eight members. The leader
+invites accounts; an invited account accepts before it becomes a member. A party
+ticket represents every connected member, so it either forms as a whole or not at
+all. Each member later receives and accepts their own matchmaker handoff.
+
+All methods below use the generic realtime RPC envelope. Guests receive
+`"authentication required"`. Party state is local to one node and is cleared on
+restart; cross-node party ownership is not implemented.
+
+## Response shape
+
+Successful create, invite, accept, promote, remove, and status calls return:
+
+```json
+{
+  "party_id": "opaque-id",
+  "leader_user_id": "alice",
+  "members": ["alice", "bob"],
+  "invitations": []
+}
+```
+
+## Calling an operation
+
+All operations have the signature `rpc(method, JSON payload)`. Use the examples
+below for any method in the reference table.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+Client->Send(CitadelWire::KindRpcRequest,
+    CitadelWire::EncodeRpcRequest(81, TEXT("party.create"), TEXT("{}")), true);
+// Decode the correlated KIND_RPC_RESPONSE body as JSON.
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+1. Build the method payload as a **Make Json Object**.
+2. Call **Encode RPC Request** with the method shown below and a new request id.
+3. Send it reliably with **RPC Request** kind `3`.
+4. On **RPC Response** kind `4`, decode the correlated JSON body.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+rpcClient.CallRpc("party.create", "{}", result => Debug.Log(result.Payload));
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+citadel.call_rpc("party.create", "{}", func(result): print(result.payload))
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+let reply = client.call_rpc("party.create", br#"{}"#).await?;
+assert!(reply.is_ok);
+```
+
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+const reply = JSON.parse(new TextDecoder.decode(await client.callRpc("party.create")));
+console.log(reply.party_id);
+```
+
+</TabItem>
+</Tabs>
+
+## `party.create`
+
+**Payload:** `{}`. **Returns:** the response shape above with the authenticated
+caller as sole leader/member. An account may belong to one active party only.
+
+## `party.invite`
+
+**Payload:** `{"party_id":"…","target_user_id":"bob"}`.
+
+**Returns:** the updated party snapshot. Only the leader may invite; the target
+must not already be a member of another party. The maximum of eight includes
+outstanding invitations.
+
+## `party.accept`
+
+**Payload:** `{"party_id":"…"}`.
+
+**Returns:** the updated party snapshot. Only the invited authenticated account
+can accept. A random party id alone is not enough without an outstanding invite.
+
+## `party.leave`
+
+**Payload:** `{"party_id":"…"}`. **Returns:** `{"left":true}`.
+
+A normal member leaves immediately. When the leader leaves, the local party is
+closed rather than silently transferring leadership; use `party.promote` first
+when another member should own it.
+
+## `party.promote`
+
+**Payload:** `{"party_id":"…","target_user_id":"bob"}`.
+
+**Returns:** the updated party snapshot. Only the current leader can promote an
+existing member.
+
+## `party.remove`
+
+**Payload:** `{"party_id":"…","target_user_id":"bob"}`.
+
+**Returns:** the updated party snapshot. Only the leader can remove a non-leader
+member. A leader cannot remove itself; use `party.close` or promote first.
+
+## `party.close`
+
+**Payload:** `{"party_id":"…"}`. **Returns:** `{"closed":true}`.
+
+Only the leader can close a party. Closing clears its invitations and lets every
+former member create or join another party.
+
+## `party.status`
+
+**Payload:** `{"party_id":"…"}`.
+
+**Returns:** the response shape above. Only a member or an invited account can
+read a party snapshot.
+
+## Queueing the party
+
+The leader adds `party_id` to [`matchmaker.add`](/reference/client-sdk/matchmaker/#matchmakeradd):
+
+```json
+{
+  "party_id": "opaque-id",
+  "min_count": 4,
+  "max_count": 4,
+  "ttl_ms": 30000
+}
+```
+
+Every member must be currently connected. While the ticket is queued, party
+membership and invitations are frozen; cancel the ticket before changing them.
+The matchmaker counts all members toward the cohort size and never forms a subset
+of the party. Each member gets a distinct, account-bound `KIND_MATCHMAKER_MATCHED`
+token and may recover it through `matchmaker.status` after reconnecting.

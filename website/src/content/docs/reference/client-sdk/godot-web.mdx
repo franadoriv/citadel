@@ -1,0 +1,153 @@
+---
+title: Godot Web SDK
+description: Browser-safe Citadel realtime API for Godot 4 exports.
+---
+
+`CitadelWebClient` is the Godot 4 browser transport. It is pure GDScript over
+`WebSocketPeer`, so it does not load `CitadelClientNative` or a GDExtension.
+It retains the desktop client's public connection, authentication, send, poll,
+and close surface while adapting its blocking handshake to browser-safe polling.
+It uses Citadel's framed binary WebSocket protocol and is reliable-only.
+
+Install `citadel-client-godot-web-v<version>.zip` at the project's `res://`
+root. It provides
+`res://addons/citadel/{protocol,client,web_client,rooms}.gd`; it deliberately
+does not include the desktop GDExtension. The same archive includes a runnable
+`web/` verification export containing matched `index.html`, `index.js`,
+`index.pck`, and `index.wasm` files. Build it from a checkout with
+`GODOT_BIN=/path/to/godot make package-client-godot-web` or, on Windows, set
+`GODOT_BIN` to `Godot.exe` and run `./make.ps1 package-client-godot-web`.
+
+Serve the included `web/` directory over HTTP(S), keep its filenames together,
+and serve `.wasm` as `application/wasm`. It also contains `citadel-e2e.toml`
+and `serve_web.py`: together they reproduce the real-browser CI check against a
+local Citadel listener. Copy the archive root's `addons/` directory into your
+own game and export that game separately.
+
+## `connect_websocket`
+
+```gdscript
+func connect_websocket(url: String) -> CitadelClient.Status
+```
+
+Begins a non-blocking WebSocket connection. `url` must start with `ws://` or
+`wss://`. It returns `OK` when Godot accepts the request, not when the
+connection is open. It returns `INVALID_ARGUMENT` for a different URL scheme
+and `CONNECT` when Godot rejects the request. Call `pump` each frame and use
+`is_open` before authenticating.
+
+On an HTTPS page use a fully-qualified `wss://` hostname matching the server
+certificate; browsers block mixed-content `ws://` connections and do not allow
+custom WebSocket handshake headers.
+
+## `pump` and `is_open`
+
+```gdscript
+func pump -> void
+func is_open -> bool
+```
+
+`pump` advances `WebSocketPeer`, parses all complete framed binary messages,
+and stores application envelopes for `poll`. It ignores non-Citadel text
+WebSocket packets, matching the native WebSocket client. It records an error and
+starts a protocol close for malformed lengths, oversized buffered data, an
+unexpected auth result, or a non-auth envelope received before the auth reply.
+`is_open` also pumps once and returns true only at `WebSocketPeer.STATE_OPEN`.
+
+Call `pump` from the application's `_process`; a second call from `poll` is
+safe. A WebSocket closing state still needs polling to complete cleanly.
+
+## `authenticate_guest` and `authenticate_with_token`
+
+```gdscript
+func authenticate_guest(out: Dictionary) -> CitadelClient.Status
+func authenticate_with_token(session_token: String, out: Dictionary) -> CitadelClient.Status
+```
+
+Both start the one-time Citadel realtime handshake and are the only way to send
+the required first `KIND_AUTH` envelope. They return `AGAIN` while waiting for
+`KIND_AUTH_RESULT`; call again after future `pump` ticks. The first Citadel
+server envelope must be that result, matching the native client. When they
+return `OK`, `out` contains `status`, `user_id`, and `reason`. A rejected
+handshake also returns `OK` at the transport layer, so check
+`out["status"] == CitadelProtocol.AUTH_STATUS_REJECTED` and use `reason`.
+They return `CONNECT` before the socket is open, propagate send errors, and
+return `INVALID_ARGUMENT` if called after its result has already been consumed.
+
+## `send`
+
+```gdscript
+func send(kind: int, data: PackedByteArray, reliable: bool) -> CitadelClient.Status
+```
+
+Frames a `u16` message kind plus opaque payload and sends it as a binary
+WebSocket message. `reliable` is accepted for compatibility with the desktop
+client but WebSocket always delivers reliably and in order. It returns
+`CONNECT` before opening or before the auth handshake completes, `INVALID_ARGUMENT`
+for an out-of-range kind or a frame larger than 16 MiB, `SEND` when Godot rejects
+the packet, or `OK`.
+
+## `poll`
+
+```gdscript
+func poll(out: Dictionary) -> CitadelClient.Status
+```
+
+Pumps once and copies the oldest non-auth envelope into `out` as
+`{ "kind": int, "payload": PackedByteArray }`. It returns `AGAIN` when no
+envelope is ready and `DISCONNECTED` after a closed socket's queue drains.
+Keep a single owner for this loop, and forward room envelopes to
+`CitadelRooms.handle_envelope(kind, payload)`.
+
+## `close` and browser limits
+
+```gdscript
+func close -> void
+```
+
+Starts a normal WebSocket close and clears local inbound/auth state. Call it
+when the game scene exits.
+
+Godot Web does not offer Citadel QUIC, unreliable datagrams, transform-sync,
+or native NetworkPeer replication codecs. `connect_quic` returns
+`INVALID_ARGUMENT` with an explanatory `last_error`.
+
+## Automated coverage
+
+The CI Web job retains a deterministic local RFC 6455 fixture for framing and
+error coverage. It also starts a real Citadel WebSocket listener, serves the
+packaged Godot Web export with its required MIME types, and opens that `.wasm`
+application in Chromium. The application itself opens two browser clients,
+guest-authenticates both, sends a reliable position, receives Citadel's peer
+relay through `poll`, and closes both sockets before setting the success marker.
+The job additionally verifies `.html`, `.js`, `.pck`, and `.wasm` payloads,
+asset references, and WebAssembly magic bytes. A deployed browser run remains
+the verification step for your own origin, TLS certificate, MIME configuration,
+and content-security policy.
+
+## Runnable lifecycle
+
+```gdscript
+var client := CitadelWebClient.new
+var auth := {}
+var authenticated := false
+var rooms: CitadelRooms
+
+func _ready -> void:
+	assert(client.connect_websocket("wss://game.example.com:7352/") == CitadelClient.Status.OK)
+	rooms = CitadelRooms.new(client)
+
+func _process(_delta: float) -> void:
+	client.pump
+	if client.is_open and not authenticated:
+		var status := client.authenticate_guest(auth)
+		if status == CitadelClient.Status.OK:
+			if auth["status"] == CitadelProtocol.AUTH_STATUS_REJECTED:
+				push_error("Citadel rejected auth: %d" % auth["reason"])
+			else:
+				authenticated = true
+	var envelope := {}
+	while authenticated and client.poll(envelope) == CitadelClient.Status.OK:
+		rooms.handle_envelope(envelope["kind"], envelope["payload"])
+		envelope = {}
+```

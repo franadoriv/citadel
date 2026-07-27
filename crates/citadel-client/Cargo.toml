@@ -1,0 +1,40 @@
+[package]
+name = "citadel-client"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal Rust client SDK for Citadel realtime transports (WebSocket + QUIC)."
+
+[dependencies]
+# Shared realtime wire format, identical to the server's.
+citadel-wire = { path = "../citadel-wire" }
+# Async runtime for client connection tasks.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+# Zero-copy buffers for framing.
+bytes = "1"
+# Typed client errors.
+thiserror = "2"
+# QUIC client transport (datagrams + streams + TLS 1.3).
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# WebSocket client.
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Player account/session HTTP client. Keep TLS on rustls, matching Citadel's
+# server/runtime HTTP stack; `json` enables the typed public lifecycle bodies.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Round-trip tests run against an in-process Citadel server.
+citadel = { path = "../.." }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

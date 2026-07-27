@@ -1,0 +1,2722 @@
+//! Embedded CPython runtime host for trusted-tier Python game logic.
+//!
+//! `PythonRuntime` mirrors the Lua adapter's command-return model behind the
+//! language-neutral [`Runtime`] trait. The base Citadel build does not compile
+//! this module; it is available only with `--features runtime-python`.
+
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::CString;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use pyo3::Py;
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyTuple};
+
+use crate::error::{AppError, AppResult, ErrorCategory};
+use crate::maps::MapCatalog;
+use crate::realtime::TransformHub;
+use crate::runtime::host_services::{DomainHost, StorageWriteInput};
+use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::static_data::StaticDataCatalog;
+use crate::runtime::{
+    LifecycleHook, OutboundCommand, PhysicsOptions, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
+    RuntimeIntrospection,
+};
+use crate::services::PlayerNotification;
+use citadel_physics::{PhysicsConfig, Shape};
+
+static PYTHON_BUILD_LOCK: Mutex<()> = Mutex::new(());
+static PYTHON_MODULE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn notification_py_dict(py: Python<'_>, notification: PlayerNotification) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", notification.id)?;
+    dict.set_item("code", notification.code)?;
+    dict.set_item("subject", notification.subject)?;
+    dict.set_item("content_json", notification.content.to_string())?;
+    dict.set_item("sender", notification.sender)?;
+    dict.set_item("created_at_unix_ms", notification.created_at_unix_ms)?;
+    dict.set_item("read_at_unix_ms", notification.read_at_unix_ms)?;
+    Ok(dict.unbind())
+}
+
+/// Default Python script entrypoint under `runtime.scripts_dir`.
+pub const PYTHON_ENTRYPOINT: &str = "main.py";
+
+/// Time budget for running top-level Python registrations at load/reload.
+const LOAD_DEADLINE_MS: u64 = 5_000;
+
+/// Maximum number of outbound commands a single handler invocation may enqueue.
+const MAX_OUTBOUND_COMMANDS: usize = 1024;
+
+const RPC_ERR_UNKNOWN_METHOD: &str = "unknown RPC method";
+const RPC_ERR_TIMEOUT: &str = "RPC handler timed out";
+const RPC_ERR_HANDLER: &str = "RPC handler error";
+
+const PYTHON_HOST_API_NAMES: &[&str] = &[
+    "on_message",
+    "on_join",
+    "on_leave",
+    "on_tick",
+    "on_rpc",
+    "on_room_create",
+    "on_room_join",
+    "broadcast",
+    "send",
+    "spawn_actor",
+    "move_actor",
+    "despawn_actor",
+    "set_physics",
+    "apply_impulse",
+    "set_move_intent",
+    "physics_state",
+    "map_info",
+    "raycast",
+    "sphere_overlap",
+    "ground_height",
+    "log",
+    "static_data.load_json",
+    "static_data.load_csv",
+    "friends.add",
+    "friends.remove",
+    "friends.block",
+    "friends.list",
+    "notifications.send",
+    "notifications.list",
+    "notifications.mark_read",
+    "groups.call",
+    "leaderboards.call",
+    "chat.call",
+    "wallet.call",
+    "storage.read",
+    "storage.write",
+    "storage.delete",
+    "storage.index_query",
+    "storage.register_index_filter",
+    "http.fetch",
+];
+
+/// The Python-side `citadel` module. Keeping this in Python avoids Rust-side
+/// PyO3 proc macros in this crate, which has `unsafe_code = "forbid"`.
+const PYTHON_HOST_PRELUDE: &str = r#"
+import json
+import logging
+import os
+import sys
+import time
+
+_message_handlers = {}
+_rpc_handlers = {}
+_storage_index_filters = {}
+_on_join = None
+_on_leave = None
+_on_tick = None
+_on_room_create = None
+_on_room_join = None
+_commands = []
+_total_bytes = 0
+_overflowed = False
+_next_npc_id = 0x40000000
+_deadline_at = None
+
+MAX_OUTBOUND_COMMANDS = 1024
+MAX_OUTBOUND_BODY_BYTES = 64 * 1024
+MAX_TOTAL_OUTBOUND_BYTES = 1 << 20
+
+class Ctx:
+    __slots__ = ("sender", "user_id", "kind", "method", "room_id")
+
+    def __init__(self, sender, user_id=None, kind=None, method=None, room_id=None):
+        self.sender = int(sender)
+        self.user_id = user_id
+        self.kind = kind
+        self.method = method
+        self.room_id = room_id
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+class Reply:
+    __slots__ = ("is_ok", "body", "error")
+
+    def __init__(self, ok, body=b"", error=""):
+        self.is_ok = bool(ok)
+        self.body = _bytes(body)
+        self.error = str(error)
+
+    @classmethod
+    def ok(cls, body=b""):
+        return cls(True, body, "")
+
+    @classmethod
+    def err(cls, message):
+        return cls(False, b"", message)
+
+def _bytes(value):
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    raise TypeError("expected bytes-like value or str")
+
+def _register(kind, store, key, handler):
+    if handler is None:
+        def decorator(fn):
+            if not callable(fn):
+                raise TypeError("handler must be callable")
+            store[key] = fn
+            return fn
+        return decorator
+    if not callable(handler):
+        raise TypeError("handler must be callable")
+    store[key] = handler
+    return handler
+
+def on_message(kind, handler=None):
+    return _register("message", _message_handlers, int(kind), handler)
+
+def on_rpc(method, handler=None):
+    return _register("rpc", _rpc_handlers, str(method), handler)
+
+def _single(name, handler):
+    def decorator(fn):
+        if not callable(fn):
+            raise TypeError("handler must be callable")
+        globals()[name] = fn
+        return fn
+    return decorator(handler) if handler is not None else decorator
+
+def on_join(handler=None):
+    return _single("_on_join", handler)
+
+def on_leave(handler=None):
+    return _single("_on_leave", handler)
+
+def on_tick(handler=None):
+    return _single("_on_tick", handler)
+
+def on_room_create(handler=None):
+    return _single("_on_room_create", handler)
+
+def on_room_join(handler=None):
+    return _single("_on_room_join", handler)
+
+def log(message, level="info"):
+    logger = logging.getLogger("citadel.script")
+    level = str(level or "info").lower()
+    if level == "trace":
+        logger.debug(str(message))
+    elif level == "debug":
+        logger.debug(str(message))
+    elif level == "warn":
+        logger.warning(str(message))
+    elif level == "error":
+        logger.error(str(message))
+    else:
+        logger.info(str(message))
+
+class _Http:
+    def fetch(self, url, opts=None):
+        """Perform one bounded Rust-owned HTTP request in the trusted runtime."""
+        if "_http_bridge" not in globals():
+            raise RuntimeError("outbound HTTP host not available")
+        return _http_bridge.fetch(str(url), {} if opts is None else dict(opts))
+
+http = _Http()
+
+def _push(command, body_len=0):
+    global _total_bytes, _overflowed
+    if len(_commands) >= MAX_OUTBOUND_COMMANDS:
+        _overflowed = True
+        return
+    if _total_bytes + body_len > MAX_TOTAL_OUTBOUND_BYTES:
+        _overflowed = True
+        return
+    _commands.append(command)
+    _total_bytes += body_len
+
+def broadcast(kind, body, unreliable=False):
+    body = _bytes(body)
+    if len(body) > MAX_OUTBOUND_BODY_BYTES:
+        raise RuntimeError("outbound body too large")
+    _push(("broadcast", int(kind), body, bool(unreliable)), len(body))
+
+def send(session, kind, body, unreliable=False):
+    body = _bytes(body)
+    if len(body) > MAX_OUTBOUND_BODY_BYTES:
+        raise RuntimeError("outbound body too large")
+    _push(("send", int(session), int(kind), body, bool(unreliable)), len(body))
+
+def spawn_actor(opts=None, **kwargs):
+    global _next_npc_id
+    merged = {}
+    if opts:
+        merged.update(dict(opts))
+    merged.update(kwargs)
+    object_id = _next_npc_id
+    _next_npc_id = _next_npc_id + 1
+    if _next_npc_id > 0xFFFFFFFF:
+        _next_npc_id = 0x40000000
+    archetype = int(merged.get("archetype", 0))
+    x = float(merged.get("x", 0.0))
+    y = float(merged.get("y", 0.0))
+    z = float(merged.get("z", 0.0))
+    _push(("spawn_actor", object_id, archetype, x, y, z))
+    return object_id
+
+def move_actor(object_id, x, y, z, vx=0.0, vy=0.0, vz=0.0):
+    _push(("move_actor", int(object_id), float(x), float(y), float(z),
+           float(vx), float(vy), float(vz)))
+
+def despawn_actor(object_id):
+    _push(("despawn_actor", int(object_id)))
+
+def set_physics(object_id, opts=None):
+    """Attach/configure physics, or detach when opts is None/disabled."""
+    encoded = None if opts is None else json.dumps(dict(opts))
+    _push(("set_physics", int(object_id), encoded))
+
+def apply_impulse(object_id, ix, iy, iz):
+    _push(("apply_impulse", int(object_id), float(ix), float(iy), float(iz)))
+
+def set_move_intent(object_id, vx, vy, vz):
+    _push(("set_move_intent", int(object_id), float(vx), float(vy), float(vz)))
+
+def physics_state(object_id):
+    """Return grounded/position/velocity, or None without a bodied actor."""
+    if "_transform_hub_bridge" not in globals():
+        return None
+    return _transform_hub_bridge.physics_state(int(object_id))
+
+def map_info(name):
+    """Return a loaded map's bounds and collision counts, or None when absent."""
+    if "_map_catalog_bridge" not in globals():
+        return None
+    return _map_catalog_bridge.map_info(str(name))
+
+def raycast(origin, direction):
+    """Return the nearest active-map hit for a finite ray segment, or None."""
+    if "_transform_hub_bridge" not in globals():
+        return None
+    return _transform_hub_bridge.raycast(tuple(origin), tuple(direction))
+
+def sphere_overlap(centre, radius):
+    """Return whether a sphere overlaps the active map collision mesh."""
+    if "_transform_hub_bridge" not in globals():
+        return False
+    return _transform_hub_bridge.sphere_overlap(tuple(centre), float(radius))
+
+def ground_height(origin, max_distance):
+    """Return the nearest walkable surface below origin, or None."""
+    if "_transform_hub_bridge" not in globals():
+        return None
+    return _transform_hub_bridge.ground_height(tuple(origin), float(max_distance))
+
+def _reset_commands():
+    global _total_bytes, _overflowed
+    _commands.clear()
+    _total_bytes = 0
+    _overflowed = False
+
+def _take_commands():
+    out = list(_commands)
+    overflowed = _overflowed
+    _reset_commands()
+    return out, overflowed
+
+def _make_ctx(sender, user_id=None, kind=None, method=None, room_id=None):
+    return Ctx(sender, user_id, kind, method, room_id)
+
+def _dispatch_message(kind, ctx, body):
+    handler = _message_handlers.get(int(kind))
+    if handler is None:
+        return False
+    handler(ctx, _bytes(body))
+    return True
+
+def _dispatch_lifecycle(hook, ctx):
+    handler = _on_join if hook == "on_join" else _on_leave
+    if handler is None:
+        return False
+    handler(ctx)
+    return True
+
+def _dispatch_tick(dt):
+    if _on_tick is None:
+        return False
+    _on_tick(float(dt))
+    return True
+
+def _call_rpc(method, ctx, body):
+    handler = _rpc_handlers.get(str(method))
+    if handler is None:
+        return None
+    reply = handler(ctx, _bytes(body))
+    if isinstance(reply, Reply):
+        return (reply.is_ok, reply.body, reply.error)
+    return (True, _bytes(reply), "")
+
+def _call_room_create(ctx, params):
+    if _on_room_create is None:
+        return None
+    spec = _on_room_create(ctx, _bytes(params))
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        return (spec, "", 0, True)
+    data = dict(spec)
+    return (
+        str(data.get("map", "")),
+        str(data.get("mode", "")),
+        int(data.get("max_players", 0)),
+        bool(data.get("open", True)),
+    )
+
+def _call_room_join(ctx, room_id):
+    if _on_room_join is None:
+        return None
+    return bool(_on_room_join(ctx, int(room_id)))
+
+def _has_tick_handler():
+    return _on_tick is not None
+
+def _has_any_handler():
+    return (
+        bool(_message_handlers)
+        or bool(_rpc_handlers)
+        or _on_join is not None
+        or _on_leave is not None
+        or _on_tick is not None
+        or _on_room_create is not None
+        or _on_room_join is not None
+    )
+
+def _introspect():
+    hooks = []
+    if _on_join is not None:
+        hooks.append("on_join")
+    if _on_leave is not None:
+        hooks.append("on_leave")
+    if _on_tick is not None:
+        hooks.append("on_tick")
+    if _on_room_create is not None:
+        hooks.append("on_room_create")
+    if _on_room_join is not None:
+        hooks.append("on_room_join")
+    return (
+        sorted(str(name) for name in _rpc_handlers.keys()),
+        sorted(int(kind) for kind in _message_handlers.keys()),
+        hooks,
+    )
+
+def _deadline_trace(frame, event, arg):
+    if _deadline_at is not None and time.monotonic() >= _deadline_at:
+        raise TimeoutError("handler exceeded its time budget")
+    return _deadline_trace
+
+def _arm_deadline(seconds):
+    global _deadline_at
+    _deadline_at = time.monotonic() + max(float(seconds), 0.001)
+    sys.settrace(_deadline_trace)
+
+def _clear_deadline():
+    global _deadline_at
+    _deadline_at = None
+    sys.settrace(None)
+
+def _prepare_imports(root):
+    if not root:
+        return
+    root = os.path.abspath(str(root))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    prefix = root + os.sep
+    for name, module in list(sys.modules.items()):
+        filename = getattr(module, "__file__", None)
+        if not filename:
+            continue
+        try:
+            filename = os.path.abspath(filename)
+        except (TypeError, ValueError):
+            continue
+        if filename == root or filename.startswith(prefix):
+            sys.modules.pop(name, None)
+
+def friends_add(user, other):
+    """Invite other to user, or accept their pending invite. Returns the new state token."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("friends host not available")
+    return _domain_host_bridge.friends_add(str(user), str(other))
+
+def friends_remove(user, other):
+    """Remove any relation between user and other. Returns whether anything was removed."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("friends host not available")
+    return _domain_host_bridge.friends_remove(str(user), str(other))
+
+def friends_block(user, other):
+    """Block other from user's side."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("friends host not available")
+    return _domain_host_bridge.friends_block(str(user), str(other))
+
+def friends_list(user):
+    """List user's relations, other-id-ordered."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("friends host not available")
+    return _domain_host_bridge.friends_list(str(user))
+
+def notifications_send(recipient, code, subject, content_json, sender=None, delivery_key=None):
+    """Persist one notification and attempt local realtime delivery after commit."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("notifications host not available")
+    return _domain_host_bridge.notifications_send(str(recipient), int(code), str(subject),
+        str(content_json), sender, delivery_key)
+
+def notifications_list(recipient, limit=50, cursor=None):
+    """Return recipient's durable notification page, newest first."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("notifications host not available")
+    return _domain_host_bridge.notifications_list(str(recipient), int(limit), cursor)
+
+def notifications_mark_read(recipient, ids):
+    """Idempotently mark this recipient's notification ids read."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("notifications host not available")
+    return _domain_host_bridge.notifications_mark_read(str(recipient), list(ids))
+
+def groups_call(actor, operation, payload_json):
+    """Run a groups operation with the JSON schema used by groups.* client RPCs."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("groups host not available")
+    return json.loads(_domain_host_bridge.groups_call(str(actor), str(operation), str(payload_json)))
+
+def leaderboards_call(actor, operation, payload_json):
+    return json.loads(_domain_host_bridge.leaderboards_call(str(actor), str(operation), str(payload_json)))
+
+def chat_call(actor, operation, payload_json):
+    return json.loads(_domain_host_bridge.chat_call(str(actor), str(operation), str(payload_json)))
+
+def wallet_call(actor, operation, payload_json):
+    return json.loads(_domain_host_bridge.wallet_call(str(actor), str(operation), str(payload_json)))
+
+def storage_read(user, collection, key):
+    """Return one user-owned storage object, or None when absent."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("storage host not available")
+    return _domain_host_bridge.storage_read(str(user), str(collection), str(key))
+
+def register_storage_index_filter(index_name, callback):
+    """Register one synchronous include/exclude callback for a configured index."""
+    if not isinstance(index_name, str) or not index_name or len(index_name) > 40 \
+       or not index_name.isascii() or not (index_name[0].isalpha() or index_name[0] == "_") \
+       or not all(char.isalnum() or char == "_" for char in index_name):
+        raise ValueError("storage index name must be an ASCII identifier of at most 40 characters")
+    if not callable(callback):
+        raise TypeError("storage index filter must be callable")
+    if index_name in _storage_index_filters:
+        raise ValueError("storage index filter already registered for %r" % index_name)
+    _storage_index_filters[index_name] = callback
+    return callback
+
+def storage_write(user, collection, key, value_json, expected_version=None,
+                  read_permission=None, write_permission=None):
+    """Write a JSON-object storage value and return its versioned object."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("storage host not available")
+    user, collection, key, value_json = str(user), str(collection), str(key), str(value_json)
+    candidates = _domain_host_bridge.storage_index_candidates(user, collection, key)
+    candidate = {
+        "user_id": user, "collection": collection, "key": key,
+        "value_json": value_json, "expected_version": expected_version,
+        "read_permission": read_permission, "write_permission": write_permission,
+    }
+    included = []
+    for index_name in candidates:
+        candidate["index_name"] = index_name
+        callback = _storage_index_filters.get(index_name)
+        if callback is None:
+            included.append(index_name)
+            continue
+        decision = callback(dict(candidate))
+        if type(decision) is not bool:
+            raise TypeError("storage index filter must return a boolean")
+        if decision:
+            included.append(index_name)
+    return _domain_host_bridge.storage_write(
+        user, collection, key, value_json, expected_version,
+        read_permission, write_permission, json.dumps(included, separators=(",", ":")))
+
+def storage_delete(user, collection, key, expected_version=None):
+    """Delete one user-owned storage object."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("storage host not available")
+    return _domain_host_bridge.storage_delete(
+        str(user), str(collection), str(key), expected_version)
+
+def storage_index_query(index_name, filters_json, limit=50):
+    """Query one configured storage index with JSON-object equality filters."""
+    if "_domain_host_bridge" not in globals():
+        raise RuntimeError("storage host not available")
+    return _domain_host_bridge.storage_index_query(
+        str(index_name), str(filters_json), int(limit))
+"#;
+
+/// PyO3 wrapper exposing the domain host to Python scripts.
+/// Provides friends_add, friends_remove, friends_block, friends_list methods.
+#[pyclass]
+struct DomainHostBridge {
+    host: Arc<dyn DomainHost>,
+}
+
+/// PyO3 wrapper exposing the read-only loaded-map catalog to Python scripts.
+#[pyclass]
+struct MapCatalogBridge {
+    maps: Arc<MapCatalog>,
+}
+
+/// PyO3 wrapper exposing the bounded, parsed static-data catalog to Python.
+///
+/// The bridge has no file or directory handles. Its catalog is sealed after the
+/// top-level script finishes, so later cache misses cannot initiate filesystem
+/// I/O from a handler or game tick.
+#[pyclass]
+struct StaticDataBridge {
+    catalog: StaticDataCatalog,
+}
+
+/// Rust-owned HTTP bridge. Python receives this narrow request facade, never a
+/// socket, an HTTP client, or proxy configuration.
+#[pyclass]
+struct OutboundHttpBridge {
+    client: TrustedHttpClient,
+}
+
+/// PyO3 bridge exposing synchronous transform-physics reads to Python scripts.
+#[pyclass]
+struct TransformHubHandle {
+    hub: Arc<TransformHub>,
+}
+
+#[pymethods]
+impl StaticDataBridge {
+    fn load_json(&self, path: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = self
+            .catalog
+            .load_json(path)
+            .map_err(static_data_python_error)?;
+        static_data_value_to_python(py, &value)
+    }
+
+    fn load_csv(&self, path: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = self
+            .catalog
+            .load_csv(path)
+            .map_err(static_data_python_error)?;
+        static_data_value_to_python(py, &value)
+    }
+}
+
+#[pymethods]
+impl OutboundHttpBridge {
+    fn fetch(&self, url: &str, opts: &Bound<'_, PyDict>, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let method = opts
+            .get_item("method")?
+            .map(|value| value.extract::<String>())
+            .transpose()?
+            .unwrap_or_else(|| "GET".to_string());
+        let body = match opts.get_item("body")? {
+            Some(value) if value.is_instance_of::<PyBytes>() => {
+                value.cast::<PyBytes>()?.as_bytes().to_vec()
+            }
+            Some(value) => value.extract::<String>()?.into_bytes(),
+            None => Vec::new(),
+        };
+        let headers = match opts.get_item("headers")? {
+            Some(value) => value.extract::<BTreeMap<String, String>>()?,
+            None => BTreeMap::new(),
+        };
+        let response = self
+            .client
+            .execute_blocking(OutboundHttpRequest {
+                method,
+                url: url.to_string(),
+                headers,
+                body,
+            })
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let result = PyDict::new(py);
+        result.set_item("status", response.status)?;
+        result.set_item("body", PyBytes::new(py, &response.body))?;
+        Ok(result.unbind())
+    }
+}
+
+#[pymethods]
+impl MapCatalogBridge {
+    #[pyo3(name = "map_info")]
+    fn map_info(&self, name: &str, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let Some(info) = self.maps.info(name) else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("bounds_min", info.bounds_min)?;
+        dict.set_item("bounds_max", info.bounds_max)?;
+        dict.set_item("vertex_count", info.vertex_count)?;
+        dict.set_item("triangle_count", info.triangle_count)?;
+        Ok(Some(dict.unbind()))
+    }
+}
+
+#[pymethods]
+impl TransformHubHandle {
+    #[pyo3(name = "physics_state")]
+    fn physics_state(&self, object_id: u32, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let Some(state) = self.hub.physics_state(object_id) else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("grounded", state.grounded)?;
+        dict.set_item("position", state.position)?;
+        dict.set_item("velocity", state.velocity)?;
+        Ok(Some(dict.unbind()))
+    }
+
+    fn raycast(
+        &self,
+        origin: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        py: Python<'_>,
+    ) -> PyResult<Option<Py<PyDict>>> {
+        let Some(hit) = self.hub.raycast(
+            [origin.0, origin.1, origin.2],
+            [direction.0, direction.1, direction.2],
+        ) else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("point", hit.point)?;
+        dict.set_item("normal", hit.normal)?;
+        dict.set_item("distance", hit.distance)?;
+        dict.set_item("triangle_index", hit.triangle_index)?;
+        Ok(Some(dict.unbind()))
+    }
+
+    fn sphere_overlap(&self, centre: (f32, f32, f32), radius: f32) -> PyResult<bool> {
+        if !radius.is_finite() || radius < 0.0 {
+            return Err(PyRuntimeError::new_err(
+                "radius must be a finite non-negative number",
+            ));
+        }
+        Ok(self
+            .hub
+            .sphere_overlap([centre.0, centre.1, centre.2], radius))
+    }
+
+    fn ground_height(
+        &self,
+        origin: (f32, f32, f32),
+        max_distance: f32,
+        py: Python<'_>,
+    ) -> PyResult<Option<Py<PyDict>>> {
+        if !max_distance.is_finite() || max_distance < 0.0 {
+            return Err(PyRuntimeError::new_err(
+                "max_distance must be a finite non-negative number",
+            ));
+        }
+        let Some(hit) = self
+            .hub
+            .ground_height([origin.0, origin.1, origin.2], max_distance)
+        else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("point", hit.point)?;
+        dict.set_item("normal", hit.normal)?;
+        dict.set_item("distance", hit.distance)?;
+        dict.set_item("triangle_index", hit.triangle_index)?;
+        Ok(Some(dict.unbind()))
+    }
+}
+
+#[pymethods]
+impl DomainHostBridge {
+    /// Invite other to user, or accept their pending invite.
+    /// Returns the new state token or raises an exception.
+    #[pyo3(name = "friends_add")]
+    fn friends_add(&self, user: &str, other: &str) -> PyResult<String> {
+        self.host
+            .friends_add(user, other)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Remove any relation between the two.
+    /// Returns whether anything was removed or raises an exception.
+    #[pyo3(name = "friends_remove")]
+    fn friends_remove(&self, user: &str, other: &str) -> PyResult<bool> {
+        self.host
+            .friends_remove(user, other)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Block other from user's side.
+    /// Raises an exception on error.
+    #[pyo3(name = "friends_block")]
+    fn friends_block(&self, user: &str, other: &str) -> PyResult<()> {
+        self.host
+            .friends_block(user, other)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// List user's relations.
+    /// Returns a list of dicts or raises an exception.
+    #[pyo3(name = "friends_list")]
+    fn friends_list(&self, user: &str, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let rows = self
+            .host
+            .friends_list(user)
+            .map_err(PyRuntimeError::new_err)?;
+
+        let list = PyList::empty(py);
+        for row in rows {
+            let dict = PyDict::new(py);
+            dict.set_item("user_id", &row.user_id)?;
+            dict.set_item("state", &row.state)?;
+            dict.set_item("updated_unix_ms", row.updated_unix_ms)?;
+            list.append(dict)?;
+        }
+        Ok(list.into())
+    }
+
+    #[pyo3(name = "notifications_send")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The Python host API deliberately mirrors the documented positional notification signature."
+    )]
+    fn notifications_send(
+        &self,
+        recipient: &str,
+        code: i32,
+        subject: &str,
+        content_json: &str,
+        sender: Option<&str>,
+        delivery_key: Option<&str>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyDict>> {
+        let notification = self
+            .host
+            .notifications_send(recipient, code, subject, content_json, sender, delivery_key)
+            .map_err(PyRuntimeError::new_err)?;
+        notification_py_dict(py, notification)
+    }
+
+    #[pyo3(name = "notifications_list")]
+    fn notifications_list(
+        &self,
+        recipient: &str,
+        limit: usize,
+        cursor: Option<&str>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyDict>> {
+        let page = self
+            .host
+            .notifications_list(recipient, limit, cursor)
+            .map_err(PyRuntimeError::new_err)?;
+        let out = PyDict::new(py);
+        let items = PyList::empty(py);
+        for notification in page.items {
+            items.append(notification_py_dict(py, notification)?)?;
+        }
+        out.set_item("items", items)?;
+        out.set_item("next_cursor", page.next_cursor)?;
+        Ok(out.unbind())
+    }
+
+    #[pyo3(name = "notifications_mark_read")]
+    fn notifications_mark_read(&self, recipient: &str, ids: Vec<String>) -> PyResult<Vec<String>> {
+        self.host
+            .notifications_mark_read(recipient, &ids)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(name = "groups_call")]
+    fn groups_call(&self, actor: &str, operation: &str, payload_json: &str) -> PyResult<String> {
+        self.host
+            .groups_call(actor, operation, payload_json)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(name = "leaderboards_call")]
+    fn leaderboards_call(
+        &self,
+        actor: &str,
+        operation: &str,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.host
+            .leaderboards_call(actor, operation, payload_json)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(name = "chat_call")]
+    fn chat_call(&self, actor: &str, operation: &str, payload_json: &str) -> PyResult<String> {
+        self.host
+            .chat_call(actor, operation, payload_json)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(name = "wallet_call")]
+    fn wallet_call(&self, actor: &str, operation: &str, payload_json: &str) -> PyResult<String> {
+        self.host
+            .wallet_call(actor, operation, payload_json)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(name = "storage_read")]
+    fn storage_read(
+        &self,
+        user: &str,
+        collection: &str,
+        key: &str,
+        py: Python<'_>,
+    ) -> PyResult<Option<Py<PyDict>>> {
+        self.host
+            .storage_read(user, collection, key)
+            .map_err(PyRuntimeError::new_err)?
+            .map(|object| storage_object_dict(object, py))
+            .transpose()
+    }
+
+    #[pyo3(name = "storage_write")]
+    #[allow(clippy::too_many_arguments)]
+    fn storage_write(
+        &self,
+        user: &str,
+        collection: &str,
+        key: &str,
+        value_json: &str,
+        expected_version: Option<&str>,
+        read_permission: Option<u8>,
+        write_permission: Option<u8>,
+        included_index_names_json: Option<&str>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyDict>> {
+        let object = self
+            .host
+            .storage_write(
+                StorageWriteInput::new(user, collection, key, value_json)
+                    .expecting(expected_version)
+                    .with_permissions(read_permission, write_permission)
+                    .with_included_index_names_json(included_index_names_json),
+            )
+            .map_err(PyRuntimeError::new_err)?;
+        storage_object_dict(object, py)
+    }
+
+    #[pyo3(name = "storage_index_candidates")]
+    fn storage_index_candidates(
+        &self,
+        user: &str,
+        collection: &str,
+        key: &str,
+    ) -> PyResult<Vec<String>> {
+        self.host
+            .storage_index_candidates(user, collection, key)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(name = "storage_delete")]
+    fn storage_delete(
+        &self,
+        user: &str,
+        collection: &str,
+        key: &str,
+        expected_version: Option<&str>,
+    ) -> PyResult<()> {
+        self.host
+            .storage_delete(user, collection, key, expected_version)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[pyo3(name = "storage_index_query")]
+    fn storage_index_query(
+        &self,
+        index_name: &str,
+        filters_json: &str,
+        limit: usize,
+        py: Python<'_>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        self.host
+            .storage_index_query(index_name, filters_json, limit)
+            .map_err(PyRuntimeError::new_err)?
+            .into_iter()
+            .map(|object| storage_index_object_dict(object, py))
+            .collect()
+    }
+}
+
+fn storage_object_dict(
+    object: crate::runtime::StorageObjectDto,
+    py: Python<'_>,
+) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("value_json", object.value_json)?;
+    dict.set_item("version", object.version)?;
+    dict.set_item("read_permission", object.read_permission)?;
+    dict.set_item("write_permission", object.write_permission)?;
+    Ok(dict.into())
+}
+
+fn storage_index_object_dict(
+    object: crate::runtime::StorageIndexObjectDto,
+    py: Python<'_>,
+) -> PyResult<Py<PyDict>> {
+    let dict = storage_object_dict(object.object, py)?;
+    let dict = dict.bind(py);
+    dict.set_item("user_id", object.user_id)?;
+    dict.set_item("collection", object.collection)?;
+    dict.set_item("key", object.key)?;
+    Ok(dict.clone().unbind())
+}
+
+struct PythonVm {
+    citadel: Py<PyModule>,
+    source_label: String,
+    python_version: String,
+    /// Parsed static gameplay data initialized with this VM. Replaced atomically
+    /// with the VM on hot reload so a bad data edit cannot partially publish.
+    static_data: StaticDataCatalog,
+}
+
+/// Embedded CPython runtime that implements the language-neutral runtime trait.
+pub struct PythonRuntime {
+    vm: Mutex<PythonVm>,
+    budget: Duration,
+    reload_path: Option<PathBuf>,
+    module_root: Option<PathBuf>,
+    /// Optional operator-owned static-data directory, distinct from scripts.
+    /// Retained so a hot reload builds a fresh catalog from the same root.
+    static_data_dir: Option<PathBuf>,
+    /// Per-file static-data read bound retained across reloads.
+    static_data_max_file_bytes: usize,
+    /// Persisted-domain-services seam exposed to `citadel.friends_*` host calls
+    ///, or `None` when no services are attached. Retained so a
+    /// hot-reload re-applies it to the fresh VM.
+    domain: Option<Arc<dyn DomainHost>>,
+    maps: Option<Arc<MapCatalog>>,
+    transform_hub: Option<Arc<TransformHub>>,
+}
+
+impl std::fmt::Debug for PythonRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonRuntime")
+            .field("budget", &self.budget)
+            .field("reload_path", &self.reload_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PythonRuntime {
+    /// Load `main.py` from `scripts_dir`, or `Ok(None)` if it is absent.
+    pub fn load(scripts_dir: &Path, deadline_ms: u64) -> AppResult<Option<Self>> {
+        Self::load_with_static_data(
+            scripts_dir,
+            deadline_ms,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+        )
+    }
+
+    /// Load `main.py` with an optional, separately configured static-data root.
+    ///
+    /// The root is never made visible to Python. The script can only request
+    /// validated relative JSON/CSV paths through `citadel.static_data` while its
+    /// top-level initialization body runs.
+    pub fn load_with_static_data(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+    ) -> AppResult<Option<Self>> {
+        let main = scripts_dir.join(PYTHON_ENTRYPOINT);
+        if !main.is_file() {
+            return Ok(None);
+        }
+        let source = read_script(&main)?;
+        let module_root = scripts_dir.to_path_buf();
+        let source_label = main.display().to_string();
+        let static_data = StaticDataCatalog::new(static_data_dir, static_data_max_file_bytes)?;
+        let vm = build_python(
+            &source,
+            &source_label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            PythonBuildOptions {
+                module_root: Some(&module_root),
+                domain: &None,
+                maps: &None,
+                transform_hub: &None,
+                static_data,
+            },
+        )?;
+        Ok(Some(Self {
+            vm: Mutex::new(vm),
+            budget: Duration::from_millis(deadline_ms.max(1)),
+            reload_path: Some(main),
+            module_root: Some(module_root),
+            static_data_dir: static_data_dir.map(Path::to_path_buf),
+            static_data_max_file_bytes,
+            domain: None,
+            maps: None,
+            transform_hub: None,
+        }))
+    }
+
+    /// Build a runtime from inline Python source.
+    pub fn from_source(
+        source: &str,
+        label: impl Into<String>,
+        deadline_ms: u64,
+    ) -> AppResult<Self> {
+        let source_label = label.into();
+        let static_data =
+            StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let vm = build_python(
+            source,
+            &source_label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            PythonBuildOptions {
+                module_root: None,
+                domain: &None,
+                maps: &None,
+                transform_hub: &None,
+                static_data,
+            },
+        )?;
+        Ok(Self {
+            vm: Mutex::new(vm),
+            budget: Duration::from_millis(deadline_ms.max(1)),
+            reload_path: None,
+            module_root: None,
+            static_data_dir: None,
+            static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            domain: None,
+            maps: None,
+            transform_hub: None,
+        })
+    }
+
+    /// Build a runtime from inline source with a root added to `sys.path`.
+    pub fn from_source_with_root(
+        source: &str,
+        label: impl Into<String>,
+        deadline_ms: u64,
+        module_root: &Path,
+    ) -> AppResult<Self> {
+        let source_label = label.into();
+        let static_data =
+            StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let vm = build_python(
+            source,
+            &source_label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            PythonBuildOptions {
+                module_root: Some(module_root),
+                domain: &None,
+                maps: &None,
+                transform_hub: &None,
+                static_data,
+            },
+        )?;
+        Ok(Self {
+            vm: Mutex::new(vm),
+            budget: Duration::from_millis(deadline_ms.max(1)),
+            reload_path: None,
+            module_root: Some(module_root.to_path_buf()),
+            static_data_dir: None,
+            static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            domain: None,
+            maps: None,
+            transform_hub: None,
+        })
+    }
+
+    /// Attach the persisted-domain-services seam, consuming and returning `self`
+    /// (builder style, before the runtime is shared as `Arc<dyn Runtime>`).
+    ///
+    /// Enables the `citadel.friends_*` host functions. The handle is
+    /// applied to the current VM's app-data and retained so a hot-reload
+    /// re-applies it to the rebuilt VM.
+    #[must_use]
+    pub fn with_domain_host(mut self, host: Arc<dyn DomainHost>) -> Self {
+        self.domain = Some(host);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_domain_host(&guard.citadel, &self.domain);
+        }
+        self
+    }
+
+    /// Attach the loaded-map catalog for read-only `citadel.map_info` calls.
+    #[must_use]
+    pub fn with_maps(mut self, maps: Arc<MapCatalog>) -> Self {
+        self.maps = Some(maps);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_map_catalog(&guard.citadel, &self.maps);
+        }
+        self
+    }
+
+    /// Attach the transform hub for synchronous `citadel.physics_state` reads.
+    #[must_use]
+    pub fn with_transform_hub(mut self, hub: Arc<TransformHub>) -> Self {
+        self.transform_hub = Some(hub);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_transform_hub(&guard.citadel, &self.transform_hub);
+        }
+        self
+    }
+
+    /// Names registered into Python's `citadel` module by this adapter.
+    #[must_use]
+    pub fn registered_host_api_names() -> HashSet<&'static str> {
+        PYTHON_HOST_API_NAMES.iter().copied().collect()
+    }
+
+    /// Whether this runtime is backed by an on-disk script.
+    #[must_use]
+    pub fn is_reloadable(&self) -> bool {
+        self.reload_path.is_some()
+    }
+
+    /// Rebuild from the backing `main.py`, rejecting broken or handlerless edits.
+    pub fn reload(&self) -> ReloadOutcome {
+        let Some(path) = self.reload_path.as_deref() else {
+            return ReloadOutcome::NotReloadable;
+        };
+        let label = path.display().to_string();
+        let source = match read_script(path) {
+            Ok(source) => source,
+            Err(e) => {
+                tracing::error!(
+                    script = %label,
+                    error = %e,
+                    "python hot-reload: cannot read script; keeping current runtime"
+                );
+                return ReloadOutcome::Rejected;
+            }
+        };
+        let fresh_static_data = match StaticDataCatalog::new(
+            self.static_data_dir.as_deref(),
+            self.static_data_max_file_bytes,
+        ) {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                tracing::error!(
+                    script = %label,
+                    error = %e,
+                    "python hot-reload: cannot initialize static-data catalog; keeping the current script and data"
+                );
+                return ReloadOutcome::Rejected;
+            }
+        };
+        let fresh = match build_python(
+            &source,
+            &label,
+            Duration::from_millis(LOAD_DEADLINE_MS),
+            PythonBuildOptions {
+                module_root: self.module_root.as_deref(),
+                domain: &self.domain,
+                maps: &self.maps,
+                transform_hub: &self.transform_hub,
+                static_data: fresh_static_data,
+            },
+        ) {
+            Ok(vm) => vm,
+            Err(e) => {
+                tracing::error!(
+                    script = %label,
+                    error = %e,
+                    "python hot-reload: new script rejected; keeping current runtime"
+                );
+                return ReloadOutcome::Rejected;
+            }
+        };
+        if !vm_has_any_handler(&fresh) {
+            tracing::warn!(
+                script = %label,
+                "python hot-reload: new script registered no handlers; keeping current runtime"
+            );
+            return ReloadOutcome::Rejected;
+        }
+        {
+            let mut guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = fresh;
+        }
+        tracing::info!(
+            script = %path.display(),
+            "python hot-reload: swapped in updated script"
+        );
+        ReloadOutcome::Reloaded
+    }
+
+    /// Entry script plus the static-data files initialized by the live VM.
+    ///
+    /// The returned list is consumed by the development hot-reload watcher only;
+    /// it never participates in runtime dispatch or tick execution.
+    #[must_use]
+    pub fn reload_watch_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.reload_path.iter().cloned().collect::<Vec<_>>();
+        let guard = self
+            .vm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        paths.extend(guard.static_data.loaded_paths());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Per-invocation budget used for non-tick handlers.
+    #[must_use]
+    pub fn budget(&self) -> Duration {
+        self.budget
+    }
+
+    /// Dispatch a message handler.
+    pub fn dispatch(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        self.run_commands("message", self.budget, |py, module| {
+            let ctx = make_ctx(module, sender, user_id, Some(kind), None, None)?;
+            let body = PyBytes::new(py, body);
+            module
+                .getattr("_dispatch_message")?
+                .call1((kind, ctx, body))?
+                .extract::<bool>()
+        })
+    }
+
+    /// Dispatch a message with the authoritative room id exposed as
+    /// `ctx.room_id`.
+    pub fn dispatch_in_room(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: u64,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        self.run_commands("match_message", self.budget, |py, module| {
+            let ctx = make_ctx(module, sender, user_id, Some(kind), None, Some(room_id))?;
+            let body = PyBytes::new(py, body);
+            module
+                .getattr("_dispatch_message")?
+                .call1((kind, ctx, body))?
+                .extract::<bool>()
+        })
+    }
+
+    /// Dispatch `on_join` or `on_leave`.
+    pub fn dispatch_lifecycle(
+        &self,
+        hook: LifecycleHook,
+        sender: u64,
+        user_id: Option<&str>,
+    ) -> Vec<OutboundCommand> {
+        let hook_name = match hook {
+            LifecycleHook::Join => "on_join",
+            LifecycleHook::Leave => "on_leave",
+        };
+        self.run_commands(hook_name, self.budget, |_, module| {
+            let ctx = make_ctx(module, sender, user_id, None, None, None)?;
+            module
+                .getattr("_dispatch_lifecycle")?
+                .call1((hook_name, ctx))?
+                .extract::<bool>()
+        })
+    }
+
+    /// Dispatch the periodic tick handler with `dt` in seconds.
+    pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        let dt_secs = dt.as_secs_f64();
+        self.run_commands("on_tick", budget, |_, module| {
+            module
+                .getattr("_dispatch_tick")?
+                .call1((dt_secs,))?
+                .extract::<bool>()
+        })
+    }
+
+    /// Dispatch an RPC handler.
+    pub fn call_rpc(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        method: &str,
+        body: &[u8],
+    ) -> RpcOutcome {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Python::attach(|py| -> PyResult<PythonRpcInner> {
+                let module = guard.citadel.bind(py);
+                clear_commands(module);
+                let result = run_with_python_deadline(module, self.budget, || {
+                    let ctx = make_ctx(module, sender, user_id, None, Some(method), None)?;
+                    let body = PyBytes::new(py, body);
+                    let reply = module.getattr("_call_rpc")?.call1((method, ctx, body))?;
+                    parse_rpc_reply(reply)
+                });
+                clear_commands(module);
+                result
+            })
+        }));
+        match outcome {
+            Ok(Ok(PythonRpcInner::Reply(bytes))) => RpcOutcome::Ok(bytes),
+            Ok(Ok(PythonRpcInner::HandlerErr(msg))) => RpcOutcome::Err(msg),
+            Ok(Ok(PythonRpcInner::NoHandler)) => {
+                tracing::debug!(
+                    script = %guard.source_label,
+                    method,
+                    "no python rpc handler for method"
+                );
+                RpcOutcome::Err(format!("{RPC_ERR_UNKNOWN_METHOD}: {method}"))
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    method,
+                    error = %e,
+                    "python rpc handler error; isolated"
+                );
+                if is_timeout_error(&e) {
+                    RpcOutcome::Err(RPC_ERR_TIMEOUT.to_string())
+                } else {
+                    RpcOutcome::Err(RPC_ERR_HANDLER.to_string())
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    method,
+                    "python rpc handler panicked; isolated"
+                );
+                clear_vm_commands(&guard);
+                RpcOutcome::Err(RPC_ERR_HANDLER.to_string())
+            }
+        }
+    }
+
+    /// Dispatch room-create hook.
+    pub fn call_room_create(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        params: &[u8],
+    ) -> Option<RoomSpec> {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Python::attach(|py| -> PyResult<Option<RoomSpec>> {
+                let module = guard.citadel.bind(py);
+                clear_commands(module);
+                let result = run_with_python_deadline(module, self.budget, || {
+                    let ctx = make_ctx(module, sender, user_id, None, Some("room.create"), None)?;
+                    let params = PyBytes::new(py, params);
+                    let spec = module.getattr("_call_room_create")?.call1((ctx, params))?;
+                    parse_room_spec(spec)
+                });
+                clear_commands(module);
+                result
+            })
+        }));
+        match outcome {
+            Ok(Ok(spec)) => spec,
+            Ok(Err(e)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    error = %e,
+                    "python on_room_create error; isolated, using default label"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    "python on_room_create panicked; isolated"
+                );
+                clear_vm_commands(&guard);
+                None
+            }
+        }
+    }
+
+    /// Dispatch room-join admission gate.
+    pub fn call_room_join(&self, sender: u64, user_id: Option<&str>, room_id: u64) -> bool {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Python::attach(|py| -> PyResult<Option<bool>> {
+                let module = guard.citadel.bind(py);
+                clear_commands(module);
+                let result = run_with_python_deadline(module, self.budget, || {
+                    let ctx = make_ctx(
+                        module,
+                        sender,
+                        user_id,
+                        None,
+                        Some("room.join"),
+                        Some(room_id),
+                    )?;
+                    module
+                        .getattr("_call_room_join")?
+                        .call1((ctx, room_id))?
+                        .extract::<Option<bool>>()
+                });
+                clear_commands(module);
+                result
+            })
+        }));
+        match outcome {
+            Ok(Ok(decision)) => decision.unwrap_or(true),
+            Ok(Err(e)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    error = %e,
+                    "python on_room_join error; isolated, rejecting"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    "python on_room_join panicked; isolated, rejecting"
+                );
+                clear_vm_commands(&guard);
+                false
+            }
+        }
+    }
+
+    /// Whether an `on_tick` handler is registered.
+    #[must_use]
+    pub fn has_tick_handler(&self) -> bool {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        Python::attach(|py| -> PyResult<bool> {
+            guard
+                .citadel
+                .bind(py)
+                .getattr("_has_tick_handler")?
+                .call0()?
+                .extract()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Point-in-time handler introspection for console/API surfaces.
+    #[must_use]
+    pub fn introspect(&self) -> RuntimeIntrospection {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let (rpcs, message_kinds, hooks) = Python::attach(|py| {
+            guard
+                .citadel
+                .bind(py)
+                .getattr("_introspect")?
+                .call0()?
+                .extract::<(Vec<String>, Vec<u32>, Vec<String>)>()
+        })
+        .unwrap_or_default();
+        RuntimeIntrospection {
+            source: format!("{} ({})", guard.source_label, guard.python_version),
+            reloadable: self.reload_path.is_some(),
+            deadline_ms: u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
+            rpcs,
+            message_kinds,
+            hooks,
+        }
+    }
+
+    fn run_commands<F>(&self, what: &str, budget: Duration, call: F) -> Vec<OutboundCommand>
+    where
+        F: FnOnce(Python<'_>, &Bound<'_, PyModule>) -> PyResult<bool>,
+    {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Python::attach(|py| -> PyResult<Vec<OutboundCommand>> {
+                let module = guard.citadel.bind(py);
+                clear_commands(module);
+                let ran = run_with_python_deadline(module, budget, || call(py, module));
+                match ran {
+                    Ok(true) => take_commands(module, &guard.source_label, what),
+                    Ok(false) => {
+                        clear_commands(module);
+                        Ok(Vec::new())
+                    }
+                    Err(e) => {
+                        clear_commands(module);
+                        Err(e)
+                    }
+                }
+            })
+        }));
+        match outcome {
+            Ok(Ok(commands)) => commands,
+            Ok(Err(e)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = what,
+                    error = %e,
+                    "python handler error; isolated, side effects discarded"
+                );
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = what,
+                    "python handler panicked; isolated and dropped"
+                );
+                clear_vm_commands(&guard);
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Apply the read-only map catalog bridge to a freshly-built Python VM.
+fn apply_map_catalog(citadel: &Py<PyModule>, maps: &Option<Arc<MapCatalog>>) {
+    if let Some(maps) = maps {
+        Python::attach(|py| {
+            if let Err(e) = citadel.bind(py).setattr(
+                "_map_catalog_bridge",
+                MapCatalogBridge {
+                    maps: Arc::clone(maps),
+                },
+            ) {
+                tracing::warn!(error = %e, "failed to set map catalog bridge on python module");
+            }
+        });
+    }
+}
+
+/// Apply the synchronous transform-physics read bridge to a freshly-built VM.
+fn apply_transform_hub(citadel: &Py<PyModule>, hub: &Option<Arc<TransformHub>>) {
+    if let Some(hub) = hub {
+        Python::attach(|py| {
+            if let Err(e) = citadel.bind(py).setattr(
+                "_transform_hub_bridge",
+                TransformHubHandle {
+                    hub: Arc::clone(hub),
+                },
+            ) {
+                tracing::warn!(error = %e, "failed to set transform hub bridge on python module");
+            }
+        });
+    }
+}
+
+impl Runtime for PythonRuntime {
+    fn dispatch(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        PythonRuntime::dispatch(self, sender, user_id, kind, body)
+    }
+
+    fn dispatch_in_room(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: u64,
+        kind: u16,
+        body: &[u8],
+    ) -> Vec<OutboundCommand> {
+        PythonRuntime::dispatch_in_room(self, sender, user_id, room_id, kind, body)
+    }
+
+    fn dispatch_lifecycle(
+        &self,
+        hook: LifecycleHook,
+        sender: u64,
+        user_id: Option<&str>,
+    ) -> Vec<OutboundCommand> {
+        PythonRuntime::dispatch_lifecycle(self, hook, sender, user_id)
+    }
+
+    fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        PythonRuntime::tick(self, dt, budget)
+    }
+
+    fn call_rpc(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        method: &str,
+        body: &[u8],
+    ) -> RpcOutcome {
+        PythonRuntime::call_rpc(self, sender, user_id, method, body)
+    }
+
+    fn call_room_create(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        params: &[u8],
+    ) -> Option<RoomSpec> {
+        PythonRuntime::call_room_create(self, sender, user_id, params)
+    }
+
+    fn call_room_join(&self, sender: u64, user_id: Option<&str>, room_id: u64) -> bool {
+        PythonRuntime::call_room_join(self, sender, user_id, room_id)
+    }
+
+    fn has_tick_handler(&self) -> bool {
+        PythonRuntime::has_tick_handler(self)
+    }
+
+    fn budget(&self) -> Duration {
+        PythonRuntime::budget(self)
+    }
+
+    fn introspect(&self) -> RuntimeIntrospection {
+        PythonRuntime::introspect(self)
+    }
+
+    fn is_reloadable(&self) -> bool {
+        PythonRuntime::is_reloadable(self)
+    }
+
+    fn reload(&self) -> ReloadOutcome {
+        PythonRuntime::reload(self)
+    }
+
+    fn reload_watch_paths(&self) -> Vec<PathBuf> {
+        PythonRuntime::reload_watch_paths(self)
+    }
+}
+
+enum PythonRpcInner {
+    Reply(Vec<u8>),
+    HandlerErr(String),
+    NoHandler,
+}
+
+/// Apply the domain-host seam to a freshly-built VM's citadel module,
+/// registering the friends host functions if a domain is provided.
+/// Called after each VM build (initial + hot-reload).
+fn apply_domain_host(citadel: &Py<PyModule>, domain: &Option<Arc<dyn DomainHost>>) {
+    if let Some(host) = domain {
+        Python::attach(|py| {
+            let module = citadel.bind(py);
+            // Create and set the bridge object so friends functions can call through to Rust
+            let bridge = DomainHostBridge {
+                host: Arc::clone(host),
+            };
+            if let Err(e) = module.setattr("_domain_host_bridge", bridge) {
+                tracing::warn!(error = %e, "failed to set domain host bridge on python module");
+            }
+        });
+    }
+}
+
+/// Install the small static-data capability before game-script initialization.
+/// The Python script receives only a bridge returning parsed values; it never
+/// receives a filesystem path, file descriptor, or directory handle.
+fn install_static_data(
+    citadel: &Bound<'_, PyModule>,
+    static_data: StaticDataCatalog,
+) -> PyResult<()> {
+    citadel.setattr(
+        "static_data",
+        StaticDataBridge {
+            catalog: static_data,
+        },
+    )
+}
+
+fn install_outbound_http(citadel: &Bound<'_, PyModule>) -> PyResult<()> {
+    let client =
+        TrustedHttpClient::new().map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    citadel.setattr("_http_bridge", OutboundHttpBridge { client })
+}
+
+fn static_data_python_error(error: crate::runtime::static_data::StaticDataError) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
+}
+
+/// Convert parsed catalog JSON into ordinary, mutable Python dictionaries and
+/// lists. The catalog remains the immutable cached source, so a script can
+/// reshape its returned value without mutating cache entries or future reloads.
+fn static_data_value_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    py.import("json")?
+        .call_method1("loads", (value.to_string(),))
+        .map(Bound::unbind)
+}
+
+struct PythonBuildOptions<'a> {
+    module_root: Option<&'a Path>,
+    domain: &'a Option<Arc<dyn DomainHost>>,
+    maps: &'a Option<Arc<MapCatalog>>,
+    transform_hub: &'a Option<Arc<TransformHub>>,
+    static_data: StaticDataCatalog,
+}
+
+fn build_python(
+    source: &str,
+    source_label: &str,
+    load_budget: Duration,
+    options: PythonBuildOptions<'_>,
+) -> AppResult<PythonVm> {
+    let PythonBuildOptions {
+        module_root,
+        domain,
+        maps,
+        transform_hub,
+        static_data,
+    } = options;
+    let prelude = cstring(PYTHON_HOST_PRELUDE, "python host prelude")?;
+    let source = cstring(source, "python source")?;
+    let filename = cstring(source_label, "python source label")?;
+    let module_id = PYTHON_MODULE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let main_module_name = cstring(
+        &format!("citadel_game_main_{module_id}"),
+        "python main module name",
+    )?;
+    let host_module_name = cstring(
+        &format!("citadel_host_{module_id}"),
+        "python host module name",
+    )?;
+    let _build_guard = PYTHON_BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Python::attach(|py| -> PyResult<PythonVm> {
+        let citadel = PyModule::from_code(
+            py,
+            prelude.as_c_str(),
+            c"citadel.py",
+            host_module_name.as_c_str(),
+        )?;
+        let sys = py.import("sys")?;
+        let modules: Bound<'_, PyDict> = sys.getattr("modules")?.cast_into()?;
+        modules.set_item("citadel", &citadel)?;
+        install_static_data(&citadel, static_data.clone())?;
+        install_outbound_http(&citadel)?;
+        if let Some(root) = module_root {
+            let root = root.to_string_lossy().to_string();
+            citadel.getattr("_prepare_imports")?.call1((root,))?;
+        }
+        run_with_python_deadline(&citadel, load_budget, || {
+            PyModule::from_code(
+                py,
+                source.as_c_str(),
+                filename.as_c_str(),
+                main_module_name.as_c_str(),
+            )?;
+            Ok(())
+        })?;
+        static_data.seal();
+        let version = sys.getattr("version")?.extract::<String>()?;
+        let vm = PythonVm {
+            citadel: citadel.unbind(),
+            source_label: source_label.to_string(),
+            python_version: version,
+            static_data,
+        };
+        Ok(vm)
+    })
+    .map_err(|e| script_error(&format!("failed to load {source_label}"), &e))
+    .inspect(|vm| {
+        apply_domain_host(&vm.citadel, domain);
+        apply_map_catalog(&vm.citadel, maps);
+        apply_transform_hub(&vm.citadel, transform_hub);
+    })
+}
+
+fn run_with_python_deadline<T>(
+    module: &Bound<'_, PyModule>,
+    budget: Duration,
+    call: impl FnOnce() -> PyResult<T>,
+) -> PyResult<T> {
+    let watchdog = WatchdogGuard::new(budget);
+    module
+        .getattr("_arm_deadline")?
+        .call1((budget.as_secs_f64(),))?;
+    let result = call();
+    let clear_result = module.getattr("_clear_deadline")?.call0();
+    match (result, clear_result) {
+        (Ok(_), Ok(_)) if watchdog.expired() => {
+            Err(PyRuntimeError::new_err("handler exceeded its time budget"))
+        }
+        (Ok(value), Ok(_)) => Ok(value),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+    }
+}
+
+fn make_ctx<'py>(
+    module: &Bound<'py, PyModule>,
+    sender: u64,
+    user_id: Option<&str>,
+    kind: Option<u16>,
+    method: Option<&str>,
+    room_id: Option<u64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    module
+        .getattr("_make_ctx")?
+        .call1((sender, user_id, kind, method, room_id))
+}
+
+fn clear_commands(module: &Bound<'_, PyModule>) {
+    if let Err(e) = module.getattr("_reset_commands").and_then(|f| f.call0()) {
+        tracing::warn!(error = %e, "failed to clear python command sink");
+    }
+}
+
+fn clear_vm_commands(vm: &PythonVm) {
+    let _ = Python::attach(|py| -> PyResult<()> {
+        clear_commands(vm.citadel.bind(py));
+        Ok(())
+    });
+}
+
+fn take_commands(
+    module: &Bound<'_, PyModule>,
+    label: &str,
+    handler: &str,
+) -> PyResult<Vec<OutboundCommand>> {
+    let taken = module.getattr("_take_commands")?.call0()?;
+    let tuple: Bound<'_, PyTuple> = taken.cast_into()?;
+    let commands_obj = tuple.get_item(0)?;
+    let overflowed = tuple.get_item(1)?.extract::<bool>()?;
+    if overflowed {
+        tracing::warn!(
+            script = %label,
+            handler,
+            cap = MAX_OUTBOUND_COMMANDS,
+            "python handler exceeded outbound command cap; extra commands dropped"
+        );
+    }
+    parse_commands(commands_obj)
+}
+
+fn parse_commands(commands: Bound<'_, PyAny>) -> PyResult<Vec<OutboundCommand>> {
+    let list: Bound<'_, PyList> = commands.cast_into()?;
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let tuple: Bound<'_, PyTuple> = item.cast_into()?;
+        let tag = tuple.get_item(0)?.extract::<String>()?;
+        let command = match tag.as_str() {
+            "broadcast" => OutboundCommand::Broadcast {
+                kind: tuple.get_item(1)?.extract()?,
+                body: tuple.get_item(2)?.extract()?,
+                unreliable: tuple.get_item(3)?.extract()?,
+            },
+            "send" => OutboundCommand::Send {
+                session: tuple.get_item(1)?.extract()?,
+                kind: tuple.get_item(2)?.extract()?,
+                body: tuple.get_item(3)?.extract()?,
+                unreliable: tuple.get_item(4)?.extract()?,
+            },
+            "spawn_actor" => OutboundCommand::SpawnActor {
+                object_id: tuple.get_item(1)?.extract()?,
+                archetype: tuple.get_item(2)?.extract()?,
+                position: [
+                    tuple.get_item(3)?.extract()?,
+                    tuple.get_item(4)?.extract()?,
+                    tuple.get_item(5)?.extract()?,
+                ],
+            },
+            "move_actor" => OutboundCommand::MoveActor {
+                object_id: tuple.get_item(1)?.extract()?,
+                position: [
+                    tuple.get_item(2)?.extract()?,
+                    tuple.get_item(3)?.extract()?,
+                    tuple.get_item(4)?.extract()?,
+                ],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [
+                    tuple.get_item(5)?.extract()?,
+                    tuple.get_item(6)?.extract()?,
+                    tuple.get_item(7)?.extract()?,
+                ],
+            },
+            "despawn_actor" => OutboundCommand::DespawnActor {
+                object_id: tuple.get_item(1)?.extract()?,
+            },
+            "set_physics" => {
+                let options_json: Option<String> = tuple.get_item(2)?.extract()?;
+                let opts = options_json
+                    .as_deref()
+                    .map(physics_options_from_json)
+                    .transpose()
+                    .map_err(PyRuntimeError::new_err)?;
+                OutboundCommand::SetPhysics {
+                    object_id: tuple.get_item(1)?.extract()?,
+                    opts,
+                }
+            }
+            "apply_impulse" => OutboundCommand::ApplyImpulse {
+                object_id: tuple.get_item(1)?.extract()?,
+                impulse: [
+                    tuple.get_item(2)?.extract()?,
+                    tuple.get_item(3)?.extract()?,
+                    tuple.get_item(4)?.extract()?,
+                ],
+            },
+            "set_move_intent" => OutboundCommand::SetMoveIntent {
+                object_id: tuple.get_item(1)?.extract()?,
+                intent: [
+                    tuple.get_item(2)?.extract()?,
+                    tuple.get_item(3)?.extract()?,
+                    tuple.get_item(4)?.extract()?,
+                ],
+            },
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unknown outbound command tag: {other}"
+                )));
+            }
+        };
+        out.push(command);
+    }
+    Ok(out)
+}
+
+fn physics_options_from_json(input: &str) -> Result<PhysicsOptions, String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        gravity: Option<f32>,
+        buoyancy: Option<f32>,
+        drag: Option<f32>,
+        radius: Option<f32>,
+        height: Option<f32>,
+        max_speed: Option<f32>,
+        shape: Option<String>,
+        enabled: Option<bool>,
+    }
+
+    let input: Input = serde_json::from_str(input)
+        .map_err(|e| format!("physics options must be an object: {e}"))?;
+    let mut config = PhysicsConfig::default();
+    config.gravity = input.gravity.unwrap_or(config.gravity);
+    config.buoyancy = input.buoyancy.unwrap_or(config.buoyancy);
+    config.drag = input.drag.unwrap_or(config.drag);
+    config.max_speed = input.max_speed.unwrap_or(config.max_speed);
+    let (default_radius, default_height) = match config.shape {
+        Shape::Capsule { radius, height } => (radius, height),
+        Shape::Aabb { half_extents } => (half_extents[0], half_extents[1] * 2.0),
+    };
+    let radius = input.radius.unwrap_or(default_radius);
+    let height = input.height.unwrap_or(default_height);
+    config.shape = match input.shape.as_deref() {
+        None | Some("capsule") => Shape::Capsule { radius, height },
+        Some("aabb") => Shape::Aabb {
+            half_extents: [radius, height * 0.5, radius],
+        },
+        Some(shape) => {
+            return Err(format!(
+                "unsupported physics shape '{shape}' (expected 'capsule' or 'aabb')"
+            ));
+        }
+    };
+    Ok(PhysicsOptions {
+        enabled: input.enabled.unwrap_or(true),
+        config,
+    })
+}
+
+fn parse_rpc_reply(reply: Bound<'_, PyAny>) -> PyResult<PythonRpcInner> {
+    if reply.is_none() {
+        return Ok(PythonRpcInner::NoHandler);
+    }
+    let tuple: Bound<'_, PyTuple> = reply.cast_into()?;
+    let ok = tuple.get_item(0)?.extract::<bool>()?;
+    if ok {
+        Ok(PythonRpcInner::Reply(tuple.get_item(1)?.extract()?))
+    } else {
+        Ok(PythonRpcInner::HandlerErr(
+            tuple.get_item(2)?.extract::<String>()?,
+        ))
+    }
+}
+
+fn parse_room_spec(spec: Bound<'_, PyAny>) -> PyResult<Option<RoomSpec>> {
+    if spec.is_none() {
+        return Ok(None);
+    }
+    let tuple: Bound<'_, PyTuple> = spec.cast_into()?;
+    Ok(Some(RoomSpec {
+        map: tuple.get_item(0)?.extract()?,
+        mode: tuple.get_item(1)?.extract()?,
+        max_players: tuple.get_item(2)?.extract()?,
+        open: tuple.get_item(3)?.extract()?,
+    }))
+}
+
+fn vm_has_any_handler(vm: &PythonVm) -> bool {
+    Python::attach(|py| -> PyResult<bool> {
+        vm.citadel
+            .bind(py)
+            .getattr("_has_any_handler")?
+            .call0()?
+            .extract()
+    })
+    .unwrap_or(false)
+}
+
+fn is_timeout_error(err: &PyErr) -> bool {
+    let text = err.to_string();
+    text.contains("time budget")
+        || text.contains("TimeoutError")
+        || text.contains("KeyboardInterrupt")
+}
+
+fn read_script(path: &Path) -> AppResult<String> {
+    std::fs::read_to_string(path).map_err(|e| {
+        AppError::new(
+            ErrorCategory::Runtime,
+            format!("cannot read Python game script: {}", path.display()),
+        )
+        .with_detail(e.to_string())
+    })
+}
+
+fn cstring(value: &str, label: &str) -> AppResult<CString> {
+    CString::new(value).map_err(|_| {
+        AppError::new(
+            ErrorCategory::Runtime,
+            format!("{label} contains an interior NUL byte"),
+        )
+    })
+}
+
+fn script_error(context: &str, err: &PyErr) -> AppError {
+    AppError::new(ErrorCategory::Runtime, context.to_string()).with_detail(err.to_string())
+}
+
+struct WatchdogState {
+    done: Mutex<bool>,
+    done_changed: Condvar,
+    expired: AtomicBool,
+}
+
+struct WatchdogGuard {
+    state: Arc<WatchdogState>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl WatchdogGuard {
+    fn new(budget: Duration) -> Self {
+        let state = Arc::new(WatchdogState {
+            done: Mutex::new(false),
+            done_changed: Condvar::new(),
+            expired: AtomicBool::new(false),
+        });
+        let thread_state = Arc::clone(&state);
+        let handle = match std::thread::Builder::new()
+            .name("citadel-python-watchdog".to_string())
+            .spawn(move || watchdog_thread(thread_state, budget))
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to spawn python deadline watchdog; timeout overrun will rely on the trace deadline"
+                );
+                return Self {
+                    state,
+                    handle: None,
+                };
+            }
+        };
+        Self {
+            state,
+            handle: Some(handle),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.state.expired.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        match self.state.done.lock() {
+            Ok(mut done) => {
+                *done = true;
+                self.state.done_changed.notify_all();
+            }
+            Err(poisoned) => {
+                let mut done = poisoned.into_inner();
+                *done = true;
+                self.state.done_changed.notify_all();
+            }
+        }
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::warn!("python deadline watchdog thread panicked; ignored");
+        }
+    }
+}
+
+fn watchdog_thread(state: Arc<WatchdogState>, budget: Duration) {
+    let done = state.done.lock().unwrap_or_else(|e| e.into_inner());
+    let timed_out = match state
+        .done_changed
+        .wait_timeout_while(done, budget, |done| !*done)
+    {
+        Ok((done, timeout)) => !*done && timeout.timed_out(),
+        Err(poisoned) => {
+            let (done, timeout) = poisoned.into_inner();
+            !*done && timeout.timed_out()
+        }
+    };
+    if !timed_out {
+        return;
+    }
+    // The Python trace hook runs in the handler's own interpreter thread and
+    // raises `TimeoutError` at the next bytecode boundary. Do not attempt to
+    // attach from this thread: while a handler holds the GIL, that blocks here
+    // and `WatchdogGuard::drop` would then deadlock joining this worker.
+    state.expired.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::runtime::HOST_API_SURFACE;
+    use crate::runtime::host_api_spec::HostApiStatus;
+
+    const NPC_ID_BASE: u32 = 0x4000_0000;
+
+    fn runtime(src: &str) -> PythonRuntime {
+        PythonRuntime::from_source(src, "test.py", 100).expect("python runtime loads")
+    }
+
+    #[test]
+    fn host_api_surface_matches_manifest_python() {
+        let shipped: HashSet<&'static str> = HOST_API_SURFACE
+            .iter()
+            .filter(|entry| entry.status == HostApiStatus::Shipped)
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(PythonRuntime::registered_host_api_names(), shipped);
+    }
+
+    #[test]
+    fn message_handler_broadcasts() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    citadel.broadcast(2, ctx.sender.to_bytes(8, "big") + body, unreliable=True)
+"#,
+        );
+        assert_eq!(
+            rt.dispatch(42, None, 1, b"abc"),
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: [42u64.to_be_bytes().as_slice(), b"abc"].concat(),
+                unreliable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn imperative_registration_and_lifecycle_work() {
+        let rt = runtime(
+            r#"
+import citadel
+
+def joined(ctx):
+    citadel.send(ctx.sender, 7, b"joined")
+
+citadel.on_join(joined)
+"#,
+        );
+        assert_eq!(
+            rt.dispatch_lifecycle(LifecycleHook::Join, 9, None),
+            vec![OutboundCommand::Send {
+                session: 9,
+                kind: 7,
+                body: b"joined".to_vec(),
+                unreliable: false,
+            }]
+        );
+        assert!(
+            rt.dispatch_lifecycle(LifecycleHook::Leave, 9, None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tick_handler_receives_dt() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_tick
+def tick(dt):
+    citadel.broadcast(5, str(round(dt, 2)).encode())
+"#,
+        );
+        assert!(rt.has_tick_handler());
+        assert_eq!(
+            rt.tick(Duration::from_millis(125), Duration::from_millis(100)),
+            vec![OutboundCommand::Broadcast {
+                kind: 5,
+                body: b"0.12".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn exceptions_are_isolated() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def boom(ctx, body):
+    citadel.broadcast(2, b"lost")
+    raise RuntimeError("secret")
+"#,
+        );
+        assert!(rt.dispatch(1, None, 1, b"").is_empty());
+    }
+
+    #[test]
+    fn rpc_success_error_and_unknown_method() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_rpc("ping")
+def ping(ctx, body):
+    return citadel.Reply.ok(b"pong")
+
+@citadel.on_rpc("bad")
+def bad(ctx, body):
+    return citadel.Reply.err("invalid")
+"#,
+        );
+        assert_eq!(
+            rt.call_rpc(1, None, "ping", b""),
+            RpcOutcome::Ok(b"pong".to_vec())
+        );
+        assert_eq!(
+            rt.call_rpc(1, None, "bad", b""),
+            RpcOutcome::Err("invalid".to_string())
+        );
+        assert!(matches!(
+            rt.call_rpc(1, None, "missing", b""),
+            RpcOutcome::Err(msg) if msg.contains("unknown RPC method")
+        ));
+    }
+
+    #[test]
+    fn room_hooks_work_and_fail_closed() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_room_create
+def create(ctx, params):
+    return {"map": "Arena", "mode": "duel", "max_players": 2, "open": True}
+
+@citadel.on_room_join
+def join(ctx, room_id):
+    return room_id == 7
+"#,
+        );
+        let spec = rt.call_room_create(1, None, b"").expect("room spec");
+        assert_eq!(spec.map, "Arena");
+        assert_eq!(spec.mode, "duel");
+        assert_eq!(spec.max_players, 2);
+        assert!(spec.open);
+        assert!(rt.call_room_join(1, None, 7));
+        assert!(!rt.call_room_join(1, None, 8));
+
+        let broken = runtime(
+            r#"
+import citadel
+
+@citadel.on_room_join
+def join(ctx, room_id):
+    raise RuntimeError("nope")
+"#,
+        );
+        assert!(!broken.call_room_join(1, None, 7));
+    }
+
+    #[test]
+    fn actor_commands_match_lua_shapes() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def actor(ctx, body):
+    actor_id = citadel.spawn_actor({"archetype": 3, "x": 1, "y": 2, "z": 3})
+    citadel.move_actor(actor_id, 4, 5, 6, 7, 8, 9)
+    citadel.despawn_actor(actor_id)
+"#,
+        );
+        let commands = rt.dispatch(1, None, 1, b"");
+        assert_eq!(commands.len(), 3);
+        let object_id = match &commands[0] {
+            OutboundCommand::SpawnActor {
+                object_id,
+                archetype,
+                position,
+            } => {
+                assert!(*object_id >= NPC_ID_BASE);
+                assert_eq!(*archetype, 3);
+                assert_eq!(*position, [1.0, 2.0, 3.0]);
+                *object_id
+            }
+            other => panic!("expected spawn, got {other:?}"),
+        };
+        assert_eq!(
+            commands[1],
+            OutboundCommand::MoveActor {
+                object_id,
+                position: [4.0, 5.0, 6.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [7.0, 8.0, 9.0],
+            }
+        );
+        assert_eq!(commands[2], OutboundCommand::DespawnActor { object_id });
+    }
+
+    #[test]
+    fn reload_swaps_success_and_rejects_broken_script() {
+        let dir = TempDir::new("py-reload");
+        dir.write_main(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    citadel.broadcast(2, b"v1")
+"#,
+        );
+        let rt = PythonRuntime::load(&dir.0, 100)
+            .expect("loads")
+            .expect("present");
+        assert_eq!(
+            rt.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"v1".to_vec(),
+                unreliable: false,
+            }]
+        );
+
+        dir.write_main(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    citadel.broadcast(2, b"v2")
+"#,
+        );
+        assert_eq!(rt.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            rt.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"v2".to_vec(),
+                unreliable: false,
+            }]
+        );
+
+        dir.write_main("this is not python ==");
+        assert_eq!(rt.reload(), ReloadOutcome::Rejected);
+        assert_eq!(
+            rt.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"v2".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn hung_handler_is_bounded_by_deadline_trace() {
+        let rt = PythonRuntime::from_source(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def hang(ctx, body):
+    while True:
+        pass
+"#,
+            "hang.py",
+            50,
+        )
+        .expect("loads");
+        let start = Instant::now();
+        assert!(rt.dispatch(1, None, 1, b"").is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "deadline should interrupt pure-Python loop promptly"
+        );
+        assert!(rt.dispatch(1, None, 999, b"").is_empty());
+    }
+
+    #[test]
+    fn introspection_reports_registered_handlers() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_message(9)
+def message(ctx, body): pass
+
+@citadel.on_rpc("ping")
+def ping(ctx, body): return b"pong"
+
+@citadel.on_leave
+def leave(ctx): pass
+"#,
+        );
+        let info = rt.introspect();
+        assert!(info.source.contains("test.py"));
+        assert_eq!(info.rpcs, vec!["ping"]);
+        assert_eq!(info.message_kinds, vec![9]);
+        assert_eq!(info.hooks, vec!["on_leave"]);
+    }
+
+    fn friends_host() -> Arc<dyn DomainHost> {
+        use crate::repository::{
+            InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
+            InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryStorageRepository,
+            InMemoryWalletRepository,
+        };
+        use crate::runtime::ServiceDomainHost;
+        use crate::services::{
+            ChatChannelAuthorizer, ChatService, FriendsService, GroupsService, LeaderboardService,
+            PlayerNotificationService, WalletService,
+        };
+        use crate::storage::{
+            Collection, StorageIndexDefinition, StorageIndexField, StorageIndexName,
+        };
+        let friends = Arc::new(FriendsService::new(Arc::new(
+            InMemoryFriendsRepository::new(),
+        )));
+        let groups = Arc::new(GroupsService::new(
+            Arc::new(InMemoryGroupsRepository::new()),
+        ));
+        let chat = Arc::new(ChatService::new(Arc::new(InMemoryChatRepository::new())));
+        let authorizer = Arc::new(ChatChannelAuthorizer::new(
+            Arc::clone(&friends),
+            Arc::clone(&groups),
+        ));
+        Arc::new(
+            ServiceDomainHost::new(friends, Arc::new(InMemoryStorageRepository::new()))
+                .with_storage_indexes(vec![
+                    StorageIndexDefinition::new(
+                        StorageIndexName::new("profiles_by_score").expect("index name"),
+                        Collection::new("profiles").expect("collection"),
+                        None,
+                        vec![StorageIndexField::new("score").expect("field")],
+                    )
+                    .expect("index definition"),
+                ])
+                .with_player_notifications(Arc::new(PlayerNotificationService::new(Arc::new(
+                    InMemoryBackend::new(),
+                ))))
+                .with_groups(groups)
+                .with_leaderboards(Arc::new(LeaderboardService::new(Arc::new(
+                    InMemoryLeaderboardsRepository::new(),
+                ))))
+                .with_chat(chat)
+                .with_chat_authorizer(authorizer)
+                .with_wallet(Arc::new(WalletService::new(Arc::new(
+                    InMemoryWalletRepository::new(),
+                )))),
+        )
+    }
+
+    /// Names of the shipped `Domain`-category host functions from the canonical
+    /// manifest — the behavioral gate below must exercise exactly this set.
+    fn shipped_domain_host_api_names() -> HashSet<&'static str> {
+        HOST_API_SURFACE
+            .iter()
+            .filter(|entry| {
+                entry.category == crate::runtime::HostApiCategory::Domain
+                    && entry.status == HostApiStatus::Shipped
+            })
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn domain_host_api_behaviorally_covers_manifest() {
+        // Exercise EVERY shipped Domain function against a real (in-memory) host
+        // and assert real effects — a name-claim stub raises here and fails.
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_rpc("exercise")
+def exercise(ctx, body):
+    u, o = "prober", "target"
+    added = citadel.friends_add(u, o)
+    citadel.friends_add(o, u)
+    chat = citadel.chat_call(u, "send", '{"target":{"kind":"direct","other_user_id":"target"},"content":"hi"}')
+    n1 = len(citadel.friends_list(u))
+    citadel.friends_block(u, o)
+    blocked = citadel.friends_list(u)[0]["state"]
+    removed = citadel.friends_remove(u, o)
+    n2 = len(citadel.friends_list(u))
+    notification = citadel.notifications_send(u, 7, "hello", "{}", "server", "probe")
+    page = citadel.notifications_list(u)
+    read = citadel.notifications_mark_read(u, [notification["id"]])
+    group = citadel.groups_call(u, "create", '{"name":"probers"}')
+    boards = citadel.leaderboards_call(u, "list", "{}")
+    wallet = citadel.wallet_call(u, "balances", "{}")
+    return (added + "|" + str(n1) + "|" + blocked + "|" + str(removed) + "|" + str(n2) + "|" + str(len(page["items"])) + "|" + str(len(read)) + "|" + group["name"] + "|" + str(len(boards)) + "|" + str(chat["id"]) + "|" + str(len(wallet))).encode()
+"#,
+        )
+        .with_domain_host(friends_host());
+
+        let RpcOutcome::Ok(reply) = rt.call_rpc(1, Some("prober"), "exercise", b"") else {
+            panic!("domain host functions must be wired, not stubbed");
+        };
+        // Python `str(True)` is "True".
+        assert_eq!(reply, b"invited_sent|1|blocked|True|0|1|1|probers|0|1|0");
+
+        let exercised: HashSet<&str> = [
+            "friends.add",
+            "friends.remove",
+            "friends.block",
+            "friends.list",
+            "notifications.send",
+            "notifications.list",
+            "notifications.mark_read",
+            "groups.call",
+            "leaderboards.call",
+            "chat.call",
+            "wallet.call",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            exercised,
+            shipped_domain_host_api_names(),
+            "every shipped Domain host-API function needs a behavioral smoke here"
+        );
+    }
+
+    #[test]
+    fn friends_host_api_errors_without_a_domain_host() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_rpc("befriend")
+def befriend(ctx, body):
+    citadel.friends_add(ctx.user_id, body.decode())
+    return b"unreachable"
+"#,
+        );
+        let RpcOutcome::Err(msg) = rt.call_rpc(1, Some("alice"), "befriend", b"bob") else {
+            panic!("expected error");
+        };
+        assert!(!msg.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_index_query_is_wired_to_the_python_host() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_rpc("search")
+def search(ctx, body):
+    def filter(candidate):
+        if candidate["key"] == "boom":
+            raise RuntimeError("filter failed")
+        return candidate["key"] == "main"
+    citadel.register_storage_index_filter("profiles_by_score", filter)
+    citadel.storage_write(ctx.user_id, "profiles", "skip", '{"score":7}')
+    citadel.storage_write(ctx.user_id, "profiles", "main", '{"score":7}')
+    try:
+        citadel.storage_write(ctx.user_id, "profiles", "boom", '{"score":7}')
+        errored = False
+    except RuntimeError:
+        errored = True
+    missing = citadel.storage_read(ctx.user_id, "profiles", "boom") is None
+    found = citadel.storage_index_query("profiles_by_score", '{"score":7}', 10)
+    return (str(errored).lower() + "|" + str(missing).lower() + "|" + str(len(found)) + "|" + found[0]["user_id"] + "|" + found[0]["key"]).encode()
+"#,
+        )
+        .with_domain_host(friends_host());
+
+        let RpcOutcome::Ok(reply) = rt.call_rpc(1, Some("alice"), "search", b"") else {
+            panic!("storage index host must return a reply");
+        };
+        assert_eq!(reply, b"true|true|1|alice|main");
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("citadel-{prefix}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn main_py(&self) -> PathBuf {
+            self.0.join(PYTHON_ENTRYPOINT)
+        }
+
+        fn write_main(&self, src: &str) {
+            std::fs::write(self.main_py(), src).expect("write main.py");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}

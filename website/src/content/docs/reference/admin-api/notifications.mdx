@@ -1,0 +1,405 @@
+---
+title: Notifications (console API + realtime relay pattern)
+description: Per-method reference for the console notifications send/list/delete API, targeting vs broadcast, plus the realtime client relay pattern used to deliver a custom "notification" kind today.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Citadel's notifications surface has two distinct parts today:
+
+1. A **console-operator API** (`/console/v1/notifications*`) that models a
+   targeted-or-broadcast message store: send to one account by id, broadcast
+   to everyone, list (with visibility filtering), and delete.
+2. A **realtime delivery pattern** built from primitives that already ship:
+   your Lua script relays a custom envelope kind with `citadel.on_message` +
+   `citadel.broadcast`/`citadel.send`, and each client SDK sends/receives that
+   kind. There is **no** automatic push when `POST /console/v1/notifications`
+   is called — see [Realtime delivery today](#realtime-delivery-today).
+
+Source: `src/repository/notifications.rs` (the persisted notification store and
+its pure visibility/paging/eviction helpers), `src/services/notifications.rs`
+(the thin validate-then-delegate service),
+`src/http/console_api/notifications.rs` (HTTP handlers), `src/runtime/lua.rs`
+(the `citadel.on_message`/`citadel.broadcast`/`citadel.send` host API
+described on the [Lua runtime API](/reference/server-sdk/lua-runtime) page).
+
+:::note[Scope]
+The console API below is a **send/list/delete model only** — sending a
+notification does not push it to a connected game client in real time. A
+recipient only sees a notification by polling `GET
+/console/v1/notifications`. The store is now **persisted** behind the
+repository seam (durable on the Postgres and SQLite backends; the in-memory
+backend stays non-durable by design). Realtime push delivery
+(deliver-if-online over the session/routing seam) is still out of scope and
+recorded as technical debt in `docs/architecture/technical-debt.md`.
+:::
+
+## Recipients: `user_id` vs. broadcast
+
+```rust
+pub enum Recipient {
+    User(String), // targeted at one account by user id
+    Broadcast,    // delivered to every account (fan-out)
+}
+```
+
+Over HTTP this is expressed as an optional `user_id` field: present targets
+one account; **absent** sends/represents a broadcast. A notification's
+visibility follows the recipient:
+
+- A targeted notification (`Recipient::User(id)`) is visible only to that
+  `id` (and to the operator-wide unfiltered view).
+- A broadcast (`Recipient::Broadcast`) is visible to **every** user filter,
+  in addition to the unfiltered view.
+
+The store is a single global bounded ring (default 10,000 entries,
+`DEFAULT_NOTIFICATION_CAPACITY`); the oldest entry is evicted once full. It is
+persisted behind the repository seam, so on the Postgres and SQLite backends the
+notifications survive a node restart (the in-memory backend stays non-durable by
+design). Notification ids are a monotonic global sequence; they stay a stable
+`before`-cursor key while retained.
+
+## Authentication
+
+Every route below requires a console bearer token from `POST
+/console/v1/login` (see [Login and roles](/reference/admin-api/console/#login-and-roles)):
+
+```
+Authorization: Bearer <token>
+```
+
+| Role | Access |
+| --- | --- |
+| `admin` | Read and mutate (send, delete). |
+| `viewer` | Read-only. A mutation attempt returns `403 forbidden`. |
+
+## `GET /console/v1/notifications`
+
+Newest-first page of notifications.
+
+**Auth:** bearer token, any role.
+
+**Query parameters**
+
+| Name | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user_id` | string | no | Restrict to that user's own targeted notifications plus every broadcast. Absent lists everything (the operator-wide view). |
+| `limit` | integer | no | Page size, newest-first. Default `50`, capped at `200`. |
+| `before` | integer | no | Resume cursor: only notifications strictly older than this id. |
+
+**Response `200 OK`**
+
+```json
+{
+  "items": [
+    { "id": 43, "user_id": "u-1", "subject": "welcome",
+      "content": { "level": 1 }, "code": 0,
+      "created_at_unix_ms": 1751791000000, "read": false }
+  ],
+  "total": 1
+}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | integer | Server-assigned id, monotonic, never reused. |
+| `user_id` | string \| `null` | Targeted recipient's user id, or `null` for a broadcast. |
+| `subject` | string | Subject line. |
+| `content` | object | Arbitrary JSON payload (always a JSON object). |
+| `code` | integer | Application-defined status/kind code. |
+| `created_at_unix_ms` | integer | When it was sent (Unix milliseconds). |
+| `read` | boolean | Whether the recipient has marked it read. |
+| `total` | integer | Total notifications visible to the requested `user_id` filter, ignoring `before`/`limit`. |
+
+**Errors**
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| `401` | `authentication_failed` | Missing/invalid/expired bearer token. |
+
+**Example**
+
+```bash
+curl -s "http://127.0.0.1:7350/console/v1/notifications?user_id=u-1&limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## `POST /console/v1/notifications`
+
+Send a notification, targeted or broadcast.
+
+**Auth:** bearer token, `admin` only. A `viewer` gets `403 forbidden`.
+
+**Request body**
+
+```json
+{ "user_id": "u-1", "subject": "welcome", "content": { "level": 1 }, "code": 0 }
+```
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `user_id` | string | no | Target account id. **Omit to broadcast to every account.** |
+| `subject` | string | yes | Must be non-empty (rejected otherwise). |
+| `content` | object | no | Arbitrary JSON object payload. Defaults to `{}`; rejected if not a JSON object. |
+| `code` | integer | no | Application-defined status/kind code. Defaults to `0`. |
+
+**Response `201 Created`**
+
+```json
+{ "id": 43, "user_id": "u-1", "subject": "welcome",
+  "content": { "level": 1 }, "code": 0,
+  "created_at_unix_ms": 1751791000000, "read": false }
+```
+
+**Errors**
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| `400` | `invalid_request` | Blank `subject`, non-object `content`, or malformed body. |
+| `401` | `authentication_failed` | Missing/invalid/expired bearer token. |
+| `403` | `forbidden` | Caller is a `viewer`. |
+
+Audited as `notifications.send` (target logged as `user {id}` or `broadcast`).
+
+**Example**
+
+```bash
+curl -s -X POST http://127.0.0.1:7350/console/v1/notifications \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"u-1","subject":"welcome","content":{"level":1}}'
+```
+
+Omit `user_id` to broadcast:
+
+```bash
+curl -s -X POST http://127.0.0.1:7350/console/v1/notifications \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"subject":"server restart in 10 minutes"}'
+```
+
+## `DELETE /console/v1/notifications/{id}`
+
+Delete one notification.
+
+**Auth:** bearer token, `admin` only. A `viewer` gets `403 forbidden`.
+
+**Path parameters**
+
+| Name | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `id` | integer | yes | The notification id (from a list page). |
+
+**Response:** `204 No Content` (no body).
+
+**Errors**
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| `401` | `authentication_failed` | Missing/invalid/expired bearer token. |
+| `403` | `forbidden` | Caller is a `viewer`. |
+| `404` | `not_found` | Unknown `id`. |
+
+Audited as `notifications.delete`.
+
+**Example**
+
+```bash
+curl -s -X DELETE http://127.0.0.1:7350/console/v1/notifications/43 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+:::note[No dedicated detail-by-id route]
+Unlike Chat, Groups, and Accounts, notifications have **no** `GET
+/console/v1/notifications/{id}` detail route today — only the collection
+`GET` (with `user_id`/`limit`/`before` filtering), `POST`, and `DELETE` are
+wired (`src/http/console_api/notifications.rs`). Reading one specific
+notification means paging the collection route and matching its `id`.
+:::
+
+## Errors (shared shape)
+
+Every error uses the console API's shared JSON error body:
+
+```json
+{ "code": "not_found", "message": "notification not found" }
+```
+
+See the [console API's error table](/reference/admin-api/console/#errors) for the full
+status/code list.
+
+## Realtime delivery today
+
+There is **no automatic push** when a notification is sent — `POST
+/console/v1/notifications` only stores it; a recipient discovers it by
+polling `GET /console/v1/notifications`. As with [Chat](/reference/admin-api/chat), the
+only way to reach a *connected* game client in real time today is the same
+general-purpose relay pattern: your [Lua runtime script](/reference/server-sdk/lua-runtime)
+registers a handler for an application-chosen envelope `kind` with
+`citadel.on_message`, and forwards it to peers with `citadel.broadcast`
+(everyone) or `citadel.send` (one session, by its transport-level session
+id). Reserved kinds run through 26 (see the
+[envelope reference](/reference/protocol/envelope/#constants)), so an
+application-defined notification kind must be **27 or higher**.
+
+:::note[Future work — not implemented]
+The store is now persisted, but session-aware "deliver if online, otherwise
+queue for next poll" **push delivery** is still **future work**
+(`docs/architecture/technical-debt.md`). The pattern below is a manual fan-out
+convention your Lua script defines and drives yourself — the server does not
+automatically forward a `POST /console/v1/notifications` call onto the realtime
+socket, and there is no built-in binding between a stored notification's
+`id`/`user_id` and a live session.
+:::
+
+### Server: relay a notification-style broadcast (Lua)
+
+```lua
+local KIND_NOTIFY_BROADCAST = 102  -- server -> client: an app-defined notification push (app-defined kind)
+
+-- Example: your own RPC or hook calls this to push a message to every
+-- connected client right now (independent of the console notification store).
+citadel.on_rpc("push_notification", function(ctx, body)
+  citadel.broadcast(KIND_NOTIFY_BROADCAST, body, false)  -- reliable
+  return "ok"
+end)
+```
+
+`citadel.broadcast(kind, body, unreliable)` reaches every connected session
+except the caller; `citadel.send(session, kind, body, unreliable)` targets one
+session by its transport-level id if you are tracking which session belongs
+to which `user_id` in your own script state.
+
+### Client: receive the custom notification kind
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+constexpr uint16 KIND_NOTIFY_BROADCAST = 102;
+
+auto* Citadel = GetGameInstance->GetSubsystem<UCitadelClientSubsystem>;
+
+// Poll each tick and dispatch by kind (the single reader of the envelope queue).
+uint16 Kind;
+TArray<uint8> Body;
+while (Citadel->Poll(Kind, Body) == ECitadelStatus::Ok)
+{
+    if (Kind == KIND_NOTIFY_BROADCAST)
+    {
+        FString Text = FString(UTF8_TO_TCHAR(Body.GetData));
+        // ... show Text in a toast/notification UI ...
+    }
+}
+```
+
+</TabItem>
+<TabItem label="Blueprint">
+
+Blueprints have no source text; this is the node recipe. **Note:** `Send`
+and `Poll` are **C++-only** on the Unreal SDK today (their `uint16` envelope
+`Kind` parameter is not Blueprint-representable) — a Blueprint-only project
+cannot receive a raw custom envelope kind like this until that surface is
+exposed to Blueprint.
+
+1. Add a small C++ helper (a `UCitadelClientSubsystem` subclass or a
+   `UBlueprintFunctionLibrary`) that polls each tick and checks
+   `Kind == KIND_NOTIFY_BROADCAST`.
+2. From that helper, fire a `BlueprintImplementableEvent` (e.g.
+   `OnNotificationReceived(FString Text)`) with the decoded UTF-8 body.
+3. From Blueprint: bind **On Notification Received** to your toast/notification
+   widget.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+const ushort KindNotifyBroadcast = 102;
+
+// Poll each frame and dispatch by kind.
+var buffer = new byte[4096];
+while (client.Poll(buffer, out ushort kind, out int length, out bool truncated) == PollResult.Message)
+{
+    if (kind == KindNotifyBroadcast)
+    {
+        string text = System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+        // ... show text in a toast/notification UI ...
+    }
+}
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+const KIND_NOTIFY_BROADCAST := 102
+
+# Poll each frame and dispatch by kind.
+var out := {}
+while client.poll(out) == CitadelClient.Status.OK:
+	if out["kind"] == KIND_NOTIFY_BROADCAST:
+		var body: PackedByteArray = out["payload"]
+		var text := body.get_string_from_utf8
+		# ... show text in a toast/notification UI ...
+```
+
+:::note[Godot client is a skeleton]
+`clients/godot/citadel/client.gd` is a documented skeleton: the native
+GDExtension backing `send`/`poll` is not wired up in this repo yet (see
+`docs/features/godot-sdk-skeleton.md`). The call above is the intended
+surface and will work once the native extension lands; today `poll` returns
+an error status instead of moving bytes.
+:::
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+use citadel_wire::Envelope;
+
+const KIND_NOTIFY_BROADCAST: u16 = 102;
+
+// Receive loop: dispatch by kind.
+while let Some(env) = ws.recv.await? {
+    if env.kind == KIND_NOTIFY_BROADCAST {
+        let text = String::from_utf8_lossy(&env.body);
+        // ... handle the notification ...
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+See the [envelope format reference](/reference/protocol/envelope/) for the exact byte
+layout of framed vs. datagram encodings, and the
+[Lua runtime API](/reference/server-sdk/lua-runtime) for the full `citadel.on_message` /
+`citadel.broadcast` / `citadel.send` host surface.
+
+## Test coverage
+
+The visibility/paging/eviction/read-state logic lives in pure helpers unit-tested
+in `src/repository/notifications.rs`, and the persistence contract (enqueue,
+newest-first paging with a `before` cursor, ring eviction, delete, mark-read) is
+verified against **all three backends** (in-memory, SQLite always, Postgres
+opt-in) by `tests/notifications_repository_contract.rs`. The service validation
+(blank subject, non-object content) is unit-tested in
+`src/services/notifications.rs`. The HTTP handlers (list/send/delete, role
+gating, audit trail) are unit-tested in `src/http/console_api/notifications.rs`
+and covered end-to-end by `tests/console_notifications.rs`.
+
+## Known limitations
+
+- **No realtime push.** A recipient only sees a notification by polling `GET
+  /console/v1/notifications` — there is no delivery over the realtime socket
+  when they are online.
+- **No detail-by-id route.** See the note above; only list/send/delete are
+  wired.
+- **No notification-specific client SDK surface.** The relay pattern above
+  uses only generic envelope send/receive; there is no `OnNotification`-style
+  method bound to the console notification store on any client SDK today.
+- **Blueprint cannot receive raw envelope kinds today.** See the Blueprint
+  tab above.
+- **Godot's native client is a skeleton.** `poll` does not move bytes until
+  the GDExtension is wired up.

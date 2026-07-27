@@ -1,0 +1,16 @@
+[package]
+name = "citadel-nav"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Isolated safe navigation wrapper over Recast/Detour for Citadel."
+
+[dependencies]
+citadel-map = { path = "../citadel-map" }
+recastnavigation-sys = { version = "1.0.3", features = ["detour"] }
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

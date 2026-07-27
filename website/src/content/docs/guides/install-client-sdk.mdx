@@ -1,0 +1,268 @@
+---
+title: Install a client SDK (download & drop in)
+description: Step-by-step instructions to download the ready-to-use Unity, Unreal, or Godot client SDK for a Citadel release and drop it into your game project — no repo checkout, no native build.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Every published Citadel release provides ready-to-use Windows SDK ZIPs. Native
+Apple Silicon and Intel macOS ZIPs can be built locally, but their public release
+path is deferred until Developer-ID signing and Apple notarization credentials
+are configured. When they are published, download the archive for both your
+engine **and** your Mac architecture. You do not need to clone the repo or build
+a native library — the compiled pieces are inside the matching ZIP.
+
+:::tip[Match the version]
+The server and every client ZIP in one release share the same `v{version}`
+(e.g. `v0.8.1`). Use the client ZIP whose version matches the server you run, so
+the wire protocol lines up.
+:::
+
+## Step 1 — Run a Citadel server
+
+You need a server for the client to connect to. The fastest path is the server
+package from the same Release:
+
+1. Download `citadel-windows-x86_64-v{version}.zip` from the Releases page and
+   unzip it.
+2. Double-click `citadel.exe` (or run `.\citadel.exe serve` in a terminal).
+3. Leave it running. By default it listens on **QUIC `127.0.0.1:7351`**,
+   **WebSocket `127.0.0.1:7352`**.
+
+When a signed macOS release is available, use
+`citadel-macos-aarch64-v{version}.zip` on Apple Silicon or
+`citadel-macos-x86_64-v{version}.zip` on Intel, then run `./citadel` in
+Terminal.
+
+See the [Quickstart](/quickstart/) for editing game logic (`scripts/main.lua`).
+
+## Step 2 — Download your engine's SDK
+
+From the same Release, grab the ZIP for your engine:
+
+| Engine | Windows download | macOS download (when published) |
+| --- | --- | --- |
+| Unity | `citadel-client-unity-windows-x86_64-v{version}.zip` | `citadel-client-unity-macos-<arch>-v{version}.zip` |
+| Unreal | `citadel-client-unreal-windows-x86_64-v{version}.zip` | `citadel-client-unreal-macos-<arch>-v{version}.zip` |
+| Godot | `citadel-client-godot-windows-x86_64-v{version}.zip` | `citadel-client-godot-macos-<arch>-v{version}.zip` |
+
+Windows packages ship the x86_64 native pieces. The macOS archives have the
+same source layout but contain only their architecture's signed native artifact:
+Apple Silicon is `aarch64` in the archive name and `arm64` in Unity/Godot names;
+Intel is `x86_64`. Linux native packages remain a follow-up.
+
+:::tip[Stage an SDK from a checkout]
+When working from the Citadel repository, stage the exact copy-into-project
+layout instead of assembling files yourself:
+
+```bash
+make bin-client-unity
+make bin-client-unreal
+make bin-client-godot
+make bin-client-godot-web
+make bin-client-js
+make bin-client-rust
+```
+
+Each target writes under `bin/clients/<engine>/`. See the complete
+[make-targets reference](/reference/operations/make-targets/#bin-client-engine-and-bin-clients).
+JavaScript is source-staged today; npm publication is intentionally deferred.
+:::
+
+## Step 3 — Install it in your project
+
+<Tabs syncKey="engine">
+<TabItem label="Unity (C#)">
+
+**Requirements:** Unity **2021.3 LTS** or newer; Windows x86_64, or a matching
+macOS Apple Silicon/Intel release archive when one is published.
+
+**Unzip the download.** You get this folder:
+
+```
+citadel-client-unity-windows-x86_64-v{version}/
+├── Citadel/                     C# bindings (CitadelClient, CitadelNative, CitadelProtocol)
+├── Demo/                        sample MonoBehaviours (move + broadcast + RPC)
+├── Plugins/
+│   └── x86_64/
+│       └── citadel_client_ffi.dll   native library (Windows x86_64)
+└── README.md
+```
+
+**Install:**
+
+1. Open your Unity project. In your OS file explorer, copy the `Citadel/`,
+   `Demo/`, and `Plugins/` folders into your project's **`Assets/`** folder — for
+   example into `Assets/Citadel/`. (Do this outside Unity, then let Unity import.)
+2. Back in Unity, in the **Project** window, click
+   `Plugins/x86_64/citadel_client_ffi.dll`. In the **Inspector**, set the plugin
+   platform to **Standalone / Windows / x86_64**, then click **Apply**. Unity
+   writes the `.meta` files automatically.
+3. That's it — the SDK is installed. To try the sample, follow the
+   [Unity QUIC sample](/guides/unity-quic-sample/) to wire the scene, then press
+   **Play**.
+
+**Verify:** with the sample scene wired and the server running, pressing **Play**
+prints `native ABI version 1 OK` and `connected to 127.0.0.1:7351 (QUIC)` in the
+**Console**.
+
+:::caution[`DllNotFoundException: citadel_client_ffi`]
+The `.dll` is missing or its import platform is not set. Confirm it lives in
+`Assets/…/Plugins/x86_64/` and that its platform is **Standalone Windows x86_64**
+in the Inspector.
+:::
+
+On macOS the equivalent folder is `Plugins/macOS/` and it contains
+`libcitadel_client_ffi.dylib`. Enable **macOS** and its matching CPU in Unity's
+plugin Inspector; do not mix Apple Silicon and Intel archives in that folder.
+
+</TabItem>
+<TabItem label="Unreal (C++)">
+
+**Requirements:** Unreal Engine **5.x** (compile-verified against **5.8**) and a
+**C++ project** (the plugin compiles from source). Windows builds need Visual
+Studio; macOS builds need the matching Xcode toolchain and a signed macOS SDK
+archive when it is published.
+
+:::caution[Your project must be a C++ project]
+Unreal compiles the plugin's C++ when it loads. If your project is
+**Blueprint-only**, first add any C++ class (**Tools → New C++ Class → None →
+Create Class**) once; that turns it into a C++ project. Then continue below.
+:::
+
+**Unzip the download.** You get this folder:
+
+```
+citadel-client-unreal-windows-x86_64-v{version}/
+└── Plugins/
+    └── Citadel/                        the drop-in plugin
+        ├── Citadel.uplugin
+        └── Source/CitadelClient/
+            └── ThirdParty/
+                ├── Win64/citadel_client_ffi.lib   native staticlib (prebuilt)
+                └── include/citadel_client.h        C ABI header
+```
+
+**Install:**
+
+1. Close the Unreal editor. In your OS file explorer, copy the **`Plugins/Citadel`**
+   folder into your project's **`Plugins/`** directory, so you end up with
+   `<YourProject>/Plugins/Citadel/`. Create the `Plugins/` folder first if it does
+   not exist.
+2. Right-click your **`.uproject`** file and choose **Generate Visual Studio
+   project files**.
+3. Open the project. If Unreal prompts that the **Citadel** module is missing or
+   out of date and offers to rebuild, click **Yes** — it compiles the plugin
+   (the native `.lib` + header are already in `ThirdParty/`, so nothing else to
+   build).
+4. In the editor, open **Edit → Plugins**, search **Citadel**, and confirm it is
+   **Enabled** (restart the editor if asked).
+
+**Verify:** the plugin loads without errors and, in Blueprint, the
+`Citadel Client Subsystem` nodes (`Connect Quic`, `Authenticate Device`, …) are
+available. See [Engine integration → Unreal](/guides/engines/#unreal-c--drop-in-plugin)
+for the Blueprint-callable flow.
+
+</TabItem>
+<TabItem label="Godot (GDScript)">
+
+**Requirements:** Godot **4.3** or newer, Windows x86_64. **No build needed** —
+the native GDExtension is prebuilt inside the ZIP.
+
+For a Godot Web export, use
+`citadel-client-godot-web-v<version>.zip` and extract it at the project's
+`res://` root. It installs `addons/citadel/` GDScript files plus a verified
+`web/` WebAssembly export (`.html`, `.js`, `.pck`, `.wasm`); do not use the
+native GDExtension ZIP. Serve the Web output over HTTP(S), keeping its generated
+filenames together and serving `.wasm` as `application/wasm`. Instantiate
+`CitadelWebClient`. It connects through `WebSocketPeer` to a
+reachable `wss://` Citadel endpoint; call its non-blocking `pump` from
+`_process`. This supports reliable authentication, RPC, rooms, notifications,
+and relayed messages, but not QUIC/datagram transform or native replication
+helpers. See [Engine integration → Godot](/guides/engines/) for the lifecycle
+and browser TLS requirements.
+
+The matching macOS package uses `libcitadel_godot.macos.template_{debug,release}`
+with an `arm64` or `x86_64` suffix. Godot selects that entry from
+`citadel.gdextension` automatically; use the archive matching the editor's
+architecture.
+
+**Unzip the download.** You get this folder:
+
+```
+citadel-client-godot-windows-x86_64-v{version}/
+├── addons/
+│   └── citadel/
+│       ├── citadel.gdextension
+│       ├── client.gd  protocol.gd  transform_sync.gd
+│       └── bin/                     prebuilt Windows libraries
+│           ├── citadel_godot.windows.template_debug.x86_64.dll     (editor)
+│           ├── citadel_godot.windows.template_release.x86_64.dll   (exported game)
+│           └── citadel_client_ffi.dll                              (C ABI runtime)
+├── sample/peer_sync.gd
+└── README.md
+```
+
+**Install:**
+
+1. Close Godot. In your OS file explorer, copy the **`addons/`** folder into your
+   Godot project's root (next to `project.godot`), so you end up with
+   `res://addons/citadel/`. If you already have an `addons/` folder, merge the
+   `citadel/` folder into it.
+2. Reopen the project in Godot. Godot loads the GDExtension automatically and
+   registers the `CitadelClientNative` type on startup.
+
+**Verify:** open a script and confirm `CitadelClient` autocompletes. A minimal
+connect looks like:
+
+```gdscript
+var client := CitadelClient.new
+if not client.check_abi_version:
+    push_warning(client.last_error)   # extension failed to load
+var status := client.connect_quic("127.0.0.1:7351", "localhost", true)
+if status == CitadelClient.Status.OK:
+    var auth := {}
+    status = client.authenticate_guest(auth)   # or authenticate_with_token(token, auth)
+```
+
+:::caution[`CitadelClientNative GDExtension is not loaded`]
+`check_abi_version` returns `false` and `last_error` says the extension is not
+loaded. Confirm the `bin/*.dll` files are present under `res://addons/citadel/bin/`
+and that you are on **Godot 4.3+**, then reopen the project.
+:::
+
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+Rust projects add the workspace crate (or stage its source with
+`make bin-client-rust`) and use the WebSocket or QUIC client directly:
+
+```toml
+citadel-client = { path = "bin/clients/rust/citadel-client" }
+```
+
+See the [Rust SDK reference](/reference/client-sdk/rust-sdk/).
+</TabItem>
+<TabItem label="JavaScript">
+
+JavaScript is currently source-staged, not published to npm:
+
+```bash
+make bin-client-js
+```
+
+Import `bin/clients/js/src/index.js` from a browser module, Node 22+, or your
+bundler. It currently supports WebSocket transport only. The staged folder also
+includes `examples/threejs-starter/`: serve `bin/clients/js/` as a static root
+and open `/examples/threejs-starter/` for the runnable browser-game integration.
+</TabItem>
+</Tabs>
+
+## Next steps
+
+- **Authenticate and connect** — [Authentication reference](/reference/client-sdk/authentication/).
+- **Move and replicate** — [Transform sync](/reference/client-sdk/transform-sync/)
+  and [Networked actors](/reference/client-sdk/networked-actors/).
+- **How the engines bind to one core** — [Engine integration](/guides/engines/).
+- **Build from source instead** (Linux, a macOS architecture without a published
+  archive, or to modify the SDK) — see each engine's SDK README under `clients/`.

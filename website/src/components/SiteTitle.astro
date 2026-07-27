@@ -1,0 +1,64 @@
+---
+import { CURRENT_VERSION } from '../site-meta';
+
+const { siteTitle, siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="site-title sl-flex">
+	<span class="project-name" translate="no">{siteTitle}</span>
+	<span class="release-badge" aria-label={`Current version ${CURRENT_VERSION}`}>
+		<span class="badge-label">Current</span>
+		<span class="badge-version">v{CURRENT_VERSION}</span>
+	</span>
+</a>
+
+<style>
+	@layer starlight.core {
+		.site-title {
+			align-items: center;
+			gap: 0.65rem;
+			min-width: 0;
+			color: var(--sl-color-text-accent);
+			font-size: var(--sl-text-h4);
+			font-weight: 650;
+			text-decoration: none;
+			white-space: nowrap;
+		}
+
+		.project-name {
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
+
+		.release-badge {
+			display: inline-flex;
+			align-items: center;
+			gap: 0.32rem;
+			padding: 0.22rem 0.45rem;
+			border: 1px solid color-mix(in srgb, var(--sl-color-accent) 55%, transparent);
+			border-radius: 999px;
+			background: color-mix(in srgb, var(--sl-color-accent) 13%, transparent);
+			color: var(--sl-color-text);
+			font-family: var(--sl-font-mono);
+			font-size: 0.67rem;
+			font-weight: 600;
+			letter-spacing: 0.025em;
+			line-height: 1;
+		}
+
+		.badge-label {
+			color: var(--sl-color-gray-2);
+			font-family: var(--sl-font-system);
+			font-size: 0.62rem;
+			font-weight: 700;
+			letter-spacing: 0.06em;
+			text-transform: uppercase;
+		}
+
+		@media (max-width: 30rem) {
+			.badge-label {
+				display: none;
+			}
+		}
+	}
+</style>

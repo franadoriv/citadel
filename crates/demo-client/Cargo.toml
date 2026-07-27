@@ -1,0 +1,24 @@
+[package]
+name = "demo-client"
+version = "0.1.0"
+edition = "2024"
+description = "Native visual demo client for Citadel QUIC transport (quinn + macroquad)."
+
+[dependencies]
+# Shared wire format and the client SDK (QUIC transport).
+citadel-wire = { path = "../citadel-wire" }
+citadel-client = { path = "../citadel-client" }
+# Lightweight 2D windowing/rendering. Chosen over Bevy: fast builds, trivial 2D,
+# no ECS overhead; enough to draw a cube and echoed ghost markers.
+macroquad = "0.4"
+# Background tokio runtime for the async QUIC client, driven off the render loop.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

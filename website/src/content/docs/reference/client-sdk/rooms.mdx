@@ -1,0 +1,185 @@
+---
+title: Rooms (match / lobby membership + map load)
+description: Server-owned, admission-gated player groupings. A client creates or joins a room; the server (Lua-controlled) decides the room's map and who may enter, then tells the client which level to load. Room membership also scopes who sees whom.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+> **Match scope:** a room is also the server's current single-node authoritative
+> match boundary. Relay traffic and game-logic broadcasts from a room member are
+> sent only to that room's members. Leaving or disconnecting removes presence
+> immediately; matches with no members are pruned.
+
+A **room** is a server-owned group of players — Citadel's equivalent of a Nakama
+*match*. A client **joins-or-creates** a room **by name**: everyone who asks for the
+same name lands in the *same* room (the first caller creates it, the rest join). The
+server decides the room's **map** and **who may enter** (both from your Lua game
+logic), then tells the client which level to load via a subscribable **join event**.
+Room membership is also a *visibility dimension*: [networked actors](./networked-actors)
+only spawn for peers in the **same room**.
+
+:::tip[Matchmaking by name]
+`JoinOrCreateRoom("lobby")` on two clients puts them in **one** room — this is the
+basic matchmaking primitive. The name is a matchmaking key, *not* the map; the map is
+chosen server-side by `on_room_create`. Rooms are pruned automatically when their last
+member leaves, which also frees the name for reuse.
+:::
+
+:::note[Engine coverage]
+The **Unreal** SDK ships the client API below (C++ and Blueprint) and is verified
+end to end. The **Unity (C#)** and **Godot (GDScript)** tabs show the *target* API;
+their bindings land through the client-SDK-sync pass and follow the same shape.
+:::
+
+## Flow
+
+```
+connect ──▶ authenticate ──▶ create OR join room ──▶ server: ROOM_JOINED{map} ──▶
+   client loads map ──▶ client: MAP_READY ──▶ play
+```
+
+The server never picks the map by convention — your `on_room_create` Lua hook returns
+it, so the map is *game-controlled* and can depend on the creator, params, or state.
+
+## Wire protocol
+
+Rooms use reliable envelope kinds **21–25**:
+
+| Kind | Name | Direction | Body |
+| ---- | ---- | --------- | ---- |
+| 21 | `ROOM_CREATE` | client → server | `{u16 len, params}` — `params` = room **name** / matchmaking key (join-or-create) |
+| 22 | `ROOM_JOIN` | client → server | `{u64 room_id}` |
+| 23 | `ROOM_JOINED` | server → client | `{u64 room_id, str map, str mode}` |
+| 24 | `ROOM_LEAVE` | both | `{u64 room_id}` |
+| 25 | `ROOM_MAP_READY` | client → server | `{u64 room_id}` |
+
+Strings are `u16` length-prefixed UTF-8. All integers are big-endian.
+
+## Server: control the map and admission (Lua)
+
+Two optional hooks let your game own room policy. Both are isolated (a handler error
+or timeout can't crash the server); if you register neither, rooms fall back to
+"the create params are the map name" and "everyone may join".
+
+```lua
+-- Called once, when a NAMED room is first created. `name` is the matchmaking key
+-- the client asked for (e.g. "lobby") — NOT the map. Return the room's label; the
+-- SERVER owns the map choice. A bare string is the map name; a table sets more.
+citadel.on_room_create(function(ctx, name)
+  return {
+    map = "ForestArena",   -- the level clients load (server-chosen)
+    mode = "ffa",
+    max_players = 8,       -- 0 = unlimited
+    open = true,           -- accept further joins?
+  }
+  -- return "ForestArena"  -- shorthand: just the map name
+end)
+
+-- Admission gate: return true to admit, false to reject.
+citadel.on_room_join(function(ctx, room_id)
+  return true
+end)
+```
+
+## Client: create / join and react to the join
+
+Subscribe to the join event **before** creating or joining. It carries the map name
+so your game can open the level, then acknowledge with map-ready.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+auto* Rooms = GetGameInstance->GetSubsystem<UCitadelRoomSubsystem>;
+Rooms->OnRoomJoined.AddDynamic(this, &AMyGameMode::HandleRoomJoined);
+
+// Join the "lobby" room, creating it if needed (everyone asking "lobby" shares it):
+Rooms->JoinOrCreateRoom(TEXT("lobby"));
+// ...or join a specific room by id:  Rooms->JoinRoom(ExistingRoomId);
+
+void AMyGameMode::HandleRoomJoined(const FCitadelRoomInfo& Room)
+{
+    UGameplayStatics::OpenLevel(this, FName(*Room.Map));
+    // After the level is loaded, tell the server we're ready:
+    Rooms->SendMapReady(Room.RoomId);
+}
+```
+
+</TabItem>
+<TabItem label="Unreal Blueprint">
+
+Blueprints aren't text, so this is the node recipe:
+
+1. **Get Game Instance Subsystem** → `CitadelRoomSubsystem`.
+2. From it, **Bind Event to On Room Joined** (a red event node) → a **Custom Event**
+   `HandleRoomJoined(Room: CitadelRoomInfo)`. Do this on **Begin Play** (after login).
+3. Call **Join Or Create Room** (`Room Name = "lobby"`) — or **Join Room** (`Room Id`).
+4. In `HandleRoomJoined`: **Break CitadelRoomInfo** → feed `Map` into **Open Level
+   (by Name)**; feed `Room Id` into **Send Map Ready** (call after the level loads).
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+// Make one helper after connecting. Assign it to PeerManager.rooms so the
+// application's single native poll loop forwards inbound room frames to it.
+var rooms = new CitadelRooms(connection.Client);
+peerManager.rooms = rooms;
+rooms.Joined += room => {
+    SceneManager.LoadScene(room.Map);
+    rooms.SendMapReady(room.RoomId);
+};
+
+rooms.JoinOrCreate("lobby");       // or rooms.Join(existingRoomId);
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+# Forward each envelope from your one poll loop: rooms.handle_envelope(kind, payload).
+var rooms := CitadelRooms.new(client)
+rooms.joined.connect(func(room: Dictionary):
+    get_tree.change_scene_to_file("res://maps/%s.tscn" % room["map"])
+    rooms.send_map_ready(room["room_id"]))
+
+rooms.join_or_create("lobby")       # or rooms.join(existing_room_id)
+```
+
+</TabItem>
+<TabItem label="JavaScript / Web">
+
+```js
+const client = await CitadelClient.connect("ws://127.0.0.1:7352/");
+await client.handshakeGuest;
+
+client.onRoomJoined((room) => {
+  loadMap(room.map);              // your engine/router owns the level load
+  client.sendMapReady(room.roomId);
+});
+
+client.joinOrCreateRoom("lobby"); // or client.joinRoom(existingRoomId)
+```
+
+</TabItem>
+</Tabs>
+
+## Room-scoped visibility
+
+Players in different rooms share one server-side `TransformWorld`, but a
+[networked actor](./networked-actors) is only spawned for peers in the **same room**:
+a newcomer's spawn goes only to same-room members, its own spawn-batch is filtered to
+same-room actors, and disconnect despawns are scoped the same way. Two rooms therefore
+never see each other's avatars even though they run in one world.
+
+## Known limitations (Phase A)
+
+- **One room per participant.** Joining a new room leaves the previous one.
+- **Snapshots are not yet room-filtered.** Cross-room transforms are never *rendered*
+  (a client only draws actors it was told to spawn), but they still travel on the
+  snapshot path — wasted bandwidth when rooms overlap in world space. Per-room snapshot
+  relevance is a planned follow-up.
+- **Ticket matchmaker labels are currently fixed.** The ticket
+  [matchmaker](./matchmaker/) creates and admits a cohort to a server-owned room, but
+  its label is currently `map: "default"`, `mode: "matchmaker"`; Lua cannot yet
+  customize that allocation path.

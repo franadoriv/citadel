@@ -1,0 +1,492 @@
+---
+title: Chat (console API + realtime relay pattern)
+description: Per-method reference for the console chat channel/history/moderation API, plus the realtime client relay pattern used to deliver chat today (custom envelope kind via Lua).
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Citadel's chat surface has two distinct parts today:
+
+1. A **console-operator API** (`/console/v1/chat*`) that models channels,
+   paged message history, and moderation (tombstone delete). This is a
+   history/moderation model, not a delivery mechanism.
+2. A **realtime delivery pattern** built from primitives that already ship:
+   your Lua script relays a custom envelope kind with `citadel.on_message` +
+   `citadel.broadcast`/`citadel.send`, and each client SDK sends/receives that
+   kind. There is no chat-specific wire kind or client method yet — see the
+   note in [Realtime delivery today](#realtime-delivery-today).
+
+Source: `src/services/chat.rs` (thin service over the repository),
+`src/repository/chat.rs` (channel/history model + in-memory backend),
+`src/repository/pg/chat.rs` and `src/repository/sqlite/chat.rs` (durable
+backends), `src/http/console_api/chat.rs` (HTTP handlers), `src/runtime/lua.rs`
+(the `citadel.on_message`/`citadel.broadcast`/`citadel.send` host API described
+on the [Lua runtime API](/reference/server-sdk/lua-runtime) page).
+
+:::note[Scope]
+The console API below is a **channel/history and moderation model only** — it
+does not deliver messages to game clients in real time. Until a dedicated
+chat wire protocol lands, the console's `POST .../messages` route is the
+producer, so the model is exercisable end to end. Wire delivery remains
+deferred.
+:::
+
+## The `ChannelType` enum
+
+```rust
+pub enum ChannelType {
+    Room,   // "room"   — a named, joinable room (the common "world chat"/lobby shape)
+    Group,  // "group"  — a group's channel
+    Direct, // "direct" — a direct (1:1) channel between two accounts
+}
+```
+
+Serialized as the lowercase snake_case tokens shown above. A channel is
+created implicitly by its **first appended message**; the type given at
+creation is fixed for the channel's lifetime — a later append's
+`channel_type` is ignored once the channel exists.
+
+History is kept in a per-channel bounded ring (default 1000 messages,
+`DEFAULT_CHANNEL_HISTORY_CAP`): appending past the bound evicts the oldest
+message. Message ids are per-channel, sequential, and monotonic starting at
+1 — they are never reused, even past eviction, so a page's `before` cursor
+stays meaningful across the channel's whole lifetime.
+
+Channels and their history are **persisted behind the repository seam**: on the
+Postgres and SQLite backends they survive a node restart (stored in a single
+`chat_messages` table keyed by `(channel_id, id)`, with the retention bound
+enforced on append). The in-memory backend stays non-durable by design — a
+restart clears it.
+
+## Authentication
+
+Every route below requires a console bearer token from `POST
+/console/v1/login` (see [Login and roles](/reference/admin-api/console/#login-and-roles)):
+
+```
+Authorization: Bearer <token>
+```
+
+| Role | Access |
+| --- | --- |
+| `admin` | Read and mutate (append, delete/tombstone). |
+| `viewer` | Read-only. A mutation attempt returns `403 forbidden`. |
+
+## `GET /console/v1/chat`
+
+List every channel, most-recently-active first (ties broken by channel id).
+
+**Auth:** bearer token, any role.
+
+**Query parameters**
+
+| Name | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `filter` | string | no | Case-sensitive substring match over the channel id. |
+| `limit` | integer | no | Max channels returned. Default `100`, capped at `500`. |
+
+**Response `200 OK`**
+
+```json
+{
+  "items": [
+    { "channel": "raid-1", "channel_type": "group",
+      "messages": 12, "last_activity_unix_ms": 1751791003000 },
+    { "channel": "lobby", "channel_type": "room",
+      "messages": 2, "last_activity_unix_ms": 1751791000123 }
+  ],
+  "total": 2
+}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `channel` | string | Channel id, chosen by whoever first appended to it. |
+| `channel_type` | string | `room`, `group`, or `direct`. |
+| `messages` | integer | Total messages ever appended (monotonic; unaffected by eviction/tombstoning — an activity counter, not the retained row count). |
+| `last_activity_unix_ms` | integer | Most recent append's time (Unix milliseconds). |
+| `total` | integer | Total channel count before filtering/limiting. |
+
+**Errors**
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| `401` | `authentication_failed` | Missing/invalid/expired bearer token. |
+
+**Example**
+
+```bash
+curl -s "http://127.0.0.1:7350/console/v1/chat?filter=lobby&limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## `POST /console/v1/chat/{channel}/messages`
+
+Append a message. This is the console-side message **producer** — until
+realtime wire delivery lands, this route is how history gets populated
+end to end. Creates the channel (as `channel_type`) on first use;
+`channel_type` is ignored if the channel already exists.
+
+**Auth:** bearer token, `admin` only. A `viewer` gets `403 forbidden`.
+
+**Path parameters**
+
+| Name | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `channel` | string | yes | The channel id (created if it doesn't exist). |
+
+**Request body**
+
+```json
+{ "sender": "alice", "content": "hello world", "channel_type": "room" }
+```
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `sender` | string | yes | The sending identity, as presented by the operator. Not validated against the account/session stack at this layer. |
+| `content` | string | yes | The message body. |
+| `channel_type` | string | no | `room` (default), `group`, or `direct`. Only used if the channel does not exist yet. Unknown fields in the body are rejected. |
+
+**Response `200 OK`**
+
+```json
+{ "id": 1, "sender": "alice", "content": "hello world",
+  "created_at_unix_ms": 1751791000000, "deleted": false }
+```
+
+**Errors**
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| `400` | `invalid_request` | Malformed body, unknown field, or unknown `channel_type` token. |
+| `401` | `authentication_failed` | Missing/invalid/expired bearer token. |
+| `403` | `forbidden` | Caller is a `viewer`. |
+
+Audited as `chat.message.append`.
+
+**Example**
+
+```bash
+curl -s -X POST http://127.0.0.1:7350/console/v1/chat/lobby/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"sender":"alice","content":"hello world"}'
+```
+
+## `GET /console/v1/chat/{channel}/messages`
+
+Paged history for one channel, newest first. An unknown channel returns an
+empty page rather than an error — reading history never requires the channel
+to have been created yet.
+
+**Auth:** bearer token, any role.
+
+**Path parameters**
+
+| Name | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `channel` | string | yes | The channel id. |
+
+**Query parameters**
+
+| Name | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `limit` | integer | no | Max messages returned. Default `50`, capped at `200`. |
+| `before` | integer | no | Resume cursor: only messages with `id < before` (pass the previous page's oldest returned `id`). |
+
+**Response `200 OK`**
+
+```json
+{
+  "channel": "lobby",
+  "items": [
+    { "id": 2, "sender": "bob", "content": "hi alice",
+      "created_at_unix_ms": 1751791000123, "updated_at_unix_ms": 1751791000123,
+      "revision": 1, "last_event_id": 2, "deleted": false },
+    { "id": 1, "sender": "alice", "content": "",
+      "created_at_unix_ms": 1751791000000, "updated_at_unix_ms": 1751791000345,
+      "revision": 2, "last_event_id": 3, "deleted": true }
+  ],
+  "next": 1
+}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `channel` | string | The channel this page belongs to. |
+| `items` | array | Messages, newest first. Every message includes `created_at_unix_ms`, `updated_at_unix_ms`, `revision`, and `last_event_id`. `content` is blanked and `deleted: true` for a tombstoned message. |
+| `next` | integer \| absent | Cursor for the next page (pass as `before`); present only when the page was full and older messages may remain. |
+
+**Errors**
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| `401` | `authentication_failed` | Missing/invalid/expired bearer token. |
+
+**Example**
+
+```bash
+curl -s "http://127.0.0.1:7350/console/v1/chat/lobby/messages?limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## `DELETE /console/v1/chat/{channel}/messages/{id}`
+
+Tombstone one message: blank its `content` and set `deleted: true`. The row
+(and its id) stays in history so ids and paging remain contiguous. A successful
+moderation also increments the message revision/event watermark and writes one
+redacted durable `chat_moderation_audit` record in the same transaction. Its
+independent retention never stores message text or raw player/operator ids.
+
+**Auth:** bearer token, `admin` only. A `viewer` gets `403 forbidden`.
+
+**Path parameters**
+
+| Name | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `channel` | string | yes | The channel id. |
+| `id` | integer | yes | The per-channel message id (from a history page). |
+
+**Response:** `204 No Content` (no body). Idempotent — deleting an
+already-tombstoned message still returns `204` and makes no further change.
+
+**Errors**
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| `401` | `authentication_failed` | Missing/invalid/expired bearer token. |
+| `403` | `forbidden` | Caller is a `viewer`. |
+| `404` | `not_found` | Unknown `channel` or unknown `id` within it. |
+
+Audited as `chat.message.delete`.
+
+**Example**
+
+```bash
+curl -s -X DELETE http://127.0.0.1:7350/console/v1/chat/lobby/messages/1 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Errors (shared shape)
+
+Every error uses the console API's shared JSON error body:
+
+```json
+{ "code": "not_found", "message": "chat message not found" }
+```
+
+See the [console API's error table](/reference/admin-api/console/#errors) for the full
+status/code list.
+
+## Realtime delivery today
+
+There is **no dedicated chat wire kind and no chat-specific client SDK
+method** yet. What exists today is the same general-purpose relay pattern
+[Rooms](/reference/client-sdk/rooms) and [transform sync](/reference/client-sdk/transform-sync) are
+built on: your [Lua runtime script](/reference/server-sdk/lua-runtime) registers a
+handler for an application-chosen envelope `kind` with `citadel.on_message`,
+and re-sends it to peers with `citadel.broadcast` (everyone but the sender)
+or `citadel.send` (one session). Reserved kinds run through 26 (see the
+[envelope reference](/reference/protocol/envelope/#constants) and
+[rooms](/reference/client-sdk/rooms/#wire-protocol)), so an application-defined chat kind
+must be **27 or higher**.
+
+:::note[Future work — not implemented]
+A dedicated chat wire protocol and chat-specific client SDK API (message
+history sync, per-channel subscribe/unsubscribe, typing indicators, etc.) are
+**future work**. The
+pattern below is the *only* way chat messages reach a connected game client
+today: a plain custom envelope kind, relayed by your own Lua script. It is
+not chat-aware — the server does not know `kind 100` means "chat message" —
+your game defines that convention.
+:::
+
+### Server: relay a chat message (Lua)
+
+```lua
+local KIND_CHAT_SEND = 100  -- client -> server: "post a chat line" (app-defined)
+local KIND_CHAT_RECV = 101  -- server -> client: relayed chat line, sender-tagged
+
+-- Whoever the server currently is (accounts, or nil for a guest) is on ctx.user_id;
+-- the transport-level participant id is always on ctx.sender.
+citadel.on_message(KIND_CHAT_SEND, function(ctx, body)
+  local tagged = string.pack(">I8", ctx.sender) .. body
+  citadel.broadcast(KIND_CHAT_RECV, tagged, false)  -- reliable: chat lines must arrive
+end)
+```
+
+`citadel.broadcast` never echoes to the sender, so a sender should render its
+own outgoing line locally instead of waiting for the relay. `false` (the
+`unreliable` flag) picks a reliable stream — appropriate for chat text, unlike
+the `true` used for the position-relay example, since a dropped chat line is
+a worse experience than a dropped position update.
+
+### Client: send and receive the custom chat kind
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+constexpr uint16 KIND_CHAT_SEND = 100;
+constexpr uint16 KIND_CHAT_RECV = 101;
+
+auto* Citadel = GetGameInstance->GetSubsystem<UCitadelClientSubsystem>;
+
+// Send a chat line (reliable).
+FString Line = TEXT("hello world");
+FTCHARToUTF8 Utf8(*Line);
+TArray<uint8> Payload((const uint8*)Utf8.Get, Utf8.Length);
+Citadel->Send(KIND_CHAT_SEND, Payload, /*bReliable=*/true);
+
+// Poll each tick and dispatch by kind (the single reader of the envelope queue).
+uint16 Kind;
+TArray<uint8> Body;
+while (Citadel->Poll(Kind, Body) == ECitadelStatus::Ok)
+{
+    if (Kind == KIND_CHAT_RECV)
+    {
+        // First 8 bytes: big-endian sender session id; rest: the chat text.
+        FString Text = FString(UTF8_TO_TCHAR(Body.GetData + 8));
+        // ... render Text in your chat widget ...
+    }
+}
+```
+
+</TabItem>
+<TabItem label="Blueprint">
+
+Blueprints have no source text; this is the node recipe. **Note:** `Send`
+and `Poll` are **C++-only** on the Unreal SDK today (their `uint16` envelope
+`Kind` parameter is not Blueprint-representable) — a Blueprint-only project
+cannot send or receive a raw custom envelope kind like this chat example
+until that surface is exposed to Blueprint. Use a small C++ helper class (as
+shown in the C++ tab) and expose a `BlueprintCallable`/`BlueprintImplementableEvent`
+wrapper from it if you need this reachable from Blueprint.
+
+1. Add a C++ subclass of `UCitadelClientSubsystem` (or a small `UBlueprintFunctionLibrary`)
+   that wraps `Send(KIND_CHAT_SEND, Payload, true)` behind a `BlueprintCallable`
+   function taking an `FString` chat line.
+2. Add a `BlueprintImplementableEvent` (e.g. `OnChatReceived(FString Text)`) fired
+   from a C++ tick/poll loop that calls `Poll`, checks `Kind == KIND_CHAT_RECV`,
+   strips the 8-byte sender prefix, and converts the remainder to `FString`.
+3. From Blueprint: call your wrapped **Send Chat Line** function on chat submit;
+   bind **On Chat Received** to append incoming lines to your chat UI widget.
+
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+const ushort KindChatSend = 100;
+const ushort KindChatRecv = 101;
+
+// Send a chat line (reliable).
+byte[] payload = System.Text.Encoding.UTF8.GetBytes("hello world");
+client.Send(KindChatSend, payload, reliable: true);
+
+// Poll each frame and dispatch by kind.
+var buffer = new byte[4096];
+while (client.Poll(buffer, out ushort kind, out int length, out bool truncated) == PollResult.Message)
+{
+    if (kind == KindChatRecv)
+    {
+        // First 8 bytes: big-endian sender session id; rest: the chat text.
+        ulong sender = ReadSenderIdBigEndian(buffer);
+        string text = System.Text.Encoding.UTF8.GetString(buffer, 8, length - 8);
+        // ... render text in your chat UI ...
+    }
+}
+```
+
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+const KIND_CHAT_SEND := 100
+const KIND_CHAT_RECV := 101
+
+# Send a chat line (reliable).
+var payload := "hello world".to_utf8_buffer
+client.send(KIND_CHAT_SEND, payload, true)
+
+# Poll each frame and dispatch by kind.
+var out := {}
+while client.poll(out) == CitadelClient.Status.OK:
+	if out["kind"] == KIND_CHAT_RECV:
+		var body: PackedByteArray = out["payload"]
+		# First 8 bytes: big-endian sender session id; rest: the chat text.
+		var text := body.slice(8).get_string_from_utf8
+		# ... render text in your chat UI ...
+```
+
+:::note[Godot client is a skeleton]
+`clients/godot/citadel/client.gd` is a documented skeleton: the native
+GDExtension backing `send`/`poll` is not wired up in this repo yet (see
+`docs/features/godot-sdk-skeleton.md`). The calls above are the intended
+surface and will work once the native extension lands; today `send`/`poll`
+return an error status instead of moving bytes.
+:::
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust
+use citadel_wire::Envelope;
+
+const KIND_CHAT_SEND: u16 = 100;
+const KIND_CHAT_RECV: u16 = 101;
+
+// Send a chat line (reliable stream on QUIC; WebSocket is always reliable).
+let body = b"hello world".to_vec;
+ws.send(&Envelope::new(KIND_CHAT_SEND, body)).await?;
+// quic.send_reliable(&Envelope::new(KIND_CHAT_SEND, body)).await?;
+
+// Receive loop: dispatch by kind.
+while let Some(env) = ws.recv.await? {
+    if env.kind == KIND_CHAT_RECV {
+        // First 8 bytes: big-endian sender session id; rest: the chat text.
+        let sender = u64::from_be_bytes(env.body[..8].try_into.unwrap);
+        let text = String::from_utf8_lossy(&env.body[8..]);
+        // ... handle the chat line ...
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+See the [envelope format reference](/reference/protocol/envelope/) for the exact byte
+layout of framed vs. datagram encodings, and the
+[Lua runtime API](/reference/server-sdk/lua-runtime) for the full `citadel.on_message` /
+`citadel.broadcast` / `citadel.send` host surface.
+
+## Test coverage
+
+Chat channel/history bounds, tombstone semantics, and paging are unit-tested
+in `src/repository/chat.rs` (the pure eviction/paging/listing helpers plus the
+in-memory reference) and `src/services/chat.rs` (the thin service). The same
+channel/history/eviction/tombstone contract is enforced across the in-memory,
+SQLite, and Postgres backends by `tests/chat_repository_contract.rs` (Postgres
+opt-in via `DATABASE_URL`). The HTTP handlers (channel listing, append, history
+paging, tombstone delete, role gating) are unit-tested in
+`src/http/console_api/chat.rs` and covered end-to-end by
+`tests/console_chat.rs`. The Lua relay pattern (`citadel.on_message` +
+`citadel.broadcast`, sender-tagging, unreliable/reliable delivery) is
+exercised by the gateway integration tests in `src/realtime/gateway.rs`
+(`lua_handler_drives_the_relay_end_to_end` and neighboring tests).
+
+## Known limitations
+
+- **Durable on Postgres/SQLite; in-memory backend is not.** Channel/message
+  history is persisted through the repository seam and survives a restart on the
+  Postgres and SQLite backends; a node running the in-memory backend still loses
+  it on restart (by design).
+- **No realtime wire delivery for the console API.** The console's `POST`
+  route is a manual producer, not a live feed — a message appended through
+  the console is not pushed to any connected game client.
+- **No chat-specific client SDK surface.** The relay pattern above uses only
+  generic envelope send/receive; there is no `SendChatMessage`/`OnChatMessage`
+  style method on any client SDK today.
+- **Blueprint cannot send/receive raw envelope kinds today.** See the
+  Blueprint tab above.
+- **Godot's native client is a skeleton.** `send`/`poll` do not move bytes
+  until the GDExtension is wired up.

@@ -1,0 +1,49 @@
+import os
+
+godot_cpp = os.environ.get("GODOT_CPP_PATH", "godot-cpp")
+ffi_include = os.path.abspath(os.path.join("..", "..", "..", "crates", "citadel-client-ffi", "include"))
+ffi_lib = os.environ.get(
+    "CITADEL_FFI_LIB_DIR",
+    os.path.abspath(os.path.join("..", "..", "..", "target", "release")),
+)
+
+if not os.path.isfile(os.path.join(godot_cpp, "SConstruct")):
+    raise RuntimeError("Set GODOT_CPP_PATH to a Godot 4 godot-cpp checkout")
+
+env = SConscript(os.path.join(godot_cpp, "SConstruct"))
+env.Append(CPPPATH=["src", ffi_include])
+env.Append(LIBPATH=[ffi_lib])
+# Link the Rust static archive by absolute path on every platform. Besides
+# avoiding MSVC's LIBPATH loss, this prevents macOS from accidentally selecting
+# the cdylib and leaving a runtime `@rpath` dependency beside a GDExtension.
+ffi_link = os.path.join(
+    ffi_lib,
+    "citadel_client_ffi.lib" if os.name == "nt" else "libcitadel_client_ffi.a",
+)
+# Pass the archive as a linker flag rather than `LIBS`: SCons otherwise turns
+# an absolute `.a` path into `-l<path-without-prefix>`, which macOS cannot
+# resolve. `link.exe` also accepts the absolute `.lib` argument on Windows.
+env.Append(LINKFLAGS=[ffi_link])
+if os.name == "nt":
+    # Rust's Windows pipe implementation imports this ntdll entry point when
+    # linked as a static archive into the GDExtension.
+    env.Append(LIBS=["ntdll"])
+
+sources = Glob("src/*.cpp")
+library = env.SharedLibrary(
+    target="bin/citadel_godot{}{}".format(env["suffix"], env["SHLIBSUFFIX"]),
+    source=sources,
+)
+Default(library)
+
+# On Windows Godot loads a copied extension DLL from the addon's `bin` folder.
+# Ship the C-ABI runtime next to it so its Rust symbols are resolvable in the
+# editor and in exported games without a machine-global DLL search path.
+if os.name == "nt":
+    ffi_runtime = os.path.join(ffi_lib, "citadel_client_ffi.dll")
+    runtime_copy = env.Command(
+        "bin/citadel_client_ffi.dll",
+        ffi_runtime,
+        Copy("$TARGET", "$SOURCE"),
+    )
+    Default(runtime_copy)
