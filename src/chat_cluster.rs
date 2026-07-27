@@ -135,7 +135,7 @@ impl LocalChatPresenceAnnouncer {
         let generation = self.generations.lock().map_or_else(
             |_| OwnershipGeneration::new(self.next_generation.fetch_add(1, Ordering::Relaxed) + 1),
             |mut generations| {
-                *generations.entry(channel_id.to_owned).or_insert_with(|| {
+                *generations.entry(channel_id.to_owned()).or_insert_with(|| {
                     OwnershipGeneration::new(
                         self.next_generation.fetch_add(1, Ordering::Relaxed) + 1,
                     )

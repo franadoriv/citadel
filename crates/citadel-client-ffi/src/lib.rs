@@ -115,7 +115,7 @@ pub struct CitadelClient {
 impl CitadelClient {
     fn set_error(&self, msg: impl Into<String>) {
         if let Ok(mut slot) = self.last_error.lock() {
-            *slot = msg.into;
+            *slot = msg.into();
         }
     }
 }
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn citadel_client_authenticate(
 
         // SAFETY: out pointers are non-null (checked) and caller-writable.
         unsafe {
-            *out_user_len = result.user_id.len;
+            *out_user_len = result.user_id.len();
             *out_reason = result.reason_class;
         }
         if result.is_authenticated() {
@@ -445,7 +445,7 @@ pub unsafe extern "C" fn citadel_client_poll(
                 // SAFETY: out_* pointers are non-null (checked) and caller-writable.
                 unsafe {
                     *out_kind = env.kind;
-                    *out_len = payload.len;
+                    *out_len = payload.len();
                     *out_truncated = truncated;
                 }
                 CitadelStatus::Ok

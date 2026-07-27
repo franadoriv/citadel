@@ -627,7 +627,7 @@ impl DeltaBunch {
         }
         let mut bytes = [0u8; SCHEMA_HASH_BYTES];
         for byte in &mut bytes {
-            *byte = r.read_bits(8).ok? as u8;
+            *byte = r.read_bits(8).ok()? as u8;
         }
         let layout_version = r.read_bits(LAYOUT_VERSION_BITS).ok()? as u32;
         Some((bytes, layout_version))

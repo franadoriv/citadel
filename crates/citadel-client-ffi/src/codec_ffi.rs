@@ -516,7 +516,7 @@ pub unsafe extern "C" fn citadel_rep_decoded_field_bytes(
             return CitadelStatus::InvalidArgument;
         };
         unsafe {
-            *out_len = bytes.len;
+            *out_len = bytes.len();
         }
         let copy = bytes.len().min(cap);
         if copy > 0 {
@@ -776,7 +776,7 @@ pub unsafe extern "C" fn citadel_rep_encoder_finish(
         }
         // SAFETY: out pointers are non-null (checked) and caller-writable.
         unsafe {
-            *out_len = blob.len;
+            *out_len = blob.len();
             *out_truncated = truncated;
         }
         CitadelStatus::Ok

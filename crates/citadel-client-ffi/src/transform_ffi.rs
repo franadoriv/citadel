@@ -148,8 +148,8 @@ pub unsafe extern "C" fn citadel_transform_view_sample_now(
         // SAFETY: both output pointers were checked non-null and are
         // caller-writable. A zero transform is deterministic when not found.
         unsafe {
-            *out_found = state.is_some;
-            *out_state = state.unwrap_or_default.into;
+            *out_found = state.is_some();
+            *out_state = state.unwrap_or_default().into();
         }
         CitadelStatus::Ok
     })
@@ -183,8 +183,8 @@ pub unsafe extern "C" fn citadel_transform_view_authoritative_state(
         let state = runtime.authoritative_state(object_id);
         // SAFETY: output pointers were validated and are caller-writable.
         unsafe {
-            *out_found = state.is_some;
-            *out_state = state.unwrap_or_default.into;
+            *out_found = state.is_some();
+            *out_state = state.unwrap_or_default().into();
             *out_input_seq = runtime.owner_ack(object_id).unwrap_or(0);
         }
         CitadelStatus::Ok
@@ -269,8 +269,8 @@ pub unsafe extern "C" fn citadel_transform_encode_input(
         }
         // SAFETY: pointers were checked non-null and caller-writable.
         unsafe {
-            *out_len = encoded.len;
-            *out_truncated = encoded.len > cap;
+            *out_len = encoded.len();
+            *out_truncated = encoded.len() > cap;
         }
         CitadelStatus::Ok
     })

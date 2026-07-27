@@ -59,7 +59,7 @@ impl CancellationToken {
     /// Whether cancellation has already been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        *self.rx.borrow
+        *self.rx.borrow()
     }
 
     /// Resolve once cancellation has been requested.

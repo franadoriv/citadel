@@ -495,7 +495,7 @@ impl StorageRepository for InMemoryStorageRepository {
         let state = self.guard()?;
         let mut counts: BTreeMap<Collection, u64> = BTreeMap::new();
         for object in state.objects.values() {
-            *counts.entry(object.id.collection.clone).or_insert(0) += 1;
+            *counts.entry(object.id.collection.clone()).or_insert(0) += 1;
         }
         Ok(counts
             .into_iter()

@@ -1462,7 +1462,7 @@ mod tests {
 
     fn schema() -> RepSchema {
         RepSchema::new(
-            *layout.schema_hash,
+            *layout().schema_hash(),
             vec![
                 RepFieldCodec::IntRange { min: 0, max: 100 },
                 RepFieldCodec::IntRange { min: 0, max: 8 },
@@ -2519,7 +2519,7 @@ mod tests {
                 .unwrap()
         });
         let sch = RepSchema::new(
-            *bad.schema_hash,
+            *bad.schema_hash(),
             vec![RepFieldCodec::Scalar(
                 ScalarQuant::new(0.0, 1.0, 16).unwrap(),
             )],
@@ -2552,7 +2552,7 @@ mod tests {
                 .unwrap()
         });
         let sch = RepSchema::new(
-            *cl.schema_hash,
+            *cl.schema_hash(),
             vec![RepFieldCodec::Collection {
                 item: Box::new(RepFieldCodec::IntRange { min: 0, max: 100 }),
                 max_items: 16,

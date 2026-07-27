@@ -69,7 +69,7 @@ fn layout() -> &'static RepLayout {
 
 fn schema() -> RepSchema {
     RepSchema::new(
-        *layout.schema_hash,
+        *layout().schema_hash(),
         vec![
             RepFieldCodec::IntRange { min: 0, max: 100 },
             RepFieldCodec::Scalar(ScalarQuant::new(0.0, 1.0, 1024).expect("quant")),
