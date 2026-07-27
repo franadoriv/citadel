@@ -8,7 +8,7 @@ name = "citadel"
 # Bump this per milestone before pushing develop -> release; the release workflow
 # reads it and names the GitHub Release v{version}. Pre-1.0 while the API and
 # feature set are still stabilizing. See docs/release-process.md.
-version = "0.9.8"
+version = "0.9.9"
 edition = "2024"
 
 [features]
