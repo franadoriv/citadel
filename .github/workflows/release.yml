@@ -2,9 +2,11 @@ name: release
 
 # Build the standalone Windows release packages and create a GitHub Release. A
 # release is cut by fast-forwarding develop to the long-lived release branch, or
-# through workflow_dispatch. Public ZIP downloads remain Windows-only until Apple
-# Developer ID and notarization credentials are available; native macOS package
-# targets are deliberately not run in CI yet.
+# through workflow_dispatch. Every run first requires a new Cargo version whose
+# `v<version>` tag does not already exist; the publish step creates that tag.
+# Public ZIP downloads remain Windows-only until Apple Developer ID and
+# notarization credentials are available; native macOS package targets are
+# deliberately not run in CI yet.
 
 on:
   push:
@@ -15,7 +17,40 @@ on:
 permissions:
   contents: write
 jobs:
+  validate-release-version:
+    name: Require a new release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read and validate the release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' Cargo.toml | head -1)"
+          if [[ -z "$version" ]]; then
+            echo "Could not read the Citadel version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Cargo version '$version' is not valid semver" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Release tag '$tag' already exists; bump Cargo.toml before pushing to release." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   package:
+    needs: validate-release-version
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +93,7 @@ jobs:
           if-no-files-found: error
 
   godot-web:
+    needs: validate-release-version
     name: Package Godot WebAssembly SDK
     runs-on: ubuntu-latest
     steps:
@@ -89,7 +125,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [package, godot-web]
+    needs: [validate-release-version, package, godot-web]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
