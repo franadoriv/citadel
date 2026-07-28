@@ -66,6 +66,9 @@ pub use citadel_wire::protocol::{
 };
 
 const MATCHMAKER_HANDOFF_TTL_MS: u64 = 30_000;
+/// Receiver-side expiration for a chat typing indication. Typing is intentionally
+/// ephemeral: it has no durable event id and never participates in resync.
+const CHAT_TYPING_TTL_MS: u64 = 5_000;
 
 #[derive(Clone)]
 struct JoinToken(String);
@@ -274,6 +277,7 @@ impl DomainRpcServices {
                     .await
             }
             "chat.leave" => self.chat_leave(registry, sender, user, payload).await,
+            "chat.typing" => self.chat_typing(registry, sender, user, payload).await,
             "chat.send" => self.chat_send(registry, sender, user, payload).await,
             "chat.history" => self.chat_history(sender, user, payload).await,
             "chat.edit" => self.chat_edit(registry, sender, user, payload).await,
@@ -697,6 +701,66 @@ impl DomainRpcServices {
             event_id,
         );
         Self::ok(serde_json::json!({"message": message, "event_id": event_id}))
+    }
+
+    /// Broadcast a server-authorized, non-durable typing indication to the
+    /// other local subscribers in the channel. The receiver must clear a true
+    /// indication at `expires_at`; a false indication expires immediately.
+    async fn chat_typing(
+        &self,
+        registry: &SessionRegistry,
+        sender: ParticipantId,
+        user: &str,
+        payload: &[u8],
+    ) -> (u8, Vec<u8>) {
+        let value = match Self::json_object(payload) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let channel_id = match Self::chat_channel_id(&value) {
+            Ok(channel_id) => channel_id,
+            Err(message) => return Self::err(&message),
+        };
+        let Some(typing) = value.get("typing").and_then(serde_json::Value::as_bool) else {
+            return Self::err("missing boolean field: typing");
+        };
+        let (channel, lease) = match self.authorize_subscription(sender, user, &channel_id).await {
+            Ok(value) => value,
+            Err(error) => return Self::err(&error),
+        };
+        let now = SystemClock.now();
+        if let Err(error) = self
+            .chat
+            .consume_rate_limits(&self.chat_rate_limits.typing(user, &channel.id), now)
+            .await
+        {
+            return Self::err(&error.to_string());
+        }
+        let expires_at = if typing {
+            now.unix_millis().saturating_add(CHAT_TYPING_TTL_MS)
+        } else {
+            now.unix_millis()
+        };
+        let Some(subscription) = self.chat_presence.subscription(&channel.id, sender) else {
+            return Self::err("CHAT_NOT_SUBSCRIBED");
+        };
+        let event = serde_json::json!({
+            "version": 1,
+            "type": "typing",
+            "channel_id": channel.id,
+            "channel_type": channel.channel_type.as_str(),
+            "presence": {"presence_id": subscription.presence_id, "user_id": user},
+            "typing": typing,
+            "expires_at": expires_at,
+        });
+        let recipients = self
+            .chat_presence
+            .subscribers_at_authority_epoch(&channel.id, lease.access_epoch)
+            .into_iter()
+            .filter(|entry| entry.participant != sender)
+            .collect::<Vec<_>>();
+        self.send_ephemeral_chat_event(registry, &recipients, event);
+        Self::ok(serde_json::json!({"typing": typing, "expires_at": expires_at}))
     }
 
     async fn chat_history(
@@ -1226,6 +1290,20 @@ impl DomainRpcServices {
                 self.chat_presence
                     .mark_needs_resync(channel_id, subscription.participant);
             }
+        }
+    }
+
+    /// Send an ephemeral chat event. A full outbound queue may drop it without
+    /// setting `needs_resync`: typing is neither persisted nor recoverable.
+    fn send_ephemeral_chat_event(
+        &self,
+        registry: &SessionRegistry,
+        subscriptions: &[ChatSubscription],
+        event: serde_json::Value,
+    ) {
+        let outbound = Outbound::reliable(Envelope::new(KIND_CHAT_EVENT, event.to_string()));
+        for subscription in subscriptions {
+            let _ = registry.send_to(subscription.participant, &outbound);
         }
     }
 
@@ -6212,6 +6290,106 @@ mod domain_rpc_tests {
         let (_, status, body) = recv(&mut alice_rx).await;
         assert_eq!(status, protocol::RPC_STATUS_ERROR);
         assert_eq!(String::from_utf8_lossy(&body), "CHAT_NOT_SUBSCRIBED");
+    }
+
+    #[tokio::test]
+    async fn chat_typing_is_authorized_ephemeral_and_receiver_expiring() {
+        let gateway = friends_gateway();
+        let (alice, mut alice_rx) = register(&gateway, Some("alice"));
+        let (bob, mut bob_rx) = register(&gateway, Some("bob"));
+
+        for (sender, request_id, other) in [(alice, 1, "bob"), (bob, 2, "alice")] {
+            gateway.handle_inbound(
+                sender,
+                &rpc(
+                    request_id,
+                    "friends.add",
+                    serde_json::json!({"other": other}),
+                ),
+            );
+            let receiver = if sender == alice {
+                &mut alice_rx
+            } else {
+                &mut bob_rx
+            };
+            let _ = recv(receiver).await;
+        }
+        gateway.handle_inbound(
+            alice,
+            &rpc(
+                3,
+                "chat.join",
+                serde_json::json!({"target": {"kind": "direct", "other_user_id": "bob"}}),
+            ),
+        );
+        let (_, status, body) = recv(&mut alice_rx).await;
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        let channel_id = json(&body)["channel_id"]
+            .as_str()
+            .expect("channel id")
+            .to_owned();
+        gateway.handle_inbound(
+            bob,
+            &rpc(
+                4,
+                "chat.join",
+                serde_json::json!({"target": {"kind": "direct", "other_user_id": "alice"}}),
+            ),
+        );
+        let _ = alice_rx.recv().await.expect("presence event");
+        let _ = recv(&mut bob_rx).await;
+
+        gateway.handle_inbound(
+            alice,
+            &rpc(
+                5,
+                "chat.typing",
+                serde_json::json!({"channel_id": channel_id, "typing": true}),
+            ),
+        );
+        let event = bob_rx.recv().await.expect("typing event");
+        assert_eq!(event.delivery, Delivery::Reliable);
+        assert_eq!(event.envelope.kind, KIND_CHAT_EVENT);
+        let event = json(&event.envelope.body);
+        assert_eq!(event["type"], "typing");
+        assert_eq!(event["typing"], true);
+        assert_eq!(event["presence"]["user_id"], "alice");
+        assert!(event["event_id"].is_null(), "typing is not durable");
+        let expiry = event["expires_at"].as_u64().expect("expiry");
+        let (_, status, body) = recv(&mut alice_rx).await;
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        assert_eq!(json(&body)["expires_at"], expiry);
+        assert!(alice_rx.try_recv().is_err(), "the sender is not echoed");
+
+        gateway.handle_inbound(
+            alice,
+            &rpc(
+                6,
+                "chat.typing",
+                serde_json::json!({"channel_id": channel_id, "typing": false}),
+            ),
+        );
+        let stop = bob_rx.recv().await.expect("typing stop event");
+        let stop = json(&stop.envelope.body);
+        assert_eq!(stop["type"], "typing");
+        assert_eq!(stop["typing"], false);
+        assert!(stop["expires_at"].as_u64().expect("stop expiry") <= expiry);
+        let _ = recv(&mut alice_rx).await;
+
+        gateway.handle_inbound(
+            bob,
+            &rpc(
+                7,
+                "chat.typing",
+                serde_json::json!({"channel_id": channel_id, "typing": true}),
+            ),
+        );
+        let alice_event = alice_rx.recv().await.expect("authorized recipient event");
+        assert_eq!(
+            json(&alice_event.envelope.body)["presence"]["user_id"],
+            "bob"
+        );
+        let _ = recv(&mut bob_rx).await;
     }
 
     #[tokio::test]

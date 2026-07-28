@@ -54,6 +54,20 @@ impl ChatRateLimitPolicy {
         ]
     }
 
+    /// Limit ephemeral typing state by user and user/channel pair without
+    /// consuming the durable-message allowance.
+    #[must_use]
+    pub fn typing(&self, user_id: &str, channel_id: &str) -> Vec<ChatRateLimit> {
+        vec![
+            rule("typing:user", &[user_id], self.limits.typing_user),
+            rule(
+                "typing:user-channel",
+                &[user_id, channel_id],
+                self.limits.typing_user_channel,
+            ),
+        ]
+    }
+
     /// Limit author edits and deletes by user and user/channel pair.
     #[must_use]
     pub fn mutation(&self, user_id: &str, channel_id: &str) -> Vec<ChatRateLimit> {
@@ -111,5 +125,10 @@ mod tests {
         assert_eq!(plan.len(), 3);
         assert!(plan.iter().all(|rule| !rule.key.contains("alice")));
         assert!(plan.iter().all(|rule| !rule.key.contains("ch_secret")));
+
+        let typing = policy.typing("alice", "ch_secret");
+        assert_eq!(typing.len(), 2);
+        assert!(typing.iter().all(|rule| !rule.key.contains("alice")));
+        assert!(typing.iter().all(|rule| !rule.key.contains("ch_secret")));
     }
 }

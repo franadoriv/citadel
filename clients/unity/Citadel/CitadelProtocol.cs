@@ -99,7 +99,7 @@ namespace Citadel
         /// <c>notifications.list</c> RPC.
         /// </summary>
         public const ushort KindNotification = 27;
-        /// <summary>Server-to-client authorized chat presence or durable mutation event (UTF-8 JSON).</summary>
+        /// <summary>Server-to-client authorized chat presence, ephemeral typing, or durable mutation event (UTF-8 JSON).</summary>
         public const ushort KindChatEvent = 28;
 
         /// <summary>

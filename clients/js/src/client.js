@@ -240,9 +240,10 @@ export class CitadelClient {
   }
 
   /**
-   * Subscribe to decoded local chat presence and durable-mutation events.
-   * Events are at-least-once; callers deduplicate durable mutations by
-   * `(channel_id, event_id)` and reconcile `resync_required` with history.
+   * Subscribe to decoded local chat presence, typing, and durable-mutation
+   * events. Events are at-least-once; callers deduplicate durable mutations by
+   * `(channel_id, event_id)`, expire `typing` at `expires_at`, and reconcile
+   * `resync_required` with history.
    * Malformed server payloads are ignored rather than crashing the socket loop.
    *
    * @param {(event: object) => void} handler
@@ -259,6 +260,22 @@ export class CitadelClient {
         // diagnostics when a peer violates the JSON event contract.
       }
     });
+  }
+
+  /**
+   * Set this connection's ephemeral typing state for an already-joined chat
+   * channel. Receivers clear a true indication at the server-provided
+   * `expires_at` timestamp; call with `false` when input is abandoned.
+   *
+   * @param {string} channelId
+   * @param {boolean} typing
+   * @param {{ timeoutMs?: number }} [opts]
+   * @returns {Promise<{typing: boolean, expires_at: number}>}
+   */
+  async setChatTyping(channelId, typing, opts = {}) {
+    const payload = new TextEncoder().encode(JSON.stringify({ channel_id: channelId, typing }));
+    const response = await this.callRpc("chat.typing", payload, opts);
+    return JSON.parse(new TextDecoder().decode(response));
   }
 
   /**

@@ -159,11 +159,13 @@ pub const KIND_MATCHMAKER_MATCHED: u16 = 26;
 /// the persisted notification. Delivery is best effort and at-least-once; a
 /// client deduplicates by `id` and reconciles with `notifications.list`.
 pub const KIND_NOTIFICATION: u16 = 27;
-/// Authorized chat presence and durable mutation delivery (`S→C`, reliable).
+/// Authorized chat presence, ephemeral typing, and durable mutation delivery
+/// (`S→C`, reliable).
 ///
 /// The UTF-8 JSON body is an at-least-once event. Clients deduplicate durable
 /// events by `(channel_id, event_id)` and reconcile with `chat.history` after a
-/// `resync_required` event.
+/// `resync_required` event. A `typing` event is non-durable and carries a
+/// receiver-side `expires_at` timestamp instead of an event id.
 pub const KIND_CHAT_EVENT: u16 = 28;
 
 // Compile-time guarantees that the reserved ranges are disjoint and sit above the

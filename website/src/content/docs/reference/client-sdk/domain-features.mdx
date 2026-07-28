@@ -54,6 +54,7 @@ copied id never authorizes an operation. The retired raw `{ "channel",
 | --- | --- | --- | --- |
 | `chat.join` | `{ "target": { "kind":"direct", "other_user_id":"player-b" } }` (or current `group` / `room`) | `{ "channel_id", "channel_type", "presence", "watermark_event_id", "subscription" }` | `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
 | `chat.leave` | `{ "channel_id":"ch_…" }` | `{ "left": boolean }` | `CHAT_NOT_SUBSCRIBED` only for a conflicting session identity |
+| `chat.typing` | `{ "channel_id":"ch_…", "typing":true }` | `{ "typing", "expires_at" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
 | `chat.send` | `{ "channel_id":"ch_…", "content":"hello" }` | `{ "message", "event_id" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
 | `chat.history` | `{ "channel_id":"ch_…", "limit":50, "before_message_id":123, "acknowledge_watermark":9 }` | `{ "items", "watermark_event_id" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
 | `chat.edit` | `{ "channel_id":"ch_…", "message_id":123, "content":"replacement" }` | `{ "message", "event_id" }` | author/window/access/rate errors |
@@ -70,8 +71,10 @@ Unknown, forbidden, and revoked targets all return `CHAT_UNAVAILABLE`.
 Use each SDK's normal inbound envelope callback or poll dispatcher and branch on
 kind 28. Events are at-least-once: deduplicate durable mutations by
 `(channel_id, event_id)`. `presence.join`, `presence.leave`, `message.create`,
-`message.update`, and `message.remove` carry the shown type; `access.revoked`
-ends delivery for the recipient; `resync_required` carries a durable
+`message.update`, and `message.remove` carry the shown type; `typing` carries
+`{ presence, typing, expires_at }` and is non-durable, so clients clear a true
+state at its Unix-millisecond `expires_at`; `access.revoked` ends delivery for
+the recipient; `resync_required` carries a durable
 `watermark_event_id` and requires a `chat.history` acknowledgement. This is
 single-node delivery; another node's sockets are not yet recipients.
 
@@ -85,11 +88,12 @@ an operator-console action until trusted room authorities are introduced.
 Valid content is non-empty UTF-8 text up to 2,048 bytes with no control
 characters other than line breaks. Fixed-window limits are shared by nodes using
 the same database: send is 8/user, 12/user-channel, and 160/channel per 10 s;
-edit/delete are 4/user and 8/user-channel per minute. History and target access
+typing is 20/user and 12/user-channel per 10 s and never consumes the
+durable-message allowance; edit/delete are 4/user and 8/user-channel per minute. History and target access
 are also limited. A denial returns `CHAT_RATE_LIMITED` without revealing private
 channel state. Moderation is limited to 30/acting moderator and 60/channel per
-minute. Local presence and committed durable live fan-out ship; typing and
-cross-node delivery remain later work.
+minute. Local presence, ephemeral typing, and committed durable live fan-out
+ship; cross-node typing delivery remains later work.
 
 ## Wallet
 

@@ -72,9 +72,10 @@ const KIND_MATCHMAKER_MATCHED := 26
 ## by `id` and reconcile the inbox with the `notifications.list` RPC.
 const KIND_NOTIFICATION := 27
 
-## Server->client: authorized chat presence and durable message event. The body
-## is UTF-8 JSON and is at-least-once; deduplicate durable events by
-## (channel_id, event_id), then reconcile with chat.history when requested.
+## Server->client: authorized chat presence, ephemeral typing, and durable
+## message event. The body is UTF-8 JSON and is at-least-once; deduplicate
+## durable events by (channel_id, event_id), expire typing at expires_at, then
+## reconcile with chat.history when requested.
 const KIND_CHAT_EVENT := 28
 
 ## Maximum `kind + payload` bytes in one Citadel reliable stream envelope.

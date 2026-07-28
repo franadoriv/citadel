@@ -52,6 +52,11 @@ export interface ChatEvent {
   [field: string]: unknown;
 }
 
+export interface ChatTypingResult {
+  typing: boolean;
+  expires_at: number;
+}
+
 /** A connected Citadel WebSocket client (reliable, ordered delivery). */
 export class CitadelClient {
   readonly closed: boolean;
@@ -72,6 +77,7 @@ export class CitadelClient {
   onRoomJoined(handler: (room: RoomInfo) => void): () => void;
   onRoomLeft(handler: (roomId: bigint) => void): () => void;
   onChatEvent(handler: (event: ChatEvent) => void): () => void;
+  setChatTyping(channelId: string, typing: boolean, opts?: { timeoutMs?: number }): Promise<ChatTypingResult>;
   callRpc(method: string, payload?: Uint8Array, opts?: { timeoutMs?: number }): Promise<Uint8Array>;
   close(code?: number, reason?: string): void;
 }

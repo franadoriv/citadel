@@ -52,7 +52,7 @@ export const KIND_ROOM_MAP_READY = 25;
 export const KIND_MATCHMAKER_MATCHED = 26;
 /** Server-to-client durable player-notification live delivery (UTF-8 JSON). */
 export const KIND_NOTIFICATION = 27;
-/** Server-to-client authorized chat presence and live mutation event (UTF-8 JSON). */
+/** Server-to-client authorized chat presence, ephemeral typing, and live mutation event (UTF-8 JSON). */
 export const KIND_CHAT_EVENT = 28;
 
 // Reserved-range bounds (inclusive), for callers that want to test membership.

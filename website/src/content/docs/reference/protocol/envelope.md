@@ -321,20 +321,24 @@ the recipient has a local live session. **Edge behavior:** live delivery is
 best-effort and at-least-once: deduplicate by notification id and reconcile with
 `notifications.list` after reconnect or a gap.
 
-### `KIND_CHAT_EVENT` (28) — local chat presence and durable live delivery
+### `KIND_CHAT_EVENT` (28) — local chat presence, typing, and durable live delivery
 
 **Direction/delivery:** server → client; reliable. **Body:** UTF-8 JSON.
 **When:** after a client has successfully called `chat.join` and the server has
 committed a durable create, edit, or tombstone; it also carries local
-`presence.join` / `presence.leave` and `access.revoked` transitions.
+`presence.join` / `presence.leave`, ephemeral `typing`, and `access.revoked`
+transitions.
 
 The JSON has `version: 1`, `type`, and `channel_id`. Durable mutation types also
 include `event_id` and a `message`; clients deduplicate them by
 `(channel_id, event_id)`. A bounded local outbound queue can drop an attempted
 event. Citadel then sends `resync_required` with `watermark_event_id` on the next
 delivery opportunity; the client calls `chat.history` and echoes that watermark
-as `acknowledge_watermark`. This is local-node only and at-least-once, not a
-cluster-wide chat router.
+as `acknowledge_watermark`. A `typing` event is not durable, has no `event_id`,
+and has `{ presence, typing, expires_at }`; receivers must clear a true typing
+state at the Unix-millisecond `expires_at` even when no explicit stop arrives.
+Dropped typing events do not trigger resync. This is local-node only and
+at-least-once, not a cluster-wide chat router.
 
 ## Matchmaker handoff notification
 
