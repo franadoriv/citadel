@@ -3,6 +3,28 @@
 All notable changes to Citadel are documented here. Version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.11] - 2026-07-28
+
+### Added
+
+- Linux server releases now include both x86_64 and ARM64 (`aarch64-musl`)
+  archives, SHA-256 checksums, CI archive validation, and a hardened systemd
+  service template for production deployment.
+- Added production PEM TLS configuration for QUIC and WebTransport, with native
+  clients verifying public-root certificate chains and hostnames.
+- Added authorized, ephemeral chat typing indicators with receiver-side expiry
+  for clients connected to the same node.
+
+### Changed
+
+- Restored the capability catalog and corrected the README to accurately
+  describe portable Linux releases, TLS transport behavior, and local-node chat
+  typing support.
+
+### Fixed
+
+- Restored the original Citadel logo asset.
+
 ## [0.9.10] - 2026-07-28
 
 ### Added
