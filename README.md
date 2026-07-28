@@ -1,7 +1,7 @@
 # Citadel
 
 <p align="center">
-  <img src="assets/branding/citadel-logo.png" alt="Citadel" width="240" />
+  <img src="./assets/branding/citadel-logo.png?raw=true" alt="Citadel" width="240" />
 </p>
 
 Citadel is a Rust-first, custom game server inspired by

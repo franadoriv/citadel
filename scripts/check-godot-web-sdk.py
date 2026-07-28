@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Static source/vector guard for Godot's browser-only WebSocket transport."""
 from pathlib import Path
+import re
 import sys
 
 
@@ -81,7 +82,6 @@ def main() -> int:
         (ci_workflow, "verify_godot_web_e2e.py"),
         (ci_workflow, "citadel-e2e.toml"),
         (release_workflow, "godot-web:"),
-        (release_workflow, "needs: [package, godot-web]"),
         (artifact_readme, "application/wasm"),
         (smoke, "CitadelWebClient.new()"),
         (smoke, "authenticate_guest"),
@@ -95,6 +95,18 @@ def main() -> int:
         (e2e_browser, "--enable-unsafe-swiftshader"),
     ]
     errors = [f"missing {needle}" for source, needle in required if needle not in source]
+    # The release publish job must wait for both native packages and the Godot
+    # WebAssembly package.  Do not require an exact `needs` list: release
+    # version validation is also a legitimate dependency.
+    publish_needs = re.search(
+        r"^  publish:\s*\n\s*needs:\s*\[([^\]]*)\]",
+        release_workflow,
+        flags=re.MULTILINE,
+    )
+    if not publish_needs or not {"package", "godot-web"}.issubset(
+        {dependency.strip() for dependency in publish_needs.group(1).split(",")}
+    ):
+        errors.append("release publish must depend on package and godot-web")
     if "var result := _peer.poll()" in client:
         errors.append("WebSocketPeer.poll is void in Godot 4")
     if "CitadelRooms must accept the browser client contract" not in test_source:
