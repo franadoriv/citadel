@@ -209,6 +209,12 @@ the GitHub Release asset and run `./citadel` without installing Rust or cloning
 the repository. It does not cover ARM64; publish a separate architecture build
 when ARM64 support is needed.
 
+Release CI builds this target through
+[Cross](https://github.com/cross-rs/cross), which provides the complete musl
+C/C++ toolchain required by Citadel's native navigation dependency. For a local
+musl package, install Cross and run `make package-linux LINUX_CARGO=cross` with
+Docker available.
+
 ### `package-client-<engine>` and `package-clients-windows`
 
 Where `package-windows` produces the **server** release, these targets produce

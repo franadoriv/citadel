@@ -88,16 +88,19 @@ jobs:
           ./make.ps1 package-windows
           ./make.ps1 package-clients-windows
 
+      - name: Install Cross compiler
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5 --locked
+
       - name: Package portable Linux server
         if: matrix.platform == 'linux'
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v musl-gcc >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --yes musl-tools
-          fi
-          make package-linux
+          make package-linux LINUX_CARGO=cross
           package="$(find dist -maxdepth 1 -name 'citadel-linux-x86_64-musl-v*.zip' -print -quit)"
           test -n "$package"
           unzip -q "$package" -d "$RUNNER_TEMP/citadel-linux-package"

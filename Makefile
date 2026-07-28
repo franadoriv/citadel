@@ -88,6 +88,10 @@ MACOS_GODOT_ARCH = $(if $(filter aarch64,$(MACOS_ARCH)),arm64,$(MACOS_ARCH))
 # requirement. It is intentionally server-only; native client SDKs need
 # per-engine/per-platform packaging of their own.
 LINUX_TARGET ?= x86_64-unknown-linux-musl
+# `cross` supplies a complete musl C/C++ toolchain for native dependencies such
+# as RecastNavigation. Keep `cargo` as the default for environments that have
+# that toolchain already; release CI sets this to `cross`.
+LINUX_CARGO ?= cargo
 
 help: ## Show this help
 	@echo "Citadel — make targets:"
@@ -206,7 +210,7 @@ package-windows: ## Stage + zip the Windows release ($(DIST_DIR)/citadel-windows
 
 package-linux: ## Stage + zip the portable x86_64 Linux server ($(DIST_DIR)/citadel-linux-x86_64-musl-v{version}.zip)
 	@echo ">> Packaging Citadel v$(VERSION) for linux-x86_64-musl"
-	cargo build --release --target $(LINUX_TARGET) --bin citadel
+	$(LINUX_CARGO) build --release --target $(LINUX_TARGET) --bin citadel
 	$(eval PKG_NAME := citadel-linux-x86_64-musl-v$(VERSION))
 	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
 	@rm -rf "$(PKG_STAGE)"
