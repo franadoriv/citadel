@@ -84,10 +84,12 @@ MACOS_GODOT_PYTHON = $(MACOS_GODOT_VENV)/bin/python
 MACOS_DEPLOYMENT_TARGET ?= 15.0
 MACOS_GODOT_ARCH = $(if $(filter aarch64,$(MACOS_ARCH)),arm64,$(MACOS_ARCH))
 # The Linux server release is built against musl so the archive works on the
-# broadest range of x86_64 Linux distributions without a host glibc version
+# broadest range of Linux distributions without a host glibc version
 # requirement. It is intentionally server-only; native client SDKs need
-# per-engine/per-platform packaging of their own.
+# per-engine/per-platform packaging of their own. Override both values to build
+# ARM64, e.g. aarch64-unknown-linux-musl / aarch64-musl.
 LINUX_TARGET ?= x86_64-unknown-linux-musl
+LINUX_PACKAGE_ARCH ?= x86_64-musl
 # `cross` supplies a complete musl C/C++ toolchain for native dependencies such
 # as RecastNavigation. Keep `cargo` as the default for environments that have
 # that toolchain already; release CI sets this to `cross`.
@@ -208,10 +210,10 @@ package-windows: ## Stage + zip the Windows release ($(DIST_DIR)/citadel-windows
 	cd "$(DIST_DIR)" && zip -r "$(PKG_NAME).zip" "$(PKG_NAME)"
 	@echo ">> Packaged $(DIST_DIR)/$(PKG_NAME).zip"
 
-package-linux: ## Stage + zip the portable x86_64 Linux server ($(DIST_DIR)/citadel-linux-x86_64-musl-v{version}.zip)
-	@echo ">> Packaging Citadel v$(VERSION) for linux-x86_64-musl"
+package-linux: ## Stage + zip a portable Linux server ($(DIST_DIR)/citadel-linux-<arch>-v{version}.zip)
+	@echo ">> Packaging Citadel v$(VERSION) for linux-$(LINUX_PACKAGE_ARCH)"
 	$(LINUX_CARGO) build --release --target $(LINUX_TARGET) --bin citadel
-	$(eval PKG_NAME := citadel-linux-x86_64-musl-v$(VERSION))
+	$(eval PKG_NAME := citadel-linux-$(LINUX_PACKAGE_ARCH)-v$(VERSION))
 	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
 	@rm -rf "$(PKG_STAGE)"
 	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps"

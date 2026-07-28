@@ -62,7 +62,7 @@ a direct install message if Git Bash is unavailable.
 | `bin-clients` | Runs every `bin-client-<engine>` target above. | `bin/clients/` |
 | `bin-all` | Runs `bin-server`, `bin-benchmark`, and `bin-clients` together — everything staged in one pass. | `bin/` |
 | `package-windows` | Builds the server and the Unity native plugin, then stages and zips a versioned Windows release. | `dist/citadel-windows-x86_64-v<version>.zip` |
-| `package-linux` | Builds a statically linked x86_64 Linux server, stages the standalone layout, and zips it. | `dist/citadel-linux-x86_64-musl-v<version>.zip` |
+| `package-linux` | Builds a statically linked Linux server for the selected architecture, stages the standalone layout, and zips it. | `dist/citadel-linux-<x86_64-musl\|aarch64-musl>-v<version>.zip` |
 | `package-windows-python` | Builds the Python-enabled server, stages bundled CPython and `scripts/main.py`, smokes `citadel.exe check`, then zips it. | `dist/citadel-windows-x86_64-python-v<version>.zip` |
 | `package-client-unity` | Builds the native FFI, then stages and zips the ready-to-use Unity SDK. | `dist/citadel-client-unity-windows-x86_64-v<version>.zip` |
 | `package-client-unreal` | Builds the native FFI, then stages and zips the ready-to-use Unreal drop-in plugin (source + Win64 FFI). | `dist/citadel-client-unreal-windows-x86_64-v<version>.zip` |
@@ -206,14 +206,22 @@ It cross-compiles the default server for `x86_64-unknown-linux-musl`, stages
 `dist/citadel-linux-x86_64-musl-v<version>.zip`. The static musl binary does
 not depend on the host distribution's glibc, so an x86_64 Linux user can unzip
 the GitHub Release asset and run `./citadel` without installing Rust or cloning
-the repository. It does not cover ARM64; publish a separate architecture build
-when ARM64 support is needed.
+the repository. Release CI also produces `aarch64-unknown-linux-musl` as
+`dist/citadel-linux-aarch64-musl-v<version>.zip` for 64-bit ARM hosts.
 
 Release CI builds this target through
 [Cross](https://github.com/cross-rs/cross), which provides the complete musl
 C/C++ toolchain required by Citadel's native navigation dependency. For a local
 musl package, install Cross and run `make package-linux LINUX_CARGO=cross` with
 Docker available.
+
+To package ARM64 locally, select both the Rust target and release filename:
+
+```bash
+make package-linux LINUX_CARGO=cross \
+  LINUX_TARGET=aarch64-unknown-linux-musl \
+  LINUX_PACKAGE_ARCH=aarch64-musl
+```
 
 ### `package-client-<engine>` and `package-clients-windows`
 

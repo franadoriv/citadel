@@ -1,6 +1,6 @@
 ---
 title: Install a server release
-description: Download, configure, and run a prebuilt Citadel server on Windows or x86_64 Linux — no source checkout or Rust toolchain.
+description: Download, configure, and run a prebuilt Citadel server on Windows or Linux — no source checkout or Rust toolchain.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -21,13 +21,14 @@ keeps the client and server protocol versions aligned.
 | --- | --- |
 | Windows 64-bit | `citadel-windows-x86_64-v{version}.zip` |
 | Linux x86_64 / AMD64 | `citadel-linux-x86_64-musl-v{version}.zip` |
+| Linux ARM64 / AArch64 | `citadel-linux-aarch64-musl-v{version}.zip` |
 
 The Linux archive contains a statically linked `musl` executable. It is intended
 for normal x86_64 Linux distributions, including servers based on Ubuntu,
 Debian, Fedora, and RHEL, without depending on the host's glibc version.
 
-It is not an ARM64 build: Raspberry Pi 64-bit, AWS Graviton, and other ARM64
-hosts need a dedicated ARM64 release archive or a source build.
+The ARM64 archive supports 64-bit ARM hosts such as Raspberry Pi OS 64-bit, AWS
+Graviton, and Oracle ARM. Do not use it on a 32-bit Raspberry Pi OS install.
 
 ## 2. Extract and start
 

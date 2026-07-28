@@ -1,11 +1,11 @@
-# Citadel — standalone Linux server (x86_64)
+# Citadel — standalone Linux server
 
-This archive is ready to run on **64-bit x86 Linux**. It contains a statically
+This archive is ready to run on the architecture named in its filename. It contains a statically
 linked `musl` server binary, so you do not need Rust, Cargo, or a particular
 glibc version.
 
 ```text
-citadel-linux-x86_64-musl-v<version>/
+citadel-linux-<arch>-v<version>/
 ├── citadel          # server binary
 ├── citadel.toml     # editable configuration
 ├── scripts/main.lua # starter game logic (hot reload enabled)
@@ -28,5 +28,6 @@ To accept connections from other machines, change the `[http]` and
 `[transport.*]` bind addresses in `citadel.toml` from `127.0.0.1` to
 `0.0.0.0`, then restart.
 
-This download is for x86_64/AMD64 Linux only. ARM64 Linux hosts need an ARM64
-release binary; source builds remain available for unsupported architectures.
+Choose the archive matching your host: `x86_64-musl` for AMD64/x86_64 and
+`aarch64-musl` for 64-bit ARM (AWS Graviton, Oracle ARM, and Raspberry Pi).
+Source builds remain available for unsupported architectures.

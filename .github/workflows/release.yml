@@ -4,8 +4,8 @@ name: release
 # release is cut by fast-forwarding develop to the long-lived release branch, or
 # through workflow_dispatch. Every run first requires a new Cargo version whose
 # `v<version>` tag does not already exist; the publish step creates that tag.
-# Public ZIP downloads include Windows and a statically linked x86_64 Linux
-# server. Native macOS package targets are deliberately not run in CI until
+# Public ZIP downloads include Windows and statically linked x86_64 and ARM64
+# Linux servers. Native macOS package targets are deliberately not run in CI until
 # Apple Developer ID and notarization credentials are available.
 
 on:
@@ -64,6 +64,13 @@ jobs:
           - runner: ubuntu-latest
             target: linux-x86_64-musl
             platform: linux
+            rust_target: x86_64-unknown-linux-musl
+            package_arch: x86_64-musl
+          - runner: ubuntu-latest
+            target: linux-aarch64-musl
+            platform: linux
+            rust_target: aarch64-unknown-linux-musl
+            package_arch: aarch64-musl
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -72,7 +79,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.rust_target || 'x86_64-unknown-linux-musl' }}
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -100,8 +107,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make package-linux LINUX_CARGO=cross
-          package="$(find dist -maxdepth 1 -name 'citadel-linux-x86_64-musl-v*.zip' -print -quit)"
+          make package-linux LINUX_CARGO=cross LINUX_TARGET="${{ matrix.rust_target }}" LINUX_PACKAGE_ARCH="${{ matrix.package_arch }}"
+          package="$(find dist -maxdepth 1 -name 'citadel-linux-${{ matrix.package_arch }}-v*.zip' -print -quit)"
           test -n "$package"
           unzip -q "$package" -d "$RUNNER_TEMP/citadel-linux-package"
           package_root="$(unzip -Z1 "$package" | head -1 | cut -d/ -f1)"
