@@ -136,6 +136,48 @@ jobs:
           package="$(find dist -maxdepth 1 -name 'citadel-client-godot-web-v*.zip' -print -quit)"
           python3 scripts/package_godot_web_artifact.py --verify-package "$package"
 
+  linux-release-packages:
+    name: Validate portable Linux server (${{ matrix.package_arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: x86_64-unknown-linux-musl
+            package_arch: x86_64-musl
+          - rust_target: aarch64-unknown-linux-musl
+            package_arch: aarch64-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - name: Install Cross compiler
+        run: cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5 --locked
+      - name: Build and inspect the release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          make package-linux LINUX_CARGO=cross LINUX_TARGET="${{ matrix.rust_target }}" LINUX_PACKAGE_ARCH="${{ matrix.package_arch }}"
+          package="$(find dist -maxdepth 1 -name "citadel-linux-${{ matrix.package_arch }}-v*.zip" -print -quit)"
+          test -n "$package"
+          unzip -q "$package" -d "$RUNNER_TEMP/citadel-linux-package"
+          package_root="$(unzip -Z1 "$package" | head -1 | cut -d/ -f1)"
+          binary="$RUNNER_TEMP/citadel-linux-package/$package_root/citadel"
+          test -x "$binary"
+          file "$binary" | grep -Eqi 'statically linked|static-pie linked'
+          (
+            cd "$RUNNER_TEMP/citadel-linux-package/$package_root"
+            case "${{ matrix.rust_target }}" in
+              x86_64-unknown-linux-musl) ./citadel check ;;
+              aarch64-unknown-linux-musl)
+                sudo apt-get update
+                sudo apt-get install --yes qemu-user-static
+                qemu-aarch64-static ./citadel check
+                ;;
+            esac
+          )
+
   # Re-enable a native matrix here after Developer ID/notary credentials are
   # configured and the public macOS release path is approved:
   # macos-packages:

@@ -120,7 +120,15 @@ jobs:
           file "$binary" | grep -Eqi 'statically linked|static-pie linked'
           (
             cd "$RUNNER_TEMP/citadel-linux-package/$package_root"
-            ./citadel check
+            case "${{ matrix.rust_target }}" in
+              x86_64-unknown-linux-musl) ./citadel check ;;
+              aarch64-unknown-linux-musl)
+                sudo apt-get update
+                sudo apt-get install --yes qemu-user-static
+                qemu-aarch64-static ./citadel check
+                ;;
+              *) echo "Unsupported Linux smoke target: ${{ matrix.rust_target }}" >&2; exit 1 ;;
+            esac
           )
 
       # Re-enable native macOS matrix entries, Apple credential import,
