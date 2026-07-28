@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
-  <title id="title">Citadel</title>
-  <desc id="desc">A gold citadel on a deep blue shield.</desc>
-  <circle cx="256" cy="256" r="240" fill="#0b1736"/>
-  <circle cx="256" cy="256" r="222" fill="none" stroke="#f5c451" stroke-width="12"/>
-  <path fill="#f5c451" d="M132 370V224h34v-42h38v42h32v-42h40v42h32v-42h38v42h34v146h-42v-42h-44v42h-48v-42h-44v42zm76-84h40v-34h-40zm56 0h40v-34h-40z"/>
-  <path fill="#fff5cf" d="M214 328h84v42h-84z"/>
-  <path fill="#f5c451" d="M238 112h36v70h-36z"/>
-</svg>
