@@ -108,7 +108,9 @@ jobs:
           test -n "$package_root"
           binary="$RUNNER_TEMP/citadel-linux-package/$package_root/citadel"
           test -x "$binary"
-          file "$binary" | grep -qi 'statically linked'
+          # Modern musl toolchains emit either "statically linked" or
+          # "static-pie linked"; both are self-contained static executables.
+          file "$binary" | grep -Eqi 'statically linked|static-pie linked'
           (
             cd "$RUNNER_TEMP/citadel-linux-package/$package_root"
             ./citadel check
