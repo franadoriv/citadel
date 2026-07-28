@@ -23,7 +23,7 @@ pub use http::{
     CitadelHttpClient, EmailAuthenticationRequest, LookupUsersRequest, LookupUsersResponse,
     PublicProfile, SessionTokenPair, UpdateAccountRequest,
 };
-pub use quic::QuicClient;
+pub use quic::{ClientTls, QuicClient};
 pub use websocket::WsClient;
 
 /// Errors returned by the client SDK.

@@ -51,7 +51,7 @@ use citadel_client::{QuicClient, ClientTls};
 use citadel_wire::{Envelope, protocol::KIND_POSITION};
 
 # async fn run -> anyhow::Result<> {
-let tls = ClientTls::insecure_skip_verification; // dev only
+let tls = ClientTls::webpki_roots(); // production: CA + hostname verification
 let mut client = QuicClient::connect("127.0.0.1:7351", "localhost", tls).await?;
 
 client.send_unreliable(&Envelope::new(KIND_POSITION, vec![0u8; 8])).await?; // datagram
@@ -79,7 +79,7 @@ use std::time::Duration;
 use citadel_client::{QuicClient, ClientTls};
 
 # async fn run -> anyhow::Result<> {
-let tls = ClientTls::insecure_skip_verification; // dev only
+let tls = ClientTls::insecure_skip_verification(); // local dev only
 let client = QuicClient::connect("127.0.0.1:7351", "localhost", tls).await?;
 
 // `add`: two big-endian i32 operands; the handler replies with their i32 sum.
@@ -110,7 +110,7 @@ full correlation contract.
 | --- | --- |
 | `WsClient` | `connect(url)`, `send(&Envelope)`, `recv -> Option<Envelope>`, `call_rpc(method, payload) -> Vec<u8>`, `close` |
 | `QuicClient` | `connect(addr, server_name, ClientTls)`, `send_reliable(&Envelope)`, `send_unreliable(&Envelope)`, `recv_datagram -> Envelope`, `recv_uni -> Vec<Envelope>`, `call_rpc(method, payload) -> Vec<u8>`, `close` |
-| `ClientTls` | `trusting(cert_chain)`, `insecure_skip_verification` |
+| `ClientTls` | `webpki_roots()`, `trusting(cert_chain)`, `insecure_skip_verification()` |
 
 `Envelope` is re-exported from `citadel-wire`. QUIC requires the ALPN `citadel/0`,
 matching the server.
@@ -118,10 +118,11 @@ matching the server.
 For the full generated API, see the [Rust SDK reference](/reference/client-sdk/rust-sdk/)
 and the [generated rustdoc](/reference/operations/generated/).
 
-:::caution[Not implemented yet]
-The insecure TLS option exists only for local development against the self-signed
-dev cert; there is no production verification path yet. No reconnection/backoff,
-auth/session binding (internal ), or message-kind taxonomy yet. Single
-global relay room. `call_rpc` has no built-in timeout or retry (wrap it yourself);
-streaming RPC is not implemented.
+:::caution[Development TLS]
+`ClientTls::insecure_skip_verification()` exists only for local development
+against a self-signed certificate. Public Citadel servers should use
+`ClientTls::webpki_roots()` and pass the certificate's DNS hostname as
+`server_name`. No reconnection/backoff, auth/session binding (internal ), or
+message-kind taxonomy yet. Single global relay room. `call_rpc` has no built-in
+timeout or retry (wrap it yourself); streaming RPC is not implemented.
 :::

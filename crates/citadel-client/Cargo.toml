@@ -16,6 +16,8 @@ thiserror = "2"
 # QUIC client transport (datagrams + streams + TLS 1.3).
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Mozilla's CA root program, bundled for verified public QUIC connections.
+webpki-roots = "0.26"
 # WebSocket client.
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

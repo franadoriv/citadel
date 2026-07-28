@@ -512,7 +512,8 @@ set, a non-zero `static_data_max_file_bytes` when that root is set,
 the offending field and never echo secrets.
 
 :::note[Transport TLS]
-`[cluster.tls]` protects only node-control traffic. QUIC and WebTransport still
-use their existing development certificate flows; configuring this section does
-not enable public client TLS termination.
+`[cluster.tls]` protects only node-control traffic. Configure `[transport.tls]`
+with a PEM certificate/key pair for public QUIC and WebTransport; native QUIC
+clients should use CA and hostname verification (`ClientTls::webpki_roots()`).
+WebSocket remains plain `ws://` in Citadel and needs a reverse proxy for WSS.
 :::

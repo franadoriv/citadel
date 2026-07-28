@@ -40,8 +40,9 @@ QUIC client with datagrams and reliable streams. Requires ALPN `citadel/0`.
 
 | Constructor | Description |
 | --- | --- |
-| `ClientTls::trusting(cert_chain)` | Pin a known server certificate. |
-| `ClientTls::insecure_skip_verification` | Dev/test only: disable verification (clearly named; never validates identity). |
+| `ClientTls::webpki_roots()` | Production: verify a public CA-issued certificate and the `server_name` hostname. |
+| `ClientTls::trusting(cert_chain)` | Pin a known certificate chain, including a local development certificate. |
+| `ClientTls::insecure_skip_verification()` | Dev/test only: disable verification (clearly named; never validates identity). |
 
 ## RPC call helpers
 
@@ -79,7 +80,7 @@ Correlation and usage notes:
 - Endpoints and certificates are parameters; no credentials are embedded.
 
 :::caution[Not implemented yet]
-Dev-only TLS options; no production verification path. No reconnection/backoff,
+The insecure TLS option is dev-only; production uses CA and hostname verification. No reconnection/backoff,
 auth/session binding (internal ), or message-kind taxonomy. Single
 global relay room.
 :::

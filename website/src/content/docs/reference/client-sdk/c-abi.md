@@ -96,8 +96,8 @@ void citadel_client_free(CitadelClient *handle);
 ### `citadel_client_connect_quic`
 
 Connect to a QUIC endpoint. `addr` and `server_name` are NUL-terminated C
-strings. `insecure = true` selects dev TLS that does not verify the server
-certificate (for the self-signed dev cert). On success, writes a heap-allocated
+strings. `insecure = false` verifies a public CA certificate and the supplied
+hostname; `insecure = true` selects dev TLS without verification. On success, writes a heap-allocated
 handle to `*out_handle`.
 
 ### `citadel_client_connect_websocket`
@@ -150,7 +150,7 @@ cargo build -p citadel-client-ffi --release
 ```
 
 :::caution[Not implemented yet]
-QUIC only wires the dev insecure-TLS path (`insecure = true`); a pinned/verified
-path is a follow-up. Desktop host targets only; mobile/consoles and per-engine
+QUIC verifies public CA certificates and the supplied hostname when
+`insecure = false`; the insecure path is dev-only. Desktop host targets only; mobile/consoles and per-engine
 packaging are later phases.
 :::

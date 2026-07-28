@@ -53,8 +53,9 @@ int main(void) {
 }
 ```
 
-For QUIC, use `citadel_client_connect_quic(addr, server_name, insecure, &c)` with
-`insecure = true` for the dev self-signed cert.
+For QUIC, use `citadel_client_connect_quic(addr, server_name, insecure, &c)`.
+Set `insecure = false` in production to validate a public CA certificate and
+the hostname; reserve `insecure = true` for the local self-signed cert.
 
 ## Model
 
@@ -81,8 +82,8 @@ a NUL-terminated message into your buffer. It returns the number of bytes writte
 including the NUL.
 
 :::caution[Not implemented yet]
-QUIC currently only wires the dev insecure-TLS path (`insecure = true`); a
-pinned/verified path is a follow-up. Desktop host targets only here; mobile and
+QUIC verifies public CA certificates and the supplied hostname when
+`insecure = false`; `insecure = true` is dev-only. Desktop host targets only here; mobile and
 consoles are later phases. Session validation is deferred (internal ).
 No credentials are embedded.
 :::

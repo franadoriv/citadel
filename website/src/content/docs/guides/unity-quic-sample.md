@@ -186,7 +186,9 @@ Windows x86_64 is released; macOS `.dylib` packages for Apple Silicon and Intel
 can be built locally and await their signed/notarized public release path. Linux `.so`,
 IL2CPP stripping, a shipped `.unitypackage`, and a richer host API are
 follow-ups. The sample uses the insecure dev TLS path (no certificate
-verification) for local development only; a pinned/verified path is deferred
+verification) for local development only. For a public server, pass
+`insecure: false`; the C ABI then verifies the CA-issued certificate and the
+hostname supplied to `ConnectQuic`.
 (internal ). No credentials are embedded.
 RPC correlation lives in the managed layer; a C ABI-level RPC convenience,
 client-side RPC timeouts/retries, and streaming RPC are follow-ups.

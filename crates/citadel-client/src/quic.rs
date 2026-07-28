@@ -5,11 +5,10 @@
 //! streams ([`QuicClient::send_reliable`]) and unreliable datagrams
 //! ([`QuicClient::send_unreliable`]), using the shared `citadel-wire` codec.
 //!
-//! TLS: a QUIC client must validate the server certificate. Two dev/test
-//! helpers are provided: [`ClientTls::trusting`] pins a known certificate DER,
-//! and [`ClientTls::insecure_skip_verification`] disables verification entirely.
-//! The insecure path is clearly named and intended only for local development;
-//! it never validates identity and must not be used against untrusted servers.
+//! TLS: a QUIC client validates the server certificate by default with the
+//! bundled public CA roots and the `server_name` passed to [`QuicClient::connect`].
+//! Development helpers can pin a known certificate DER or explicitly disable
+//! verification; the latter must never be used against untrusted servers.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,8 +34,13 @@ pub const CITADEL_ALPN: &[u8] = b"citadel/0";
 /// Maximum bytes read from a single reliable stream response.
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
-/// TLS configuration strategy for the QUIC client (dev/test).
+/// TLS configuration strategy for the QUIC client.
+#[derive(Default)]
 pub enum ClientTls {
+    /// Verify a CA-issued certificate chain using the bundled public CA roots
+    /// and the `server_name` passed to [`QuicClient::connect`].
+    #[default]
+    WebPkiRoots,
     /// Trust exactly the given certificate chain (e.g. a server dev cert).
     Trusting(Vec<CertificateDer<'static>>),
     /// Disable certificate verification entirely. Dev/test only; never
@@ -45,6 +49,13 @@ pub enum ClientTls {
 }
 
 impl ClientTls {
+    /// Use the bundled public CA roots and hostname verification. This is the
+    /// production default for public Citadel servers.
+    #[must_use]
+    pub fn webpki_roots() -> Self {
+        Self::WebPkiRoots
+    }
+
     /// Convenience constructor for [`ClientTls::Trusting`].
     #[must_use]
     pub fn trusting(cert_chain: Vec<CertificateDer<'static>>) -> Self {
@@ -59,6 +70,13 @@ impl ClientTls {
 
     fn into_client_config(self) -> ClientResult<ClientConfig> {
         let mut rustls_config = match self {
+            Self::WebPkiRoots => {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth()
+            }
             Self::Trusting(chain) => {
                 let mut roots = rustls::RootCertStore::empty();
                 for cert in chain {
@@ -280,5 +298,17 @@ impl ServerCertVerifier for NoVerify {
             SignatureScheme::RSA_PSS_SHA256,
             SignatureScheme::RSA_PKCS1_SHA256,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_root_tls_config_builds() {
+        ClientTls::webpki_roots()
+            .into_client_config()
+            .expect("public CA roots build a QUIC TLS config");
     }
 }

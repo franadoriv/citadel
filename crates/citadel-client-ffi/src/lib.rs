@@ -128,9 +128,10 @@ pub extern "C" fn citadel_client_abi_version() -> u32 {
 
 /// Connect to a Citadel QUIC endpoint.
 ///
-/// `addr` and `server_name` are NUL-terminated C strings. `insecure` selects dev
-/// TLS that does not verify the server certificate (for the dev self-signed
-/// cert). On success, writes a heap-allocated handle to `*out_handle`; the
+/// `addr` and `server_name` are NUL-terminated C strings. `insecure = false`
+/// verifies a CA-issued certificate and hostname with public CA roots;
+/// `insecure = true` is only for a local development self-signed certificate.
+/// On success, writes a heap-allocated handle to `*out_handle`; the
 /// caller owns it and must call [`citadel_client_free`].
 ///
 /// # Safety
@@ -162,12 +163,6 @@ pub unsafe extern "C" fn citadel_client_connect_quic(
             Ok(a) => a,
             Err(_) => return CitadelStatus::InvalidArgument,
         };
-        if !insecure {
-            // Only the dev insecure path is wired for now; a pinned-cert path is
-            // a follow-up. Be explicit rather than silently insecure.
-            return CitadelStatus::InvalidArgument;
-        }
-
         let runtime = match build_runtime() {
             Ok(rt) => rt,
             Err(()) => return CitadelStatus::Internal,
@@ -175,7 +170,11 @@ pub unsafe extern "C" fn citadel_client_connect_quic(
         let connect = runtime.block_on(QuicClient::connect(
             socket,
             &name,
-            ClientTls::insecure_skip_verification(),
+            if insecure {
+                ClientTls::insecure_skip_verification()
+            } else {
+                ClientTls::webpki_roots()
+            },
         ));
         let client = match connect {
             Ok(c) => c,

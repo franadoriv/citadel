@@ -28,9 +28,8 @@ use citadel_client::{QuicClient, ClientTls};
 use citadel_wire::{Envelope, protocol::KIND_POSITION};
 
 # async fn run -> anyhow::Result<> {
-// Dev only: the server uses a self-signed cert. This skips verification and is
-// clearly named; use ClientTls::trusting(cert_chain) to pin a real cert.
-let tls = ClientTls::insecure_skip_verification;
+// Production: verify a public CA certificate and the server hostname.
+let tls = ClientTls::webpki_roots();
 let mut client = QuicClient::connect("127.0.0.1:7351", "localhost", tls).await?;
 
 // Send our position as an unreliable datagram (hot-path state).
@@ -61,14 +60,15 @@ message to *other* sessions; it never echoes it back to you.
 
 ## TLS
 
-- `ClientTls::trusting(cert_chain)` pins a known server certificate (the
-  production-ish path).
-- `ClientTls::insecure_skip_verification` disables verification for local
+- `ClientTls::webpki_roots()` verifies public CA certificates and the hostname.
+- `ClientTls::trusting(cert_chain)` pins a known certificate, including a local
+  development certificate.
+- `ClientTls::insecure_skip_verification()` disables verification for local
   development against the self-signed dev cert. It is clearly named and never
   validates identity.
 
 :::caution[Not implemented yet]
-There is no production certificate-verification path or session validation yet
+There is no session validation yet
 (internal ). Endpoints and certificates are parameters; no credentials
 are embedded. There is no reconnection/backoff in the SDK yet.
 :::

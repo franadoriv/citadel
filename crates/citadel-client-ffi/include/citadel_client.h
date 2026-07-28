@@ -185,9 +185,10 @@ uint32_t citadel_client_abi_version(void);
 /**
  * Connect to a Citadel QUIC endpoint.
  *
- * `addr` and `server_name` are NUL-terminated C strings. `insecure` selects dev
- * TLS that does not verify the server certificate (for the dev self-signed
- * cert). On success, writes a heap-allocated handle to `*out_handle`; the
+ * `addr` and `server_name` are NUL-terminated C strings. `insecure = false`
+ * verifies a CA-issued certificate and hostname with public CA roots;
+ * `insecure = true` is only for a local development self-signed certificate.
+ * On success, writes a heap-allocated handle to `*out_handle`; the
  * caller owns it and must call [`citadel_client_free`].
  *
  * # Safety
