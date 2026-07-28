@@ -1,7 +1,7 @@
 # Citadel
 
 <p align="center">
-  <img src="./assets/branding/citadel-logo.png?raw=true" alt="Citadel" width="240" />
+  <img src="./assets/branding/citadel-logo.svg" alt="Citadel" width="240" />
 </p>
 
 Citadel is a Rust-first, custom game server inspired by
@@ -212,6 +212,7 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
   <tbody>
     <tr><th colspan="3" align="left">Core, identity, and sessions</th></tr>
     <tr><td>Server bootstrap, CLI, TOML config, and first-run setup</td><td>Run a standalone node with generated config, game directory, and SQLite defaults.</td><td>✅</td></tr>
+    <tr><td>Portable server releases and Linux deployment</td><td>Versioned Windows, Linux x86_64 musl, and Linux ARM64 musl archives ship with SHA-256 checksums, CI package validation, and a systemd deployment template.</td><td>✅</td></tr>
     <tr><td>Dockerfile and editable Docker workflow</td><td>Dockerfile and Compose development assets remain available, but release CI/CD no longer builds, tests, attests, or publishes OCI images. Historical GHCR images are not updated by releases.</td><td>🚧</td></tr>
     <tr><td>Health, live status, observability, audit logs</td><td>Health/status endpoints, structured logs, errors, tracing seams, and operator audit records.</td><td>✅</td></tr>
     <tr><td>Device authentication</td><td>Creates or authenticates a device identity and issues a session.</td><td>✅</td></tr>
@@ -259,7 +260,7 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
   </tbody>
   <tbody>
     <tr><th colspan="3" align="left">Realtime multiplayer, rooms, matchmaking, maps, and physics</th></tr>
-    <tr><td>QUIC, WebTransport, and WebSocket</td><td>Native low-latency transport, browser datagram path, and reliable browser/fallback path. Hand-rolled RUDP is deliberately not shipped.</td><td>✅</td></tr>
+    <tr><td>QUIC, WebTransport, and WebSocket</td><td>Native low-latency transport, browser datagram path, and reliable browser/fallback path. QUIC/WebTransport accept production PEM TLS; native clients verify public CA certificates and hostnames, while WebSocket uses WSS through a reverse proxy. Hand-rolled RUDP is deliberately not shipped.</td><td>✅</td></tr>
     <tr><td>Authenticated realtime connection and generic RPC</td><td>Account/guest handshake and correlated request-response messages.</td><td>✅</td></tr>
     <tr><td>Relayed realtime messages</td><td>Game logic can validate, broadcast, or unicast relay messages.</td><td>✅</td></tr>
     <tr><td>Named rooms, membership, labels, and map-ready</td><td>All shipped runtimes expose room creation/admission hooks; the common room boundary scopes membership.</td><td>✅</td></tr>
