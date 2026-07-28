@@ -1,0 +1,23 @@
+[Unit]
+Description=Citadel game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=citadel
+Group=citadel
+WorkingDirectory=/opt/citadel
+ExecStart=/opt/citadel/citadel --config /opt/citadel/citadel.toml serve
+Restart=on-failure
+RestartSec=5s
+Environment=CITADEL_DATABASE_URL=sqlite:///var/lib/citadel/data.sqlite
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/citadel
+StateDirectory=citadel
+
+[Install]
+WantedBy=multi-user.target

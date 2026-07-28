@@ -216,12 +216,13 @@ package-linux: ## Stage + zip a portable Linux server ($(DIST_DIR)/citadel-linux
 	$(eval PKG_NAME := citadel-linux-$(LINUX_PACKAGE_ARCH)-v$(VERSION))
 	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
 	@rm -rf "$(PKG_STAGE)"
-	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps"
+	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps" "$(PKG_STAGE)/systemd"
 	cp "target/$(LINUX_TARGET)/release/citadel" "$(PKG_STAGE)/citadel"
 	chmod +x "$(PKG_STAGE)/citadel"
 	sed 's|scripts_dir = "./game"|scripts_dir = "./scripts"|' citadel.toml > "$(PKG_STAGE)/citadel.toml"
 	cp packaging/server/scripts/main.lua "$(PKG_STAGE)/scripts/main.lua"
 	cp packaging/linux/README.md "$(PKG_STAGE)/README.md"
+	cp packaging/linux/citadel.service "$(PKG_STAGE)/systemd/citadel.service"
 	@rm -f "$(DIST_DIR)/$(PKG_NAME).zip"
 	cd "$(DIST_DIR)" && zip -r "$(PKG_NAME).zip" "$(PKG_NAME)"
 	@echo ">> Packaged $(DIST_DIR)/$(PKG_NAME).zip"

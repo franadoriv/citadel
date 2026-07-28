@@ -10,6 +10,13 @@ your operating system from the [GitHub Releases](https://github.com/franadoriv/c
 page, extract it, then run the included server. You do **not** need to clone
 the repository, install Rust, or compile anything.
 
+Each release also includes `SHA256SUMS.txt`. Download it beside the archive and
+verify the archive before extracting it:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
 :::tip[Choose the matching version]
 Use client SDK archives from the same `v{version}` release as your server. That
 keeps the client and server protocol versions aligned.
@@ -90,6 +97,27 @@ credentials before exposing it. The [configuration reference](/reference/operati
 describes those settings.
 
 :::
+
+## Run on Linux with systemd
+
+The Linux archive includes `systemd/citadel.service`. This template runs the
+server as a dedicated unprivileged user, restarts it after failures, and keeps
+the SQLite database in `/var/lib/citadel` instead of the installation folder.
+
+```bash
+sudo useradd --system --user-group --home-dir /var/lib/citadel citadel
+sudo install -d -o citadel -g citadel /opt/citadel
+sudo cp -a citadel-linux-*/. /opt/citadel/
+sudo install -m 0644 /opt/citadel/systemd/citadel.service /etc/systemd/system/citadel.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now citadel
+sudo systemctl status citadel
+```
+
+Edit `/opt/citadel/citadel.toml` before starting a public server, then restart
+with `sudo systemctl restart citadel`. View logs with
+`journalctl -u citadel -f`. The unit intentionally does not open firewall ports
+or provide TLS certificates; configure those explicitly for your environment.
 
 ## Updating
 

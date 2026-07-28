@@ -10,6 +10,7 @@ citadel-linux-<arch>-v<version>/
 ├── citadel.toml     # editable configuration
 ├── scripts/main.lua # starter game logic (hot reload enabled)
 └── maps/            # put cooked level geometry here
+└── systemd/          # production service template
 ```
 
 ## Run it
@@ -31,3 +32,10 @@ To accept connections from other machines, change the `[http]` and
 Choose the archive matching your host: `x86_64-musl` for AMD64/x86_64 and
 `aarch64-musl` for 64-bit ARM (AWS Graviton, Oracle ARM, and Raspberry Pi).
 Source builds remain available for unsupported architectures.
+
+## Run as a system service
+
+The `systemd/citadel.service` template runs Citadel as a dedicated `citadel`
+user, restarts it after a failure, and stores its SQLite data under
+`/var/lib/citadel`. Follow the full deployment steps in the public server
+installation guide before enabling it.
