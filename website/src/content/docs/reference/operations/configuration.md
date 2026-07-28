@@ -12,7 +12,9 @@ used as given. With **no** `--config`, Citadel discovers a `citadel.toml` in the
 current working directory and loads it if present — the zero-flag "unzip and run"
 default — otherwise it falls back to the built-in defaults. The repository (and
 the standalone release) ships an editable `citadel.toml` at its root, so
-`cargo run` / the packaged `citadel(.exe)` starts against it with no flags.
+`cargo run` / the packaged `citadel` or `citadel.exe` starts against it with no
+flags. The release archive uses `scripts/` for its starter game logic; the
+repository configuration may use a different `scripts_dir`.
 
 ## Full example with defaults
 

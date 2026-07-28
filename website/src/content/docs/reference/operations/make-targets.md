@@ -15,7 +15,7 @@ from the repo root.
   freshly built binary plus its supporting files into a subfolder here so you
   can `cd` in and run it directly, with no Cargo workspace nearby.
 - **`dist/`** — git-ignored **versioned release packages**, produced by the
-  `package-windows` and native-architecture `package-macos` targets.
+  `package-windows`, `package-linux`, and native-architecture `package-macos` targets.
 - **`packaging/`** — tracked **templates** consumed by staging (e.g. the
   hello-world `scripts/main.lua`, release `README` templates). You do not run
   anything from `packaging/` directly; the `bin-*` and `package-*` targets copy
@@ -62,6 +62,7 @@ a direct install message if Git Bash is unavailable.
 | `bin-clients` | Runs every `bin-client-<engine>` target above. | `bin/clients/` |
 | `bin-all` | Runs `bin-server`, `bin-benchmark`, and `bin-clients` together — everything staged in one pass. | `bin/` |
 | `package-windows` | Builds the server and the Unity native plugin, then stages and zips a versioned Windows release. | `dist/citadel-windows-x86_64-v<version>.zip` |
+| `package-linux` | Builds a statically linked x86_64 Linux server, stages the standalone layout, and zips it. | `dist/citadel-linux-x86_64-musl-v<version>.zip` |
 | `package-windows-python` | Builds the Python-enabled server, stages bundled CPython and `scripts/main.py`, smokes `citadel.exe check`, then zips it. | `dist/citadel-windows-x86_64-python-v<version>.zip` |
 | `package-client-unity` | Builds the native FFI, then stages and zips the ready-to-use Unity SDK. | `dist/citadel-client-unity-windows-x86_64-v<version>.zip` |
 | `package-client-unreal` | Builds the native FFI, then stages and zips the ready-to-use Unreal drop-in plugin (source + Win64 FFI). | `dist/citadel-client-unreal-windows-x86_64-v<version>.zip` |
@@ -191,6 +192,22 @@ make package-windows-python
 
 It produces `dist/citadel-windows-x86_64-python-v<version>.zip`, using the same
 bundled CPython layout as `bin-server-python`.
+
+### `package-linux`
+
+`package-linux` produces the downloadable Linux server archive:
+
+```bash
+make package-linux
+```
+
+It cross-compiles the default server for `x86_64-unknown-linux-musl`, stages
+`citadel`, its configuration, starter Lua script, and `maps/`, then writes
+`dist/citadel-linux-x86_64-musl-v<version>.zip`. The static musl binary does
+not depend on the host distribution's glibc, so an x86_64 Linux user can unzip
+the GitHub Release asset and run `./citadel` without installing Rust or cloning
+the repository. It does not cover ARM64; publish a separate architecture build
+when ARM64 support is needed.
 
 ### `package-client-<engine>` and `package-clients-windows`
 

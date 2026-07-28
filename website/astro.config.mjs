@@ -39,6 +39,7 @@ export default defineConfig({
 					label: 'Guides',
 					collapsed: true,
 					items: [
+						{ label: 'Install a server release', slug: 'guides/install-server' },
 						{ label: 'Install a client SDK (Unity/Unreal/Godot)', slug: 'guides/install-client-sdk' },
 						{ label: 'Connect a web client', slug: 'guides/web-client' },
 						{ label: 'Connect a native client', slug: 'guides/native-client' },

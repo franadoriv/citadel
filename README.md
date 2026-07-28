@@ -108,13 +108,16 @@ addresses, or toggle transports. See
 ### Download a release
 
 Milestone downloads and their included quickstarts are published with each
-release. To stage the runnable local server package use `make bin-server` (or `.\make bin-server` in
-PowerShell); use `make package-windows` and `make package-clients-windows` to
-build Windows release artifacts locally. On macOS, `make package-macos` and
+release. The Linux `citadel-linux-x86_64-musl-v<version>.zip` asset is a
+ready-to-run, statically linked server for x86_64/AMD64 Linux: unzip it and run
+`./citadel`; neither Rust nor the source tree is required. To stage the runnable
+local server package use `make bin-server` (or `.\make bin-server` in
+PowerShell); use `make package-windows`, `make package-linux`, and `make
+package-clients-windows` to build release artifacts locally. On macOS, `make package-macos` and
 `make package-clients-macos` build native Apple Silicon or Intel archives for
 the host architecture. Local macOS archives are unsigned developer builds. The
 public macOS release workflow is intentionally deferred until Apple release
-credentials are configured; Windows releases remain unblocked.
+credentials are configured; Windows and Linux releases remain unblocked.
 
 The server exposes an HTTP surface with a health check, a status API, and an
 admin console:

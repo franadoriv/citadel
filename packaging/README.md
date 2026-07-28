@@ -28,8 +28,8 @@ feeds:
   `make bin-client-<engine>`, `make bin-clients`, `make bin-all`, or the
   matching `.\make.ps1` targets). This is what a developer runs locally.
 - **`dist/`** — git-ignored **versioned release packages** (zips), produced
-  by `make package-windows` / `.\make.ps1 package-windows`.
+  by `make package-windows`, `make package-linux`, or `.\make.ps1 package-windows`.
 
 Adding a new packaging template: put it under `packaging/<area>/`, then wire
-it into the relevant `bin-*` and/or `package-windows` target in `Makefile`
+it into the relevant `bin-*` and/or `package-*` target in `Makefile`
 and `make.ps1` so it gets copied into the staged output.

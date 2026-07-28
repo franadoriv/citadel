@@ -149,7 +149,7 @@ CITADEL_IMAGE=citadel:smoke CITADEL_SMOKE_SKIP_BUILD=1 bash scripts/smoke-contai
   this tag.
 - The image is a Linux container: it runs on Linux directly and through Docker
   Desktop on macOS (Intel or Apple Silicon) and Windows. It is not a native
-  macOS server archive; Citadel continues to ship a native Windows ZIP.
+  macOS server archive; Citadel ships standalone Windows and x86_64 Linux ZIPs.
 - A local Docker engine smoke test is optional and does not run in release CI.
   If Docker Desktop is stopped, static repository checks still validate the
   image and Compose contract but cannot prove a container started.

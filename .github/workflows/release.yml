@@ -1,12 +1,12 @@
 name: release
 
-# Build the standalone Windows release packages and create a GitHub Release. A
+# Build the standalone Windows and portable Linux release packages and create a GitHub Release. A
 # release is cut by fast-forwarding develop to the long-lived release branch, or
 # through workflow_dispatch. Every run first requires a new Cargo version whose
 # `v<version>` tag does not already exist; the publish step creates that tag.
-# Public ZIP downloads remain Windows-only until Apple Developer ID and
-# notarization credentials are available; native macOS package targets are
-# deliberately not run in CI yet.
+# Public ZIP downloads include Windows and a statically linked x86_64 Linux
+# server. Native macOS package targets are deliberately not run in CI until
+# Apple Developer ID and notarization credentials are available.
 
 on:
   push:
@@ -59,6 +59,11 @@ jobs:
           - runner: windows-2022
             target: windows-x86_64
             platform: windows
+          # musl produces a statically linked server that does not depend on a
+          # particular distro's glibc. This is the portable Linux download.
+          - runner: ubuntu-latest
+            target: linux-x86_64-musl
+            platform: linux
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -66,6 +71,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -75,10 +82,34 @@ jobs:
       # unsigned macOS developer archives from this workflow.
 
       - name: Package server and SDKs (Windows)
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           ./make.ps1 package-windows
           ./make.ps1 package-clients-windows
+
+      - name: Package portable Linux server
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v musl-gcc >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes musl-tools
+          fi
+          make package-linux
+          package="$(find dist -maxdepth 1 -name 'citadel-linux-x86_64-musl-v*.zip' -print -quit)"
+          test -n "$package"
+          unzip -q "$package" -d "$RUNNER_TEMP/citadel-linux-package"
+          package_root="$(unzip -Z1 "$package" | head -1 | cut -d/ -f1)"
+          test -n "$package_root"
+          binary="$RUNNER_TEMP/citadel-linux-package/$package_root/citadel"
+          test -x "$binary"
+          file "$binary" | grep -qi 'statically linked'
+          (
+            cd "$RUNNER_TEMP/citadel-linux-package/$package_root"
+            ./citadel check
+          )
 
       # Re-enable native macOS matrix entries, Apple credential import,
       # notarization profile setup, and this package step together once the

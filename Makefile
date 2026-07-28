@@ -54,7 +54,7 @@ DATABASE_URL ?= postgres://$(PG_USER):$(PG_PASSWORD)@localhost:$(PG_PORT)/$(PG_D
 .PHONY: help build check fmt clippy test clean \
         server web native demo-web demo-native demo-native2 \
         docs-install docs-build docs-serve unity-plugin \
-        db-up db-down db-migrate package-windows package-windows-python package-macos \
+        db-up db-down db-migrate package-windows package-windows-python package-linux package-macos \
         package-client-unity package-client-unreal package-client-godot package-client-godot-web package-clients-windows \
         package-client-unity-macos package-client-unreal-macos package-client-godot-macos package-clients-macos \
         bin-server bin-server-python bin-benchmark benchmark-serve \
@@ -83,6 +83,11 @@ MACOS_GODOT_VENV ?= $(CURDIR)/target/godot-build-venv
 MACOS_GODOT_PYTHON = $(MACOS_GODOT_VENV)/bin/python
 MACOS_DEPLOYMENT_TARGET ?= 15.0
 MACOS_GODOT_ARCH = $(if $(filter aarch64,$(MACOS_ARCH)),arm64,$(MACOS_ARCH))
+# The Linux server release is built against musl so the archive works on the
+# broadest range of x86_64 Linux distributions without a host glibc version
+# requirement. It is intentionally server-only; native client SDKs need
+# per-engine/per-platform packaging of their own.
+LINUX_TARGET ?= x86_64-unknown-linux-musl
 
 help: ## Show this help
 	@echo "Citadel — make targets:"
@@ -195,6 +200,22 @@ package-windows: ## Stage + zip the Windows release ($(DIST_DIR)/citadel-windows
 	cp clients/unity/Demo/*.cs "$(PKG_STAGE)/clients/unity/Demo/"
 	cp target/release/citadel_client_ffi.dll "$(PKG_STAGE)/clients/unity/Plugins/x86_64/"
 	cp packaging/windows/unity-README.md "$(PKG_STAGE)/clients/unity/README.md"
+	@rm -f "$(DIST_DIR)/$(PKG_NAME).zip"
+	cd "$(DIST_DIR)" && zip -r "$(PKG_NAME).zip" "$(PKG_NAME)"
+	@echo ">> Packaged $(DIST_DIR)/$(PKG_NAME).zip"
+
+package-linux: ## Stage + zip the portable x86_64 Linux server ($(DIST_DIR)/citadel-linux-x86_64-musl-v{version}.zip)
+	@echo ">> Packaging Citadel v$(VERSION) for linux-x86_64-musl"
+	cargo build --release --target $(LINUX_TARGET) --bin citadel
+	$(eval PKG_NAME := citadel-linux-x86_64-musl-v$(VERSION))
+	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
+	@rm -rf "$(PKG_STAGE)"
+	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps"
+	cp "target/$(LINUX_TARGET)/release/citadel" "$(PKG_STAGE)/citadel"
+	chmod +x "$(PKG_STAGE)/citadel"
+	sed 's|scripts_dir = "./game"|scripts_dir = "./scripts"|' citadel.toml > "$(PKG_STAGE)/citadel.toml"
+	cp packaging/server/scripts/main.lua "$(PKG_STAGE)/scripts/main.lua"
+	cp packaging/linux/README.md "$(PKG_STAGE)/README.md"
 	@rm -f "$(DIST_DIR)/$(PKG_NAME).zip"
 	cd "$(DIST_DIR)" && zip -r "$(PKG_NAME).zip" "$(PKG_NAME)"
 	@echo ">> Packaged $(DIST_DIR)/$(PKG_NAME).zip"

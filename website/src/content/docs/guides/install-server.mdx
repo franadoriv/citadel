@@ -1,0 +1,99 @@
+---
+title: Install a server release
+description: Download, configure, and run a prebuilt Citadel server on Windows or x86_64 Linux — no source checkout or Rust toolchain.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Citadel server releases are standalone ZIP archives. Download the archive for
+your operating system from the [GitHub Releases](https://github.com/franadoriv/citadel/releases)
+page, extract it, then run the included server. You do **not** need to clone
+the repository, install Rust, or compile anything.
+
+:::tip[Choose the matching version]
+Use client SDK archives from the same `v{version}` release as your server. That
+keeps the client and server protocol versions aligned.
+:::
+
+## 1. Choose a server archive
+
+| Host | Download |
+| --- | --- |
+| Windows 64-bit | `citadel-windows-x86_64-v{version}.zip` |
+| Linux x86_64 / AMD64 | `citadel-linux-x86_64-musl-v{version}.zip` |
+
+The Linux archive contains a statically linked `musl` executable. It is intended
+for normal x86_64 Linux distributions, including servers based on Ubuntu,
+Debian, Fedora, and RHEL, without depending on the host's glibc version.
+
+It is not an ARM64 build: Raspberry Pi 64-bit, AWS Graviton, and other ARM64
+hosts need a dedicated ARM64 release archive or a source build.
+
+## 2. Extract and start
+
+### Windows
+
+Extract the ZIP, open PowerShell in the extracted folder, and run:
+
+```powershell
+.\citadel.exe
+```
+
+### Linux
+
+Extract the ZIP, open a terminal in the extracted folder, and run:
+
+```bash
+./citadel
+```
+
+The default command is `serve`; `citadel` and `citadel serve` are equivalent.
+The startup banner prints the dashboard, health, and transport addresses. On a
+local install the dashboard is normally
+`http://127.0.0.1:7350/dashboard`.
+
+## 3. Check configuration before opening it to players
+
+Each archive includes an editable `citadel.toml`, a starter Lua script under
+`scripts/main.lua`, and a `maps/` directory. Validate configuration without
+opening network listeners:
+
+<Tabs>
+<TabItem label="Windows">
+
+```powershell
+.\citadel.exe check
+```
+
+</TabItem>
+<TabItem label="Linux">
+
+```bash
+./citadel check
+```
+
+</TabItem>
+</Tabs>
+
+Edit `citadel.toml` and restart the server to change ports, database, game
+logic location, or enabled transports. See the full
+[configuration reference](/reference/operations/configuration/).
+
+:::caution[Before public deployment]
+
+The shipped configuration listens on loopback addresses for safe local testing.
+For LAN or internet access, set the relevant HTTP and transport bind addresses,
+set `server.public_addr` to a publicly reachable DNS name or IP (never
+`0.0.0.0`), configure firewall/TLS controls, and change all default dashboard
+credentials before exposing it. The [configuration reference](/reference/operations/configuration/)
+describes those settings.
+
+:::
+
+## Updating
+
+Stop the server, back up `citadel.toml`, your `scripts/`, `maps/`, and the
+database file or external database, then extract the new archive into a new
+directory. Copy only the files you intentionally customized, run `citadel
+check`, and start the new version. Do not overwrite an existing installation
+blindly: release templates may gain new configuration defaults.

@@ -23,9 +23,10 @@ the wire protocol lines up.
 You need a server for the client to connect to. The fastest path is the server
 package from the same Release:
 
-1. Download `citadel-windows-x86_64-v{version}.zip` from the Releases page and
-   unzip it.
-2. Double-click `citadel.exe` (or run `.\citadel.exe serve` in a terminal).
+1. Download the matching server archive from the Releases page: either
+   `citadel-windows-x86_64-v{version}.zip` or, on x86_64/AMD64 Linux,
+   `citadel-linux-x86_64-musl-v{version}.zip`.
+2. Extract it and run `citadel.exe` on Windows or `./citadel` on Linux.
 3. Leave it running. By default it listens on **QUIC `127.0.0.1:7351`**,
    **WebSocket `127.0.0.1:7352`**.
 
@@ -34,7 +35,8 @@ When a signed macOS release is available, use
 `citadel-macos-x86_64-v{version}.zip` on Intel, then run `./citadel` in
 Terminal.
 
-See the [Quickstart](/quickstart/) for editing game logic (`scripts/main.lua`).
+See [Install a server release](/guides/install-server/) for the complete
+download, configuration, and safe public-deployment path.
 
 ## Step 2 — Download your engine's SDK
 
