@@ -70,7 +70,7 @@ impl WebTransportServer {
     ) -> AppResult<Self> {
         let server = web_transport_quinn::ServerBuilder::new()
             .with_addr(bind)
-            .with_certificate(cert.cert_chain.clone(), cert.key())
+            .with_certificate(cert.cert_chain.clone(), cert.key()?)
             .map_err(|e| {
                 AppError::new(
                     ErrorCategory::Transport,

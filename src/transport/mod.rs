@@ -397,10 +397,27 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
 
     if cfg.quic.enabled {
         let bind = parse_bind("transport.quic.bind", &cfg.quic.bind)?;
-        let cert = quic::SelfSignedCert::generate(&["localhost".to_string()])?;
+        let cert = if cfg.tls.is_configured() {
+            quic::SelfSignedCert::from_pem(
+                std::path::Path::new(
+                    cfg.tls
+                        .certificate_file
+                        .as_deref()
+                        .expect("validated TLS certificate path"),
+                ),
+                std::path::Path::new(
+                    cfg.tls
+                        .private_key_file
+                        .as_deref()
+                        .expect("validated TLS key path"),
+                ),
+            )?
+        } else {
+            quic::SelfSignedCert::generate(&["localhost".to_string()])?
+        };
         let server = quic::QuicServer::bind_with_gateway(bind, &cert, Arc::clone(&gateway))?
             .with_handshake_timeout(handshake_timeout);
-        tracing::info!(addr = %server.local_addr(), "starting QUIC transport (dev cert)");
+        tracing::info!(addr = %server.local_addr(), tls = if cfg.tls.is_configured() { "PEM" } else { "development self-signed" }, "starting QUIC transport");
         supervisor.spawn(server);
     }
 
@@ -415,15 +432,36 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
 
     if cfg.webtransport.enabled {
         let bind = parse_bind("transport.webtransport.bind", &cfg.webtransport.bind)?;
-        let cert = webtransport::WebTransportDevCert::generate(&["localhost".to_string()])?;
+        let cert = if cfg.tls.is_configured() {
+            webtransport::WebTransportDevCert::from_pem(
+                std::path::Path::new(
+                    cfg.tls
+                        .certificate_file
+                        .as_deref()
+                        .expect("validated TLS certificate path"),
+                ),
+                std::path::Path::new(
+                    cfg.tls
+                        .private_key_file
+                        .as_deref()
+                        .expect("validated TLS key path"),
+                ),
+            )?
+        } else {
+            webtransport::WebTransportDevCert::generate(&["localhost".to_string()])?
+        };
         let server =
             webtransport::WebTransportServer::bind_with_gateway(bind, &cert, Arc::clone(&gateway))?
                 .with_handshake_timeout(handshake_timeout);
-        tracing::info!(
-            addr = %server.local_addr(),
-            cert_sha256_base64 = %server.cert_sha256_base64(),
-            "starting WebTransport transport (dev cert; pass cert hash to the browser)"
-        );
+        if cfg.tls.is_configured() {
+            tracing::info!(addr = %server.local_addr(), "starting WebTransport transport with PEM TLS");
+        } else {
+            tracing::info!(
+                addr = %server.local_addr(),
+                cert_sha256_base64 = %server.cert_sha256_base64(),
+                "starting WebTransport transport (dev cert; pass cert hash to the browser)"
+            );
+        }
         supervisor.spawn(server);
     }
 

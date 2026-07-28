@@ -94,7 +94,8 @@ For LAN or internet access, set the relevant HTTP and transport bind addresses,
 set `server.public_addr` to a publicly reachable DNS name or IP (never
 `0.0.0.0`), configure firewall/TLS controls, and change all default dashboard
 credentials before exposing it. The [configuration reference](/reference/operations/configuration/)
-describes those settings.
+describes those settings. See [Production TLS and proxy](/guides/production-tls/)
+for a complete public deployment.
 
 :::
 
@@ -118,6 +119,28 @@ Edit `/opt/citadel/citadel.toml` before starting a public server, then restart
 with `sudo systemctl restart citadel`. View logs with
 `journalctl -u citadel -f`. The unit intentionally does not open firewall ports
 or provide TLS certificates; configure those explicitly for your environment.
+
+## Production TLS and reverse proxy
+
+For a public server, put a CA-issued certificate and its key on the host (for
+example, via Certbot), readable only by the service account or a restricted
+group. Configure the same pair for direct QUIC and WebTransport TLS:
+
+```toml
+[transport.tls]
+certificate_file = "/etc/letsencrypt/live/game.example.com/fullchain.pem"
+private_key_file = "/etc/letsencrypt/live/game.example.com/privkey.pem"
+```
+
+Open UDP `7351` (native QUIC) and UDP `7353` (WebTransport) when those
+listeners are public. The certificate must cover the hostname clients use.
+Restart Citadel after renewal because certificate files are read at startup.
+
+Citadel's WebSocket listener remains plain `ws://` by design. Put it and the
+HTTP dashboard behind an HTTPS reverse proxy that terminates TLS and forwards
+WebSocket upgrades to `127.0.0.1:7352`; keep the dashboard protected with its
+own strong credentials or network access controls. Do not proxy HTTP/3/QUIC as
+ordinary TCP: clients must reach Citadel's UDP port directly.
 
 ## Updating
 

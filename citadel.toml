@@ -75,6 +75,13 @@ hot_reload_poll_ms = 500
 # primary native transport, WebTransport serves browsers over HTTP/3, and
 # WebSocket is the broadest-compatibility fallback. All three are enabled here so
 # the standalone server accepts every supported client out of the box.
+[transport.tls]
+# Public QUIC/WebTransport TLS. Leave both paths commented for local development;
+# Citadel then creates a short-lived self-signed certificate. For production set
+# both to a CA-issued PEM chain and its private key (not used by WebSocket).
+# certificate_file = "/etc/letsencrypt/live/game.example.com/fullchain.pem"
+# private_key_file = "/etc/letsencrypt/live/game.example.com/privkey.pem"
+
 [transport.quic]
 enabled = true
 bind = "127.0.0.1:7351"

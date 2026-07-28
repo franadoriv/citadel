@@ -44,6 +44,12 @@ enabled = false
 bind = "127.0.0.1:7351"
 outbound_queue_capacity = 1024
 
+[transport.tls]
+# Optional CA-issued PEM TLS for public QUIC and WebTransport. Set both paths
+# together in production; omit both for the local self-signed development mode.
+# certificate_file = "/etc/letsencrypt/live/game.example.com/fullchain.pem"
+# private_key_file = "/etc/letsencrypt/live/game.example.com/privkey.pem"
+
 [transport.websocket]
 # Reliable-only fallback for browsers without WebTransport and UDP-blocked nets.
 enabled = false
@@ -190,6 +196,24 @@ Notes:
 - A transport's `bind` and `outbound_queue_capacity` are only validated when that
   transport is `enabled`.
 - All enabled transports share one [gateway room](/concepts/gateway/).
+
+### `[transport.tls]`
+
+This optional section configures the PEM certificate chain used directly by the
+public QUIC and WebTransport UDP listeners. It is intentionally separate from
+`[cluster.tls]`, which only secures node-control traffic.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `certificate_file` | path | *(unset)* | PEM leaf certificate followed by intermediates. |
+| `private_key_file` | path | *(unset)* | Matching PEM private key (PKCS#8, RSA/PKCS#1, or SEC1). |
+
+Set both paths or neither. With both omitted, Citadel generates local-only
+self-signed certificates; do not expose that mode publicly. Set both paths to
+a CA-issued chain/key before publishing QUIC or WebTransport. Citadel reads the
+files at startup, so renew a certificate then restart the service. This section
+does **not** turn the built-in WebSocket listener into `wss://`; use a reverse
+proxy for WebSocket and the HTTP dashboard.
 
 ### `[chat.limits]`
 

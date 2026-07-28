@@ -9,8 +9,12 @@
 //! This is for local development only; production certificate provisioning is a
 //! separate operational task.
 
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+
 use rcgen::{CertificateParams, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult, ErrorCategory};
@@ -54,9 +58,44 @@ impl WebTransportDevCert {
         })
     }
 
+    /// Load a CA-issued PEM certificate chain and private key for production.
+    /// The historic type name remains for API compatibility with development
+    /// callers; unlike [`generate`](Self::generate), this method does not make
+    /// a self-signed certificate or expose a pinning requirement.
+    pub fn from_pem(certificate_file: &Path, private_key_file: &Path) -> AppResult<Self> {
+        let cert_file = File::open(certificate_file)
+            .map_err(|e| cert_err("failed to open transport TLS certificate file", e))?;
+        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| cert_err("failed to parse transport TLS certificate PEM", e))?;
+        let Some(leaf) = cert_chain.first() else {
+            return Err(AppError::new(
+                ErrorCategory::Config,
+                "transport TLS certificate file contains no certificates",
+            ));
+        };
+        let cert_sha256 = Sha256::digest(leaf.as_ref()).into();
+        let key_file = File::open(private_key_file)
+            .map_err(|e| cert_err("failed to open transport TLS private key file", e))?;
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+            .map_err(|e| cert_err("failed to parse transport TLS private key PEM", e))?
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorCategory::Config,
+                    "transport TLS private key file contains no private key",
+                )
+            })?;
+        Ok(Self {
+            cert_chain,
+            key_der: key.secret_der().to_vec(),
+            cert_sha256,
+        })
+    }
+
     /// The PKCS#8 private key as a typed der value.
-    pub fn key(&self) -> PrivateKeyDer<'static> {
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_der.clone()))
+    pub fn key(&self) -> AppResult<PrivateKeyDer<'static>> {
+        PrivateKeyDer::try_from(self.key_der.clone())
+            .map_err(|e| cert_err("invalid transport TLS private key", e))
     }
 
     /// The leaf certificate SHA-256 digest.

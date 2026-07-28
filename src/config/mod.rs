@@ -835,6 +835,8 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransportConfig {
+    /// TLS material shared by the public QUIC and WebTransport listeners.
+    pub tls: TransportTlsConfig,
     /// QUIC listener settings.
     pub quic: QuicConfig,
     /// WebSocket fallback listener settings.
@@ -845,6 +847,38 @@ pub struct TransportConfig {
     pub auth: AuthConfig,
     /// Authoritative transform synchronization.
     pub transform_sync: TransformSyncConfig,
+}
+
+/// Optional PEM certificate chain and private key for public UDP transports.
+///
+/// When both paths are empty, enabled QUIC and WebTransport listeners generate
+/// their existing short-lived development certificates. Production operators
+/// must set both values to use a CA-issued certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransportTlsConfig {
+    /// PEM certificate chain presented by QUIC and WebTransport.
+    pub certificate_file: Option<String>,
+    /// PEM private key corresponding to `certificate_file`.
+    pub private_key_file: Option<String>,
+}
+
+impl TransportTlsConfig {
+    /// Whether both PEM paths were provided.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.certificate_file.is_some() && self.private_key_file.is_some()
+    }
+
+    fn validate(&self) -> AppResult<()> {
+        match (&self.certificate_file, &self.private_key_file) {
+            (None, None) => Ok(()),
+            (Some(cert), Some(key)) if !cert.trim().is_empty() && !key.trim().is_empty() => Ok(()),
+            _ => Err(AppError::config(
+                "transport.tls.certificate_file and transport.tls.private_key_file must be set together and not be empty",
+            )),
+        }
+    }
 }
 
 /// Authoritative transform-sync settings (, design
@@ -1397,6 +1431,7 @@ impl Config {
         }
         self.cluster
             .validate(&self.server.node_id, &self.database)?;
+        self.transport.tls.validate()?;
         if self.transport.quic.enabled {
             validate_socket_addr("transport.quic.bind", &self.transport.quic.bind)?;
             if self.transport.quic.outbound_queue_capacity == 0 {
@@ -2351,6 +2386,32 @@ fields = ["region"]
         zero.runtime.static_data_dir = Some("./common".to_string());
         zero.runtime.static_data_max_file_bytes = 0;
         let error = zero.validate().expect_err("zero data limit is invalid");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+    }
+
+    #[test]
+    fn transport_tls_paths_must_be_configured_together() {
+        let configured = Config::from_toml_str(
+            r#"
+            [transport.tls]
+            certificate_file = "/etc/citadel/fullchain.pem"
+            private_key_file = "/etc/citadel/privkey.pem"
+            "#,
+        )
+        .expect("parse");
+        assert!(configured.transport.tls.is_configured());
+        configured
+            .validate()
+            .expect("complete TLS config validates");
+
+        let partial = Config::from_toml_str(
+            r#"
+            [transport.tls]
+            certificate_file = "/etc/citadel/fullchain.pem"
+            "#,
+        )
+        .expect("parse");
+        let error = partial.validate().expect_err("partial TLS config rejected");
         assert_eq!(error.category(), crate::error::ErrorCategory::Config);
     }
 }

@@ -1,19 +1,22 @@
 //! TLS configuration for the QUIC transport.
 //!
 //! QUIC requires TLS 1.3. For local development and tests we generate an
-//! in-memory self-signed certificate; production certificate provisioning is a
-//! later operational task. The client-side helper here trusts that self-signed
+//! in-memory self-signed certificate. Production listeners can instead load a
+//! CA-issued PEM certificate chain and key. The client-side helper here trusts that self-signed
 //! certificate explicitly so integration tests can connect without a real CA.
 //!
 //! Security note: [`insecure_client_config`] disables certificate verification
 //! and MUST only be used in tests/dev tooling. It is gated behind an explicit,
 //! clearly named function so it cannot be reached by accident from server code.
 
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, ServerConfig};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::error::{AppError, AppResult, ErrorCategory};
 
@@ -44,9 +47,44 @@ impl SelfSignedCert {
         })
     }
 
-    /// The PKCS#8 private key as a typed der value.
-    fn key(&self) -> PrivatePkcs8KeyDer<'static> {
-        PrivatePkcs8KeyDer::from(self.key_der.clone())
+    /// Load a CA-issued PEM certificate chain and private key.
+    ///
+    /// Despite the historic type name, this is the production TLS path too;
+    /// callers should use [`SelfSignedCert::generate`] only for development.
+    /// The key may be PKCS#8, RSA/PKCS#1, or SEC1 PEM. File contents are never
+    /// included in errors.
+    pub fn from_pem(certificate_file: &Path, private_key_file: &Path) -> AppResult<Self> {
+        let cert_file = File::open(certificate_file)
+            .map_err(|e| tls_error("failed to open transport TLS certificate file", e))?;
+        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| tls_error("failed to parse transport TLS certificate PEM", e))?;
+        if cert_chain.is_empty() {
+            return Err(AppError::new(
+                ErrorCategory::Config,
+                "transport TLS certificate file contains no certificates",
+            ));
+        }
+        let key_file = File::open(private_key_file)
+            .map_err(|e| tls_error("failed to open transport TLS private key file", e))?;
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+            .map_err(|e| tls_error("failed to parse transport TLS private key PEM", e))?
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorCategory::Config,
+                    "transport TLS private key file contains no private key",
+                )
+            })?;
+        Ok(Self {
+            cert_chain,
+            key_der: key.secret_der().to_vec(),
+        })
+    }
+
+    /// The configured private key as a typed DER value.
+    fn key(&self) -> AppResult<PrivateKeyDer<'static>> {
+        PrivateKeyDer::try_from(self.key_der.clone())
+            .map_err(|e| tls_error("invalid transport TLS private key", e))
     }
 }
 
@@ -54,7 +92,7 @@ impl SelfSignedCert {
 pub fn server_config(cert: &SelfSignedCert) -> AppResult<ServerConfig> {
     let mut rustls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(cert.cert_chain.clone(), cert.key().into())
+        .with_single_cert(cert.cert_chain.clone(), cert.key()?)
         .map_err(|e| tls_error("invalid server certificate/key", e))?;
     // QUIC requires the ALPN to be negotiated; advertise a Citadel protocol id.
     rustls_config.alpn_protocols = vec![CITADEL_ALPN.to_vec()];
@@ -104,6 +142,30 @@ mod tests {
         let cert = SelfSignedCert::generate(&["localhost".to_string()]).expect("generate");
         server_config(&cert).expect("server config");
         client_config_trusting(&cert).expect("client config");
+    }
+
+    #[test]
+    fn loads_pem_certificate_and_key() {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate certificate");
+        let dir = std::env::temp_dir().join(format!(
+            "citadel-tls-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).expect("create temp directory");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, generated.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, generated.key_pair.serialize_pem()).expect("write key");
+
+        let loaded = SelfSignedCert::from_pem(&cert_path, &key_path).expect("load PEM");
+        server_config(&loaded).expect("server config from PEM");
+
+        std::fs::remove_dir_all(&dir).expect("remove temp directory");
     }
 
     #[test]
