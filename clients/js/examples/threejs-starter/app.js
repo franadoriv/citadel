@@ -1,4 +1,4 @@
-// A minimal browser-game integration: @citadel/client owns WebSocket framing
+// A minimal browser-game integration: @citadel/client owns transport framing
 // and dispatch; Three.js owns the scene, input, and visual interpolation.
 //
 // Serve `clients/js/` as the static root so this source import works both in a
@@ -14,6 +14,8 @@ import {
 
 const ENDPOINT = new URLSearchParams(window.location.search).get("endpoint")
   ?? "ws://127.0.0.1:7352/";
+const WEBTRANSPORT_ENDPOINT = new URLSearchParams(window.location.search).get("webtransportEndpoint");
+const WEBTRANSPORT_CERT_HASH = new URLSearchParams(window.location.search).get("webtransportCertHash");
 const SEND_INTERVAL_MS = 50;
 const PEER_STALE_MS = 5_000;
 const POSITION_BYTES = 20; // x/y/z LE f32 + send time LE f64; game-owned layout.
@@ -121,7 +123,11 @@ function updateRemoteVisuals(now, dt) {
 function maybeSendPosition(now) {
   if (!client?.isOpen || now - lastSentAt < SEND_INTERVAL_MS) return;
   lastSentAt = now;
-  client.send(KIND_POSITION, encodePosition(localPlayer.position, now));
+  client.send(KIND_POSITION, encodePosition(localPlayer.position, now), {
+    // Position updates are safe to drop; WebSocket keeps them reliable because
+    // it has no datagram path, while WebTransport sends bare Citadel datagrams.
+    reliable: client.transportKind !== "webtransport",
+  });
 }
 
 function frame(now) {
@@ -144,10 +150,19 @@ window.addEventListener("resize", () => {
 
 async function connect() {
   try {
-    client = await CitadelClient.connect(ENDPOINT);
+    client = WEBTRANSPORT_ENDPOINT
+      ? await CitadelClient.connectAuto({
+        webTransportUrl: WEBTRANSPORT_ENDPOINT,
+        webSocketUrl: ENDPOINT,
+      }, {
+        webTransport: WEBTRANSPORT_CERT_HASH
+          ? { serverCertificateHashBase64: WEBTRANSPORT_CERT_HASH }
+          : {},
+      })
+      : await CitadelClient.connect(ENDPOINT);
     client.on(KIND_PEER_POSITION, receivePeerPosition);
     await client.handshakeGuest();
-    status.textContent = `connected to ${ENDPOINT}`;
+    status.textContent = `connected over ${client.transportKind} to ${ENDPOINT}`;
     status.classList.add("connected");
   } catch (error) {
     status.textContent = `connection failed: ${error instanceof Error ? error.message : String(error)}`;

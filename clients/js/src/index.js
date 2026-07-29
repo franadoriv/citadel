@@ -13,6 +13,7 @@
 //   const reply = await client.callRpc("ping");
 
 export { CitadelClient, RpcError } from "./client.js";
+export { webTransportCertificateHash } from "./transport.js";
 export { CitadelHttpClient, HttpApiError } from "./http.js";
 export {
   Envelope,

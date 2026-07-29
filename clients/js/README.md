@@ -2,7 +2,8 @@
 
 The realtime client SDK for Citadel in the browser and Node, peer to the
 Unity, Godot, and Unreal SDKs under `clients/`. It speaks Citadel's wire format
-directly over WebSocket — no native library, no build step.
+directly over WebTransport (when available) or WebSocket — no native library
+and no application build step.
 
 - **Zero-build ESM.** Plain `.js` modules with JSDoc types plus a hand-written
   `index.d.ts`. Import from `file://`, `<script type="module">`, Node (≥ 22), or
@@ -15,20 +16,28 @@ directly over WebSocket — no native library, no build step.
   [`examples/threejs-starter/`](examples/threejs-starter/) is the canonical
   browser-game integration.
 
-## Install
+## Download and import from a release
 
-Pre-publish, import straight from source (the demo does this):
+Every Citadel release includes `citadel-client-js-v<version>.zip`. Download it,
+verify the release checksum, and extract it into your game site. The archive's
+own `SHA256SUMS.txt` verifies its individual files:
 
 ```js
-import { CitadelClient, KIND_POSITION } from "../path/to/clients/js/src/index.js";
+import { CitadelClient, KIND_POSITION } from "./citadel-client-js-v0.9.11/dist/citadel-client.min.mjs";
 ```
 
-Once published: `npm install @citadel/client`.
+The `.gz` and `.br` siblings are for a static server that sends the matching
+`Content-Encoding`; import the `.mjs` URL, never a compressed sidecar. The
+bundle is minified/mangled for compact delivery, not as a security boundary:
+do not put secrets in browser code.
+
+For a checkout-based game, the demo imports `src/index.js` directly. npm
+publication is not required for the release artifact.
 
 ## Quick start
 
 ```js
-import { CitadelClient, KIND_POSITION } from "@citadel/client";
+import { CitadelClient, KIND_POSITION } from "./citadel-client-js-v0.9.11/dist/citadel-client.min.mjs";
 
 const client = await CitadelClient.connect("ws://127.0.0.1:7352/");
 await client.handshakeGuest();                 // register as a guest
@@ -45,8 +54,8 @@ const reply = await client.callRpc("ping");    // Uint8Array
 
 The SDK deliberately does not depend on a renderer. For a browser game,
 Three.js is Citadel's canonical JavaScript example: it gives you a scene loop,
-input, meshes, and interpolation while `@citadel/client` handles only
-WebSocket framing and messages.
+input, meshes, and interpolation while `@citadel/client` handles transport
+framing and messages.
 
 Run the starter against the tracked local relay:
 
@@ -63,7 +72,7 @@ keeps the responsibilities intentionally separate:
 
 | Layer | Owns |
 | --- | --- |
-| `@citadel/client` | WebSocket connection, guest handshake, framed envelopes, message dispatch. |
+| `@citadel/client` | WebTransport/WebSocket connection, guest handshake, envelopes, message dispatch. |
 | Three.js application | Input, local visual prediction, meshes, remote interpolation, and packet layout. |
 | Citadel game logic | Validation and authoritative rules when the game needs them. |
 
@@ -76,8 +85,10 @@ relay to authoritative movement.
 | Symbol | What it does |
 | --- | --- |
 | `CitadelClient.connect(url, opts?)` | Open a WebSocket and resolve when ready. |
+| `CitadelClient.connectWebTransport(url, opts?)` | Open Chromium WebTransport. Reliable sends use streams; unreliable sends use datagrams. |
+| `CitadelClient.connectAuto({ webTransportUrl, webSocketUrl }, opts?)` | Prefer WebTransport and use the explicit WebSocket fallback only before WebTransport becomes ready. |
 | `client.handshakeGuest()` | Send `KIND_AUTH` (guest) and await the ack that registers the session. |
-| `client.send(kind, body?)` | Send a framed envelope. |
+| `client.send(kind, body?, { reliable? })` | Reliable by default; `reliable: false` selects a WebTransport datagram while WebSocket remains reliable-only. |
 | `client.on(kind, cb)` / `off` / `onAny(cb)` | Dispatch inbound envelopes by kind. |
 | `client.callRpc(method, payload?, opts?)` | Correlated RPC; resolves reply bytes or throws `RpcError`. |
 | `client.waitForKind(kind, timeoutMs?)` | One-shot await of the next envelope of a kind. |
@@ -85,6 +96,7 @@ relay to authoritative movement.
 | `client.onRoomJoined(cb)` / `sendMapReady(id)` | Receive the server-chosen map, load it, then acknowledge it. |
 | `client.close()` | Close the connection. |
 | `Envelope`, `FrameDecoder` | Wire framing (`encodeFramed` / stream decode). |
+| `webTransportCertificateHash(base64)` | Turn Citadel's logged development-certificate hash into a browser pin descriptor. |
 | `encodeRpcRequest`, `decodeRpcResponse`, `decodeAuthResult`, `splitSender`, `tagWithSender` | Low-level codecs. |
 | `KIND_*`, `AUTH_*`, `RPC_*`, `*_BYTES` | Protocol constants (contract-checked). |
 
@@ -105,10 +117,16 @@ client.onRoomJoined((room) => {
 client.joinOrCreateRoom("lobby");
 ```
 
-## Tests
+## Build and test the downloadable artifact
 
 ```bash
-node --test clients/js/test/*.test.js   # codec round-trip + protocol layouts (zero deps)
+cd clients/js
+npm ci
+npm test
+npm run package                         # stage dist/citadel-client-js-v<version>/
+
+# Windows PowerShell: stage, ZIP, and verify the archive.
+.\make.ps1 package-client-js
 ```
 
 ## Combat benchmark
@@ -143,7 +161,12 @@ python3 -m http.server 8080 --directory bin/benchmark
 
 ## Status & limitations
 
-- WebSocket transport only. Browser WebTransport/QUIC is a planned follow-up.
-- Not yet published to npm (import from source for now).
+- WebTransport is a Chromium browser path. WebSocket remains the portable
+  fallback; the SDK does not migrate an authenticated connection.
+- The development WebTransport certificate is short-lived. Supply its logged
+  base64 hash with `serverCertificateHashBase64`; a trusted production
+  certificate needs no pin.
+- npm publication is intentionally not required: use the versioned release ZIP
+  for direct browser imports.
 - Constant/layout parity is guaranteed by CI; end-to-end behavior is verified by
   the demo and the Rust `citadel-client` integration tests.

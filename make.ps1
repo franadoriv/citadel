@@ -36,6 +36,7 @@ param(
         "package-client-unreal",
         "package-client-godot",
         "package-client-godot-web",
+        "package-client-js",
         "package-clients-windows",
         "bin-server",
         "bin-server-python",
@@ -973,6 +974,88 @@ function Invoke-PackageClientGodotWeb {
     throw "Python 3 was not found. Install Python 3 or use the py launcher."
 }
 
+function Invoke-PackageClientJs {
+    # The browser runtime remains dependency-free. Node and the pinned local
+    # esbuild dependency are build-time only; the staged bundle is a direct ESM
+    # import plus source-map and content-encoding sidecars.
+    $version = Get-CargoVersion
+    $pkgName = "citadel-client-js-v$version"
+    $stage = Join-Path $RepoRoot (Join-Path $DistDir $pkgName)
+    $zipPath = Join-Path $RepoRoot (Join-Path $DistDir "$pkgName.zip")
+    $sdkDir = Join-Path $RepoRoot "clients\js"
+
+    Push-Location $sdkDir
+    try {
+        Invoke-Native -FilePath "npm" -Arguments @("ci")
+        Invoke-Native -FilePath "npm" -Arguments @("run", "package")
+    }
+    finally {
+        Pop-Location
+    }
+
+    $requiredStageFiles = @(
+        "dist\citadel-client.min.mjs",
+        "dist\citadel-client.min.mjs.map",
+        "dist\citadel-client.min.mjs.gz",
+        "dist\citadel-client.min.mjs.br",
+        "index.d.ts",
+        "README.md",
+        "examples\threejs-starter\index.html",
+        "SHA256SUMS.txt"
+    )
+    foreach ($required in $requiredStageFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $stage $required) -PathType Leaf)) {
+            throw "JS SDK staging is missing required release file: $required"
+        }
+    }
+
+    if (Test-Path -LiteralPath $zipPath) {
+        Remove-Item -LiteralPath $zipPath -Force
+    }
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::Open(
+        $zipPath,
+        [System.IO.Compression.ZipArchiveMode]::Create
+    )
+    try {
+        $stageParent = Split-Path -Parent $stage
+        $epoch = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+        Get-ChildItem -LiteralPath $stage -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $entryName = $_.FullName.Substring($stageParent.Length + 1).Replace("\", "/")
+            $entry = $archive.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            $entry.LastWriteTime = $epoch
+            $input = [System.IO.File]::OpenRead($_.FullName)
+            $output = $entry.Open()
+            try {
+                $input.CopyTo($output)
+            }
+            finally {
+                $output.Dispose()
+                $input.Dispose()
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    try {
+        $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
+        foreach ($required in $requiredStageFiles) {
+            $entryName = "$pkgName/" + $required.Replace("\", "/")
+            if ($entryName -notin $entryNames) {
+                throw "JS SDK ZIP is missing required release entry: $entryName"
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+    Write-Host ">> Packaged and verified $zipPath"
+}
+
 function Invoke-PackageClientsWindows {
     # Build + stage + zip the ready-to-use native Windows engine SDKs. The
     # browser WebAssembly archive is exported by the separate Godot-capable
@@ -1328,6 +1411,7 @@ function Show-Help {
         @("package-client-unreal", "Stage + zip the Unreal client plugin (dist/citadel-client-unreal-windows-x86_64-v{version}.zip)"),
         @("package-client-godot", "Stage + zip the Godot client SDK (dist/citadel-client-godot-windows-x86_64-v{version}.zip)"),
         @("package-client-godot-web", "Stage + zip the Godot Web/WebAssembly SDK (requires GODOT_BIN; dist/citadel-client-godot-web-v{version}.zip)"),
+        @("package-client-js", "Build, stage, and zip the browser ESM SDK (dist/citadel-client-js-v{version}.zip)"),
         @("package-clients-windows", "Stage + zip the Unity, Unreal, and native Godot Windows SDKs as versioned zips"),
         @("bin-server", "Stage a ready-to-run server at bin/server (exe + config + scripts/main.lua + empty maps/)"),
         @("bin-server-python", "Stage a Python-enabled server at bin/server-python (bundled CPython + scripts/main.py)"),
@@ -1406,6 +1490,7 @@ switch ($Target) {
     "package-client-unreal" { Invoke-PackageClientUnreal }
     "package-client-godot" { Invoke-PackageClientGodot }
     "package-client-godot-web" { Invoke-PackageClientGodotWeb }
+    "package-client-js" { Invoke-PackageClientJs }
     "package-clients-windows" { Invoke-PackageClientsWindows }
     "bin-server" { Invoke-BinServer }
     "bin-server-python" { Invoke-BinServerPython }

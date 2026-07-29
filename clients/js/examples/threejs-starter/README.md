@@ -1,8 +1,8 @@
 # Three.js multiplayer starter
 
 This is the smallest playable browser scene built with **Three.js** and
-`@citadel/client`. The SDK owns WebSocket framing, guest authentication, and
-message dispatch. The game owns the render loop, input, packet layout, local
+`@citadel/client`. The SDK owns WebTransport/WebSocket framing, guest
+authentication, and message dispatch. The game owns the render loop, input, packet layout, local
 prediction, and peer interpolation.
 
 It runs against Citadel's tracked position relay. That relay intentionally
@@ -40,12 +40,22 @@ Use another WebSocket endpoint when needed:
 http://127.0.0.1:8000/examples/threejs-starter/?endpoint=ws://localhost:7352/
 ```
 
+To prefer the local Chromium WebTransport listener, copy the server's logged
+`cert_sha256_base64` value and supply both explicit endpoints. The starter sends
+its drop-safe position updates as datagrams when WebTransport wins, and keeps
+them reliable on WebSocket fallback:
+
+```text
+http://127.0.0.1:8000/examples/threejs-starter/?webtransportEndpoint=https://127.0.0.1:7353/&webtransportCertHash=<base64-server-hash>
+```
+
 ## Run from the staged SDK
 
 `make bin-client-js` includes this example. Serve `bin/clients/js/` as the
-static root and open the same `/examples/threejs-starter/` path. Once
-`@citadel/client` is published, replace the relative SDK import in `app.js`
-with the package import; the Three.js and game-loop code stay unchanged.
+static root and open the same `/examples/threejs-starter/` path. A release ZIP
+contains this starter plus `dist/citadel-client.min.mjs`; replace the relative
+source import in `app.js` with a relative import to that extracted ESM file.
+The Three.js and game-loop code stay unchanged.
 
 ## What to change next
 

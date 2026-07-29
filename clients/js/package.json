@@ -1,7 +1,7 @@
 {
   "name": "@citadel/client",
   "version": "0.1.0",
-  "description": "Citadel realtime client SDK for the browser and Node (WebSocket).",
+  "description": "Citadel realtime client SDK for browser WebSocket/WebTransport and Node WebSocket.",
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
@@ -23,7 +23,11 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "package": "node scripts/build-release.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
   },
   "keywords": [
     "citadel",

@@ -1,12 +1,17 @@
-// Browser/Node WebSocket client for Citadel's realtime transport.
+// Browser/Node realtime client for Citadel's WebSocket and WebTransport paths.
 //
 // Pure network/state logic (no rendering), the JS peer of the Rust
-// `citadel-client` crate's `WsClient`: connect, present the guest handshake,
-// send/receive framed envelopes, dispatch by kind, and await correlated RPC
-// replies. Works with the global `WebSocket` (browsers, Node >= 22) or an
-// injected implementation via `opts.WebSocket`.
+// `citadel-client` crate's transport client: connect, present the guest
+// handshake, send/receive envelopes, dispatch by kind, and await correlated
+// RPC replies. WebSocket works in browsers and Node >= 22; WebTransport is a
+// Chromium browser path with an injectable implementation for tests.
 
-import { Envelope, FrameDecoder } from "./envelope.js";
+import { Envelope } from "./envelope.js";
+import {
+  WebSocketTransport,
+  WebTransportTransport,
+  webTransportCertificateHash,
+} from "./transport.js";
 import {
   KIND_AUTH,
   KIND_AUTH_RESULT,
@@ -32,22 +37,40 @@ import {
 /** Default timeout (ms) for handshake / RPC awaits. */
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+/** @param {Promise<unknown>} promise @param {number} timeoutMs @param {() => void} onTimeout */
+function waitWithTimeout(promise, timeoutMs, onTimeout) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onTimeout();
+      reject(new Error(`connect timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 /**
- * A connected Citadel WebSocket client. Reliable, ordered delivery only.
+ * A connected Citadel realtime client. WebSocket delivery is always reliable;
+ * WebTransport callers can choose reliable streams or unreliable datagrams per
+ * message.
  *
  * Construct with the async {@link CitadelClient.connect} factory rather than
  * `new`.
  */
 export class CitadelClient {
   /**
-   * @param {WebSocket} ws An OPEN WebSocket with `binaryType = "arraybuffer"`.
+   * @param {WebSocket | WebSocketTransport | WebTransportTransport} transport
    * @private
    */
-  constructor(ws) {
-    /** @type {WebSocket} @private */
-    this._ws = ws;
-    /** @private */
-    this._decoder = new FrameDecoder();
+  constructor(transport) {
+    /** @type {WebSocketTransport | WebTransportTransport} @private */
+    this._transport = transport?.kind && typeof transport.setHandlers === "function"
+      ? transport
+      : new WebSocketTransport(transport);
+    /** @type {"websocket" | "webtransport"} */
+    this.transportKind = this._transport.kind;
     /** @type {Map<number, Set<Function>>} @private */
     this._handlers = new Map();
     /** @type {Set<Function>} @private */
@@ -67,21 +90,12 @@ export class CitadelClient {
     /** @type {Set<(roomId: bigint) => void>} @private */
     this._roomLeftHandlers = new Set();
 
-    ws.binaryType = "arraybuffer";
-    ws.addEventListener("message", (ev) => {
-      let envelopes;
-      try {
-        envelopes = this._decoder.push(ev.data);
-      } catch (err) {
-        this._failAll(err);
-        try { ws.close(); } catch { /* already closing */ }
-        return;
-      }
-      for (const env of envelopes) this._dispatch(env);
-    });
-    ws.addEventListener("close", () => {
-      this.closed = true;
-      this._failAll(new Error("connection closed"));
+    this._transport.setHandlers({
+      onEnvelope: (env) => this._dispatch(env),
+      onClose: (error) => {
+        this.closed = true;
+        this._failAll(error);
+      },
     });
   }
 
@@ -122,9 +136,91 @@ export class CitadelClient {
     });
   }
 
-  /** Whether the socket is open. */
+  /**
+   * Connect to a Chromium WebTransport endpoint. Reliable Citadel envelopes
+   * use fresh unidirectional streams; callers opt into bare unreliable
+   * datagrams with `send(kind, body, { reliable: false })`.
+   *
+   * `serverCertificateHashBase64` is the development hash logged by Citadel's
+   * WebTransport listener. Omit it for a CA-trusted production certificate.
+   *
+   * @param {string} url
+   * @param {{ WebTransport?: typeof WebTransport, timeoutMs?: number, serverCertificateHashes?: Array<{ algorithm: "sha-256", value: BufferSource }>, serverCertificateHashBase64?: string, [key: string]: unknown }} [opts]
+   * @returns {Promise<CitadelClient>}
+   */
+  static async connectWebTransport(url, opts = {}) {
+    const {
+      WebTransport: WebTransportImpl = globalThis.WebTransport,
+      timeoutMs = DEFAULT_TIMEOUT_MS,
+      serverCertificateHashBase64,
+      serverCertificateHashes,
+      ...init
+    } = opts;
+    if (!WebTransportImpl) {
+      throw new Error("WebTransport is unavailable in this runtime");
+    }
+    if (serverCertificateHashBase64 && serverCertificateHashes) {
+      throw new TypeError("provide either serverCertificateHashBase64 or serverCertificateHashes, not both");
+    }
+    if (serverCertificateHashBase64) {
+      init.serverCertificateHashes = [webTransportCertificateHash(serverCertificateHashBase64)];
+    } else if (serverCertificateHashes) {
+      init.serverCertificateHashes = serverCertificateHashes;
+    }
+
+    let webTransport;
+    try {
+      webTransport = new WebTransportImpl(url, init);
+    } catch (error) {
+      throw error instanceof Error ? error : new Error("failed to construct WebTransport");
+    }
+    try {
+      await waitWithTimeout(Promise.resolve(webTransport.ready), timeoutMs, () => {
+        try { webTransport.close(); } catch { /* noop */ }
+      });
+    } catch (error) {
+      try { webTransport.close(); } catch { /* noop */ }
+      throw error;
+    }
+    return new CitadelClient(new WebTransportTransport(webTransport));
+  }
+
+  /**
+   * Prefer WebTransport and fall back to an explicitly supplied WebSocket URL
+   * if capability detection or the pre-ready WebTransport connection fails.
+   * The endpoints are separate because production proxies need not map one URL
+   * to the other. The SDK never migrates a connected/authenticated client.
+   *
+   * @param {{ webTransportUrl?: string, webSocketUrl?: string }} endpoints
+   * @param {{ fallbackToWebSocket?: boolean, webTransport?: object, webSocket?: ConnectOptions }} [opts]
+   * @returns {Promise<CitadelClient>}
+   */
+  static async connectAuto(endpoints, opts = {}) {
+    const { webTransportUrl, webSocketUrl } = endpoints || {};
+    const {
+      fallbackToWebSocket = true,
+      webTransport: webTransportOptions = {},
+      webSocket: webSocketOptions = {},
+    } = opts;
+
+    let webTransportError;
+    if (webTransportUrl) {
+      try {
+        return await CitadelClient.connectWebTransport(webTransportUrl, webTransportOptions);
+      } catch (error) {
+        webTransportError = error;
+      }
+    }
+    if (webSocketUrl && (!webTransportUrl || fallbackToWebSocket)) {
+      return CitadelClient.connect(webSocketUrl, webSocketOptions);
+    }
+    if (webTransportError) throw webTransportError;
+    throw new TypeError("connectAuto requires webTransportUrl, webSocketUrl, or both");
+  }
+
+  /** Whether the selected realtime transport is open. */
   get isOpen() {
-    return !this.closed && this._ws.readyState === 1 /* OPEN */;
+    return !this.closed && this._transport.isOpen;
   }
 
   /**
@@ -147,17 +243,21 @@ export class CitadelClient {
    * @param {number} kind
    * @param {Uint8Array} [body]
    */
-  send(kind, body = EMPTY) {
-    this.sendEnvelope(new Envelope(kind, body));
+  send(kind, body = EMPTY, opts = {}) {
+    this.sendEnvelope(new Envelope(kind, body), opts);
   }
 
   /**
    * Send a pre-built {@link Envelope}.
    * @param {Envelope} env
    */
-  sendEnvelope(env) {
+  sendEnvelope(env, opts = {}) {
     if (this.closed) throw new Error("cannot send on a closed client");
-    this._ws.send(env.encodeFramed());
+    const reliable = opts.reliable ?? true;
+    const pending = this._transport.send(env, reliable);
+    if (pending && typeof pending.then === "function") {
+      void pending.catch((error) => this._transport.fail(error));
+    }
   }
 
   /**
@@ -314,7 +414,7 @@ export class CitadelClient {
 
   /** Close the connection. */
   close(code, reason) {
-    try { this._ws.close(code, reason); } catch { /* already closing */ }
+    this._transport.close(code, reason);
   }
 
   /**

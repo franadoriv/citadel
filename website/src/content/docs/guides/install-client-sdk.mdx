@@ -1,6 +1,6 @@
 ---
 title: Install a client SDK (download & drop in)
-description: Step-by-step instructions to download the ready-to-use Unity, Unreal, or Godot client SDK for a Citadel release and drop it into your game project — no repo checkout, no native build.
+description: Step-by-step instructions to download the ready-to-use Unity, Unreal, Godot, or JavaScript client SDK for a Citadel release and use it in your game project.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -47,6 +47,7 @@ From the same Release, grab the ZIP for your engine:
 | Unity | `citadel-client-unity-windows-x86_64-v{version}.zip` | `citadel-client-unity-macos-<arch>-v{version}.zip` |
 | Unreal | `citadel-client-unreal-windows-x86_64-v{version}.zip` | `citadel-client-unreal-macos-<arch>-v{version}.zip` |
 | Godot | `citadel-client-godot-windows-x86_64-v{version}.zip` | `citadel-client-godot-macos-<arch>-v{version}.zip` |
+| JavaScript / web | `citadel-client-js-v{version}.zip` (platform-independent browser ESM) | Same archive |
 
 Windows packages ship the x86_64 native pieces. The macOS archives have the
 same source layout but contain only their architecture's signed native artifact:
@@ -68,7 +69,9 @@ make bin-client-rust
 
 Each target writes under `bin/clients/<engine>/`. See the complete
 [make-targets reference](/reference/operations/make-targets/#bin-client-engine-and-bin-clients).
-JavaScript is source-staged today; npm publication is intentionally deferred.
+To build the downloadable JavaScript archive from a checkout, run
+`make package-client-js` or `./make.ps1 package-client-js` on Windows; npm
+publication remains intentionally unnecessary.
 :::
 
 ## Step 3 — Install it in your project
@@ -247,16 +250,24 @@ See the [Rust SDK reference](/reference/client-sdk/rust-sdk/).
 </TabItem>
 <TabItem label="JavaScript">
 
-JavaScript is currently source-staged, not published to npm:
+Download `citadel-client-js-v{version}.zip`, verify it against the release's
+`SHA256SUMS.txt`, and extract it into your static game files. The archive also
+contains its own `SHA256SUMS.txt` for individual files:
 
-```bash
-make bin-client-js
+```js
+import { CitadelClient } from "./citadel-client-js-v{version}/dist/citadel-client.min.mjs";
 ```
 
-Import `bin/clients/js/src/index.js` from a browser module, Node 22+, or your
-bundler. It currently supports WebSocket transport only. The staged folder also
-includes `examples/threejs-starter/`: serve `bin/clients/js/` as a static root
-and open `/examples/threejs-starter/` for the runnable browser-game integration.
+The `.mjs` file is the only import target. Its `.gz` and `.br` siblings are
+precompressed variants for a static server that sets the matching
+`Content-Encoding`; do not import those files directly. The ESM bundle is
+minified/mangled for compact delivery, not to protect secrets.
+
+The archive includes `examples/threejs-starter/`. Serve its extracted root as a
+static directory and open `/examples/threejs-starter/` for the runnable
+browser-game integration. It can use Chromium WebTransport datagrams with an
+explicit WebSocket fallback, or WebSocket alone in portable browsers. npm
+publication is not required.
 </TabItem>
 </Tabs>
 

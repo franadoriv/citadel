@@ -33,6 +33,42 @@ export interface ConnectOptions {
   timeoutMs?: number;
 }
 
+/** Request delivery over a reliable stream or (where available) a datagram. */
+export interface SendOptions {
+  reliable?: boolean;
+}
+
+/** Browser WebTransport certificate descriptor for a SHA-256 certificate pin. */
+export interface WebTransportCertificateHash {
+  algorithm: "sha-256";
+  value: Uint8Array | ArrayBuffer;
+}
+
+export interface WebTransportConnectOptions {
+  /** Injectable browser constructor for tests or non-global runtimes. */
+  WebTransport?: typeof WebTransport;
+  timeoutMs?: number;
+  /** Native browser certificate descriptors. Omit for a CA-trusted production certificate. */
+  serverCertificateHashes?: WebTransportCertificateHash[];
+  /** Base64 SHA-256 development-certificate hash printed by Citadel at startup. */
+  serverCertificateHashBase64?: string;
+}
+
+export interface AutoConnectOptions {
+  /** Default true: use WebSocket only if WebTransport is unavailable or fails before ready. */
+  fallbackToWebSocket?: boolean;
+  webTransport?: WebTransportConnectOptions;
+  webSocket?: ConnectOptions;
+}
+
+export interface AutoConnectEndpoints {
+  webTransportUrl?: string;
+  webSocketUrl?: string;
+}
+
+/** Convert Citadel's logged base64 development hash into a WebTransport pin. */
+export function webTransportCertificateHash(base64: string): WebTransportCertificateHash;
+
 export interface AuthResult {
   status: number;
   userId: string;
@@ -57,15 +93,18 @@ export interface ChatTypingResult {
   expires_at: number;
 }
 
-/** A connected Citadel WebSocket client (reliable, ordered delivery). */
+/** A connected Citadel realtime client. WebSocket is reliable-only; WebTransport adds datagrams. */
 export class CitadelClient {
   readonly closed: boolean;
   readonly isOpen: boolean;
+  readonly transportKind: "websocket" | "webtransport";
   currentRoom: RoomInfo | null;
   static connect(url: string, opts?: ConnectOptions): Promise<CitadelClient>;
+  static connectWebTransport(url: string, opts?: WebTransportConnectOptions): Promise<CitadelClient>;
+  static connectAuto(endpoints: AutoConnectEndpoints, opts?: AutoConnectOptions): Promise<CitadelClient>;
   handshakeGuest(opts?: { timeoutMs?: number }): Promise<AuthResult>;
-  send(kind: number, body?: Uint8Array): void;
-  sendEnvelope(env: Envelope): void;
+  send(kind: number, body?: Uint8Array, opts?: SendOptions): void;
+  sendEnvelope(env: Envelope, opts?: SendOptions): void;
   on(kind: number, handler: EnvelopeHandler): () => void;
   off(kind: number, handler: EnvelopeHandler): void;
   onAny(handler: AnyHandler): () => void;

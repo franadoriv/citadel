@@ -5,8 +5,9 @@ name: release
 # through workflow_dispatch. Every run first requires a new Cargo version whose
 # `v<version>` tag does not already exist; the publish step creates that tag.
 # Public ZIP downloads include Windows and statically linked x86_64 and ARM64
-# Linux servers. Native macOS package targets are deliberately not run in CI until
-# Apple Developer ID and notarization credentials are available.
+# Linux servers plus the portable browser JavaScript SDK. Native macOS package
+# targets are deliberately not run in CI until Apple Developer ID and
+# notarization credentials are available.
 
 on:
   push:
@@ -175,8 +176,44 @@ jobs:
           path: dist/citadel-client-godot-web-v*.zip
           if-no-files-found: error
 
+  js-sdk:
+    needs: validate-release-version
+    name: Package JavaScript browser SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/js/package-lock.json
+
+      - name: Test, package, and validate JavaScript SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd clients/js
+          npm ci
+          npm test
+          cd ../..
+          make package-client-js
+          package="dist/citadel-client-js-v${{ needs.validate-release-version.outputs.version }}.zip"
+          test -f "$package"
+          unzip -Z1 "$package" | grep -Fx "citadel-client-js-v${{ needs.validate-release-version.outputs.version }}/dist/citadel-client.min.mjs" >/dev/null
+          unzip -Z1 "$package" | grep -Fx "citadel-client-js-v${{ needs.validate-release-version.outputs.version }}/SHA256SUMS.txt" >/dev/null
+
+      - name: Upload JavaScript browser SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: citadel-js-sdk
+          path: dist/citadel-client-js-v*.zip
+          if-no-files-found: error
+
   publish:
-    needs: [validate-release-version, package, godot-web]
+    needs: [validate-release-version, package, godot-web, js-sdk]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

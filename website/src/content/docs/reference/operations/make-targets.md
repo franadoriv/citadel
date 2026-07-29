@@ -68,6 +68,7 @@ a direct install message if Git Bash is unavailable.
 | `package-client-unreal` | Builds the native FFI, then stages and zips the ready-to-use Unreal drop-in plugin (source + Win64 FFI). | `dist/citadel-client-unreal-windows-x86_64-v<version>.zip` |
 | `package-client-godot` | Builds the native GDExtension (via SCons + godot-cpp) over the FFI, then stages and zips a drop-in Godot addon with the prebuilt Windows libraries. | `dist/citadel-client-godot-windows-x86_64-v<version>.zip` |
 | `package-client-godot-web` | Stages and zips the portable, source-only Godot Web addon. It does not build a GDExtension. | `dist/citadel-client-godot-web-v<version>.zip` |
+| `package-client-js` | Bundles, minifies, verifies, and zips the portable browser ESM SDK with TypeScript declarations, Three.js starter, source map, gzip/Brotli sidecars, and internal checksums. | `dist/citadel-client-js-v<version>.zip` |
 | `package-clients-windows` | Runs the three native `package-client-<engine>` targets plus the portable Godot Web package. | Three `dist/citadel-client-<engine>-windows-x86_64-v<version>.zip` archives and `dist/citadel-client-godot-web-v<version>.zip` |
 | `package-macos` | Builds the standalone server and Unity native library for the active native macOS architecture. | `dist/citadel-macos-<aarch64\|x86_64>-v<version>.zip` |
 | `package-client-unity-macos` | Builds the macOS FFI dylib and stages a Unity SDK for the active native architecture. | `dist/citadel-client-unity-macos-<aarch64\|x86_64>-v<version>.zip` |
@@ -234,6 +235,7 @@ make package-client-unity
 make package-client-unreal
 make package-client-godot
 make package-client-godot-web
+make package-client-js
 
 # or all native engine packages plus the portable Web addon:
 make package-clients-windows
@@ -258,6 +260,14 @@ Each zip carries the same copy-into-project layout as the matching
   and its manifest. Extract it at the Godot project's `res://` root. It uses
   `WebSocketPeer`, so it is portable across browser platforms and deliberately
   contains no `.gdextension`, `.dll`, `.dylib`, or `.so` artifact.
+
+- `package-client-js` creates the platform-independent
+  `dist/citadel-client-js-v<version>.zip`. Extract it into a browser game's
+  static files and import `dist/citadel-client.min.mjs` from a module script.
+  Its `.gz` and `.br` siblings are precompressed variants for a static server
+  that sets `Content-Encoding`; browser code imports only the `.mjs` file. The
+  external source map omits `sourcesContent`, and minification is for compact
+  delivery rather than source-code secrecy.
 
 The version comes from the workspace `Cargo.toml`, so all native client zips,
 the portable Godot Web zip, and

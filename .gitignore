@@ -4,6 +4,10 @@
 # The staged layout and the zip are build artifacts; CI publishes them.
 /dist
 
+# Local Node build dependencies for the browser SDK and documentation site.
+clients/js/node_modules/
+website/node_modules/
+
 # Local runnable staging, produced by the bin-* make target family
 # (make bin-server / bin-benchmark / bin-client-<engine> / bin-clients /
 # bin-all, or the matching .\make.ps1 targets). bin/server/ = citadel.exe +

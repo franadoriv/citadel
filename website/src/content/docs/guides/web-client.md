@@ -1,12 +1,12 @@
 ---
 title: Connect a web client
-description: Build a browser game with Three.js and the @citadel/client WebSocket SDK; use raw Citadel wire transports only when you need their lower-level control.
+description: Build a browser game with Three.js and the @citadel/client browser SDK, using WebTransport datagrams when available and WebSocket fallback everywhere else.
 ---
 
 The primary Citadel path for a browser game is **Three.js +
 `@citadel/client`**. Three.js owns the visible game — scene, input, meshes, and
-smoothing — while the SDK owns the WebSocket connection, Citadel framing, guest
-handshake, and inbound-message dispatch. It is the JavaScript equivalent of
+smoothing — while the SDK owns the WebTransport/WebSocket connection, Citadel
+framing, guest handshake, and inbound-message dispatch. It is the JavaScript equivalent of
 showing a Unity developer a C# scene integration, rather than a bare socket log.
 
 `@citadel/client` remains renderer-neutral: Three.js is a recommended,
@@ -50,7 +50,7 @@ published, replace the starter's relative source import with
 
 | Layer | Owns | Does not own |
 | --- | --- | --- |
-| `@citadel/client` | WebSocket connection, guest/token handshake, Citadel envelopes and dispatch. | Scene graph, controls, models, interpolation policy. |
+| `@citadel/client` | WebTransport/WebSocket connection, guest/token handshake, Citadel envelopes and dispatch. | Scene graph, controls, models, interpolation policy. |
 | Your Three.js app | Render loop, input, local visual prediction, remote visual interpolation, game packet layout. | Wire framing or server authority. |
 | Citadel game logic | Validation, combat, persistence, and authoritative state. | Browser rendering. |
 
@@ -115,10 +115,13 @@ before extending it. See the server-side handlers in
 | Symbol | What it does |
 | --- | --- |
 | `CitadelClient.connect(url, opts?)` | Open a WebSocket and resolve when ready. |
+| `CitadelClient.connectWebTransport(url, opts?)` | Open Chromium WebTransport. Reliable sends use streams; unreliable sends use datagrams. |
+| `CitadelClient.connectAuto({ webTransportUrl, webSocketUrl }, opts?)` | Prefer WebTransport, then use the explicitly supplied WebSocket fallback if it is unavailable or fails before ready. |
 | `handshakeGuest` | Present the guest handshake and await the ack. |
-| `send(kind, body?)` | Send a framed envelope. |
+| `send(kind, body?, { reliable? })` | Send reliably by default; WebTransport uses a bare datagram when `reliable: false`. WebSocket remains reliable-only. |
 | `on(kind, cb)` / `off` / `onAny(cb)` | Dispatch inbound envelopes by kind. |
 | `callRpc(method, payload?, opts?)` | Correlated RPC; resolves reply bytes. |
+| `webTransportCertificateHash(base64)` | Convert the server's logged development-certificate hash to the native browser pin shape. |
 | `Envelope`, `FrameDecoder` | Low-level framing. |
 | `KIND_*`, `splitSender`, `encodeRpcRequest`, … | Protocol constants and codecs. |
 
@@ -140,11 +143,10 @@ client, and opens <http://127.0.0.1:8080/client.html>. Re-run
 See [Local build & staging targets](/reference/operations/make-targets/) for
 the full `bin-*` family.
 
-## Advanced: raw wire and WebTransport paths
+## Advanced: raw wire path
 
 The SDK is the default for browser games. Work at the raw level only when you
-need a transport that the SDK has not yet wrapped, such as browser WebTransport,
-or you are implementing another client library. The protocol is documented in
+are implementing another client library. The protocol is documented in
 [Envelopes & wire protocol](/concepts/envelopes/): WebSocket carries a framed
 `u32` big-endian body length, `u16` big-endian kind, then a payload.
 
@@ -163,40 +165,45 @@ function encodeFramed(kind, payload) {
   return buf;
 }
 
-ws.onopen = => ws.send(encodeFramed(5 /* KIND_AUTH */, new Uint8Array(0)));
+ws.onopen = () => ws.send(encodeFramed(5 /* KIND_AUTH */, new Uint8Array(0)));
 ```
 
-### WebTransport (Chromium)
+## WebTransport with WebSocket fallback (Chromium)
 
-The SDK currently supports WebSocket only. WebTransport gives Chromium a
-QUIC-grade datagram path; use the raw browser API until  lands.
-
-1. Start the server. On startup it logs `cert_sha256_base64 = <hash>` for the
-   WebTransport listener. Copy that base64 hash.
-2. Connect while pinning the development certificate hash:
+WebTransport gives Chromium a QUIC-grade datagram path without changing the
+SDK's handshake, RPC, rooms, or dispatch APIs. Start the server and copy the
+`cert_sha256_base64 = <hash>` value it logs for local development. Then give
+the SDK both endpoints; it never guesses one endpoint from the other:
 
 ```js
-const certHash = /* base64 from the server log */;
-const hashBytes = Uint8Array.from(atob(certHash), (c) => c.charCodeAt(0));
-const wt = new WebTransport("https://127.0.0.1:7353/", {
-  serverCertificateHashes: [{ algorithm: "sha-256", value: hashBytes }],
-});
-await wt.ready;
+import { CitadelClient, KIND_POSITION } from "./citadel-client.min.mjs";
 
-// Datagrams carry the bare envelope: u16 BE kind + payload, no length prefix.
-const writer = wt.datagrams.writable.getWriter;
-const dgram = new Uint8Array(2 + 20);
-new DataView(dgram.buffer).setUint16(0, 1 /* KIND_POSITION */);
-await writer.write(dgram);
+const certHash = /* base64 from the server log */;
+const client = await CitadelClient.connectAuto({
+  webTransportUrl: "https://127.0.0.1:7353/",
+  webSocketUrl: "ws://127.0.0.1:7352/",
+}, {
+  webTransport: { serverCertificateHashBase64: certHash },
+});
+await client.handshakeGuest();
+
+// Position updates may be dropped; the SDK sends a bare u16-kind datagram on
+// WebTransport and keeps the message reliable when WebSocket was selected.
+client.send(KIND_POSITION, positionBytes, {
+  reliable: client.transportKind !== "webtransport",
+});
 ```
 
 The development certificate is short-lived (at most 14 days) and ECDSA P-256,
-matching Chrome's `serverCertificateHashes` requirement. Fall back to WebSocket
-when the hash is unavailable or WebTransport is unsupported.
+matching Chrome's `serverCertificateHashes` requirement. For a CA-trusted
+production certificate, omit `serverCertificateHashBase64`. `connectAuto`
+falls back only before the WebTransport connection is ready; it never silently
+migrates an authenticated client after a connection closes. Use
+`connectWebTransport` when fallback is not appropriate.
 
 :::caution[Known limitations]
 The WebSocket listener is plain `ws://` (no built-in `wss://`); terminate TLS at
-a reverse proxy for production. Browser WebTransport/QUIC is a planned SDK
-follow-up. CI covers the SDK codec and constant parity; exercise browser scenes
-manually with two tabs.
+a reverse proxy for production. WebTransport support is currently a Chromium
+browser path; WebSocket remains the portable browser transport. CI covers the
+SDK codec and constant parity; exercise browser scenes manually with two tabs.
 :::

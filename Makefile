@@ -55,7 +55,7 @@ DATABASE_URL ?= postgres://$(PG_USER):$(PG_PASSWORD)@localhost:$(PG_PORT)/$(PG_D
         server web native demo-web demo-native demo-native2 \
         docs-install docs-build docs-serve unity-plugin \
         db-up db-down db-migrate package-windows package-windows-python package-linux package-macos \
-        package-client-unity package-client-unreal package-client-godot package-client-godot-web package-clients-windows \
+        package-client-unity package-client-unreal package-client-godot package-client-godot-web package-client-js package-clients-windows \
         package-client-unity-macos package-client-unreal-macos package-client-godot-macos package-clients-macos \
         bin-server bin-server-python bin-benchmark benchmark-serve \
         bin-client-unity bin-client-unreal bin-client-godot bin-client-godot-web bin-client-js bin-client-rust \
@@ -408,6 +408,15 @@ package-client-godot: ## Stage + zip the drop-in Godot client SDK with the prebu
 # It must stay separate from the native package: it does not load a GDExtension.
 package-client-godot-web: ## Stage + zip the distributable Godot Web/WebAssembly SDK (requires GODOT_BIN)
 	$(PYTHON) scripts/package_godot_web_artifact.py --godot "$(GODOT_BIN)"
+
+# Portable browser SDK: bundle once as ESM, include sidecars for static servers,
+# and keep the archive name independent of the build host.
+package-client-js: ## Build + zip the browser ESM SDK ($(DIST_DIR)/citadel-client-js-v{version}.zip)
+	@echo ">> Packaging Citadel JS browser SDK v$(VERSION)"
+	cd clients/js && npm ci && npm run package
+	@rm -f "$(DIST_DIR)/citadel-client-js-v$(VERSION).zip"
+	cd "$(DIST_DIR)" && zip -r "citadel-client-js-v$(VERSION).zip" "citadel-client-js-v$(VERSION)"
+	@echo ">> Packaged $(DIST_DIR)/citadel-client-js-v$(VERSION).zip"
 
 package-clients-windows: package-client-unity package-client-unreal package-client-godot ## Stage + zip the Windows Unity, Unreal, and native Godot SDKs
 	@echo ">> Packaged the Unity, Unreal, and Godot Windows client zips under $(DIST_DIR)/"
