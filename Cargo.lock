@@ -376,6 +376,7 @@ dependencies = [
  "citadel-nav",
  "citadel-physics",
  "citadel-process-env",
+ "citadel-tmx",
  "citadel-wire",
  "clap",
  "csv",
@@ -457,6 +458,14 @@ dependencies = [
 [[package]]
 name = "citadel-process-env"
 version = "0.1.0"
+
+[[package]]
+name = "citadel-tmx"
+version = "0.1.0"
+dependencies = [
+ "citadel-map",
+ "tiled",
+]
 
 [[package]]
 name = "citadel-wire"
@@ -1991,6 +2000,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a651516ddc9168ebd67b24afd085a718be02f8858fe406591b013d101ce2f40"
 
 [[package]]
+name = "quick-xml"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3041,6 +3059,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tiled"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "267cbf8cb938ae27267fccf769e891e646318e8279e5a15bb75fc6b0e4f1d834"
+dependencies = [
+ "base64",
+ "flate2",
+ "quick-xml",
 ]
 
 [[package]]

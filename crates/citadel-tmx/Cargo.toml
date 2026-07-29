@@ -1,0 +1,9 @@
+[package]
+name = "citadel-tmx"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded Tiled TMX collision import for Citadel maps."
+
+[dependencies]
+citadel-map = { path = "../citadel-map" }
+tiled = { version = "0.16", default-features = false }

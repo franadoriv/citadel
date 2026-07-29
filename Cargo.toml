@@ -22,6 +22,7 @@ citadel-wire = { path = "crates/citadel-wire" }
 citadel-map = { path = "crates/citadel-map" }
 citadel-nav = { path = "crates/citadel-nav" }
 citadel-physics = { path = "crates/citadel-physics" }
+citadel-tmx = { path = "crates/citadel-tmx" }
 # Async runtime. Feature-gated to what the skeleton needs today; expand as
 # networking and process management tasks land.
 tokio = { version = "1", features = [

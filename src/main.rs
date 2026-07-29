@@ -7,6 +7,7 @@
 //! graceful shutdown. `anyhow` is permitted here at the bootstrap boundary per
 //! the core platform crate selection.
 
+use std::fs;
 use std::io::{self, Write};
 
 use anyhow::{Context, Result};
@@ -24,6 +25,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command() {
+        Command::CookTmx { input, output } => {
+            let map = citadel_tmx::load(&input)
+                .with_context(|| format!("failed to import {}", input.display()))?;
+            fs::write(&output, map.encode())
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            println!(
+                "cooked TMX: map={} vertices={} triangles={}",
+                map.metadata.name,
+                map.collision.vertices.len(),
+                map.collision.triangles.len()
+            );
+            Ok(())
+        }
         Command::Check => {
             let config = cli::run_check(&cli.global).context("configuration check failed")?;
             // Initialize logging after a successful check so diagnostics honor

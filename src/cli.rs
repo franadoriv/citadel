@@ -33,7 +33,7 @@ impl Cli {
     /// subcommand was given.
     #[must_use]
     pub fn command(&self) -> Command {
-        self.command.unwrap_or(Command::Serve)
+        self.command.clone().unwrap_or(Command::Serve)
     }
 }
 
@@ -82,12 +82,19 @@ impl GlobalArgs {
 }
 
 /// Citadel subcommands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Load and validate configuration, then start the server.
     Serve,
     /// Load and validate configuration without starting listeners.
     Check,
+    /// Convert a supported Tiled TMX collision map into Citadel CMAP.
+    CookTmx {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 /// Execute `citadel check`: resolve and validate configuration.

@@ -34,6 +34,23 @@ Unreal editor: Tools → Citadel → Cook Map Data
 The map **name** the server matches is the `.map` file's stem (`MyLevel.map` →
 `MyLevel`), so it must equal the name your `on_room_create` hook returns.
 
+## Tiled TMX (2D)
+
+For a top-down 2D game the server can load a finite, orthogonal `.tmx` file from
+`maps_dir` directly, or convert it before deployment:
+
+```sh
+citadel cook-tmx --input GlobalGrove.tmx --output maps/GlobalGrove.map
+```
+
+Mark a tileset tile with the Boolean property `citadel_collision=true`, or put
+rectangle/convex-polygon objects in an object layer named `collision` (a layer
+property of the same name is also accepted). TMX X/Y pixels become Citadel X/Z;
+walls are extruded upward, with one pixel equal to one centimetre by default.
+Set `citadel_units_per_pixel` on the map to change that scale. Isometric,
+infinite, rotated/flipped, and unsupported collision shapes are rejected rather
+than silently losing authoritative collision.
+
 ## Cook a `.map` from your level
 
 The cook tools ship as **editor-only** tools (they are never compiled into a

@@ -83,47 +83,51 @@ impl MapCatalog {
             // Absent / unreadable directory => empty catalog, same as no maps.
             Err(_) => return Self { maps },
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("map") {
+        let mut paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let extension = path.extension().and_then(|e| e.to_str());
+            if !matches!(extension, Some("map") | Some("tmx")) {
                 continue;
             }
             let Some(key) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
                 continue;
             };
-            match std::fs::read(&path) {
-                Ok(bytes) => match MapFile::decode(&bytes) {
-                    Ok(mut file) => {
-                        if let Some(navmesh) = &file.navmesh {
-                            if let Err(error) = citadel_nav::validate_abi(navmesh) {
-                                tracing::warn!(map = %key, error = ?error, "skipping map with incompatible NAVMESH ABI");
-                                continue;
-                            }
-                        } else {
-                            match citadel_nav::bake(&file.collision) {
-                                Ok(navmesh) => file.navmesh = Some(navmesh),
-                                Err(error) => {
-                                    tracing::warn!(map = %key, error = ?error, "loaded map has no usable navigation mesh");
-                                }
+            if maps.contains_key(&key) {
+                tracing::warn!(map = %key, path = %path.display(), "skipping duplicate map stem");
+                continue;
+            }
+            let parsed = match extension {
+                Some("map") => std::fs::read(&path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| MapFile::decode(&bytes).map_err(|error| error.to_string())),
+                Some("tmx") => citadel_tmx::load(&path).map_err(|error| error.to_string()),
+                _ => unreachable!(),
+            };
+            match parsed {
+                Ok(mut file) => {
+                    if let Some(navmesh) = &file.navmesh {
+                        if let Err(error) = citadel_nav::validate_abi(navmesh) {
+                            tracing::warn!(map = %key, error = ?error, "skipping map with incompatible NAVMESH ABI");
+                            continue;
+                        }
+                    } else {
+                        match citadel_nav::bake(&file.collision) {
+                            Ok(navmesh) => file.navmesh = Some(navmesh),
+                            Err(error) => {
+                                tracing::warn!(map = %key, error = ?error, "loaded map has no usable navigation mesh")
                             }
                         }
-                        tracing::info!(
-                            map = %key,
-                            verts = file.collision.vertices.len(),
-                            tris = file.collision.triangles.len(),
-                            "loaded map"
-                        );
-                        maps.insert(key.clone(), LoadedMap { key, file });
                     }
-                    Err(e) => {
-                        tracing::warn!(map = %key, error = %e, "skipping malformed .map file")
-                    }
-                },
-                Err(e) => tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "skipping unreadable .map file"
-                ),
+                    tracing::info!(map = %key, verts = file.collision.vertices.len(), tris = file.collision.triangles.len(), "loaded map");
+                    maps.insert(key.clone(), LoadedMap { key, file });
+                }
+                Err(error) => {
+                    tracing::warn!(map = %key, path = %path.display(), error = %error, "skipping malformed map file")
+                }
             }
         }
         Self { maps }
