@@ -71,12 +71,68 @@ pub use python_bundle::{
 };
 pub(crate) use static_data::DEFAULT_STATIC_DATA_MAX_FILE_BYTES;
 
+/// Decision returned by a runtime's pre-dispatch realtime interceptor.
+///
+/// The gateway fails closed when an embedded runtime cannot produce a valid
+/// decision, so a runtime implementation must return [`Drop`](Self::Drop) for
+/// an error, timeout, or panic in its before hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeInterception {
+    /// Continue through the gateway's normal router.
+    Continue,
+    /// Stop routing this envelope. No outbound deliveries are queued.
+    Drop,
+}
+
+/// Result made visible to an observer after one realtime gateway dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeAfterOutcome {
+    /// Whether the before hook vetoed this envelope.
+    pub dropped: bool,
+    /// Number of local outbound deliveries synchronously queued by the gateway.
+    pub delivered: usize,
+}
+
 /// A language runtime that turns inbound game events into outbound commands.
 ///
 /// Implemented today by [`LuaRuntime`]. Future adapters (Python, JS/TS, native
 /// Rust, WASM) implement the same language-neutral surface so the gateway can
 /// hold an `Arc<dyn Runtime>` and avoid naming a concrete scripting engine.
 pub trait Runtime: Send + Sync + 'static {
+    /// Inspect one post-registration, non-auth realtime envelope before routing.
+    ///
+    /// The default preserves existing runtime adapters. Implementations expose
+    /// this as their `before_realtime` host hook and must fail closed if the hook
+    /// cannot produce a valid decision.
+    fn before_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+    ) -> RealtimeInterception {
+        let _ = (sender, user_id, room_id, kind, body);
+        RealtimeInterception::Continue
+    }
+
+    /// Observe the outcome of one eligible realtime envelope after routing.
+    ///
+    /// Implementations must isolate errors and discard any outbound commands the
+    /// observer attempts to enqueue; this callback cannot alter a completed
+    /// gateway result.
+    fn after_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+        outcome: RealtimeAfterOutcome,
+    ) {
+        let _ = (sender, user_id, room_id, kind, body, outcome);
+    }
+
     /// Run the registered message handler for `kind` and return its commands.
     fn dispatch(
         &self,

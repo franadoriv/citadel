@@ -17,10 +17,10 @@ use crate::config::LuaExecutionMode;
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
-use crate::runtime::Runtime;
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
 use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
 use crate::runtime::static_data::StaticDataCatalog;
+use crate::runtime::{RealtimeAfterOutcome, RealtimeInterception, Runtime};
 use crate::services::PlayerNotification;
 use crate::storage::StorageIndexName;
 
@@ -120,6 +120,12 @@ const ON_ROOM_CREATE_KEY: &str = "citadel.on_room_create";
 
 /// Registry key holding the `on_room_join` handler (admission gate; returns bool).
 const ON_ROOM_JOIN_KEY: &str = "citadel.on_room_join";
+
+/// Registry key holding the `before_realtime` interceptor.
+const BEFORE_REALTIME_KEY: &str = "citadel.before_realtime";
+
+/// Registry key holding the `after_realtime` observer.
+const AFTER_REALTIME_KEY: &str = "citadel.after_realtime";
 
 /// A participant lifecycle transition dispatched to a script handler.
 ///
@@ -279,6 +285,14 @@ impl CommandSink {
 #[derive(Clone, Copy)]
 struct Deadline(Option<Instant>);
 
+/// Marks invocations that may inspect realtime envelopes but must not use host
+/// capabilities with direct, external effects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InvocationMode {
+    Normal,
+    RealtimeInterceptor,
+}
+
 /// Base object id for server-owned actors (NPCs). Player/presence ids grow from 1,
 /// so NPCs live in a high range and the two id spaces never collide.
 const NPC_ID_BASE: u32 = 0x4000_0000;
@@ -431,8 +445,7 @@ pub struct RuntimeIntrospection {
     pub rpcs: Vec<String>,
     /// Message kinds with a registered `on_message` handler, sorted.
     pub message_kinds: Vec<u32>,
-    /// Registered lifecycle hooks (`on_join`, `on_leave`, `on_tick`,
-    /// `on_room_create`, `on_room_join`), in declaration order.
+    /// Registered singleton hooks, in declaration order.
     pub hooks: Vec<String>,
 }
 
@@ -721,6 +734,8 @@ impl LuaRuntime {
             ("on_tick", ON_TICK_KEY),
             ("on_room_create", ON_ROOM_CREATE_KEY),
             ("on_room_join", ON_ROOM_JOIN_KEY),
+            ("before_realtime", BEFORE_REALTIME_KEY),
+            ("after_realtime", AFTER_REALTIME_KEY),
         ]
         .iter()
         .filter(|(_, key)| {
@@ -912,6 +927,72 @@ impl LuaRuntime {
             handler.call::<()>((ctx, body_value))?;
             Ok(true)
         })
+    }
+
+    /// Run the optional before-realtime interceptor.
+    ///
+    /// Returning `false` vetoes the envelope. A missing hook continues, while an
+    /// invalid result, runtime error, deadline, or panic fails closed. Commands
+    /// emitted by the interceptor are discarded so interception cannot create
+    /// recursive outbound side effects.
+    pub fn before_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+    ) -> RealtimeInterception {
+        self.run_before_realtime(|lua| {
+            let Some(handler) =
+                lua.named_registry_value::<Option<Function>>(BEFORE_REALTIME_KEY)?
+            else {
+                return Ok(None);
+            };
+            let ctx = build_ctx(lua, sender, user_id, kind, room_id)?;
+            let body = lua.create_string(body)?;
+            ctx.set("body", body.clone())?;
+            let decision: Value = handler.call((ctx, body))?;
+            match decision {
+                Value::Nil | Value::Boolean(true) => Ok(Some(RealtimeInterception::Continue)),
+                Value::Boolean(false) => Ok(Some(RealtimeInterception::Drop)),
+                _ => Err(mlua::Error::RuntimeError(
+                    "before_realtime must return false, true, or nil".to_string(),
+                )),
+            }
+        })
+    }
+
+    /// Run the optional after-realtime observer after gateway routing.
+    ///
+    /// The same deadline and error isolation as a message handler apply, but any
+    /// commands it enqueues are intentionally discarded because the gateway has
+    /// already committed the envelope's routing result.
+    pub fn after_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+        outcome: RealtimeAfterOutcome,
+    ) {
+        let _ = self.run_locked("after_realtime", self.budget, |lua| {
+            let Some(handler) = lua.named_registry_value::<Option<Function>>(AFTER_REALTIME_KEY)?
+            else {
+                return Ok(false);
+            };
+            let ctx = build_ctx(lua, sender, user_id, kind, room_id)?;
+            let body = lua.create_string(body)?;
+            ctx.set("body", body.clone())?;
+            ctx.set("dropped", outcome.dropped)?;
+            ctx.set("delivered", outcome.delivered)?;
+            set_invocation_mode(lua, InvocationMode::RealtimeInterceptor);
+            let result = handler.call::<()>((ctx, body));
+            set_invocation_mode(lua, InvocationMode::Normal);
+            result?;
+            Ok(true)
+        });
     }
 
     /// Run the `on_join`/`on_leave` handler for `sender` and return its commands.
@@ -1155,9 +1236,11 @@ impl LuaRuntime {
         let lua = &guard.lua;
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             clear_sink(lua);
+            set_invocation_mode(lua, InvocationMode::Normal);
             set_deadline(lua, Some(Instant::now() + budget));
             let ran = call(lua);
             set_deadline(lua, None);
+            set_invocation_mode(lua, InvocationMode::Normal);
             ran
         }));
         match outcome {
@@ -1185,14 +1268,89 @@ impl LuaRuntime {
                 // A panic inside `call` skips the in-closure `set_deadline(None)`;
                 // clear it and the sink so the next invocation starts clean.
                 set_deadline(lua, None);
+                set_invocation_mode(lua, InvocationMode::Normal);
                 clear_sink(lua);
                 Vec::new()
+            }
+        }
+    }
+
+    /// Run a before-realtime decision under the usual lock, deadline, and panic
+    /// guard. Unlike ordinary handlers, all side effects are discarded and a
+    /// failure deliberately becomes a veto.
+    fn run_before_realtime<F>(&self, call: F) -> RealtimeInterception
+    where
+        F: FnOnce(&Lua) -> mlua::Result<Option<RealtimeInterception>>,
+    {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = &guard.lua;
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_sink(lua);
+            set_invocation_mode(lua, InvocationMode::RealtimeInterceptor);
+            set_deadline(lua, Some(Instant::now() + self.budget));
+            let decision = call(lua);
+            set_deadline(lua, None);
+            set_invocation_mode(lua, InvocationMode::Normal);
+            decision
+        }));
+        match outcome {
+            Ok(Ok(Some(decision))) => {
+                clear_sink(lua);
+                decision
+            }
+            Ok(Ok(None)) => {
+                clear_sink(lua);
+                RealtimeInterception::Continue
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "before_realtime",
+                    error = %error,
+                    "lua realtime interceptor failed; vetoing envelope"
+                );
+                clear_sink(lua);
+                RealtimeInterception::Drop
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "before_realtime",
+                    "lua realtime interceptor panicked; vetoing envelope"
+                );
+                set_deadline(lua, None);
+                set_invocation_mode(lua, InvocationMode::Normal);
+                clear_sink(lua);
+                RealtimeInterception::Drop
             }
         }
     }
 }
 
 impl Runtime for LuaRuntime {
+    fn before_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+    ) -> RealtimeInterception {
+        LuaRuntime::before_realtime(self, sender, user_id, room_id, kind, body)
+    }
+
+    fn after_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+        outcome: RealtimeAfterOutcome,
+    ) {
+        LuaRuntime::after_realtime(self, sender, user_id, room_id, kind, body, outcome);
+    }
+
     fn dispatch(
         &self,
         sender: u64,
@@ -1290,6 +1448,12 @@ fn clear_sink(lua: &Lua) {
 fn set_deadline(lua: &Lua, deadline: Option<Instant>) {
     if let Some(mut d) = lua.app_data_mut::<Deadline>() {
         *d = Deadline(deadline);
+    }
+}
+
+fn set_invocation_mode(lua: &Lua, mode: InvocationMode) {
+    if let Some(mut current) = lua.app_data_mut::<InvocationMode>() {
+        *current = mode;
     }
 }
 
@@ -1485,6 +1649,8 @@ fn install_host_api(
         ("on_tick", ON_TICK_KEY),
         ("on_room_create", ON_ROOM_CREATE_KEY),
         ("on_room_join", ON_ROOM_JOIN_KEY),
+        ("before_realtime", BEFORE_REALTIME_KEY),
+        ("after_realtime", AFTER_REALTIME_KEY),
     ] {
         let register = lua.create_function(move |lua, handler: Function| {
             lua.set_named_registry_value(key, handler)?;
@@ -1526,6 +1692,7 @@ fn install_host_api(
             mlua::Error::RuntimeError(format!("cannot initialize outbound HTTP client: {error}"))
         })?;
         let fetch = lua.create_function(move |lua, (url, options): (String, Option<Table>)| {
+            ensure_realtime_effects_allowed(lua)?;
             let options = options.unwrap_or(lua.create_table()?);
             let method = options
                 .get::<Option<String>>("method")?
@@ -2005,8 +2172,9 @@ fn install_host_api(
 
     let storage_index_filters = lua.create_table()?;
     let register_storage_index_filter_registry = storage_index_filters.clone();
-    let register_storage_index_filter =
-        lua.create_function(move |_, (index_name, callback): (mlua::String, Function)| {
+    let register_storage_index_filter = lua.create_function(
+        move |lua, (index_name, callback): (mlua::String, Function)| {
+            ensure_realtime_effects_allowed(lua)?;
             let index_name = StorageIndexName::new(index_name.to_string_lossy())
                 .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
             let existing: Value =
@@ -2018,7 +2186,8 @@ fn install_host_api(
             }
             register_storage_index_filter_registry.set(index_name.as_str(), callback)?;
             Ok(())
-        })?;
+        },
+    )?;
     citadel.set(
         "register_storage_index_filter",
         register_storage_index_filter,
@@ -2208,9 +2377,23 @@ fn static_data_value_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Resul
 /// The `Arc` is cloned out so the app-data borrow is released before the
 /// (potentially blocking) service call runs.
 fn domain_host(lua: &Lua) -> mlua::Result<Arc<dyn DomainHost>> {
+    ensure_realtime_effects_allowed(lua)?;
     lua.app_data_ref::<DomainHostHandle>()
         .map(|handle| Arc::clone(&handle.0))
         .ok_or_else(|| mlua::Error::RuntimeError("friends host not available".into()))
+}
+
+fn ensure_realtime_effects_allowed(lua: &Lua) -> mlua::Result<()> {
+    if lua
+        .app_data_ref::<InvocationMode>()
+        .is_some_and(|mode| *mode == InvocationMode::RealtimeInterceptor)
+    {
+        return Err(mlua::Error::RuntimeError(
+            "domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn notification_lua_table(lua: &Lua, notification: PlayerNotification) -> mlua::Result<Table> {
@@ -2556,6 +2739,7 @@ fn build_lua(
         .map_err(|e| script_error("failed to initialize Lua state", &e))?;
     lua.set_app_data(CommandSink::default());
     lua.set_app_data(Deadline(None));
+    lua.set_app_data(InvocationMode::Normal);
     lua.set_app_data(NpcIdCounter(NPC_ID_BASE));
     lua.set_app_data(NpcPatrols::default());
     install_host_api(&lua, source_label, static_data.clone(), execution_mode)
@@ -2658,6 +2842,140 @@ mod tests {
     }
 
     #[test]
+    fn realtime_interceptors_veto_and_observe_without_command_side_effects() {
+        let rt = runtime(
+            r#"
+            local seen = "unset"
+            citadel.before_realtime(function(ctx, body)
+                citadel.broadcast(99, "must-discard")
+                return false
+            end)
+            citadel.after_realtime(function(ctx, body)
+                citadel.broadcast(98, "must-discard")
+                seen = (ctx.dropped and "drop" or "pass") .. ":" .. tostring(ctx.delivered) .. ":" .. ctx.body
+            end)
+            citadel.on_message(8, function(ctx, body)
+                citadel.broadcast(9, seen)
+            end)
+        "#,
+        );
+
+        assert_eq!(
+            rt.before_realtime(7, Some("user-7"), Some(42), 1, b"blocked"),
+            RealtimeInterception::Drop
+        );
+        // The before-hook broadcast is discarded: only the message handler emits.
+        assert_eq!(
+            rt.dispatch(7, Some("user-7"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"unset".to_vec(),
+                unreliable: false,
+            }]
+        );
+
+        rt.after_realtime(
+            7,
+            Some("user-7"),
+            Some(42),
+            1,
+            b"blocked",
+            RealtimeAfterOutcome {
+                dropped: true,
+                delivered: 0,
+            },
+        );
+        // The after-hook broadcast is likewise discarded, but its immutable
+        // context is visible to script state used by the next ordinary handler.
+        assert_eq!(
+            rt.dispatch(7, Some("user-7"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"drop:0:blocked".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn invalid_before_realtime_result_fails_closed_without_wedging_dispatch() {
+        let rt = runtime(
+            r#"
+            citadel.before_realtime(function(ctx, body) return "invalid" end)
+            citadel.on_message(2, function(ctx, body) citadel.broadcast(3, body) end)
+        "#,
+        );
+        assert_eq!(
+            rt.before_realtime(1, None, None, 2, b"x"),
+            RealtimeInterception::Drop
+        );
+        assert_eq!(
+            rt.dispatch(1, None, 2, b"still-works"),
+            vec![OutboundCommand::Broadcast {
+                kind: 3,
+                body: b"still-works".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn realtime_interceptors_reject_domain_storage_side_effects() {
+        let rt = runtime(
+            r#"
+            local seen = "unset"
+            citadel.before_realtime(function(ctx, body)
+                citadel.register_storage_index_filter("profiles_by_score", function(candidate)
+                    seen = "filter-mutated"
+                    return true
+                end)
+                citadel.storage_write("user", "profiles", "before", "{}")
+                return true
+            end)
+            citadel.after_realtime(function(ctx, body)
+                citadel.register_storage_index_filter("profiles_by_score", function(candidate)
+                    seen = "filter-mutated"
+                    return true
+                end)
+                citadel.storage_write("user", "profiles", "after", "{}")
+                seen = "mutated"
+            end)
+            citadel.on_message(8, function(ctx, body)
+                citadel.storage_write("user", "profiles", "normal", "{\"score\":1}")
+                citadel.broadcast(9, seen)
+            end)
+        "#,
+        )
+        .with_domain_host(friends_host());
+
+        assert_eq!(
+            rt.before_realtime(7, Some("user"), None, 1, b"input"),
+            RealtimeInterception::Drop,
+            "a rejected storage write makes the before hook fail closed"
+        );
+        rt.after_realtime(
+            7,
+            Some("user"),
+            None,
+            1,
+            b"input",
+            RealtimeAfterOutcome {
+                dropped: false,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            rt.dispatch(7, Some("user"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"unset".to_vec(),
+                unreliable: false,
+            }],
+            "the after hook stops at the rejected direct host call"
+        );
+    }
+
+    #[test]
     fn match_message_context_and_tick_are_room_scoped() {
         let rt = runtime(
             r#"
@@ -2697,6 +3015,8 @@ mod tests {
             "on_rpc",
             "on_room_create",
             "on_room_join",
+            "before_realtime",
+            "after_realtime",
             "broadcast",
             "send",
             "spawn_actor",

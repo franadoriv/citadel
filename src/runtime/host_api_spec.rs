@@ -28,6 +28,8 @@ pub struct HostApiFn {
 pub enum HostApiCategory {
     /// Message handler registration.
     MessageHook,
+    /// Before/after realtime envelope interception registration.
+    RealtimeHook,
     /// Join/leave lifecycle hook registration.
     LifecycleHook,
     /// Periodic tick hook registration.
@@ -73,6 +75,22 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "void",
         status: HostApiStatus::Shipped,
         since: "pre-1.0",
+    },
+    HostApiFn {
+        name: "before_realtime",
+        category: HostApiCategory::RealtimeHook,
+        params: &["handler:fn(ctx,body)->bool?"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
+        name: "after_realtime",
+        category: HostApiCategory::RealtimeHook,
+        params: &["handler:fn(ctx,body)"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
     },
     HostApiFn {
         name: "on_join",

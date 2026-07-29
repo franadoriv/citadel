@@ -38,6 +38,13 @@ The common runtime model includes these core ideas:
 - `on_join` / `on_leave` — a realtime participant arrived or left;
 - `on_tick` — advance server-owned simulation on a schedule.
 
+`before_realtime` / `after_realtime` can veto an eligible post-handshake
+envelope before routing, then observe its synchronous delivery outcome.
+Interceptors never see handshake credentials or reserved authentication frames.
+The before hook can only continue or veto; it cannot rewrite the envelope. The
+after hook is observer-only, so any outbound commands it attempts are discarded.
+Both hooks may log but cannot use domain, storage, or outbound HTTP APIs.
+
 Lua, Python, and JavaScript all expose the room-lifecycle hooks
 `on_room_create` and `on_room_join`. Use the language-specific reference for
 their idiomatic argument and return shapes before designing room admission.

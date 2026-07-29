@@ -175,6 +175,45 @@ end)
 
 ---
 
+## citadel.before_realtime / citadel.after_realtime
+
+Observe the post-handshake realtime pipeline around every eligible inbound
+envelope, including game messages, RPCs, rooms, replication, transform, and
+networked-actor traffic. Authentication frames are never exposed.
+
+```lua
+citadel.before_realtime(function(ctx, body) ... end)
+citadel.after_realtime(function(ctx, body) ... end)
+```
+
+`before_realtime` runs before Citadel routes the envelope. Return `false` to
+veto it; return `true` or nothing to continue. `ctx` has `sender`, `user_id`,
+`room_id`, `kind`, and binary-safe `body` (the second argument is the same
+immutable payload). A handler error, invalid return, timeout, or panic fails
+closed and vetoes the envelope.
+
+Both interception hooks are restricted to observation and logging: domain,
+storage, and outbound HTTP APIs are unavailable while either hook runs.
+
+`after_realtime` runs once after the synchronous routing result, including a
+veto. Its `ctx` additionally has `dropped` and `delivered`, the number of local
+outbound deliveries queued by that call. It is an observer: return values and
+any `broadcast`/`send` calls are discarded. Domain, storage, and outbound HTTP
+APIs are also unavailable. Errors are isolated and cannot
+change the completed result.
+
+```lua
+citadel.before_realtime(function(ctx, body)
+  return ctx.kind ~= 77 -- drop a prohibited client kind
+end)
+
+citadel.after_realtime(function(ctx, body)
+  citadel.log("kind=" .. ctx.kind .. " delivered=" .. ctx.delivered)
+end)
+```
+
+---
+
 ## citadel.on_rpc
 
 Register a handler for a named request/response RPC method.
@@ -783,6 +822,8 @@ running:
 | Hook | `ctx` fields |
 | --- | --- |
 | `on_message` handler | `ctx.sender` (`u64`), `ctx.kind` (`u16`), `ctx.user_id` (string, present only if the participant is authenticated — absent/`nil` for a guest), `ctx.room_id` (`u64`, present when the sender belongs to a room) |
+| `before_realtime` | Message fields plus immutable `ctx.body`; return `false` to veto before routing. Authentication envelopes are excluded. |
+| `after_realtime` | Before fields plus `ctx.dropped` and `ctx.delivered`; observer-only after synchronous routing. |
 | `on_join` / `on_leave` | `ctx.sender` (`u64`), `ctx.user_id` (string or absent) |
 | `on_rpc` handler | `ctx.sender` (`u64`), `ctx.method` (string), `ctx.user_id` (string or absent) |
 | `on_room_create` handler | same shape as `on_rpc`, with `ctx.method == "room.create"` |

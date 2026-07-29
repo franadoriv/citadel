@@ -278,7 +278,7 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
   </tbody>
   <tbody>
     <tr><th colspan="3" align="left">Game logic, automation, and operator tooling</th></tr>
-    <tr><td>Before/after API and realtime interception hooks</td><td>No generic built-in request/envelope interception surface.</td><td>📋</td></tr>
+    <tr><td>Before/after API and realtime interception hooks</td><td>Post-handshake before hooks can veto eligible envelopes; after hooks observe the synchronous local delivery outcome without mutation or side effects.</td><td>✅</td></tr>
     <tr><td>Matchmaker callbacks, leaderboard/tournament reset callbacks</td><td>Schedulers and callback contracts are not shipped.</td><td>📋</td></tr>
     <tr><td>Runtime outbound HTTP, custom HTTP endpoints, events, shared cache</td><td>Trusted Lua, Python, and JavaScript expose bounded Rust-owned http.fetch; custom endpoints, events, shared cache, and hardened per-capability grants remain planned.</td><td>🚧</td></tr>
     <tr><td>Dashboard and authenticated operator API</td><td>Accounts, storage, groups, chat, notifications, leaderboards, matches, runtime, config, purchases, and audit.</td><td>✅</td></tr>
@@ -352,7 +352,7 @@ Only game-script capabilities appear here; Rust denotes the planned Citadel-as-a
     <tr><td>Message/lifecycle/tick/RPC/room hooks</td><td>✅</td><td>✅</td><td>✅</td><td>📋</td><td>Manifest-enforced parity for on_message, join/leave, tick, RPC, and room hooks.</td></tr>
     <tr><td>Broadcast/send, actors, maps, physics, storage, log</td><td>✅</td><td>✅</td><td>✅</td><td>📋</td><td>Current language-neutral host surface is mechanically checked.</td></tr>
     <tr><td>Friends, groups, leaderboards, chat, wallet, notifications host APIs</td><td>✅</td><td>✅</td><td>✅</td><td>📋</td><td>Friends/notifications have direct functions; remaining domain calls use validated bridges.</td></tr>
-    <tr><td>Before/after API and realtime interception hooks</td><td>📋</td><td>📋</td><td>📋</td><td>📋</td><td>No generic built-in request/envelope interception surface.</td></tr>
+    <tr><td>Before/after API and realtime interception hooks</td><td>✅</td><td>✅</td><td>✅</td><td>📋</td><td>Post-handshake before hooks can veto eligible envelopes; after hooks observe the synchronous local delivery outcome without mutation or side effects.</td></tr>
     <tr><td>Matchmaker callbacks, leaderboard/tournament reset callbacks</td><td>📋</td><td>📋</td><td>📋</td><td>📋</td><td>Schedulers and callback contracts are not shipped.</td></tr>
     <tr><td>Runtime outbound HTTP, custom HTTP endpoints, events, shared cache</td><td>✅</td><td>✅</td><td>✅</td><td>📋</td><td>Trusted Lua, Python, and JavaScript expose bounded Rust-owned http.fetch; custom endpoints, events, shared cache, and hardened per-capability grants remain planned.</td></tr>
   </tbody>

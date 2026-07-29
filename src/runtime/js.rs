@@ -25,8 +25,9 @@ use crate::realtime::TransformHub;
 use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
-    DomainHost, LifecycleHook, OutboundCommand, PhysicsOptions, ReloadOutcome, RoomSpec,
-    RpcOutcome, Runtime, RuntimeIntrospection, StorageWriteInput,
+    DomainHost, LifecycleHook, OutboundCommand, PhysicsOptions, RealtimeAfterOutcome,
+    RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime, RuntimeIntrospection,
+    StorageWriteInput,
 };
 use citadel_physics::{PhysicsConfig, Shape};
 
@@ -57,6 +58,8 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "on_rpc",
     "on_room_create",
     "on_room_join",
+    "before_realtime",
+    "after_realtime",
     "broadcast",
     "send",
     "spawn_actor",
@@ -104,12 +107,19 @@ const JS_HOST_PRELUDE: &str = r#"
   let onTick = null;
   let onRoomCreate = null;
   let onRoomJoin = null;
+  let beforeRealtime = null;
+  let afterRealtime = null;
   let commands = [];
   let logs = [];
   let totalBytes = 0;
   let overflowed = false;
   let nextNpcId = 0x40000000;
   let __citadel_domain_host = null;
+  const ensureRealtimeEffectsAllowed = globalThis.__citadel_realtime_effects_allowed;
+
+  if (typeof ensureRealtimeEffectsAllowed !== "function") {
+    throw new Error("realtime interceptor guard is unavailable");
+  }
 
   const MAX_OUTBOUND_COMMANDS = 1024;
   const MAX_OUTBOUND_BODY_BYTES = 64 * 1024;
@@ -278,6 +288,12 @@ const JS_HOST_PRELUDE: &str = r#"
     on_room_join(handler) {
       return singleRegistration((fn) => { onRoomJoin = fn; }, handler);
     },
+    before_realtime(handler) {
+      return singleRegistration((fn) => { beforeRealtime = fn; }, handler);
+    },
+    after_realtime(handler) {
+      return singleRegistration((fn) => { afterRealtime = fn; }, handler);
+    },
     broadcast(kind, body, unreliable) {
       bodyCommand("broadcast", [Number(kind), body, Boolean(unreliable)], 1);
     },
@@ -287,6 +303,9 @@ const JS_HOST_PRELUDE: &str = r#"
     log,
     http: {
       fetch(url, opts) {
+        if (globalThis.__citadel_realtime_interceptor) {
+          throw new Error("domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors");
+        }
         if (!globalThis.__citadel_http_fetch) {
           throw new Error("outbound HTTP host not available");
         }
@@ -409,6 +428,9 @@ const JS_HOST_PRELUDE: &str = r#"
       });
     },
     groups_call(actor, operation, payload) {
+      if (globalThis.__citadel_realtime_interceptor) {
+        throw new Error("domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors");
+      }
       if (!globalThis.__citadel_groups) throw new Error("groups host not available");
       return JSON.parse(globalThis.__citadel_groups(String(actor), String(operation), JSON.stringify(payload)));
     },
@@ -448,6 +470,7 @@ const JS_HOST_PRELUDE: &str = r#"
         encodedValue, expectedVersion, readPermission, writePermission, undefined, included);
     },
     register_storage_index_filter(indexName, callback) {
+      ensureRealtimeEffectsAllowed();
       const name = String(indexName);
       if (!/^[A-Za-z_][A-Za-z0-9_]{0,39}$/.test(name)) {
         throw new TypeError("storage index name must be an ASCII identifier of at most 40 characters");
@@ -471,6 +494,9 @@ const JS_HOST_PRELUDE: &str = r#"
   };
 
   function __citadel_friends_call(op, user, other) {
+    if (globalThis.__citadel_realtime_interceptor) {
+      throw new Error("domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors");
+    }
     if (!globalThis.__citadel_friends) {
       throw new Error("friends host not available");
     }
@@ -478,6 +504,9 @@ const JS_HOST_PRELUDE: &str = r#"
   }
 
   function __citadel_notifications_call(op, payload) {
+    if (globalThis.__citadel_realtime_interceptor) {
+      throw new Error("domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors");
+    }
     if (!globalThis.__citadel_notifications) {
       throw new Error("notifications host not available");
     }
@@ -485,11 +514,17 @@ const JS_HOST_PRELUDE: &str = r#"
   }
 
   function __citadel_domain_call(domain, actor, operation, payload) {
+    if (globalThis.__citadel_realtime_interceptor) {
+      throw new Error("domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors");
+    }
     if (!globalThis.__citadel_domain) throw new Error(domain + " host not available");
     return JSON.parse(globalThis.__citadel_domain(String(domain), String(actor), String(operation), JSON.stringify(payload)));
   }
 
   function __citadel_storage_call(op, user, collection, key, valueJson, expectedVersion, readPermission, writePermission, limit, includedIndexNames) {
+    if (globalThis.__citadel_realtime_interceptor) {
+      throw new Error("domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors");
+    }
     if (!globalThis.__citadel_storage) {
       throw new Error("storage host not available");
     }
@@ -505,6 +540,7 @@ const JS_HOST_PRELUDE: &str = r#"
   }
 
   globalThis.citadel = citadel;
+  globalThis.__citadel_realtime_interceptor = false;
   globalThis.console = {
     log: (message) => log(message, "info"),
     info: (message) => log(message, "info"),
@@ -534,6 +570,28 @@ const JS_HOST_PRELUDE: &str = r#"
       return false;
     }
     handler(ctx, bytes(body));
+    return true;
+  };
+
+  globalThis.__citadel_before_realtime = function (ctx, body) {
+    if (!beforeRealtime) {
+      return true;
+    }
+    const decision = beforeRealtime(ctx, bytes(body));
+    if (decision === undefined || decision === null || decision === true) {
+      return true;
+    }
+    if (decision === false) {
+      return false;
+    }
+    throw new TypeError("before_realtime must return false, true, null, or undefined");
+  };
+
+  globalThis.__citadel_after_realtime = function (ctx, body) {
+    if (!afterRealtime) {
+      return false;
+    }
+    afterRealtime(ctx, bytes(body));
     return true;
   };
 
@@ -591,7 +649,9 @@ const JS_HOST_PRELUDE: &str = r#"
       || onLeave !== null
       || onTick !== null
       || onRoomCreate !== null
-      || onRoomJoin !== null;
+      || onRoomJoin !== null
+      || beforeRealtime !== null
+      || afterRealtime !== null;
   };
 
   globalThis.__citadel_introspect = function () {
@@ -601,6 +661,8 @@ const JS_HOST_PRELUDE: &str = r#"
     if (onTick) hooks.push("on_tick");
     if (onRoomCreate) hooks.push("on_room_create");
     if (onRoomJoin) hooks.push("on_room_join");
+    if (beforeRealtime) hooks.push("before_realtime");
+    if (afterRealtime) hooks.push("after_realtime");
     return [
       Array.from(rpcHandlers.keys()).sort(),
       Array.from(messageHandlers.keys()).sort((a, b) => a - b),
@@ -675,6 +737,7 @@ struct JsVm {
     runtime: QuickJsRuntime,
     context: Context,
     source_label: String,
+    interceptor_mode: Arc<AtomicBool>,
     /// Parsed static gameplay data initialized with this VM. Replaced atomically
     /// with the VM on hot reload so a bad data edit cannot partially publish.
     static_data: StaticDataCatalog,
@@ -833,7 +896,11 @@ impl JsRuntime {
         self.domain = Some(host);
         {
             let guard = lock_mutex(&self.vm);
-            apply_domain_host(&guard.context, &self.domain);
+            apply_domain_host(
+                &guard.context,
+                &self.domain,
+                Arc::clone(&guard.interceptor_mode),
+            );
         }
         self
     }
@@ -929,7 +996,11 @@ impl JsRuntime {
         }
         // Re-apply the domain-services seam so `citadel.friends_*` keeps working
         // after the swap (the rebuilt context starts with no domain host attached).
-        apply_domain_host(&fresh.context, &self.domain);
+        apply_domain_host(
+            &fresh.context,
+            &self.domain,
+            Arc::clone(&fresh.interceptor_mode),
+        );
         apply_map_catalog(&fresh.context, &self.maps);
         apply_transform_hub(&fresh.context, &self.transform_hub);
         {
@@ -999,6 +1070,52 @@ impl JsRuntime {
             let body = caught(&ctx, TypedArray::<u8>::new_copy(ctx.clone(), body))?;
             caught(&ctx, func.call((u32::from(kind), js_ctx, body)))
         })
+    }
+
+    /// Run the optional before-realtime interceptor. A `false` result vetoes the
+    /// envelope; any script failure is isolated and fails closed. Commands from
+    /// this phase are discarded.
+    pub fn before_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+    ) -> RealtimeInterception {
+        self.run_before_realtime(|ctx| {
+            let globals = ctx.globals();
+            let func: Function = caught(&ctx, globals.get("__citadel_before_realtime"))?;
+            let js_ctx = make_ctx(&ctx, sender, user_id, Some(kind), None, room_id)?;
+            let body_for_ctx = caught(&ctx, TypedArray::<u8>::new_copy(ctx.clone(), body))?;
+            caught(&ctx, js_ctx.set("body", body_for_ctx))?;
+            let body_for_handler = caught(&ctx, TypedArray::<u8>::new_copy(ctx.clone(), body))?;
+            caught(&ctx, func.call((js_ctx, body_for_handler)))
+        })
+    }
+
+    /// Run the optional after-realtime observer. It shares the normal runtime
+    /// isolation, but its command sink is discarded because routing is complete.
+    pub fn after_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+        outcome: RealtimeAfterOutcome,
+    ) {
+        let _ = self.run_restricted_commands("after_realtime", self.budget, |ctx| {
+            let globals = ctx.globals();
+            let func: Function = caught(&ctx, globals.get("__citadel_after_realtime"))?;
+            let js_ctx = make_ctx(&ctx, sender, user_id, Some(kind), None, room_id)?;
+            let body_for_ctx = caught(&ctx, TypedArray::<u8>::new_copy(ctx.clone(), body))?;
+            caught(&ctx, js_ctx.set("body", body_for_ctx))?;
+            caught(&ctx, js_ctx.set("dropped", outcome.dropped))?;
+            caught(&ctx, js_ctx.set("delivered", outcome.delivered))?;
+            let body_for_handler = caught(&ctx, TypedArray::<u8>::new_copy(ctx.clone(), body))?;
+            caught(&ctx, func.call((js_ctx, body_for_handler)))
+        });
     }
 
     /// Dispatch `on_join` or `on_leave`.
@@ -1235,11 +1352,38 @@ impl JsRuntime {
     where
         F: FnOnce(Ctx<'_>) -> JsHostResult<bool>,
     {
+        self.run_commands_with_mode(what, budget, false, call)
+    }
+
+    fn run_restricted_commands<F>(
+        &self,
+        what: &str,
+        budget: Duration,
+        call: F,
+    ) -> Vec<OutboundCommand>
+    where
+        F: FnOnce(Ctx<'_>) -> JsHostResult<bool>,
+    {
+        self.run_commands_with_mode(what, budget, true, call)
+    }
+
+    fn run_commands_with_mode<F>(
+        &self,
+        what: &str,
+        budget: Duration,
+        restricted: bool,
+        call: F,
+    ) -> Vec<OutboundCommand>
+    where
+        F: FnOnce(Ctx<'_>) -> JsHostResult<bool>,
+    {
         let guard = self.lock_vm();
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            guard.interceptor_mode.store(restricted, Ordering::Relaxed);
             run_with_js_deadline(&guard.runtime, budget, || {
                 guard.context.with(|ctx| {
                     clear_commands(&ctx);
+                    set_realtime_interceptor_mode(&ctx, restricted)?;
                     let ran = call(ctx.clone());
                     match ran {
                         Ok(true) => take_commands(&ctx, &guard.source_label, what),
@@ -1255,6 +1399,8 @@ impl JsRuntime {
                 })
             })
         }));
+        guard.interceptor_mode.store(false, Ordering::Relaxed);
+        clear_vm_realtime_interceptor_mode(&guard);
         match outcome {
             Ok(Ok(commands)) => commands,
             Ok(Err(JsInvocationError::Timeout)) => {
@@ -1264,6 +1410,7 @@ impl JsRuntime {
                     "javascript handler timed out; isolated, side effects discarded"
                 );
                 clear_vm_commands(&guard);
+                clear_vm_realtime_interceptor_mode(&guard);
                 Vec::new()
             }
             Ok(Err(JsInvocationError::Error(e))) => {
@@ -1274,6 +1421,7 @@ impl JsRuntime {
                     "javascript handler error; isolated, side effects discarded"
                 );
                 clear_vm_commands(&guard);
+                clear_vm_realtime_interceptor_mode(&guard);
                 Vec::new()
             }
             Err(_) => {
@@ -1283,13 +1431,97 @@ impl JsRuntime {
                     "javascript handler panicked; isolated and dropped"
                 );
                 clear_vm_commands(&guard);
+                clear_vm_realtime_interceptor_mode(&guard);
                 Vec::new()
+            }
+        }
+    }
+
+    /// Run a pre-routing decision with the usual lock and deadline, but always
+    /// clear commands afterwards. Errors, timeouts, and panics intentionally veto
+    /// the envelope rather than exposing a partially executed interceptor.
+    fn run_before_realtime<F>(&self, call: F) -> RealtimeInterception
+    where
+        F: FnOnce(Ctx<'_>) -> JsHostResult<bool>,
+    {
+        let guard = self.lock_vm();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            guard.interceptor_mode.store(true, Ordering::Relaxed);
+            run_with_js_deadline(&guard.runtime, self.budget, || {
+                guard.context.with(|ctx| {
+                    clear_commands(&ctx);
+                    set_realtime_interceptor_mode(&ctx, true)?;
+                    let decision = call(ctx.clone());
+                    set_realtime_interceptor_mode(&ctx, false)?;
+                    clear_commands(&ctx);
+                    decision
+                })
+            })
+        }));
+        guard.interceptor_mode.store(false, Ordering::Relaxed);
+        clear_vm_realtime_interceptor_mode(&guard);
+        match outcome {
+            Ok(Ok(true)) => RealtimeInterception::Continue,
+            Ok(Ok(false)) => RealtimeInterception::Drop,
+            Ok(Err(JsInvocationError::Timeout)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "before_realtime",
+                    "javascript realtime interceptor timed out; vetoing envelope"
+                );
+                clear_vm_commands(&guard);
+                clear_vm_realtime_interceptor_mode(&guard);
+                RealtimeInterception::Drop
+            }
+            Ok(Err(JsInvocationError::Error(error))) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "before_realtime",
+                    error = %error,
+                    "javascript realtime interceptor failed; vetoing envelope"
+                );
+                clear_vm_commands(&guard);
+                clear_vm_realtime_interceptor_mode(&guard);
+                RealtimeInterception::Drop
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "before_realtime",
+                    "javascript realtime interceptor panicked; vetoing envelope"
+                );
+                clear_vm_commands(&guard);
+                clear_vm_realtime_interceptor_mode(&guard);
+                RealtimeInterception::Drop
             }
         }
     }
 }
 
 impl Runtime for JsRuntime {
+    fn before_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+    ) -> RealtimeInterception {
+        JsRuntime::before_realtime(self, sender, user_id, room_id, kind, body)
+    }
+
+    fn after_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+        outcome: RealtimeAfterOutcome,
+    ) {
+        JsRuntime::after_realtime(self, sender, user_id, room_id, kind, body, outcome);
+    }
+
     fn dispatch(
         &self,
         sender: u64,
@@ -1422,13 +1654,14 @@ fn install_static_data(ctx: &Ctx<'_>, static_data: StaticDataCatalog) -> JsHostR
 
 /// Install the bounded Rust-owned HTTP bridge. The JavaScript prelude converts
 /// its JSON result into a `Uint8Array`, so scripts never see a socket or client.
-fn install_outbound_http(ctx: &Ctx<'_>) -> JsHostResult<()> {
+fn install_outbound_http(ctx: &Ctx<'_>, interceptor_mode: Arc<AtomicBool>) -> JsHostResult<()> {
     let client = TrustedHttpClient::new().map_err(|error| error.to_string())?;
     let fetch = caught(
         ctx,
         Function::new(
             ctx.clone(),
             move |ctx: Ctx<'_>, url: String, opts_json: String| -> rquickjs::Result<String> {
+                ensure_realtime_effects_allowed(&ctx, &interceptor_mode)?;
                 let opts: serde_json::Value = match serde_json::from_str(&opts_json) {
                     Ok(value) => value,
                     Err(_) => return throw_js(&ctx, "invalid HTTP options".to_string()),
@@ -1472,6 +1705,24 @@ fn install_outbound_http(ctx: &Ctx<'_>) -> JsHostResult<()> {
         ),
     )?;
     caught(ctx, ctx.globals().set("__citadel_http_fetch", fetch))?;
+    Ok(())
+}
+
+fn install_realtime_interceptor_guard(
+    ctx: &Ctx<'_>,
+    interceptor_mode: Arc<AtomicBool>,
+) -> JsHostResult<()> {
+    let guard = caught(
+        ctx,
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>| -> rquickjs::Result<()> {
+            ensure_realtime_effects_allowed(&ctx, &interceptor_mode)
+        }),
+    )?;
+    caught(
+        ctx,
+        ctx.globals()
+            .set("__citadel_realtime_effects_allowed", guard),
+    )?;
     Ok(())
 }
 
@@ -1575,6 +1826,7 @@ fn build_js(
 ) -> AppResult<JsVm> {
     let module_root = module_root.map(canonical_esm_root).transpose()?;
     let module_paths = Arc::new(Mutex::new(BTreeSet::new()));
+    let interceptor_mode = Arc::new(AtomicBool::new(false));
     let runtime = QuickJsRuntime::new().map_err(|e| {
         script_error(
             &format!("failed to create QuickJS runtime for {source_label}"),
@@ -1600,13 +1852,14 @@ fn build_js(
     })?;
     run_with_js_deadline(&runtime, load_budget, || {
         context.with(|ctx| {
+            install_realtime_interceptor_guard(&ctx, Arc::clone(&interceptor_mode))?;
             let prelude_opts = eval_options("citadel_host.js");
             caught(
                 &ctx,
                 ctx.eval_with_options::<(), _>(JS_HOST_PRELUDE.as_bytes().to_vec(), prelude_opts),
             )?;
             install_static_data(&ctx, static_data.clone())?;
-            install_outbound_http(&ctx)?;
+            install_outbound_http(&ctx, Arc::clone(&interceptor_mode))?;
             if let Some(root) = &module_root {
                 let entry_name = esm_module_id(root, &root.join(JS_ENTRYPOINT))?;
                 let promise = caught(
@@ -1635,6 +1888,7 @@ fn build_js(
         runtime,
         context,
         source_label: source_label.to_string(),
+        interceptor_mode,
         static_data,
         module_paths,
     })
@@ -1748,6 +2002,33 @@ fn clear_commands(ctx: &Ctx<'_>) {
 
 fn clear_vm_commands(vm: &JsVm) {
     vm.context.with(|ctx| clear_commands(&ctx));
+}
+
+fn set_realtime_interceptor_mode(ctx: &Ctx<'_>, enabled: bool) -> JsHostResult<()> {
+    caught(
+        ctx,
+        ctx.globals().set("__citadel_realtime_interceptor", enabled),
+    )
+}
+
+fn clear_vm_realtime_interceptor_mode(vm: &JsVm) {
+    vm.context.with(|ctx| {
+        let _ = set_realtime_interceptor_mode(&ctx, false);
+    });
+}
+
+fn ensure_realtime_effects_allowed(
+    ctx: &Ctx<'_>,
+    interceptor_mode: &Arc<AtomicBool>,
+) -> rquickjs::Result<()> {
+    if interceptor_mode.load(Ordering::Relaxed) {
+        return throw_js(
+            ctx,
+            "domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn take_commands(ctx: &Ctx<'_>, label: &str, handler: &str) -> JsHostResult<Vec<OutboundCommand>> {
@@ -2033,11 +2314,16 @@ fn throw_js<'js, T>(ctx: &Ctx<'js>, message: String) -> rquickjs::Result<T> {
 /// Each function calls the SYNCHRONOUS [`DomainHost`] seam directly (its
 /// async→sync bridge runs on the multi-threaded runtime); the script passes the
 /// acting `user` explicitly (trusted tier).
-fn apply_domain_host(context: &Context, domain: &Option<Arc<dyn DomainHost>>) {
+fn apply_domain_host(
+    context: &Context,
+    domain: &Option<Arc<dyn DomainHost>>,
+    interceptor_mode: Arc<AtomicBool>,
+) {
     let Some(host) = domain else {
         return;
     };
     let friends_host = Arc::clone(host);
+    let friends_mode = Arc::clone(&interceptor_mode);
     let _ = context.with(|ctx| -> JsHostResult<()> {
         // A single native bridge returning a JSON-encoded result (a `String`, so
         // no `'js` value is returned from the closure — sidestepping rquickjs's
@@ -2052,6 +2338,7 @@ fn apply_domain_host(context: &Context, domain: &Option<Arc<dyn DomainHost>>) {
                       user: String,
                       other: String|
                       -> rquickjs::Result<String> {
+                    ensure_realtime_effects_allowed(&ctx, &friends_mode)?;
                     let result: Result<String, String> = match op.as_str() {
                         "add" => friends_host
                             .friends_add(&user, &other)
@@ -2086,11 +2373,13 @@ fn apply_domain_host(context: &Context, domain: &Option<Arc<dyn DomainHost>>) {
         )?;
         caught(&ctx, ctx.globals().set("__citadel_friends", friends))?;
         let notifications_host = Arc::clone(host);
+        let notifications_mode = Arc::clone(&interceptor_mode);
         let notifications = caught(
             &ctx,
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, op: String, payload: String| -> rquickjs::Result<String> {
+                    ensure_realtime_effects_allowed(&ctx, &notifications_mode)?;
                     let result: Result<String, String> = (|| {
                         let value: serde_json::Value = serde_json::from_str(&payload)
                             .map_err(|_| "invalid notification payload".to_string())?;
@@ -2137,11 +2426,13 @@ fn apply_domain_host(context: &Context, domain: &Option<Arc<dyn DomainHost>>) {
         )?;
         caught(&ctx, ctx.globals().set("__citadel_notifications", notifications))?;
         let groups_host = Arc::clone(host);
+        let groups_mode = Arc::clone(&interceptor_mode);
         let groups = caught(
             &ctx,
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, actor: String, operation: String, payload: String| -> rquickjs::Result<String> {
+                    ensure_realtime_effects_allowed(&ctx, &groups_mode)?;
                     match groups_host.groups_call(&actor, &operation, &payload) {
                         Ok(json) => Ok(json),
                         Err(message) => throw_js(&ctx, message),
@@ -2151,7 +2442,9 @@ fn apply_domain_host(context: &Context, domain: &Option<Arc<dyn DomainHost>>) {
         )?;
         caught(&ctx, ctx.globals().set("__citadel_groups", groups))?;
         let domain_host = Arc::clone(host);
+        let domain_mode = Arc::clone(&interceptor_mode);
         let domain = caught(&ctx, Function::new(ctx.clone(), move |ctx: Ctx<'_>, domain: String, actor: String, operation: String, payload: String| -> rquickjs::Result<String> {
+            ensure_realtime_effects_allowed(&ctx, &domain_mode)?;
             let result = match domain.as_str() {
                 "leaderboards" => domain_host.leaderboards_call(&actor, &operation, &payload),
                 "chat" => domain_host.chat_call(&actor, &operation, &payload),
@@ -2162,11 +2455,13 @@ fn apply_domain_host(context: &Context, domain: &Option<Arc<dyn DomainHost>>) {
         }))?;
         caught(&ctx, ctx.globals().set("__citadel_domain", domain))?;
         let storage_host = Arc::clone(host);
+        let storage_mode = interceptor_mode;
         let storage = caught(
             &ctx,
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, request: String| -> rquickjs::Result<String> {
+                    ensure_realtime_effects_allowed(&ctx, &storage_mode)?;
                     #[derive(serde::Deserialize)]
                     struct StorageRequest {
                         op: String,
@@ -2467,6 +2762,124 @@ mod tests {
 
     fn runtime(src: &str) -> JsRuntime {
         JsRuntime::from_source(src, "test.js", 100).expect("javascript runtime loads")
+    }
+
+    #[test]
+    fn realtime_interceptors_veto_and_observe_without_command_side_effects() {
+        let rt = runtime(
+            r#"
+            let seen = "unset";
+            citadel.before_realtime((ctx, body) => {
+              citadel.broadcast(99, "must-discard");
+              return false;
+            });
+            citadel.after_realtime((ctx, body) => {
+              citadel.broadcast(98, "must-discard");
+              seen = `${ctx.dropped ? "drop" : "pass"}:${ctx.delivered}:${Array.from(ctx.body).join(",")}`;
+            });
+            citadel.on_message(8, () => citadel.broadcast(9, seen));
+            "#,
+        );
+
+        assert_eq!(
+            rt.before_realtime(7, Some("user-7"), Some(42), 1, &[4, 5]),
+            RealtimeInterception::Drop
+        );
+        assert_eq!(
+            rt.dispatch(7, Some("user-7"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"unset".to_vec(),
+                unreliable: false,
+            }]
+        );
+
+        rt.after_realtime(
+            7,
+            Some("user-7"),
+            Some(42),
+            1,
+            &[4, 5],
+            RealtimeAfterOutcome {
+                dropped: true,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            rt.dispatch(7, Some("user-7"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"drop:0:4,5".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn invalid_before_realtime_result_fails_closed() {
+        let rt = runtime("citadel.before_realtime(() => 'invalid');");
+        assert_eq!(
+            rt.before_realtime(7, None, None, 1, b"input"),
+            RealtimeInterception::Drop
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn realtime_interceptors_reject_domain_storage_side_effects() {
+        let rt = runtime(
+            r#"
+            let seen = "unset";
+            citadel.before_realtime(() => {
+              globalThis.__citadel_realtime_interceptor = false;
+              citadel.register_storage_index_filter("profiles_by_score", () => {
+                seen = "filter-mutated";
+                return true;
+              });
+              citadel.storage_write("user", "profiles", "before", "{}");
+              return true;
+            });
+            citadel.after_realtime(() => {
+              globalThis.__citadel_realtime_interceptor = false;
+              citadel.register_storage_index_filter("profiles_by_score", () => {
+                seen = "filter-mutated";
+                return true;
+              });
+              citadel.storage_write("user", "profiles", "after", "{}");
+              seen = "mutated";
+            });
+            citadel.on_message(8, () => {
+              citadel.storage_write("user", "profiles", "normal", '{"score":1}');
+              citadel.broadcast(9, seen);
+            });
+            "#,
+        )
+        .with_domain_host(friends_host());
+
+        assert_eq!(
+            rt.before_realtime(7, Some("user"), None, 1, b"input"),
+            RealtimeInterception::Drop,
+            "a rejected storage write makes the before hook fail closed"
+        );
+        rt.after_realtime(
+            7,
+            Some("user"),
+            None,
+            1,
+            b"input",
+            RealtimeAfterOutcome {
+                dropped: false,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            rt.dispatch(7, Some("user"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"unset".to_vec(),
+                unreliable: false,
+            }],
+            "the after hook stops at the rejected direct host call"
+        );
     }
 
     /// A throwaway directory for file-backed ESM and reload tests. Avoids a

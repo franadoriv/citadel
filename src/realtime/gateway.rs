@@ -44,7 +44,9 @@ use crate::realtime::registry::{
 };
 use crate::realtime::rooms::{RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
-use crate::runtime::{LifecycleHook, OutboundCommand, RpcOutcome, Runtime};
+use crate::runtime::{
+    LifecycleHook, OutboundCommand, RealtimeAfterOutcome, RealtimeInterception, RpcOutcome, Runtime,
+};
 use crate::services::{
     ChatChannelAuthorizer, ChatRateLimitPolicy, ChatService, ChatTarget, CreateGroupRequest,
     FriendsService, Group, GroupFilter, GroupsService, LeaderboardService, PlayerNotification,
@@ -2698,27 +2700,51 @@ impl Gateway {
             tracing::debug!(%sender, kind = env.kind, "gateway dropped a reserved post-handshake auth frame");
             return 0;
         }
-        if env.kind == KIND_RPC_REQUEST {
-            return self.handle_rpc_request(sender, &env.body);
+
+        // Realtime interception starts only after a transport has completed the
+        // handshake and registered a participant. The reserved auth guard above
+        // deliberately keeps credentials and re-auth attempts out of script code.
+        let user_id = self.registry.user_id_of(sender);
+        let room_id = self.rooms.room_of(sender);
+        let runtime = self.runtime.as_deref();
+        if let Some(runtime) = runtime
+            && runtime.before_realtime(
+                sender.get(),
+                user_id.as_deref(),
+                room_id,
+                env.kind,
+                &env.body,
+            ) == RealtimeInterception::Drop
+        {
+            runtime.after_realtime(
+                sender.get(),
+                user_id.as_deref(),
+                room_id,
+                env.kind,
+                &env.body,
+                RealtimeAfterOutcome {
+                    dropped: true,
+                    delivered: 0,
+                },
+            );
+            return 0;
         }
-        if env.kind == KIND_TSYNC_HELLO
+
+        let delivered = if env.kind == KIND_RPC_REQUEST {
+            self.handle_rpc_request(sender, &env.body)
+        } else if env.kind == KIND_TSYNC_HELLO
             || env.kind == KIND_TSYNC_ACK
             || env.kind == KIND_TSYNC_INPUT
         {
-            return self.handle_transform_control(sender, env);
-        }
-        if env.kind == KIND_NA_PRESENCE || env.kind == KIND_NA_STATE {
-            return self.handle_networked_actor(sender, env);
-        }
-        if env.kind >= ROOM_KIND_MIN && env.kind <= ROOM_KIND_MAX {
-            return self.handle_room(sender, env);
-        }
-        if env.kind == KIND_REP_DELTA || env.kind == KIND_REP_ACK {
-            return self.handle_rep_frame(sender, env);
-        }
-        if let Some(runtime) = &self.runtime {
+            self.handle_transform_control(sender, env)
+        } else if env.kind == KIND_NA_PRESENCE || env.kind == KIND_NA_STATE {
+            self.handle_networked_actor(sender, env)
+        } else if env.kind >= ROOM_KIND_MIN && env.kind <= ROOM_KIND_MAX {
+            self.handle_room(sender, env)
+        } else if env.kind == KIND_REP_DELTA || env.kind == KIND_REP_ACK {
+            self.handle_rep_frame(sender, env)
+        } else if let Some(runtime) = runtime {
             let user_id = self.registry.user_id_of(sender);
-            let room_id = self.rooms.room_of(sender);
             let commands = match room_id {
                 Some(room_id) => runtime.dispatch_in_room(
                     sender.get(),
@@ -2729,9 +2755,25 @@ impl Gateway {
                 ),
                 None => runtime.dispatch(sender.get(), user_id.as_deref(), env.kind, &env.body),
             };
-            return self.apply_commands_scoped(Some(sender), room_id, commands);
+            self.apply_commands_scoped(Some(sender), room_id, commands)
+        } else {
+            self.relay_builtin(sender, env)
+        };
+
+        if let Some(runtime) = runtime {
+            runtime.after_realtime(
+                sender.get(),
+                user_id.as_deref(),
+                room_id,
+                env.kind,
+                &env.body,
+                RealtimeAfterOutcome {
+                    dropped: false,
+                    delivered,
+                },
+            );
         }
-        self.relay_builtin(sender, env)
+        delivered
     }
 
     /// Handle a `KIND_RPC_REQUEST`: run the runtime RPC handler and reply to the
@@ -5302,6 +5344,66 @@ mod tests {
         assert_eq!(snap.messages_out_total, 1);
     }
 
+    #[tokio::test]
+    async fn realtime_before_vetoes_routing_and_after_observes_the_prior_result() {
+        let metrics = Arc::new(NodeMetrics::new());
+        let gw = runtime_gateway(
+            Arc::clone(&metrics),
+            r#"
+            local prior = "unset"
+            citadel.before_realtime(function(ctx, body)
+                if body == "block" then return false end
+            end)
+            citadel.after_realtime(function(ctx, body)
+                citadel.broadcast(99, "must-discard")
+                prior = (ctx.dropped and "drop" or "pass") .. ":" .. tostring(ctx.delivered) .. ":" .. ctx.body
+            end)
+            citadel.on_message(1, function(ctx, body)
+                citadel.broadcast(2, prior, false)
+            end)
+        "#,
+        );
+        let (a, _ra) = register(&gw, TransportKind::WebSocket);
+        let (_b, mut rb) = register(&gw, TransportKind::WebSocket);
+
+        assert_eq!(
+            gw.handle_inbound(a, &Envelope::new(KIND_POSITION, b"block".to_vec())),
+            0,
+            "before_realtime vetoes before the message handler or fan-out"
+        );
+        assert!(
+            rb.try_recv().is_err(),
+            "a veto enqueues no outbound message"
+        );
+
+        assert_eq!(
+            gw.handle_inbound(a, &Envelope::new(KIND_POSITION, b"pass".to_vec())),
+            1
+        );
+        let out = rb.recv().await.expect("normal handler reaches peer");
+        assert_eq!(out.envelope.kind, 2);
+        assert_eq!(out.envelope.body.as_ref(), b"drop:0:block");
+        assert!(rb.try_recv().is_err(), "after hook commands are discarded");
+
+        assert_eq!(
+            gw.handle_inbound(a, &Envelope::new(KIND_POSITION, b"again".to_vec())),
+            1
+        );
+        let out = rb.recv().await.expect("normal handler reaches peer again");
+        assert_eq!(
+            out.envelope.body.as_ref(),
+            b"pass:1:pass",
+            "after_realtime observes the preceding synchronous fan-out"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.messages_in_total, 3,
+            "vetoed traffic remains observable"
+        );
+        assert_eq!(snap.messages_out_total, 2, "veto itself has no fan-out");
+    }
+
     const LIFECYCLE_TICK_SCRIPT: &str = r#"
         citadel.on_join(function(ctx)
             citadel.broadcast(10, string.pack(">I8", ctx.sender), false)
@@ -5563,6 +5665,12 @@ mod tests {
         let gw = runtime_gateway(
             Arc::new(NodeMetrics::new()),
             r#"
+            citadel.before_realtime(function(ctx, body)
+                citadel.broadcast(98, body, false)
+            end)
+            citadel.after_realtime(function(ctx, body)
+                citadel.broadcast(97, body, false)
+            end)
             citadel.on_message(5, function(ctx, body)
                 citadel.broadcast(99, body, false)
             end)
@@ -5576,7 +5684,7 @@ mod tests {
         assert_eq!(relayed, 0, "reserved auth frame is dropped");
         assert!(
             rb.try_recv().is_err(),
-            "the token bytes never reach a peer via the script"
+            "the token bytes never reach a peer via a handler or interceptor"
         );
         // KIND_AUTH_RESULT is likewise reserved.
         assert_eq!(

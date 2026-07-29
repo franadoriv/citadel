@@ -11,6 +11,26 @@
     "since": "pre-1.0"
   },
   {
+    "name": "before_realtime",
+    "category": "realtime_hook",
+    "params": [
+      "handler:fn(ctx,body)->bool?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "after_realtime",
+    "category": "realtime_hook",
+    "params": [
+      "handler:fn(ctx,body)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "on_join",
     "category": "lifecycle_hook",
     "params": [

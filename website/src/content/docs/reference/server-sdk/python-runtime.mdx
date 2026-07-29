@@ -220,6 +220,47 @@ def chat(ctx, body):
 
 ---
 
+## citadel.before_realtime / citadel.after_realtime
+
+Observe the post-handshake realtime pipeline around every eligible inbound
+envelope. Authentication frames are never exposed.
+
+```python
+@citadel.before_realtime
+def before(ctx, body):
+    return True
+
+@citadel.after_realtime
+def after(ctx, body):
+    pass
+```
+
+`before_realtime` runs before Citadel routes game messages, RPCs, rooms,
+replication, transform, and networked-actor traffic. Return `False` to veto;
+return `True` or `None` to continue. `ctx` has `sender`, `user_id`, `room_id`,
+`kind`, and immutable `bytes` `body` (also supplied as the second argument). A
+handler error, invalid return, timeout, or panic fails closed and vetoes.
+Both interception hooks are restricted to observation and logging: domain,
+storage, and outbound HTTP APIs are unavailable while either hook runs.
+
+`after_realtime` runs once after synchronous routing, including a veto. Its
+`ctx` additionally has `dropped` and `delivered`, the number of local outbound
+deliveries queued by that call. It is observer-only: return values and attempted
+`broadcast` or `send` commands are discarded; domain, storage, and outbound HTTP
+APIs are unavailable; failures are isolated.
+
+```python
+@citadel.before_realtime
+def before(ctx, body):
+    return ctx.kind != 77
+
+@citadel.after_realtime
+def after(ctx, body):
+    citadel.log(f"kind={ctx.kind} delivered={ctx.delivered}")
+```
+
+---
+
 ## citadel.on_rpc
 
 Register a named request/response RPC handler.
@@ -824,6 +865,8 @@ def list_friends(ctx, body):
 | Hook | `ctx` fields |
 | --- | --- |
 | `on_message` | `sender`, `kind`, `user_id` |
+| `before_realtime` | Message fields plus immutable `body`; return `False` to veto before routing. Authentication envelopes are excluded. |
+| `after_realtime` | Before fields plus `dropped` and `delivered`; observer-only after synchronous routing. |
 | `on_join` / `on_leave` | `sender`, `user_id` |
 | `on_rpc` | `sender`, `method`, `user_id` |
 | `on_room_create` | same as RPC, with `method == "room.create"` |

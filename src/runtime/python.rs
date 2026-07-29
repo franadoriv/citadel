@@ -24,8 +24,8 @@ use crate::runtime::host_services::{DomainHost, StorageWriteInput};
 use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
-    LifecycleHook, OutboundCommand, PhysicsOptions, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
-    RuntimeIntrospection,
+    LifecycleHook, OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception,
+    ReloadOutcome, RoomSpec, RpcOutcome, Runtime, RuntimeIntrospection,
 };
 use crate::services::PlayerNotification;
 use citadel_physics::{PhysicsConfig, Shape};
@@ -66,6 +66,8 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "on_rpc",
     "on_room_create",
     "on_room_join",
+    "before_realtime",
+    "after_realtime",
     "broadcast",
     "send",
     "spawn_actor",
@@ -118,6 +120,8 @@ _on_leave = None
 _on_tick = None
 _on_room_create = None
 _on_room_join = None
+_on_before_realtime = None
+_on_after_realtime = None
 _commands = []
 _total_bytes = 0
 _overflowed = False
@@ -129,7 +133,7 @@ MAX_OUTBOUND_BODY_BYTES = 64 * 1024
 MAX_TOTAL_OUTBOUND_BYTES = 1 << 20
 
 class Ctx:
-    __slots__ = ("sender", "user_id", "kind", "method", "room_id")
+    __slots__ = ("sender", "user_id", "kind", "method", "room_id", "body", "dropped", "delivered")
 
     def __init__(self, sender, user_id=None, kind=None, method=None, room_id=None):
         self.sender = int(sender)
@@ -137,6 +141,9 @@ class Ctx:
         self.kind = kind
         self.method = method
         self.room_id = room_id
+        self.body = None
+        self.dropped = None
+        self.delivered = None
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -214,6 +221,12 @@ def on_room_create(handler=None):
 
 def on_room_join(handler=None):
     return _single("_on_room_join", handler)
+
+def before_realtime(handler=None):
+    return _single("_on_before_realtime", handler)
+
+def after_realtime(handler=None):
+    return _single("_on_after_realtime", handler)
 
 def log(message, level="info"):
     logger = logging.getLogger("citadel.script")
@@ -348,6 +361,22 @@ def _dispatch_message(kind, ctx, body):
     handler(ctx, _bytes(body))
     return True
 
+def _dispatch_before_realtime(ctx, body):
+    if _on_before_realtime is None:
+        return True
+    decision = _on_before_realtime(ctx, _bytes(body))
+    if decision is None or decision is True:
+        return True
+    if decision is False:
+        return False
+    raise TypeError("before_realtime must return False, True, or None")
+
+def _dispatch_after_realtime(ctx, body):
+    if _on_after_realtime is None:
+        return False
+    _on_after_realtime(ctx, _bytes(body))
+    return True
+
 def _dispatch_lifecycle(hook, ctx):
     handler = _on_join if hook == "on_join" else _on_leave
     if handler is None:
@@ -403,6 +432,8 @@ def _has_any_handler():
         or _on_tick is not None
         or _on_room_create is not None
         or _on_room_join is not None
+        or _on_before_realtime is not None
+        or _on_after_realtime is not None
     )
 
 def _introspect():
@@ -417,6 +448,10 @@ def _introspect():
         hooks.append("on_room_create")
     if _on_room_join is not None:
         hooks.append("on_room_join")
+    if _on_before_realtime is not None:
+        hooks.append("before_realtime")
+    if _on_after_realtime is not None:
+        hooks.append("after_realtime")
     return (
         sorted(str(name) for name in _rpc_handlers.keys()),
         sorted(int(kind) for kind in _message_handlers.keys()),
@@ -520,18 +555,24 @@ def storage_read(user, collection, key):
         raise RuntimeError("storage host not available")
     return _domain_host_bridge.storage_read(str(user), str(collection), str(key))
 
-def register_storage_index_filter(index_name, callback):
-    """Register one synchronous include/exclude callback for a configured index."""
-    if not isinstance(index_name, str) or not index_name or len(index_name) > 40 \
-       or not index_name.isascii() or not (index_name[0].isalpha() or index_name[0] == "_") \
-       or not all(char.isalnum() or char == "_" for char in index_name):
-        raise ValueError("storage index name must be an ASCII identifier of at most 40 characters")
-    if not callable(callback):
-        raise TypeError("storage index filter must be callable")
-    if index_name in _storage_index_filters:
-        raise ValueError("storage index filter already registered for %r" % index_name)
-    _storage_index_filters[index_name] = callback
-    return callback
+def _make_register_storage_index_filter(guard):
+    filters = _storage_index_filters
+
+    def register_storage_index_filter(index_name, callback):
+        """Register one synchronous include/exclude callback for a configured index."""
+        guard.ensure_realtime_effects_allowed()
+        if not isinstance(index_name, str) or not index_name or len(index_name) > 40 \
+           or not index_name.isascii() or not (index_name[0].isalpha() or index_name[0] == "_") \
+           or not all(char.isalnum() or char == "_" for char in index_name):
+            raise ValueError("storage index name must be an ASCII identifier of at most 40 characters")
+        if not callable(callback):
+            raise TypeError("storage index filter must be callable")
+        if index_name in filters:
+            raise ValueError("storage index filter already registered for %r" % index_name)
+        filters[index_name] = callback
+        return callback
+
+    return register_storage_index_filter
 
 def storage_write(user, collection, key, value_json, expected_version=None,
                   read_permission=None, write_permission=None):
@@ -581,6 +622,7 @@ def storage_index_query(index_name, filters_json, limit=50):
 #[pyclass]
 struct DomainHostBridge {
     host: Arc<dyn DomainHost>,
+    interceptor_mode: Arc<AtomicBool>,
 }
 
 /// PyO3 wrapper exposing the read-only loaded-map catalog to Python scripts.
@@ -604,6 +646,12 @@ struct StaticDataBridge {
 #[pyclass]
 struct OutboundHttpBridge {
     client: TrustedHttpClient,
+    interceptor_mode: Arc<AtomicBool>,
+}
+
+#[pyclass]
+struct RuntimeModeBridge {
+    interceptor_mode: Arc<AtomicBool>,
 }
 
 /// PyO3 bridge exposing synchronous transform-physics reads to Python scripts.
@@ -634,6 +682,11 @@ impl StaticDataBridge {
 #[pymethods]
 impl OutboundHttpBridge {
     fn fetch(&self, url: &str, opts: &Bound<'_, PyDict>, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors",
+            ));
+        }
         let method = opts
             .get_item("method")?
             .map(|value| value.extract::<String>())
@@ -663,6 +716,29 @@ impl OutboundHttpBridge {
         result.set_item("status", response.status)?;
         result.set_item("body", PyBytes::new(py, &response.body))?;
         Ok(result.unbind())
+    }
+}
+
+impl DomainHostBridge {
+    fn ensure_realtime_effects_allowed(&self) -> PyResult<()> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl RuntimeModeBridge {
+    fn ensure_realtime_effects_allowed(&self) -> PyResult<()> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -759,6 +835,7 @@ impl DomainHostBridge {
     /// Returns the new state token or raises an exception.
     #[pyo3(name = "friends_add")]
     fn friends_add(&self, user: &str, other: &str) -> PyResult<String> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .friends_add(user, other)
             .map_err(PyRuntimeError::new_err)
@@ -768,6 +845,7 @@ impl DomainHostBridge {
     /// Returns whether anything was removed or raises an exception.
     #[pyo3(name = "friends_remove")]
     fn friends_remove(&self, user: &str, other: &str) -> PyResult<bool> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .friends_remove(user, other)
             .map_err(PyRuntimeError::new_err)
@@ -777,6 +855,7 @@ impl DomainHostBridge {
     /// Raises an exception on error.
     #[pyo3(name = "friends_block")]
     fn friends_block(&self, user: &str, other: &str) -> PyResult<()> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .friends_block(user, other)
             .map_err(PyRuntimeError::new_err)
@@ -786,6 +865,7 @@ impl DomainHostBridge {
     /// Returns a list of dicts or raises an exception.
     #[pyo3(name = "friends_list")]
     fn friends_list(&self, user: &str, py: Python<'_>) -> PyResult<Py<PyList>> {
+        self.ensure_realtime_effects_allowed()?;
         let rows = self
             .host
             .friends_list(user)
@@ -817,6 +897,7 @@ impl DomainHostBridge {
         delivery_key: Option<&str>,
         py: Python<'_>,
     ) -> PyResult<Py<PyDict>> {
+        self.ensure_realtime_effects_allowed()?;
         let notification = self
             .host
             .notifications_send(recipient, code, subject, content_json, sender, delivery_key)
@@ -832,6 +913,7 @@ impl DomainHostBridge {
         cursor: Option<&str>,
         py: Python<'_>,
     ) -> PyResult<Py<PyDict>> {
+        self.ensure_realtime_effects_allowed()?;
         let page = self
             .host
             .notifications_list(recipient, limit, cursor)
@@ -848,6 +930,7 @@ impl DomainHostBridge {
 
     #[pyo3(name = "notifications_mark_read")]
     fn notifications_mark_read(&self, recipient: &str, ids: Vec<String>) -> PyResult<Vec<String>> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .notifications_mark_read(recipient, &ids)
             .map_err(PyRuntimeError::new_err)
@@ -855,6 +938,7 @@ impl DomainHostBridge {
 
     #[pyo3(name = "groups_call")]
     fn groups_call(&self, actor: &str, operation: &str, payload_json: &str) -> PyResult<String> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .groups_call(actor, operation, payload_json)
             .map_err(PyRuntimeError::new_err)
@@ -867,6 +951,7 @@ impl DomainHostBridge {
         operation: &str,
         payload_json: &str,
     ) -> PyResult<String> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .leaderboards_call(actor, operation, payload_json)
             .map_err(PyRuntimeError::new_err)
@@ -874,6 +959,7 @@ impl DomainHostBridge {
 
     #[pyo3(name = "chat_call")]
     fn chat_call(&self, actor: &str, operation: &str, payload_json: &str) -> PyResult<String> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .chat_call(actor, operation, payload_json)
             .map_err(PyRuntimeError::new_err)
@@ -881,6 +967,7 @@ impl DomainHostBridge {
 
     #[pyo3(name = "wallet_call")]
     fn wallet_call(&self, actor: &str, operation: &str, payload_json: &str) -> PyResult<String> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .wallet_call(actor, operation, payload_json)
             .map_err(PyRuntimeError::new_err)
@@ -894,6 +981,7 @@ impl DomainHostBridge {
         key: &str,
         py: Python<'_>,
     ) -> PyResult<Option<Py<PyDict>>> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .storage_read(user, collection, key)
             .map_err(PyRuntimeError::new_err)?
@@ -915,6 +1003,7 @@ impl DomainHostBridge {
         included_index_names_json: Option<&str>,
         py: Python<'_>,
     ) -> PyResult<Py<PyDict>> {
+        self.ensure_realtime_effects_allowed()?;
         let object = self
             .host
             .storage_write(
@@ -934,6 +1023,7 @@ impl DomainHostBridge {
         collection: &str,
         key: &str,
     ) -> PyResult<Vec<String>> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .storage_index_candidates(user, collection, key)
             .map_err(PyRuntimeError::new_err)
@@ -947,6 +1037,7 @@ impl DomainHostBridge {
         key: &str,
         expected_version: Option<&str>,
     ) -> PyResult<()> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .storage_delete(user, collection, key, expected_version)
             .map_err(PyRuntimeError::new_err)
@@ -960,6 +1051,7 @@ impl DomainHostBridge {
         limit: usize,
         py: Python<'_>,
     ) -> PyResult<Vec<Py<PyDict>>> {
+        self.ensure_realtime_effects_allowed()?;
         self.host
             .storage_index_query(index_name, filters_json, limit)
             .map_err(PyRuntimeError::new_err)?
@@ -997,6 +1089,7 @@ struct PythonVm {
     citadel: Py<PyModule>,
     source_label: String,
     python_version: String,
+    interceptor_mode: Arc<AtomicBool>,
     /// Parsed static gameplay data initialized with this VM. Replaced atomically
     /// with the VM on hot reload so a bad data edit cannot partially publish.
     static_data: StaticDataCatalog,
@@ -1165,7 +1258,11 @@ impl PythonRuntime {
         self.domain = Some(host);
         {
             let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
-            apply_domain_host(&guard.citadel, &self.domain);
+            apply_domain_host(
+                &guard.citadel,
+                &self.domain,
+                Arc::clone(&guard.interceptor_mode),
+            );
         }
         self
     }
@@ -1334,6 +1431,49 @@ impl PythonRuntime {
                 .call1((kind, ctx, body))?
                 .extract::<bool>()
         })
+    }
+
+    /// Run the optional before-realtime interceptor. A `False` result vetoes the
+    /// envelope; errors and deadline failures are isolated and fail closed.
+    pub fn before_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+    ) -> RealtimeInterception {
+        self.run_before_realtime(|py, module| {
+            let ctx = make_ctx(module, sender, user_id, Some(kind), None, room_id)?;
+            ctx.setattr("body", PyBytes::new(py, body))?;
+            module
+                .getattr("_dispatch_before_realtime")?
+                .call1((ctx, PyBytes::new(py, body)))?
+                .extract::<bool>()
+        })
+    }
+
+    /// Run the optional after-realtime observer. Commands it creates are drained
+    /// and discarded because the gateway result is already fixed.
+    pub fn after_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+        outcome: RealtimeAfterOutcome,
+    ) {
+        let _ = self.run_restricted_commands("after_realtime", self.budget, |py, module| {
+            let ctx = make_ctx(module, sender, user_id, Some(kind), None, room_id)?;
+            ctx.setattr("body", PyBytes::new(py, body))?;
+            ctx.setattr("dropped", outcome.dropped)?;
+            ctx.setattr("delivered", outcome.delivered)?;
+            module
+                .getattr("_dispatch_after_realtime")?
+                .call1((ctx, PyBytes::new(py, body)))?
+                .extract::<bool>()
+        });
     }
 
     /// Dispatch `on_join` or `on_leave`.
@@ -1557,8 +1697,34 @@ impl PythonRuntime {
     where
         F: FnOnce(Python<'_>, &Bound<'_, PyModule>) -> PyResult<bool>,
     {
+        self.run_commands_with_mode(what, budget, false, call)
+    }
+
+    fn run_restricted_commands<F>(
+        &self,
+        what: &str,
+        budget: Duration,
+        call: F,
+    ) -> Vec<OutboundCommand>
+    where
+        F: FnOnce(Python<'_>, &Bound<'_, PyModule>) -> PyResult<bool>,
+    {
+        self.run_commands_with_mode(what, budget, true, call)
+    }
+
+    fn run_commands_with_mode<F>(
+        &self,
+        what: &str,
+        budget: Duration,
+        restricted: bool,
+        call: F,
+    ) -> Vec<OutboundCommand>
+    where
+        F: FnOnce(Python<'_>, &Bound<'_, PyModule>) -> PyResult<bool>,
+    {
         let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guard.interceptor_mode.store(restricted, Ordering::Relaxed);
             Python::attach(|py| -> PyResult<Vec<OutboundCommand>> {
                 let module = guard.citadel.bind(py);
                 clear_commands(module);
@@ -1576,6 +1742,7 @@ impl PythonRuntime {
                 }
             })
         }));
+        guard.interceptor_mode.store(false, Ordering::Relaxed);
         match outcome {
             Ok(Ok(commands)) => commands,
             Ok(Err(e)) => {
@@ -1595,6 +1762,50 @@ impl PythonRuntime {
                 );
                 clear_vm_commands(&guard);
                 Vec::new()
+            }
+        }
+    }
+
+    /// Run one pre-routing decision under the normal lock/deadline boundary.
+    /// Commands are cleared regardless of the return value, and every failure
+    /// becomes a veto so a partially broken interceptor cannot admit traffic.
+    fn run_before_realtime<F>(&self, call: F) -> RealtimeInterception
+    where
+        F: FnOnce(Python<'_>, &Bound<'_, PyModule>) -> PyResult<bool>,
+    {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guard.interceptor_mode.store(true, Ordering::Relaxed);
+            Python::attach(|py| -> PyResult<bool> {
+                let module = guard.citadel.bind(py);
+                clear_commands(module);
+                let decision = run_with_python_deadline(module, self.budget, || call(py, module));
+                clear_commands(module);
+                decision
+            })
+        }));
+        guard.interceptor_mode.store(false, Ordering::Relaxed);
+        match outcome {
+            Ok(Ok(true)) => RealtimeInterception::Continue,
+            Ok(Ok(false)) => RealtimeInterception::Drop,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "before_realtime",
+                    error = %error,
+                    "python realtime interceptor failed; vetoing envelope"
+                );
+                clear_vm_commands(&guard);
+                RealtimeInterception::Drop
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "before_realtime",
+                    "python realtime interceptor panicked; vetoing envelope"
+                );
+                clear_vm_commands(&guard);
+                RealtimeInterception::Drop
             }
         }
     }
@@ -1633,6 +1844,29 @@ fn apply_transform_hub(citadel: &Py<PyModule>, hub: &Option<Arc<TransformHub>>) 
 }
 
 impl Runtime for PythonRuntime {
+    fn before_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+    ) -> RealtimeInterception {
+        PythonRuntime::before_realtime(self, sender, user_id, room_id, kind, body)
+    }
+
+    fn after_realtime(
+        &self,
+        sender: u64,
+        user_id: Option<&str>,
+        room_id: Option<u64>,
+        kind: u16,
+        body: &[u8],
+        outcome: RealtimeAfterOutcome,
+    ) {
+        PythonRuntime::after_realtime(self, sender, user_id, room_id, kind, body, outcome);
+    }
+
     fn dispatch(
         &self,
         sender: u64,
@@ -1724,13 +1958,18 @@ enum PythonRpcInner {
 /// Apply the domain-host seam to a freshly-built VM's citadel module,
 /// registering the friends host functions if a domain is provided.
 /// Called after each VM build (initial + hot-reload).
-fn apply_domain_host(citadel: &Py<PyModule>, domain: &Option<Arc<dyn DomainHost>>) {
+fn apply_domain_host(
+    citadel: &Py<PyModule>,
+    domain: &Option<Arc<dyn DomainHost>>,
+    interceptor_mode: Arc<AtomicBool>,
+) {
     if let Some(host) = domain {
         Python::attach(|py| {
             let module = citadel.bind(py);
             // Create and set the bridge object so friends functions can call through to Rust
             let bridge = DomainHostBridge {
                 host: Arc::clone(host),
+                interceptor_mode,
             };
             if let Err(e) = module.setattr("_domain_host_bridge", bridge) {
                 tracing::warn!(error = %e, "failed to set domain host bridge on python module");
@@ -1754,10 +1993,30 @@ fn install_static_data(
     )
 }
 
-fn install_outbound_http(citadel: &Bound<'_, PyModule>) -> PyResult<()> {
+fn install_outbound_http(
+    citadel: &Bound<'_, PyModule>,
+    interceptor_mode: Arc<AtomicBool>,
+) -> PyResult<()> {
     let client =
         TrustedHttpClient::new().map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    citadel.setattr("_http_bridge", OutboundHttpBridge { client })
+    citadel.setattr(
+        "_http_bridge",
+        OutboundHttpBridge {
+            client,
+            interceptor_mode,
+        },
+    )
+}
+
+fn install_realtime_interceptor_guard(
+    citadel: &Bound<'_, PyModule>,
+    interceptor_mode: Arc<AtomicBool>,
+) -> PyResult<()> {
+    let guard = Py::new(citadel.py(), RuntimeModeBridge { interceptor_mode })?;
+    let register = citadel
+        .getattr("_make_register_storage_index_filter")?
+        .call1((guard,))?;
+    citadel.setattr("register_storage_index_filter", register)
 }
 
 fn static_data_python_error(error: crate::runtime::static_data::StaticDataError) -> PyErr {
@@ -1806,6 +2065,7 @@ fn build_python(
         &format!("citadel_host_{module_id}"),
         "python host module name",
     )?;
+    let interceptor_mode = Arc::new(AtomicBool::new(false));
     let _build_guard = PYTHON_BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     Python::attach(|py| -> PyResult<PythonVm> {
         let citadel = PyModule::from_code(
@@ -1818,7 +2078,8 @@ fn build_python(
         let modules: Bound<'_, PyDict> = sys.getattr("modules")?.cast_into()?;
         modules.set_item("citadel", &citadel)?;
         install_static_data(&citadel, static_data.clone())?;
-        install_outbound_http(&citadel)?;
+        install_outbound_http(&citadel, Arc::clone(&interceptor_mode))?;
+        install_realtime_interceptor_guard(&citadel, Arc::clone(&interceptor_mode))?;
         if let Some(root) = module_root {
             let root = root.to_string_lossy().to_string();
             citadel.getattr("_prepare_imports")?.call1((root,))?;
@@ -1838,13 +2099,14 @@ fn build_python(
             citadel: citadel.unbind(),
             source_label: source_label.to_string(),
             python_version: version,
+            interceptor_mode,
             static_data,
         };
         Ok(vm)
     })
     .map_err(|e| script_error(&format!("failed to load {source_label}"), &e))
     .inspect(|vm| {
-        apply_domain_host(&vm.citadel, domain);
+        apply_domain_host(&vm.citadel, domain, Arc::clone(&vm.interceptor_mode));
         apply_map_catalog(&vm.citadel, maps);
         apply_transform_hub(&vm.citadel, transform_hub);
     })
@@ -2226,6 +2488,146 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert_eq!(PythonRuntime::registered_host_api_names(), shipped);
+    }
+
+    #[test]
+    fn realtime_interceptors_veto_and_observe_without_command_side_effects() {
+        let rt = runtime(
+            r#"
+import citadel
+
+seen = "unset"
+
+@citadel.before_realtime
+def before(ctx, body):
+    citadel.broadcast(99, b"must-discard")
+    return False
+
+@citadel.after_realtime
+def after(ctx, body):
+    global seen
+    citadel.broadcast(98, b"must-discard")
+    seen = f"{'drop' if ctx.dropped else 'pass'}:{ctx.delivered}:{ctx.body.hex()}"
+
+@citadel.on_message(8)
+def message(ctx, body):
+    citadel.broadcast(9, seen)
+"#,
+        );
+
+        assert_eq!(
+            rt.before_realtime(7, Some("user-7"), Some(42), 1, &[4, 5]),
+            RealtimeInterception::Drop
+        );
+        assert_eq!(
+            rt.dispatch(7, Some("user-7"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"unset".to_vec(),
+                unreliable: false,
+            }]
+        );
+
+        rt.after_realtime(
+            7,
+            Some("user-7"),
+            Some(42),
+            1,
+            &[4, 5],
+            RealtimeAfterOutcome {
+                dropped: true,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            rt.dispatch(7, Some("user-7"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"drop:0:0405".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn invalid_before_realtime_result_fails_closed() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.before_realtime
+def before(ctx, body):
+    return "invalid"
+"#,
+        );
+        assert_eq!(
+            rt.before_realtime(7, None, None, 1, b"input"),
+            RealtimeInterception::Drop
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn realtime_interceptors_reject_domain_storage_side_effects() {
+        let rt = runtime(
+            r#"
+import citadel
+
+seen = "unset"
+
+@citadel.before_realtime
+def before(ctx, body):
+    def before_filter(candidate):
+        global seen
+        seen = "filter-mutated"
+        return True
+    citadel.register_storage_index_filter("profiles_by_score", before_filter)
+    citadel.storage_write("user", "profiles", "before", "{}")
+    return True
+
+@citadel.after_realtime
+def after(ctx, body):
+    global seen
+    def after_filter(candidate):
+        global seen
+        seen = "filter-mutated"
+        return True
+    citadel.register_storage_index_filter("profiles_by_score", after_filter)
+    citadel.storage_write("user", "profiles", "after", "{}")
+    seen = "mutated"
+
+@citadel.on_message(8)
+def message(ctx, body):
+    citadel.storage_write("user", "profiles", "normal", '{"score":1}')
+    citadel.broadcast(9, seen)
+"#,
+        )
+        .with_domain_host(friends_host());
+
+        assert_eq!(
+            rt.before_realtime(7, Some("user"), None, 1, b"input"),
+            RealtimeInterception::Drop,
+            "a rejected storage write makes the before hook fail closed"
+        );
+        rt.after_realtime(
+            7,
+            Some("user"),
+            None,
+            1,
+            b"input",
+            RealtimeAfterOutcome {
+                dropped: false,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            rt.dispatch(7, Some("user"), 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"unset".to_vec(),
+                unreliable: false,
+            }],
+            "the after hook stops at the rejected direct host call"
+        );
     }
 
     #[test]
