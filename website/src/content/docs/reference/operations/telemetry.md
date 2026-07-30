@@ -43,9 +43,9 @@ citadel serve
 ```
 
 No Sentry server, account, or additional Citadel binary is required when using
-Bugsink. The included `CITADEL_BUGSINK_DSN` variable remains supported for
-existing deployments, but it is a compatibility alias. When both variables are
-set, `CITADEL_SENTRY_DSN` takes precedence.
+Bugsink. Existing deployments can retain `CITADEL_BUGSINK_DSN`, but new
+deployments should use `CITADEL_SENTRY_DSN`. The older name is a compatibility
+alias; when both variables are set, `CITADEL_SENTRY_DSN` takes precedence.
 
 ## Data handling
 
