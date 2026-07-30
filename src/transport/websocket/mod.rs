@@ -32,6 +32,7 @@ use citadel_wire::Envelope;
 use citadel_wire::protocol::KIND_AUTH_RESULT;
 
 use crate::error::{AppError, AppResult, ErrorCategory};
+use crate::error_reporting;
 use crate::lifecycle::{AsyncService, CancellationToken};
 use crate::realtime::{Gateway, Outbound, SessionHandle};
 use crate::transport::codec::decode_framed;
@@ -338,6 +339,10 @@ async fn handle_connection(
                 } => {
                     metrics.liveness_timeout();
                     gateway.node_metrics().record_websocket_liveness_timeout();
+                    error_reporting::report_app_error(
+                        "transport.websocket.liveness",
+                        &AppError::new(ErrorCategory::Transport, "WebSocket liveness timeout"),
+                    );
                     tracing::warn!(conn = %id, %session_id, "WebSocket liveness timeout; closing unresponsive peer");
                     break;
                 }
