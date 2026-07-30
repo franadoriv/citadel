@@ -4,7 +4,6 @@ on:
   pull_request:
   push:
     branches:
-      - develop
       - main
       - master
 
@@ -12,7 +11,8 @@ jobs:
   rust:
     # macOS validation is intentionally deferred until the Apple release
     # credentials are available. Keep the native packaging targets local-only
-    # for now so ordinary develop CI remains the established Linux gate.
+    # for pull-request and integration-branch CI, where Linux remains the
+    # established validation gate.
     runs-on: ubuntu-latest
     env:
       # CI validates behavior, not debug-symbol quality. Keeping symbols out of
