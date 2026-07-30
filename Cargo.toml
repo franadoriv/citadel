@@ -141,10 +141,16 @@ sqlx = { version = "0.8", default-features = false, features = [
 # Official MongoDB Rust driver. Its defaults use Rustls and include the DNS
 # resolver required by secure `mongodb+srv://` deployments; no OpenSSL surface.
 mongodb = "3.8"
+# Cross-platform host telemetry for the operator dashboard.  Only the system
+# and disk collectors are enabled: no process list, users, network, or sensor
+# probing is needed for the status snapshot.
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
 
 [dev-dependencies]
 # URL parsing for the in-process WebTransport client used in integration tests.
 url = "2"
+# Route-level assertions for authenticated operator endpoints.
+tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

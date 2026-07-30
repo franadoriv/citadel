@@ -4,7 +4,8 @@
 //! health, identity, build, uptime, configured transports, and the
 //! [`NodeMetrics`](crate::observability::NodeMetrics) snapshot. It is a thin,
 //! read-only adapter over shared [`App`] state that never mutates domain data;
-//! the only side effect is bumping the `http_requests_total` counter.
+//! the only side effect is bumping the `http_requests_total` counter. Host
+//! resource telemetry is intentionally kept on the authenticated console API.
 //!
 //! The human-facing [`DASHBOARD_PATH`] (`/dashboard`) is served by the
 //! [`console`](super::console) module, whose Status section consumes this JSON
@@ -196,6 +197,10 @@ pub(super) async fn status_handler(State(app): State<App>) -> Json<NodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
     use crate::config::{Config, LuaExecutionMode};
 
     #[test]
@@ -227,6 +232,7 @@ mod tests {
         assert_eq!(value["runtime"]["tier"], "trusted");
         assert_eq!(value["runtime"]["lua_execution_mode"], "sandboxed");
         assert!(value["metrics"]["http_requests_total"].is_number());
+        assert!(value.get("host").is_none(), "host capacity stays private");
     }
 
     #[test]
@@ -235,5 +241,24 @@ mod tests {
         config.runtime.lua_execution_mode = LuaExecutionMode::Trusted;
         let status = NodeStatus::from_app(&App::new(config));
         assert_eq!(status.runtime.lua_execution_mode, "trusted");
+    }
+
+    #[tokio::test]
+    async fn public_status_does_not_expose_host_capacity() {
+        let response = crate::http::router(App::new(Config::default()))
+            .oneshot(
+                Request::builder()
+                    .uri(STATUS_PATH)
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("status JSON");
+        assert!(value.get("host").is_none());
     }
 }

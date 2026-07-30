@@ -12,6 +12,8 @@
 //! - [`LOGIN_PATH`] (`POST`, public): exchange `[console]` credentials for an
 //!   opaque bearer token (see [`ConsoleTokenStore`](crate::services::ConsoleTokenStore)).
 //! - [`ME_PATH`] (`GET`): the authenticated operator identity.
+//! - [`TELEMETRY_PATH`] (`GET`): authenticated host CPU, memory, and mounted
+//!   filesystem capacity for the Status dashboard.
 //! - One route per console section ([`SECTION_PATHS`]). Sections whose backend
 //!   has not landed yet answer `501 Not Implemented` — authenticated, routed,
 //!   and JSON-shaped, so the SPA can treat them uniformly. Each section task
@@ -35,6 +37,7 @@ pub mod notifications;
 pub mod purchases;
 pub mod runtime;
 pub mod storage;
+pub mod telemetry;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
@@ -64,6 +67,7 @@ pub use notifications::NOTIFICATIONS_PATH;
 pub use purchases::{PURCHASES_PATH, SUBSCRIPTIONS_PATH};
 pub use runtime::RUNTIME_PATH;
 pub use storage::STORAGE_PATH;
+pub use telemetry::TELEMETRY_PATH;
 
 /// Path prefix shared by every console API route.
 pub const CONSOLE_API_PREFIX: &str = "/console/v1";
@@ -215,6 +219,7 @@ pub(super) fn routes() -> Router<App> {
         .route(ME_PATH, get(me_handler))
         .route(audit::AUDIT_PATH, get(audit::list_handler))
         .route(errors::ERRORS_PATH, get(errors::list_handler))
+        .route(telemetry::TELEMETRY_PATH, get(telemetry::get_handler))
         .route(config::CONFIG_PATH, get(config::get_handler))
         .route(
             accounts::ACCOUNTS_PATH,

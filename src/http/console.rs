@@ -10,8 +10,10 @@
 //! - No build step, framework, or CDN. The page is plain HTML + CSS + vanilla
 //!   JS embedded at compile time via [`include_str!`], so the binary stays
 //!   fully self-contained and the console works with zero external fetches.
-//! - The **Status** section polls the public [`STATUS_PATH`] (no bearer
-//!   token) and renders auto-refreshing gauges, node facts, and transports.
+//! - The **Status** section polls public [`STATUS_PATH`] (no bearer token) for
+//!   node facts and transports. Its host CPU, memory, and storage cards use an
+//!   authenticated console API request, so capacity information is never
+//!   exposed through the public status contract.
 //! - Every other section (Accounts, Groups, Chat, Notifications, Storage,
 //!   Database Explorer, Leaderboards, Matches, Purchases/Subscriptions, Configuration, API
 //!   Explorer/Runtime, Audit Logs) drives its live `/console/v1/*` backend:
@@ -95,8 +97,10 @@ mod tests {
 
     #[test]
     fn status_section_reads_the_status_endpoint() {
-        // The Status section stays on the public /status endpoint (no bearer).
+        // Node facts stay on the public /status endpoint (no bearer).
         assert!(CONSOLE_HTML.contains("fetch('/status'"));
+        // Host capacity telemetry is only requested with the console bearer.
+        assert!(CONSOLE_HTML.contains("/console/v1/telemetry"));
         // The rest of the SPA authenticates against the console API...
         assert!(CONSOLE_HTML.contains("/console/v1/login"));
         // ...and no placeholder affordance survives anywhere.

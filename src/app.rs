@@ -15,6 +15,7 @@ use crate::config::{Config, RuntimeConfig};
 use crate::error::{AppError, AppResult};
 use crate::error_journal::ErrorJournal;
 use crate::error_reporting;
+use crate::host_telemetry::{HostTelemetryService, HostTelemetrySnapshot};
 use crate::observability::NodeMetrics;
 use crate::repository::{Backend, BackendKind, InMemoryBackend, select_backend};
 use crate::services::{
@@ -31,8 +32,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The assembled Citadel application.
 ///
 /// Holds resolved configuration, node identity, a process start instant for
-/// uptime, a shared [`NodeMetrics`] registry surfaced by the dashboard, the
-/// selected persistence [`Backend`], and the composed identity/session services.
+/// uptime, shared [`NodeMetrics`] and host-resource telemetry surfaced by the
+/// dashboard, the selected persistence [`Backend`], and the composed
+/// identity/session services.
 /// It is cheap to [`Clone`] (config is small; metrics, backend, and services are
 /// shared behind an `Arc`), so it can serve as axum shared state without
 /// wrapping.
@@ -47,6 +49,7 @@ pub struct App {
     config: Config,
     started_at: Instant,
     metrics: Arc<NodeMetrics>,
+    host_telemetry: Arc<HostTelemetryService>,
     backend: Arc<dyn Backend>,
     auth: Arc<dyn AuthenticationService>,
     sessions: SharedSessionService,
@@ -131,6 +134,7 @@ impl App {
             config,
             started_at: Instant::now(),
             metrics: Arc::new(NodeMetrics::new()),
+            host_telemetry: Arc::new(HostTelemetryService::new()),
             backend,
             auth,
             sessions,
@@ -255,6 +259,16 @@ impl App {
     #[must_use]
     pub fn metrics(&self) -> &Arc<NodeMetrics> {
         &self.metrics
+    }
+
+    /// Return host CPU, memory, and filesystem capacity telemetry.
+    ///
+    /// The collector is shared across [`App`] clones so CPU usage is calculated
+    /// from consecutive samples rather than from an untrustworthy first read.
+    /// OS inspection is scheduled on Tokio's blocking pool, so dashboard reads
+    /// do not block an asynchronous HTTP worker.
+    pub async fn host_telemetry(&self) -> HostTelemetrySnapshot {
+        self.host_telemetry.snapshot().await
     }
 
     /// The in-process store of issued admin-console bearer tokens.
