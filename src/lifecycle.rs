@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::error::{AppError, AppResult, ErrorCategory};
+use crate::error_reporting;
 
 /// A clonable cooperative-cancellation signal.
 ///
@@ -181,6 +182,7 @@ impl Supervisor {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::error!(service = %name, error = %e, "service stopped with error");
+                    error_reporting::report_app_error("lifecycle.supervisor", &e);
                     first_err.get_or_insert(e);
                 }
                 Err(join_err) => {
@@ -190,6 +192,7 @@ impl Supervisor {
                     )
                     .with_detail(join_err.to_string());
                     tracing::error!(service = %name, "service task panicked or was cancelled");
+                    error_reporting::report_app_error("lifecycle.supervisor", &e);
                     first_err.get_or_insert(e);
                 }
             }

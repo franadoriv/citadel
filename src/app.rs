@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::{Config, RuntimeConfig};
 use crate::error::{AppError, AppResult};
+use crate::error_journal::ErrorJournal;
+use crate::error_reporting;
 use crate::observability::NodeMetrics;
 use crate::repository::{Backend, BackendKind, InMemoryBackend, select_backend};
 use crate::services::{
@@ -50,6 +52,7 @@ pub struct App {
     sessions: SharedSessionService,
     console_tokens: Arc<ConsoleTokenStore>,
     audit: Arc<AuditLog>,
+    error_journal: Arc<ErrorJournal>,
     chat_access: Arc<ChatAccessCoordinator>,
     groups: Arc<GroupsService>,
     chat: Arc<ChatService>,
@@ -101,6 +104,7 @@ impl App {
             Arc::clone(&sessions),
         ));
         let console_tokens = Arc::new(ConsoleTokenStore::from_config(&config.console));
+        let error_journal = error_reporting::journal_for_config(&config.errors);
         let chat = Arc::new(ChatService::new(backend.chat_repository()));
         let chat_rate_limits = Arc::new(ChatRateLimitPolicy::new(config.chat.limits.clone()));
         let auth_rate_limits = Arc::new(AuthenticationRateLimitPolicy::new(
@@ -132,6 +136,7 @@ impl App {
             sessions,
             console_tokens,
             audit: Arc::new(AuditLog::default()),
+            error_journal,
             chat_access,
             groups,
             chat,
@@ -146,6 +151,17 @@ impl App {
             wallet,
             friends,
         }
+    }
+
+    /// Replace the local incident journal used by this application instance.
+    ///
+    /// The normal server bootstrap installs the process journal derived from
+    /// the executable directory. Embedders and isolated tests can supply a
+    /// separate journal without changing the process-wide default.
+    #[must_use]
+    pub fn with_error_journal(mut self, error_journal: Arc<ErrorJournal>) -> Self {
+        self.error_journal = error_journal;
+        self
     }
 
     /// Assemble an application, selecting the persistence backend from config and
@@ -249,6 +265,12 @@ impl App {
     #[must_use]
     pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit
+    }
+
+    /// The local, redacted process incident journal shown in the console.
+    #[must_use]
+    pub fn error_journal(&self) -> &Arc<ErrorJournal> {
+        &self.error_journal
     }
 
     /// Shared local fence for chat authorization and social/group revocations.

@@ -14,6 +14,7 @@ pub mod config;
 pub mod database_explorer;
 pub mod error;
 pub mod error_journal;
+pub mod error_reporting;
 pub mod http;
 pub mod identity;
 pub mod lifecycle;
