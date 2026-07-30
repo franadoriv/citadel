@@ -1,10 +1,10 @@
-//! Process-wide incident reporting.
+//! Process-wide Sentry telemetry and local incident reporting.
 //!
 //! The local journal is always available and deliberately independent from
-//! network reporting. When `CITADEL_BUGSINK_DSN` is configured, the same
-//! redacted incident summaries are also sent through the Sentry-compatible
-//! protocol. Missing or unreachable external reporting never blocks startup or
-//! changes the server's error handling.
+//! network telemetry. When `CITADEL_SENTRY_DSN` is configured, redacted
+//! incident metadata is sent to Sentry. Bugsink is supported as a
+//! Sentry-compatible self-hosted backend. Missing or unreachable telemetry
+//! never blocks startup or changes the server's error handling.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -22,9 +22,9 @@ use crate::error_journal::{
 static JOURNAL: OnceLock<RwLock<Arc<ErrorJournal>>> = OnceLock::new();
 static PANIC_HOOK: Once = Once::new();
 
-/// Keeps the optional external-reporting client alive until shutdown.
+/// Keeps the optional Sentry telemetry client alive until shutdown.
 ///
-/// Dropping the guard flushes any queued external events. The local journal is
+/// Dropping the guard flushes any queued telemetry events. The local journal is
 /// process-wide and remains available even when this guard carries no client.
 pub struct ReportingGuard {
     _external: Option<ClientInitGuard>,
@@ -42,14 +42,14 @@ pub fn initialize(config: &ErrorJournalConfig) -> ReportingGuard {
     replace_journal(Arc::clone(&journal));
     install_panic_hook();
 
-    let external = bugsink_dsn().map(|dsn| {
+    let external = sentry_dsn().map(|dsn| {
         let environment = std::env::var("CITADEL_ENVIRONMENT")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "production".to_string());
         tracing::info!(
             journal = %journal.path().display(),
-            "incident journal initialized with external reporting enabled"
+            "Sentry telemetry initialized with local incident journal"
         );
         sentry::init(ClientOptions {
             dsn: Some(dsn),
@@ -63,7 +63,7 @@ pub fn initialize(config: &ErrorJournalConfig) -> ReportingGuard {
     if external.is_none() {
         tracing::info!(
             journal = %journal.path().display(),
-            "incident journal initialized; external reporting disabled"
+            "local incident journal initialized; Sentry telemetry disabled"
         );
     }
 
@@ -104,7 +104,7 @@ pub fn journal_for_config(config: &ErrorJournalConfig) -> Arc<ErrorJournal> {
 }
 
 /// Record an application failure in the local journal and, when configured,
-/// forward a redacted summary to the external service.
+/// forward a redacted summary to Sentry when telemetry is configured.
 pub fn report_app_error(component: &str, error: &AppError) {
     let component = safe_component(component);
     let _ = active_journal().append(JournalIncident::from_app_error(&component, error));
@@ -173,17 +173,41 @@ fn install_panic_hook() {
     });
 }
 
-fn bugsink_dsn() -> Option<sentry::types::Dsn> {
-    let value = std::env::var("CITADEL_BUGSINK_DSN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())?;
+fn sentry_dsn() -> Option<sentry::types::Dsn> {
+    let sentry = std::env::var("CITADEL_SENTRY_DSN").ok();
+    let legacy_bugsink = std::env::var("CITADEL_BUGSINK_DSN").ok();
+
+    sentry_dsn_from_values(sentry, legacy_bugsink)
+}
+
+fn sentry_dsn_from_values(
+    sentry: Option<String>,
+    legacy_bugsink: Option<String>,
+) -> Option<sentry::types::Dsn> {
+    if !has_non_empty_value(sentry.as_ref()) && has_non_empty_value(legacy_bugsink.as_ref()) {
+        tracing::warn!(
+            "CITADEL_BUGSINK_DSN is a compatibility alias; configure CITADEL_SENTRY_DSN instead"
+        );
+    }
+
+    let value = configured_sentry_dsn(sentry, legacy_bugsink)?;
     match value.parse() {
         Ok(dsn) => Some(dsn),
         Err(_) => {
-            tracing::warn!("external incident reporting disabled: invalid configured DSN");
+            tracing::warn!("Sentry telemetry disabled: invalid configured DSN");
             None
         }
     }
+}
+
+fn configured_sentry_dsn(sentry: Option<String>, legacy_bugsink: Option<String>) -> Option<String> {
+    sentry
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| legacy_bugsink.filter(|value| !value.trim().is_empty()))
+}
+
+fn has_non_empty_value(value: Option<&String>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn safe_error_message(category: &str) -> String {
@@ -210,6 +234,8 @@ fn safe_component(component: &str) -> String {
 mod tests {
     use super::*;
 
+    const TEST_DSN: &str = "https://public@example.invalid/1";
+
     #[test]
     fn external_event_messages_do_not_include_error_details() {
         let error =
@@ -227,5 +253,66 @@ mod tests {
             "http_request_token_secret"
         );
         assert_eq!(safe_component(""), "unknown");
+    }
+
+    #[test]
+    fn primary_sentry_dsn_takes_precedence_over_legacy_bugsink_alias() {
+        assert_eq!(
+            configured_sentry_dsn(Some("sentry".to_string()), Some("bugsink".to_string())),
+            Some("sentry".to_string())
+        );
+    }
+
+    #[test]
+    fn primary_sentry_dsn_is_selected_when_no_legacy_alias_is_set() {
+        assert_eq!(
+            configured_sentry_dsn(Some("sentry".to_string()), None),
+            Some("sentry".to_string())
+        );
+    }
+
+    #[test]
+    fn blank_primary_dsn_falls_back_to_legacy_bugsink_alias() {
+        assert_eq!(
+            configured_sentry_dsn(Some("  ".to_string()), Some("bugsink".to_string())),
+            Some("bugsink".to_string())
+        );
+    }
+
+    #[test]
+    fn blank_or_absent_dsn_settings_disable_telemetry() {
+        assert_eq!(configured_sentry_dsn(None, None), None);
+        assert_eq!(
+            configured_sentry_dsn(Some(" ".to_string()), Some("\t".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_primary_dsn_does_not_fall_back_to_legacy_alias() {
+        assert_eq!(
+            configured_sentry_dsn(
+                Some("not-a-valid-dsn".to_string()),
+                Some("https://bugsink.example/1".to_string())
+            ),
+            Some("not-a-valid-dsn".to_string())
+        );
+    }
+
+    #[test]
+    fn sentry_dsn_parser_accepts_the_primary_value() {
+        assert!(sentry_dsn_from_values(Some(TEST_DSN.to_string()), None).is_some());
+    }
+
+    #[test]
+    fn sentry_dsn_parser_accepts_the_legacy_bugsink_value() {
+        assert!(sentry_dsn_from_values(None, Some(TEST_DSN.to_string())).is_some());
+    }
+
+    #[test]
+    fn sentry_dsn_parser_does_not_fall_back_when_the_primary_value_is_invalid() {
+        let dsn = sentry_dsn_from_values(Some("invalid".to_string()), Some(TEST_DSN.to_string()));
+
+        assert!(dsn.is_none());
     }
 }

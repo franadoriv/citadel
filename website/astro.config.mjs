@@ -162,6 +162,7 @@ export default defineConfig({
 								{ label: 'Overview', slug: 'reference/operations' },
 								{ label: 'CLI', slug: 'reference/operations/cli' },
 								{ label: 'Configuration (TOML)', slug: 'reference/operations/configuration' },
+								{ label: 'Telemetry', slug: 'reference/operations/telemetry' },
 								{ label: 'MongoDB operations', slug: 'reference/operations/mongodb' },
 								{ label: 'Local build & staging targets', slug: 'reference/operations/make-targets' },
 								{ label: 'Container images', slug: 'reference/operations/container-images' },

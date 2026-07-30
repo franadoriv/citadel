@@ -75,8 +75,8 @@ fn main() -> Result<()> {
             // the existing silent auto-defaults apply.
             run_wizard_if_interactive(&cli, &mut config).context("first-run setup failed")?;
 
-            // Local incident capture is always active. External delivery stays
-            // dormant unless CITADEL_BUGSINK_DSN is configured, and the guard
+            // Local incident capture is always active. Sentry telemetry stays
+            // dormant unless CITADEL_SENTRY_DSN is configured, and the guard
             // remains alive through the whole serving lifetime to flush events
             // during shutdown.
             let _reporting = error_reporting::initialize(&config.errors);
