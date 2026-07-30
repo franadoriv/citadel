@@ -19,6 +19,11 @@ use citadel::startup::{self, StdioPrompt, WizardPaths, WizardReport};
 use citadel::{App, error_reporting, http, observability};
 
 fn main() -> Result<()> {
+    // MongoDB's TLS stack may pull aws-lc-rs alongside Citadel's ring-backed
+    // QUIC/WebTransport stack. Rustls requires applications to select one
+    // process-wide provider when both are linked.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Install the local panic hook before configuration, logging, or the
     // first-run wizard can panic. Resolved retention replaces its defaults
     // just before serving begins.
