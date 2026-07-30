@@ -1,0 +1,44 @@
+# Configuración autocontenida para el simulador de bots.
+# Ejecutar desde esta carpeta: .\citadel.exe serve
+
+[server]
+node_id = "bot-stress-local"
+public_addr = "127.0.0.1:7350"
+
+[http]
+bind = "127.0.0.1:7350"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[runtime]
+enabled = true
+language = "lua"
+adapter = "embedded"
+tier = "trusted"
+scripts_dir = "./game"
+deadline_ms = 100
+tick_hz = 4
+hot_reload = true
+hot_reload_poll_ms = 500
+
+# La herramienta utiliza WebSocket para que el mismo cliente Rust funcione en
+# Windows, Linux y macOS sin certificados de desarrollo ni requisitos UDP.
+[transport.quic]
+enabled = true
+bind = "127.0.0.1:7351"
+outbound_queue_capacity = 16384
+
+[transport.websocket]
+enabled = true
+bind = "127.0.0.1:7352"
+# Los broadcasts a 1000 peers pueden producir picos breves. La cola es
+# intencionalmente mayor que el valor de demo, no un límite de jugadores.
+outbound_queue_capacity = 16384
+
+[transport.webtransport]
+enabled = false
+
+[transport.transform_sync]
+enabled = false

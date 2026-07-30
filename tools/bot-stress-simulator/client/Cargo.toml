@@ -1,0 +1,27 @@
+[package]
+name = "citadel-bot-stress"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-platform console load simulator for Citadel's collision-map Lua server."
+publish = false
+
+# This source is intentionally runnable as a standalone crate while sharing the
+# repository's public Rust WebSocket SDK and its exact wire envelope.
+[workspace]
+
+[dependencies]
+citadel-client = { path = "../../../crates/citadel-client" }
+citadel-wire = { path = "../../../crates/citadel-wire" }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

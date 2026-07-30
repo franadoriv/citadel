@@ -38,6 +38,13 @@ website/node_modules/
 *.sqlite-wal
 *.sqlite-shm
 
+# Local Windows server binary and potentially very large per-message stress logs.
+tools/bot-stress-simulator/server/citadel.exe
+tools/bot-stress-simulator/server/citadel-errors.jsonl
+tools/bot-stress-simulator/client/target/
+tools/bot-stress-simulator/client/logs/
+tools/bot-stress-simulator/client/reports/
+
 # Native plugin binaries built into the Unity SDK (built, not committed).
 clients/unity/Plugins/**/*.dll
 clients/unity/Plugins/**/*.so

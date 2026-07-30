@@ -41,7 +41,8 @@ use crate::realtime::chat_presence::{ChatPresenceRegistry, ChatSubscription};
 use crate::realtime::netpeer::layout::RepLayout;
 use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot};
 use crate::realtime::registry::{
-    Outbound, ParticipantId, ParticipantIdGen, SessionHandle, SessionRegistry,
+    LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen, SessionHandle,
+    SessionRegistry,
 };
 use crate::realtime::rooms::{RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
@@ -2611,10 +2612,10 @@ impl Gateway {
     /// excluded, matching a spawn-notification to existing peers). The join hook
     /// runs *after* the registry insert, so a concurrent tick may briefly observe
     /// the new participant before `on_join` fires — acceptable for the MVP.
-    pub fn register_session(&self, handle: SessionHandle) {
+    pub fn register_session(&self, handle: SessionHandle) -> LatestOutboundReceiver {
         let id = handle.id;
         let authenticated = handle.is_authenticated();
-        self.registry.register(handle);
+        let unreliable = self.registry.register(handle);
         // Every registered participant moves the participant gauge; only an
         // account-bound participant moves the authenticated-session gauge.
         self.metrics.participant_opened();
@@ -2633,6 +2634,7 @@ impl Gateway {
             self.send_rep_bootstrap(id);
         }
         self.dispatch_lifecycle(LifecycleHook::Join, id);
+        unreliable
     }
 
     fn send_rep_bootstrap(&self, id: ParticipantId) {
@@ -4495,6 +4497,28 @@ impl PlayerNotificationDelivery for Gateway {
 }
 
 #[cfg(test)]
+struct TestOutboundReceiver {
+    reliable: tokio::sync::mpsc::Receiver<Outbound>,
+    unreliable: LatestOutboundReceiver,
+}
+
+#[cfg(test)]
+impl TestOutboundReceiver {
+    async fn recv(&mut self) -> Option<Outbound> {
+        tokio::select! {
+            next = self.reliable.recv() => next,
+            next = self.unreliable.recv() => Some(next),
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<Outbound, tokio::sync::mpsc::error::TryRecvError> {
+        self.reliable
+            .try_recv()
+            .or_else(|_| self.unreliable.try_recv())
+    }
+}
+
+#[cfg(test)]
 mod transform_tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
@@ -4523,16 +4547,22 @@ mod transform_tests {
         (gw, hub)
     }
 
-    fn register(gw: &Gateway) -> (ParticipantId, mpsc::Receiver<Outbound>) {
+    fn register(gw: &Gateway) -> (ParticipantId, TestOutboundReceiver) {
         let id = gw.next_participant_id();
         let (tx, rx) = mpsc::channel(64);
-        gw.registry().register(SessionHandle {
+        let unreliable = gw.registry().register(SessionHandle {
             id,
             kind: TransportKind::Quic,
             outbound: tx,
             identity: None,
         });
-        (id, rx)
+        (
+            id,
+            TestOutboundReceiver {
+                reliable: rx,
+                unreliable,
+            },
+        )
     }
 
     #[tokio::test]
@@ -5261,16 +5291,22 @@ mod tests {
         }
     }
 
-    fn register(gw: &Gateway, kind: TransportKind) -> (ParticipantId, mpsc::Receiver<Outbound>) {
+    fn register(gw: &Gateway, kind: TransportKind) -> (ParticipantId, TestOutboundReceiver) {
         let id = gw.next_participant_id();
         let (tx, rx) = mpsc::channel(8);
-        gw.registry().register(SessionHandle {
+        let unreliable = gw.registry().register(SessionHandle {
             id,
             kind,
             outbound: tx,
             identity: None,
         });
-        (id, rx)
+        (
+            id,
+            TestOutboundReceiver {
+                reliable: rx,
+                unreliable,
+            },
+        )
     }
 
     #[tokio::test]
@@ -5506,16 +5542,22 @@ mod tests {
     fn register_via_session(
         gw: &Gateway,
         kind: TransportKind,
-    ) -> (ParticipantId, mpsc::Receiver<Outbound>) {
+    ) -> (ParticipantId, TestOutboundReceiver) {
         let id = gw.next_participant_id();
         let (tx, rx) = mpsc::channel(8);
-        gw.register_session(SessionHandle {
+        let unreliable = gw.register_session(SessionHandle {
             id,
             kind,
             outbound: tx,
             identity: None,
         });
-        (id, rx)
+        (
+            id,
+            TestOutboundReceiver {
+                reliable: rx,
+                unreliable,
+            },
+        )
     }
 
     #[tokio::test]

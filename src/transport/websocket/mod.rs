@@ -284,7 +284,7 @@ async fn handle_connection(
     let identity = handshake.outcome.identity();
     let authenticated = identity.is_some();
     let (tx, mut rx) = mpsc::channel::<Outbound>(OUTBOUND_CAPACITY);
-    gateway.register_session(SessionHandle {
+    let unreliable = gateway.register_session(SessionHandle {
         id: session_id,
         kind: TransportKind::WebSocket,
         outbound: tx,
@@ -366,6 +366,18 @@ async fn handle_connection(
                 // Outbound: relay messages from the gateway to this peer.
                 out = rx.recv() => {
                     let Some(out) = out else { break };
+                    let frame = out.envelope.encode_framed();
+                    writer
+                        .send(Message::Binary(frame.to_vec()))
+                        .await
+                        .map_err(send_err)?;
+                    metrics.envelope_sent();
+                }
+                // Unreliable state is coalesced by its state key. Peer
+                // positions include their sender ID in that key, so a browser
+                // retains the newest state for every visible peer without a
+                // stale FIFO replay.
+                out = unreliable.recv() => {
                     let frame = out.envelope.encode_framed();
                     writer
                         .send(Message::Binary(frame.to_vec()))
