@@ -892,6 +892,56 @@ pub struct TransportConfig {
     pub auth: AuthConfig,
     /// Authoritative transform synchronization.
     pub transform_sync: TransformSyncConfig,
+    /// Optional server-authoritative NetworkPeer property replication.
+    pub network_peer: NetworkPeerConfig,
+}
+
+/// Server-side NetworkPeer replication settings.
+///
+/// This is deliberately disabled by default. Enabling it only attaches the
+/// authority boundary; classes and objects are still registered exclusively by
+/// trusted server lifecycle code, never by a client frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkPeerConfig {
+    /// Attach the NetworkPeer authority to the production gateway.
+    pub enabled: bool,
+    /// Reuse prepared quantized values for identical outbound bunches.
+    pub shared_quantized_state: bool,
+    /// Uniform InterestGrid cell size, in world units.
+    pub interest_cell_size: u32,
+    /// Enter-relevancy distance, in world units.
+    pub interest_inner: u32,
+    /// Exit-relevancy distance, in world units. Must be >= `interest_inner`.
+    pub interest_outer: u32,
+}
+
+impl Default for NetworkPeerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            shared_quantized_state: false,
+            interest_cell_size: 100,
+            interest_inner: 100,
+            interest_outer: 125,
+        }
+    }
+}
+
+impl NetworkPeerConfig {
+    fn validate(&self) -> AppResult<()> {
+        if self.interest_cell_size == 0 {
+            return Err(AppError::config(
+                "transport.network_peer.interest_cell_size must be positive",
+            ));
+        }
+        if self.interest_inner == 0 || self.interest_outer < self.interest_inner {
+            return Err(AppError::config(
+                "transport.network_peer interest distances must be positive and outer >= inner",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Optional PEM certificate chain and private key for public UDP transports.
@@ -1528,6 +1578,7 @@ impl Config {
         self.cluster
             .validate(&self.server.node_id, &self.database)?;
         self.transport.tls.validate()?;
+        self.transport.network_peer.validate()?;
         if self.transport.quic.enabled {
             validate_socket_addr("transport.quic.bind", &self.transport.quic.bind)?;
             if self.transport.quic.outbound_queue_capacity == 0 {

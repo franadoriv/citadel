@@ -3,6 +3,7 @@
 // CI; the in-editor two-client behavior is a manual pre-release check.
 
 #include "CitadelTransformSync.h"
+#include "CitadelNetworkPeer.h"
 
 #include "CitadelClientSubsystem.h"
 #include "CitadelNetworkedActor.h"
@@ -594,6 +595,12 @@ void UCitadelTransformSyncSubsystem::PumpInbound()
                 reinterpret_cast<const ANSICHAR*>(Payload.GetData()), Payload.Num());
             Client->OnNotificationReceived.Broadcast(
                 FString(NotificationUtf8.Length(), NotificationUtf8.Get()));
+        }
+        else if (Kind == CitadelWire::KIND_REP_DELTA)
+        {
+            // The shared queue has one reader.  NetworkPeer performs its own
+            // canonical C-ABI decode, object-identity routing, apply, and ACK.
+            UCitadelNetworkPeer::RouteRepDelta(GetGameInstance(), Payload);
         }
         // Other kinds are ignored here; a production subsystem routes them to game.
     }

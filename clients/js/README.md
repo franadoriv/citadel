@@ -97,6 +97,8 @@ relay to authoritative movement.
 | `client.close()` | Close the connection. |
 | `Envelope`, `FrameDecoder` | Wire framing (`encodeFramed` / stream decode). |
 | `webTransportCertificateHash(base64)` | Turn Citadel's logged development-certificate hash into a browser pin descriptor. |
+| `NetworkPeerAuthor` / `NetworkPeerSession` | Schema-bound `KIND_REP_DELTA` author/decode/baseline/ACK helpers. |
+| `encodeDeltaBunch` / `decodeDeltaBunch` | Standalone typed DeltaBunch codec for bool, bounded int/scalar, Vector3, quaternion, bytes, and keyed collections. |
 | `encodeRpcRequest`, `decodeRpcResponse`, `decodeAuthResult`, `splitSender`, `tagWithSender` | Low-level codecs. |
 | `KIND_*`, `AUTH_*`, `RPC_*`, `*_BYTES` | Protocol constants (contract-checked). |
 
@@ -163,6 +165,11 @@ python3 -m http.server 8080 --directory bin/benchmark
 
 - WebTransport is a Chromium browser path. WebSocket remains the portable
   fallback; the SDK does not migrate an authenticated connection.
+- `NetworkPeerAuthor` and `NetworkPeerSession` are transport helpers only: use
+  `KIND_REP_DELTA` / `KIND_REP_ACK` with your `CitadelClient`, apply decoded
+  values to your game objects, and do not claim a missing-base resend request.
+  Browser and native-editor two-client gameplay runs remain a deferred external
+  environment verification gate.
 - The development WebTransport certificate is short-lived. Supply its logged
   base64 hash with `serverCertificateHashBase64`; a trusted production
   certificate needs no pin.

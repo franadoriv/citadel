@@ -199,6 +199,25 @@ CitadelStatus citadel_rep_encoder_add_bytes(CitadelRepEncoder* /*enc*/,
 	return CITADEL_STATUS_INTERNAL;
 }
 
+CitadelStatus citadel_rep_encoder_add_vector3(CitadelRepEncoder* /*enc*/,
+	uint16_t /*field_id*/, float /*bounds*/, const float* /*value*/)
+{
+	return CITADEL_STATUS_INTERNAL;
+}
+
+CitadelStatus citadel_rep_encoder_add_quat(CitadelRepEncoder* /*enc*/,
+	uint16_t /*field_id*/, uint32_t /*bits_per_component*/, const float* /*value*/)
+{
+	return CITADEL_STATUS_INTERNAL;
+}
+
+CitadelStatus citadel_rep_encoder_add_collection(CitadelRepEncoder* /*enc*/,
+	uint16_t /*field_id*/, CitadelRepCodecV3 /*item_codec*/, uint32_t /*max_items*/,
+	const CitadelRepCollectionOp* /*ops*/, uintptr_t /*op_count*/)
+{
+	return CITADEL_STATUS_INTERNAL;
+}
+
 CitadelStatus citadel_rep_encoder_finish(CitadelRepEncoder* /*enc*/,
 	uint8_t* /*buf*/, uintptr_t /*cap*/, uintptr_t* out_len, bool* out_truncated)
 {

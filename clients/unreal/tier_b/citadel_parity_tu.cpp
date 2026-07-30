@@ -68,6 +68,34 @@ namespace
         &citadel_rep_encoder_add_scalar;
     CitadelStatus (*const kRepAddBytes)(CitadelRepEncoder*, uint16_t, uint32_t, const uint8_t*, uintptr_t) =
         &citadel_rep_encoder_add_bytes;
+    CitadelStatus (*const kRepAddVector3)(CitadelRepEncoder*, uint16_t, float, const float*) =
+        &citadel_rep_encoder_add_vector3;
+    CitadelStatus (*const kRepAddQuat)(CitadelRepEncoder*, uint16_t, uint32_t, const float*) =
+        &citadel_rep_encoder_add_quat;
+    CitadelStatus (*const kRepAddCollection)(CitadelRepEncoder*, uint16_t, CitadelRepCodecV3, uint32_t,
+        const CitadelRepCollectionOp*, uintptr_t) = &citadel_rep_encoder_add_collection;
+    CitadelStatus (*const kRepDecode)(const uint8_t*, uintptr_t, const uint8_t*, uint32_t,
+        const CitadelRepCodec*, uintptr_t, CitadelRepDecoded**) = &citadel_rep_decode;
+    CitadelStatus (*const kRepDecodeCollections)(const uint8_t*, uintptr_t, const uint8_t*, uint32_t,
+        const CitadelRepDecodeFieldCodecV3*, uintptr_t, CitadelRepDecoded**) = &citadel_rep_decode_with_collections;
+    CitadelStatus (*const kRepHeader)(const CitadelRepDecoded*, uint32_t*, bool*, uint64_t*, uint64_t*) =
+        &citadel_rep_decoded_header;
+    uintptr_t (*const kRepFieldCount)(const CitadelRepDecoded*) = &citadel_rep_decoded_field_count;
+    CitadelStatus (*const kRepFieldAt)(const CitadelRepDecoded*, uintptr_t, CitadelRepFieldValue*) =
+        &citadel_rep_decoded_field_at;
+    CitadelStatus (*const kRepFieldFloats)(const CitadelRepDecoded*, uintptr_t, float*) =
+        &citadel_rep_decoded_field_floats;
+    CitadelStatus (*const kRepFieldBytes)(const CitadelRepDecoded*, uintptr_t, uint8_t*, uintptr_t, uintptr_t*) =
+        &citadel_rep_decoded_field_bytes;
+    CitadelStatus (*const kRepCollectionCount)(const CitadelRepDecoded*, uintptr_t, uintptr_t*) =
+        &citadel_rep_decoded_collection_count;
+    CitadelStatus (*const kRepCollectionFieldId)(const CitadelRepDecoded*, uintptr_t, uint16_t*) =
+        &citadel_rep_decoded_collection_field_id;
+    CitadelStatus (*const kRepCollectionAt)(const CitadelRepDecoded*, uintptr_t, uintptr_t,
+        CitadelRepDecodedCollectionOp*) = &citadel_rep_decoded_collection_at;
+    CitadelStatus (*const kRepCollectionBytes)(const CitadelRepDecoded*, uintptr_t, uintptr_t,
+        uint8_t*, uintptr_t, uintptr_t*) = &citadel_rep_decoded_collection_op_bytes;
+    void (*const kRepDecodedFree)(CitadelRepDecoded*) = &citadel_rep_decoded_free;
     CitadelStatus (*const kRepFinish)(CitadelRepEncoder*, uint8_t*, uintptr_t, uintptr_t*, bool*) =
         &citadel_rep_encoder_finish;
     void (*const kRepFree)(CitadelRepEncoder*) = &citadel_rep_encoder_free;
@@ -91,6 +119,21 @@ namespace
         reinterpret_cast<const void*>(kRepAddInt),
         reinterpret_cast<const void*>(kRepAddScalar),
         reinterpret_cast<const void*>(kRepAddBytes),
+        reinterpret_cast<const void*>(kRepAddVector3),
+        reinterpret_cast<const void*>(kRepAddQuat),
+        reinterpret_cast<const void*>(kRepAddCollection),
+        reinterpret_cast<const void*>(kRepDecode),
+        reinterpret_cast<const void*>(kRepDecodeCollections),
+        reinterpret_cast<const void*>(kRepHeader),
+        reinterpret_cast<const void*>(kRepFieldCount),
+        reinterpret_cast<const void*>(kRepFieldAt),
+        reinterpret_cast<const void*>(kRepFieldFloats),
+        reinterpret_cast<const void*>(kRepFieldBytes),
+        reinterpret_cast<const void*>(kRepCollectionCount),
+        reinterpret_cast<const void*>(kRepCollectionFieldId),
+        reinterpret_cast<const void*>(kRepCollectionAt),
+        reinterpret_cast<const void*>(kRepCollectionBytes),
+        reinterpret_cast<const void*>(kRepDecodedFree),
         reinterpret_cast<const void*>(kRepFinish),
         reinterpret_cast<const void*>(kRepFree),
     };
@@ -99,8 +142,8 @@ namespace
 
 // (2) ABI version parity against the header #define (also asserted inside
 // CitadelWire.h; repeated here to keep the guarantee self-evident in the TU).
-static_assert(CitadelWire::ABI_VERSION == CITADEL_FFI_ABI_VERSION,
-              "Tier-B: Citadel Unreal SDK ABI version drifted from citadel_client.h");
+static_assert(CitadelWire::ABI_VERSION == 3 && CITADEL_FFI_ABI_VERSION == 3,
+              "Tier-B: Unreal NetworkPeer requires typed C ABI v3");
 
 // (3) Spot-check the status enum values the SDK maps onto ECitadelStatus.
 static_assert(CITADEL_STATUS_OK == 0, "Tier-B: CITADEL_STATUS_OK changed");

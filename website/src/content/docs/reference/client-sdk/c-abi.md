@@ -12,7 +12,7 @@ page from it (see [generated docs](/reference/operations/generated/)). See the
 ## Version
 
 ```c
-#define CITADEL_FFI_ABI_VERSION 2
+#define CITADEL_FFI_ABI_VERSION 3
 
 uint32_t citadel_client_abi_version(void);
 ```
@@ -140,6 +140,50 @@ on invalid arguments.
 
 Free a handle. After this the pointer is invalid and must not be reused. Passing
 null is a no-op.
+
+## NetworkPeer codec and typed authoring (ABI v3)
+
+ABI v3 exposes the canonical NetworkPeer codec independently of a connection.
+`citadel_schema_hash` derives the required 16-byte class identity. The legacy
+v2 `citadel_rep_decode` entrypoint and its 40-byte `CitadelRepCodec` array are
+frozen for scalar-only callers. Typed Vector3/quaternion and keyed-collection
+decode uses the additive v3 `citadel_rep_decode_with_collections` entrypoint
+with `CitadelRepDecodeFieldCodecV3` / `CitadelRepCodecV3`. The opaque decoded
+handle exposes header/field access and must be freed with
+`citadel_rep_decoded_free`.
+
+Collection iteration takes a sparse changed-field index. Before applying its
+operations, call `citadel_rep_decoded_collection_field_id` to obtain the source
+schema `field_id`; never treat that changed-field ordinal as a reflected property
+identifier. The accessor rejects scalar and out-of-range indexes.
+
+For authoring, create a `CitadelRepEncoder` with `citadel_rep_encoder_new`, call
+`citadel_rep_encoder_set_schema` for full snapshots, add each changed field, then
+call `citadel_rep_encoder_finish` and `citadel_rep_encoder_free`. A non-full
+packet requires a nonzero base token; a full packet requires the schema identity.
+The transaction fails closed: an invalid field, duplicate field id, mismatched
+codec, invalid collection operation, or cap violation makes `finish` return
+`CITADEL_STATUS_INVALID_ARGUMENT` without emitting a partial bunch.
+
+| Function family | ABI v3 support |
+| --- | --- |
+| `citadel_rep_encoder_add_bool`, `_int`, `_scalar`, `_bytes` | Bool, bounded integer, fixed-point scalar, and capped byte fields. |
+| `citadel_rep_encoder_add_vector3` | Three finite world-unit floats; `bounds = 0` selects protocol defaults. |
+| `citadel_rep_encoder_add_quat` | Smallest-three quaternion with 9, 10, or 15 bits/component. |
+| `citadel_rep_encoder_add_collection` | Keyed remove/add/change operations; collection items may use the preceding scalar, vector, or quaternion codecs. Bytes are copied before the call returns. |
+
+The frozen v2 `CitadelRepCodec` supports `0=bool`, `1=int range`,
+`2=scalar`, and `3=bytes` only. The distinct v3 `CitadelRepCodecV3` adds
+`vector_bounds` and `quat_bits`, with `4=Vector3` and
+`5=smallest-three quaternion`; never pass a v3 descriptor array to the legacy
+decode entrypoint. `CitadelRepCollectionOp` carries the keyed collection
+operation, generation, `rep_key`, typed value slots, and optional bytes.
+
+This ABI encodes/decodes bytes only. It does **not** connect or register a client,
+register a class/object, send an envelope, enable `[transport.network_peer]`, or
+perform an engine-runtime integration. Unity has a source-level managed v3 wrapper;
+Unreal and Godot have source bindings, but engine runtime verification is deferred
+because those engines were unavailable for this pass.
 
 ## Building
 

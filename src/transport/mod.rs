@@ -44,7 +44,9 @@ use crate::chat_cluster::{
     ChatDeliveryDispatcher, ChatPresenceDirectory, ChatPresenceLease, ChatPresencePublisher,
     ChatPresenceWithdrawal, LocalChatPresenceAnnouncer,
 };
-use crate::config::{Config, LuaExecutionMode, RuntimeLanguage, TransformSyncConfig};
+use crate::config::{
+    Config, LuaExecutionMode, NetworkPeerConfig, RuntimeLanguage, TransformSyncConfig,
+};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::lifecycle::{CancellationToken, Supervisor};
 use crate::matchmaker_cluster::QueueShardId;
@@ -54,6 +56,7 @@ use crate::matchmaker_transport::{
     TlsMatchmakerHandoffRouter, read_matchmaker_control_certificate,
 };
 use crate::realtime::Gateway;
+use crate::realtime::netpeer::{RateLimits, RepAuthority, RepInterestConfig};
 use crate::realtime::transform::{TransformHub, TransformHubConfig, TransformState};
 #[cfg(feature = "runtime-js")]
 use crate::runtime::JsRuntime;
@@ -167,6 +170,9 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     );
 
     gateway = gateway.with_maps(maps);
+    if let Some(rep) = build_network_peer(&cfg.network_peer) {
+        gateway = gateway.with_rep_authority(rep);
+    }
 
     // Expose the persisted domain features to game clients via built-in RPC
     // methods (`friends.*`, …; ). Guests are rejected per-call; the
@@ -470,6 +476,30 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     }
 
     Ok(supervisor)
+}
+
+/// Build the production NetworkPeer authority only when explicitly enabled.
+/// Class/object registration is intentionally left to trusted server lifecycle
+/// code, keeping client frames unable to author schemas or objects.
+fn build_network_peer(cfg: &NetworkPeerConfig) -> Option<Arc<RepAuthority>> {
+    if !cfg.enabled {
+        return None;
+    }
+    let interest = RepInterestConfig {
+        cell_size: cfg.interest_cell_size as f32,
+        inner: cfg.interest_inner as f32,
+        outer: cfg.interest_outer as f32,
+    };
+    let authority = RepAuthority::with_interest(RateLimits::default(), interest)
+        .with_shared_quantized_state(cfg.shared_quantized_state);
+    tracing::info!(
+        cell_size = cfg.interest_cell_size,
+        inner = cfg.interest_inner,
+        outer = cfg.interest_outer,
+        shared_quantized_state = cfg.shared_quantized_state,
+        "NetworkPeer authority enabled"
+    );
+    Some(Arc::new(authority))
 }
 
 /// Build the authoritative transform-sync hub from config, spawn any

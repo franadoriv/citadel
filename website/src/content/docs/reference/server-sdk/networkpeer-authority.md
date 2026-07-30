@@ -8,7 +8,14 @@ layer](/reference/protocol/networkpeer-deltabunch/)) implements the **server aut
 pipeline**: the trust boundary that makes Citadel's client-authoritative upstream
 safe. Every inbound `KIND_REP_DELTA` is treated as **hostile input**.
 
-The palpable slice: a client changes `Health`, the server validates and clamps it,
+The gateway integration is deliberately opt-in: `[transport.network_peer]` builds
+and attaches the authority only when `enabled = true`; it is disabled by default.
+A gateway admission joins the default replication match and receives a reliable
+schema/full-baseline bootstrap. Trusted lifecycle code—not client frames—registers
+classes, spawns/despawns objects, and may use `join_rep_match` to bind a receiver
+to another trusted match.
+
+The usable slice: a client changes `Health`, the server validates and clamps it,
 and a second client sees the **authoritative** value — carried in a bunch the
 server re-encoded, never the sender's bytes.
 
@@ -88,11 +95,16 @@ cannot burn CPU or memory setting a large field it does not own.
 
 ## Status and limits
 
-- Implemented: the full validate → apply → rebroadcast pipeline wired into the
-  realtime gateway (`KIND_REP_DELTA` / `KIND_REP_ACK`), server-stamped rebroadcast,
-  aggregate rate/budget with amplification accounting, bounds validation/clamp, the
-  stale + schema-binding + TOCTOU guards, `COND_*` masking, and the veto hook.
-- Not yet shipped: interest-filtered rebroadcast through the shared grid and cross-
-  engine (Unity/Godot) migration; inbound client **collections** (rejected this
-  phase); per-match scoping graduates once matches land. This phase uses single-room
-  fan-out and one standalone `DeltaBunch` per frame.
+- Implemented: the validate → apply → rebroadcast pipeline is wired into the
+  opt-in realtime gateway (`KIND_REP_DELTA` / `KIND_REP_ACK`), with trusted
+  registration/spawn/despawn and schema/full-baseline bootstrap seams;
+  server-stamped rebroadcast, aggregate rate/budget with amplification accounting,
+  bounds validation/clamp, stale/schema-binding/TOCTOU guards, `COND_*` masking,
+  and the veto hook all apply.
+- The authority's shared `InterestGrid` filters relevancy at the replication layer.
+  This is **not** automatic AOI-by-room or AOI-by-match: the generic gateway starts
+  admissions in match `0`, and a trusted caller must make later match bindings.
+  Room and matchmaker lifecycle ownership remain deferred work.
+- Inbound client collections and typed C ABI/Rust authoring are supported by the
+  wire/authority contracts. Engine bindings remain partial; runtime verification is
+  deferred because Unity, Unreal, and Godot were unavailable for this pass.

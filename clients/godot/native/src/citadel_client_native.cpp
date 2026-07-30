@@ -6,6 +6,8 @@
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/char_string.hpp>
+#include <godot_cpp/variant/quaternion.hpp>
+#include <godot_cpp/variant/vector3.hpp>
 
 namespace godot {
 namespace {
@@ -165,6 +167,8 @@ Dictionary CitadelClientNative::decode_rep(const PackedByteArray &body, const Pa
         codec.scalar_max = float(spec.get("scalar_max", 0.0));
         codec.values_per_unit = static_cast<uint32_t>(int64_t(spec.get("values_per_unit", 0)));
         codec.max_len = static_cast<uint32_t>(int64_t(spec.get("max_len", 0)));
+        codec.vector_bounds = float(spec.get("vector_bounds", 0.0));
+        codec.quat_bits = static_cast<uint32_t>(int64_t(spec.get("quat_bits", 0)));
         native_codecs.push_back(codec);
     }
     CitadelRepDecoded *decoded = nullptr;
@@ -227,6 +231,33 @@ Dictionary CitadelClientNative::encode_rep(int64_t object_id, bool is_full, int6
             case 1: status = citadel_rep_encoder_add_int(encoder, id, int64_t(field.get("min", 0)), int64_t(field.get("max", 0)), int64_t(field.get("value", 0))); break;
             case 2: status = citadel_rep_encoder_add_scalar(encoder, id, float(field.get("min", 0.0)), float(field.get("max", 0.0)), static_cast<uint32_t>(int64_t(field.get("values_per_unit", 0))), float(field.get("value", 0.0))); break;
             case 3: { const PackedByteArray bytes = field.get("value", PackedByteArray()); status = citadel_rep_encoder_add_bytes(encoder, id, static_cast<uint32_t>(int64_t(field.get("max_len", 0))), bytes.is_empty() ? nullptr : bytes.ptr(), bytes.size()); break; }
+            case 4: { const Vector3 value = field.get("value", Vector3()); const std::array<float, 3> raw{value.x, value.y, value.z}; status = citadel_rep_encoder_add_vector3(encoder, id, float(field.get("bounds", 0.0)), raw.data()); break; }
+            case 5: { const Quaternion value = field.get("value", Quaternion()); const std::array<float, 4> raw{value.x, value.y, value.z, value.w}; status = citadel_rep_encoder_add_quat(encoder, id, static_cast<uint32_t>(int64_t(field.get("bits", 0))), raw.data()); break; }
+            case 6: {
+                const Dictionary item_spec = field.get("item_codec", Dictionary());
+                CitadelRepCodec item{};
+                item.kind = static_cast<uint8_t>(int64_t(item_spec.get("kind", -1)));
+                item.int_min = int64_t(item_spec.get("int_min", 0)); item.int_max = int64_t(item_spec.get("int_max", 0));
+                item.scalar_min = float(item_spec.get("scalar_min", 0.0)); item.scalar_max = float(item_spec.get("scalar_max", 0.0));
+                item.values_per_unit = static_cast<uint32_t>(int64_t(item_spec.get("values_per_unit", 0)));
+                item.max_len = static_cast<uint32_t>(int64_t(item_spec.get("max_len", 0)));
+                item.vector_bounds = float(item_spec.get("vector_bounds", 0.0)); item.quat_bits = static_cast<uint32_t>(int64_t(item_spec.get("quat_bits", 0)));
+                const Array source = field.get("operations", Array()); std::vector<CitadelRepCollectionOp> ops; std::vector<PackedByteArray> byte_values;
+                ops.reserve(source.size()); byte_values.reserve(source.size());
+                for (int j = 0; j < source.size(); ++j) {
+                    const Dictionary input = source[j]; CitadelRepCollectionOp op{};
+                    op.op = static_cast<uint8_t>(int64_t(input.get("op", -1))); op.value_kind = static_cast<uint8_t>(int64_t(input.get("value_kind", -1)));
+                    op.rep_index = static_cast<uint32_t>(int64_t(input.get("rep_index", -1))); op.rep_generation = static_cast<uint32_t>(int64_t(input.get("rep_generation", -1)));
+                    op.rep_key = static_cast<uint64_t>(int64_t(input.get("rep_key", 0))); op.int_value = int64_t(input.get("int_value", 0));
+                    const Variant raw = input.get("value", Variant());
+                    if (raw.get_type() == Variant::VECTOR3) { const Vector3 value = raw; op.floats[0] = value.x; op.floats[1] = value.y; op.floats[2] = value.z; }
+                    else if (raw.get_type() == Variant::QUATERNION) { const Quaternion value = raw; op.floats[0] = value.x; op.floats[1] = value.y; op.floats[2] = value.z; op.floats[3] = value.w; }
+                    else if (raw.get_type() == Variant::FLOAT || raw.get_type() == Variant::INT) op.floats[0] = float(raw);
+                    else if (raw.get_type() == Variant::PACKED_BYTE_ARRAY) { byte_values.push_back(raw); op.bytes = byte_values.back().is_empty() ? nullptr : byte_values.back().ptr(); op.bytes_len = byte_values.back().size(); }
+                    ops.push_back(op);
+                }
+                status = citadel_rep_encoder_add_collection(encoder, id, item, static_cast<uint32_t>(int64_t(field.get("max_items", 0))), ops.empty() ? nullptr : ops.data(), ops.size()); break;
+            }
             default: status = CITADEL_STATUS_INVALID_ARGUMENT; break;
         }
     }

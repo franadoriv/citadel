@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use citadel_wire::baseline::{AckField, BaselineAllocator, BaselineId, BaselineTracker};
 use citadel_wire::netpeer::{
-    CollItem, CollectionDelta, DeltaBunch, FieldDelta, RepId, RepSchema, RepValue,
+    CollItem, CollectionDelta, DeltaBunch, FieldDelta, RepFieldCodec, RepId, RepSchema, RepValue,
 };
 
 /// A receiver (connection) identity for per-connection baseline state.
@@ -219,12 +219,20 @@ impl ObjectReplicator {
             // are superseded.
             state.pending.clear();
             let empty = RepSnapshot::new();
-            (true, 0u64, diff_snapshots(&empty, &current))
+            // A full is authoritative, not merely an incremental diff from an
+            // empty map.  In particular, every schema collection must be
+            // present even when it currently has no items, so a receiver can
+            // clear stale keyed entries left by an older baseline.
+            (
+                true,
+                0u64,
+                diff_snapshots(&empty, &current, Some(&self.schema)),
+            )
         } else {
             // Diff against the last *acked* snapshot (finding 6), not the last
             // unacked one, so a dropped intermediate delta still carries the change.
             let base = state.acked.as_ref().unwrap_or(&self.current);
-            let changes = diff_snapshots(base, &current);
+            let changes = diff_snapshots(base, &current, None);
             if changes.is_empty() {
                 return None;
             }
@@ -282,7 +290,11 @@ impl ObjectReplicator {
 /// Diff `current` against `base`, producing the per-field delta. Scalars differ
 /// when the value changed; collections yield removed/added/changed by `rep_id`
 /// with `gen`-tagged distinctness (design §3.3).
-fn diff_snapshots(base: &RepSnapshot, current: &RepSnapshot) -> BTreeMap<u16, FieldDelta> {
+fn diff_snapshots(
+    base: &RepSnapshot,
+    current: &RepSnapshot,
+    full_schema: Option<&RepSchema>,
+) -> BTreeMap<u16, FieldDelta> {
     let mut out = BTreeMap::new();
 
     for (&field_id, value) in &current.scalars {
@@ -291,7 +303,29 @@ fn diff_snapshots(base: &RepSnapshot, current: &RepSnapshot) -> BTreeMap<u16, Fi
         }
     }
 
-    for (&field_id, cur_map) in &current.collections {
+    // Incremental deltas mention only fields present in current state. A full
+    // additionally emits every collection declared by the schema, including
+    // empty maps omitted from `RepSnapshot`, to establish an authoritative
+    // reset boundary at the receiver.
+    let mut collection_fields: BTreeMap<u16, &CollectionState> = current
+        .collections
+        .iter()
+        .map(|(&field_id, state)| (field_id, state))
+        .collect();
+    let empty_collection = CollectionState::new();
+    if let Some(schema) = full_schema {
+        for field_id in 0..schema.num_fields() {
+            if matches!(
+                schema.field(field_id as u16),
+                Some(RepFieldCodec::Collection { .. })
+            ) {
+                collection_fields
+                    .entry(field_id as u16)
+                    .or_insert(&empty_collection);
+            }
+        }
+    }
+    for (&field_id, &cur_map) in &collection_fields {
         let empty = CollectionState::new();
         let base_map = base.collections.get(&field_id).unwrap_or(&empty);
         let mut removed = Vec::new();
@@ -321,7 +355,8 @@ fn diff_snapshots(base: &RepSnapshot, current: &RepSnapshot) -> BTreeMap<u16, Fi
             }
         }
 
-        if !removed.is_empty() || !added.is_empty() || !changed.is_empty() {
+        if full_schema.is_some() || !removed.is_empty() || !added.is_empty() || !changed.is_empty()
+        {
             out.insert(
                 field_id,
                 FieldDelta::Collection(CollectionDelta {
@@ -398,6 +433,51 @@ mod tests {
         let mut budget = MAX_ENVELOPE_ALLOC;
         let back = DeltaBunch::decode(&blob, r.schema(), &mut budget).unwrap();
         assert!(back.is_full);
+    }
+
+    #[test]
+    fn full_snapshot_emits_empty_collection_as_authoritative_reset() {
+        // `RepSnapshot` intentionally omits empty collection maps. A full must
+        // nevertheless carry the collection field so a client that has stale
+        // keyed state clears it before applying this zero-op delta.
+        let mut r = repl();
+        let mut alloc = BaselineAllocator::new();
+        r.add_receiver(7);
+
+        let full = r.build_delta(7, &mut alloc).unwrap();
+        assert!(full.is_full);
+        assert_eq!(
+            full.bunch.changes.get(&2),
+            Some(&FieldDelta::Collection(CollectionDelta::default()))
+        );
+    }
+
+    #[test]
+    fn forced_full_replays_collection_as_adds_not_incremental_change() {
+        let mut r = repl();
+        let mut alloc = BaselineAllocator::new();
+        let id = RepId {
+            index: 3,
+            generation: 1,
+        };
+        r.current_mut().set_item(2, id, 9, RepValue::Int(42));
+        r.add_receiver(7);
+        let initial = r.build_delta(7, &mut alloc).unwrap();
+        r.on_ack(7, &ack_of(initial.result_id));
+
+        // A receiver may retain stale local keyed state across recovery. The
+        // full payload is therefore an empty-base add, never a sparse change.
+        r.force_full(7);
+        let full = r.build_delta(7, &mut alloc).unwrap();
+        match full.bunch.changes.get(&2).unwrap() {
+            FieldDelta::Collection(collection) => {
+                assert!(collection.removed.is_empty());
+                assert!(collection.changed.is_empty());
+                assert_eq!(collection.added.len(), 1);
+                assert_eq!(collection.added[0].id, id);
+            }
+            _ => panic!("expected collection delta"),
+        }
     }
 
     #[test]

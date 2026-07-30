@@ -172,6 +172,40 @@ export class RpcError extends Error {
   serverMessage: string;
 }
 
+// --- NetworkPeer browser helpers ---------------------------------------------
+
+export type NetworkPeerFieldCodec =
+  | { type: "bool" }
+  | { type: "int"; min: number; max: number }
+  | { type: "scalar"; min: number; max: number; valuesPerUnit: number }
+  | { type: "vector3"; min: number; max: number; valuesPerUnit: number }
+  | { type: "quat"; bits: 9 | 10 | 15 }
+  | { type: "bytes"; maxLen: number }
+  | { type: "collection"; item: Exclude<NetworkPeerFieldCodec, { type: "collection" }>; maxItems: number };
+export interface NetworkPeerSchema { hash: Uint8Array; layoutVersion: number; fields: NetworkPeerFieldCodec[]; }
+export interface RepId { index: number; generation: number; }
+export interface CollectionDelta { removed: RepId[]; added: Array<{ id: RepId; key: bigint; value: unknown }>; changed: Array<{ id: RepId; key: bigint; value: unknown }>; }
+export interface DeltaBunch { objectId: number; isFull: boolean; resultId: bigint; baseId?: bigint; changes?: Map<number, unknown> | Record<number, unknown>; }
+export function encodeDeltaBunch(schema: NetworkPeerSchema, bunch: DeltaBunch): Uint8Array;
+export function decodeDeltaBunch(schema: NetworkPeerSchema, body: Uint8Array): DeltaBunch & { baseId: bigint; changes: Map<number, unknown> };
+export function encodeDeltaBunches(schema: NetworkPeerSchema, bunches: DeltaBunch[]): Uint8Array;
+export function decodeDeltaBunches(schema: NetworkPeerSchema, body: Uint8Array): Array<ReturnType<typeof decodeDeltaBunch>>;
+export function encodeRepAck(entries: Array<{ objectId: number; ackedResultId: bigint; history: number }>): Uint8Array;
+export function decodeRepAck(body: Uint8Array): Array<{ objectId: number; ackedResultId: bigint; history: number }>;
+export class NetworkPeerAuthor {
+  constructor(schema: NetworkPeerSchema);
+  full(objectId: number, resultId: bigint, changes?: DeltaBunch["changes"]): Uint8Array;
+  delta(objectId: number, resultId: bigint, baseId: bigint, changes?: DeltaBunch["changes"]): Uint8Array;
+}
+export class NetworkPeerSession {
+  constructor(schema: NetworkPeerSchema);
+  apply(body: Uint8Array): { status: "applied"; bunch: ReturnType<typeof decodeDeltaBunch> } | { status: "stale" } | { status: "needs_full"; objectId: number; expectedBase?: bigint };
+  applyEnvelope(envelope: Envelope): ReturnType<NetworkPeerSession["apply"]>;
+  baseline(objectId: number): bigint | undefined;
+  ackBody(): Uint8Array;
+  ackEnvelope(): Envelope;
+}
+
 // --- Protocol constants + codecs ---------------------------------------------
 
 export const EXPECTED_ABI_VERSION: number;

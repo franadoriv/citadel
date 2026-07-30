@@ -50,6 +50,10 @@ pub enum TypeTag {
     Bytes = 7,
     /// An enumeration (encoded as a bounded integer).
     Enum = 8,
+    /// A keyed collection whose item codec is declared in the wire schema.
+    /// Collection identity is `(rep_index, rep_generation)`, never a container
+    /// position, and `MaxCardinality` participates in the schema hash.
+    Collection = 9,
 }
 
 impl TypeTag {

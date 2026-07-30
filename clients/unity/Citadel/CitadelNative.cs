@@ -81,7 +81,7 @@ namespace Citadel
         /// (<c>CITADEL_FFI_ABI_VERSION</c>). Checked against
         /// <see cref="citadel_client_abi_version"/> at startup.
         /// </summary>
-        public const uint ExpectedAbiVersion = 2;
+        public const uint ExpectedAbiVersion = 3;
 
         /// <summary>Return the ABI version the native library was built with.</summary>
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
@@ -232,6 +232,23 @@ namespace Citadel
             public float scalar_max;
             public uint values_per_unit;
             public uint max_len;
+            public float vector_bounds;
+            public uint quat_bits;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RepCollectionOp
+        {
+            public byte op;
+            public byte value_kind;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)] public byte[] reserved;
+            public uint rep_index;
+            public uint rep_generation;
+            public ulong rep_key;
+            public long int_value;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public float[] floats;
+            public IntPtr bytes;
+            public UIntPtr bytes_len;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -259,5 +276,29 @@ namespace Citadel
         public static extern CitadelStatus citadel_rep_decoded_field_at(IntPtr decoded, UIntPtr index, out RepFieldValue value);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
         public static extern void citadel_rep_decoded_free(IntPtr decoded);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr citadel_rep_encoder_new(uint objectId,
+            [MarshalAs(UnmanagedType.I1)] bool isFull, ulong resultId, ulong baseId, UIntPtr fieldCount);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_set_schema(IntPtr encoder, [In] byte[] hash, uint layoutVersion);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_add_bool(IntPtr encoder, ushort fieldId, [MarshalAs(UnmanagedType.I1)] bool value);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_add_int(IntPtr encoder, ushort fieldId, long min, long max, long value);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_add_scalar(IntPtr encoder, ushort fieldId, float min, float max, uint valuesPerUnit, float value);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_add_bytes(IntPtr encoder, ushort fieldId, uint maxLen, [In] byte[] data, UIntPtr len);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_add_vector3(IntPtr encoder, ushort fieldId, float bounds, [In] float[] value);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_add_quat(IntPtr encoder, ushort fieldId, uint bitsPerComponent, [In] float[] value);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_add_collection(IntPtr encoder, ushort fieldId, RepCodec itemCodec, uint maxItems, [In] RepCollectionOp[] ops, UIntPtr opCount);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_rep_encoder_finish(IntPtr encoder, [Out] byte[] output, UIntPtr capacity, out UIntPtr outputLength, [MarshalAs(UnmanagedType.I1)] out bool truncated);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void citadel_rep_encoder_free(IntPtr encoder);
     }
 }

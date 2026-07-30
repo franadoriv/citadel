@@ -39,6 +39,7 @@ enum class ECitadelFieldType : uint16
     Quat = 6,
     Bytes = 7,
     Enum = 8,
+    Collection = 9,
 };
 
 /** Replication condition (COND_* analogue); matches Rust `RepCondition`. */
@@ -133,6 +134,34 @@ uint64 CitadelStableKeyFromName(const FString& Name);
 // The full 64-bit fold of a base bounds shape with a stable key. MUST match the
 // Rust `combined_bounds_shape`.
 uint64 CitadelCombinedBoundsShape(uint64 BoundsShape, uint64 StableKey);
+
+/** A caller-owned keyed collection operation passed to the shared C ABI. */
+struct FCitadelCollectionOp
+{
+    uint8 Op = 0; // 0=remove, 1=add, 2=change
+    uint8 ValueKind = 0; // CitadelRepCodec kind: bool/int/scalar/bytes/vector/quat
+    uint32 RepIndex = 0;
+    uint32 RepGeneration = 0;
+    uint64 RepKey = 0;
+    int64 IntValue = 0;
+    float Floats[4] = {0.f, 0.f, 0.f, 0.f};
+    TArray<uint8> Bytes;
+};
+
+/** Codec/cap metadata for a queued keyed collection field. */
+struct FCitadelCollectionCodec
+{
+    uint8 ItemKind = 0;
+    int64 IntMin = 0;
+    int64 IntMax = 0;
+    float ScalarMin = 0.f;
+    float ScalarMax = 0.f;
+    uint32 ValuesPerUnit = 0;
+    uint32 MaxLen = 0;
+    float VectorBounds = 0.f;
+    uint32 QuatBits = 10;
+    uint32 MaxItems = 0;
+};
 
 /**
  * The immutable, per-UClass replicated-field table (the UE `FRepLayout`
@@ -246,9 +275,9 @@ private:
 
 /**
  * The opt-in component you add to an actor to auto-sync its replication-flagged
- * properties to Citadel. Phase 1 provides the change-detection layer only:
- * dirty mask + shadow net + the dev pre-encode audit. It does NOT yet build or
- * send a DeltaBunch.
+ * properties to Citadel. Dirty state is tracked with a push mask plus a shadow
+ * safety net; `BuildDeltaBunch` delegates typed value encoding to the canonical
+ * C ABI (including Vector3 and quaternion).
  */
 UCLASS(ClassGroup = (Citadel), meta = (BlueprintSpawnableComponent))
 class UCitadelNetworkPeer : public UActorComponent
@@ -256,8 +285,13 @@ class UCitadelNetworkPeer : public UActorComponent
     GENERATED_BODY()
 
 public:
+    /** Match-unique authoritative object id; zero is deliberately unbound. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Citadel|Replication")
+    int64 ObjectId = 0;
+
     // Resolve + cache the owner's layout (once) at registration.
     virtual void InitializeComponent() override;
+    virtual void OnComponentDestroyed(bool bDestroyingHierarchy) override;
 
     /** Push-model mark (design section 3.1). O(1). */
     void MarkDirty(uint16 FieldId);
@@ -293,7 +327,7 @@ public:
 
     /**
      * Encode a client->server DeltaBunch of this actor's changed, CLIENT-OWNED
-     * scalar fields through the shared C ABI encoder, so the bits are
+     * typed fields through the shared C ABI encoder, so the bits are
      * byte-identical to the server's `citadel_wire::netpeer` encoder — the client
      * never reimplements the BitWriter or codecs.
      *
@@ -305,10 +339,43 @@ public:
      * scalar field is included. Returns the encoded bytes to send under
      * `CitadelWire::KIND_REP_DELTA`, or an empty array on failure.
      *
-     * Collections are not encoded from the client here (client-owned collections
-     * are rare); the server retains full keyed-collection support. See docs.
+     * A failed typed field rejects the entire bunch; no partial update is
+     * emitted. `ResultId` must advance the locally accepted token and deltas must
+     * use the last accepted baseline; callers can use `AcceptBaseline` and
+     * `NeedsFullRecovery` to enforce that control flow.
      */
     TArray<uint8> BuildDeltaBunch(bool bIsFull, uint64 ResultId, uint64 BaseId) const;
+
+    /** Record a server-accepted result token. Stale/non-monotonic tokens are rejected. */
+    bool AcceptBaseline(uint64 ResultId);
+    /** A delta must not be authored until a nonzero accepted baseline exists. */
+    bool NeedsFullRecovery() const { return AcceptedBaselineId == 0; }
+    uint64 AcceptedBaseline() const { return AcceptedBaselineId; }
+
+    /**
+     * Queue a keyed collection delta for a client-owned field. Operation bytes
+     * are copied immediately; identity is the caller-supplied (index,generation)
+     * plus rep_key, never an Unreal array index. Replacing a queued field is
+     * intentional: the C ABI validates the complete replacement transaction.
+     */
+    bool QueueCollection(uint16 FieldId, const FCitadelCollectionCodec& Codec,
+        const TArray<FCitadelCollectionOp>& Operations);
+
+    /** Return the bound authoritative server object id, or zero when unbound or out of wire range. */
+    uint32 BoundObjectId() const
+    {
+        return ObjectId > 0 && ObjectId <= static_cast<int64>(TNumericLimits<uint32>::Max())
+            ? static_cast<uint32>(ObjectId) : 0;
+    }
+
+    /** Decode one authoritative KIND_REP_DELTA bunch and apply it to this exact
+     * bound actor.  A mismatched object, stale token, missing base, malformed
+     * value, or unsupported reflected container rejects the whole bunch. */
+    bool ReceiveDeltaBunch(const TArray<uint8>& Body);
+
+    /** Route an inbound replication body to the component bound to its decoded
+     * object id.  The transport pump calls this; it never guesses an actor. */
+    static void RouteRepDelta(class UGameInstance* GameInstance, const TArray<uint8>& Body);
 
 private:
     // Snapshot every registered field's current value into ShadowValues.
@@ -319,8 +386,24 @@ private:
     // unsupported/unbounded field, which is skipped).
     bool AppendFieldToEncoder(struct CitadelRepEncoder* Encoder,
         const FCitadelFieldDesc& Field) const;
-
+    // Validate the entire decoded bunch before any reflected property mutates;
+    // ApplyDecodedFields snapshots and restores as a second atomicity guard.
+    bool ValidateDecodedFields(const struct CitadelRepDecoded* Decoded, bool bIsFull) const;
+    bool ValidateCollectionField(const struct CitadelRepDecoded* Decoded, uintptr_t ChangedIndex,
+        uint16 SourceFieldId, bool bIsFull) const;
+    bool ApplyDecodedFields(const struct CitadelRepDecoded* Decoded, bool bIsFull);
+    bool ApplyCollectionField(const struct CitadelRepDecoded* Decoded, uintptr_t ChangedIndex,
+        uint16 SourceFieldId);
+    void SendRepAck(uint64 ResultId);
+    void RequestFullRecovery();
     const FCitadelRepLayout* CachedLayout = nullptr; // built once, per UClass
     TBitArray<> DirtyMask;                            // one bit per field_id
     TArray<TArray<uint8>> ShadowValues;               // registered fields only
+    uint64 AcceptedBaselineId = 0;                     // monotonic server-accepted token
+    TMap<uint16, FCitadelCollectionCodec> PendingCollectionCodecs;
+    TMap<uint16, TArray<FCitadelCollectionOp>> PendingCollections;
+    // Keyed collection identity is protocol identity, never an Unreal array
+    // ordinal.  It is reset only with this component/object lifecycle.
+    TMap<uint16, TMap<uint64, int32>> CollectionIndices;
+    bool bReceiveNeedsFullRecovery = false;
 };

@@ -38,7 +38,8 @@ use crate::observability::NodeMetrics;
 use crate::party::{PartyId, PartyRegistry, PartySnapshot};
 use crate::realtime::auth::{AuthOutcome, Authenticator, PresentedCredential};
 use crate::realtime::chat_presence::{ChatPresenceRegistry, ChatSubscription};
-use crate::realtime::netpeer::RepAuthority;
+use crate::realtime::netpeer::layout::RepLayout;
+use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot};
 use crate::realtime::registry::{
     Outbound, ParticipantId, ParticipantIdGen, SessionHandle, SessionRegistry,
 };
@@ -57,6 +58,7 @@ use crate::session::NodeId;
 use crate::session::SessionTokenSecret;
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 use crate::transport::{Delivery, Envelope};
+use citadel_wire::netpeer::RepSchema;
 
 pub use citadel_wire::protocol::{
     KIND_AUTH, KIND_AUTH_RESULT, KIND_CHAT_EVENT, KIND_MATCHMAKER_MATCHED, KIND_NA_DESPAWN,
@@ -2393,6 +2395,62 @@ impl Gateway {
         self.rep.as_ref()
     }
 
+    /// Register one approved replicated class from trusted server lifecycle
+    /// code. Network clients have no protocol route to this method.
+    pub fn register_rep_class(
+        &self,
+        class_id: u32,
+        layout: &'static RepLayout,
+        schema: RepSchema,
+    ) -> Result<(), RepReject> {
+        self.rep
+            .as_ref()
+            .ok_or(RepReject::UnknownObject)?
+            .register_class(class_id, layout, schema)
+    }
+
+    /// Spawn a replicated object from trusted server lifecycle code. Clients can
+    /// propose values only through the authority's validated delta path.
+    pub fn spawn_rep_object(
+        &self,
+        object_id: u32,
+        match_id: u64,
+        class_id: u32,
+        owner: Option<ParticipantId>,
+        persistent: bool,
+        initial: RepSnapshot,
+    ) -> Result<(), RepReject> {
+        self.rep
+            .as_ref()
+            .ok_or(RepReject::UnknownObject)?
+            .spawn_object(
+                object_id,
+                match_id,
+                class_id,
+                owner.map(ParticipantId::get),
+                persistent,
+                initial,
+            )
+    }
+
+    /// Despawn a replicated object from trusted server lifecycle code.
+    pub fn despawn_rep_object(&self, object_id: u32) -> bool {
+        self.rep
+            .as_ref()
+            .is_some_and(|rep| rep.despawn_object(object_id))
+    }
+
+    /// Bind a connected receiver to a trusted match and reliably send its schema
+    /// table followed by full baselines. Match ownership/AOI policy remains
+    /// outside this generic gateway seam.
+    pub fn join_rep_match(&self, id: ParticipantId, match_id: u64, is_guest: bool) {
+        let Some(rep) = &self.rep else {
+            return;
+        };
+        rep.join_match(id.get(), match_id, is_guest);
+        self.send_rep_bootstrap(id);
+    }
+
     /// Whether an embedded script runtime is driving message dispatch.
     #[must_use]
     pub fn has_runtime(&self) -> bool {
@@ -2563,7 +2621,36 @@ impl Gateway {
         if authenticated {
             self.metrics.session_opened();
         }
+        // The default global match is only the gateway lifecycle seam, not
+        // match-scoped AOI. Match owners can immediately rebind through
+        // `join_rep_match`; reconnects receive a fresh schema + full baseline.
+        // Preserve a trusted admission assignment that arrived before a socket
+        // finished its transport handshake.
+        if let Some(rep) = &self.rep {
+            if !rep.is_joined(id.get()) {
+                rep.join_match(id.get(), 0, !authenticated);
+            }
+            self.send_rep_bootstrap(id);
+        }
         self.dispatch_lifecycle(LifecycleHook::Join, id);
+    }
+
+    fn send_rep_bootstrap(&self, id: ParticipantId) {
+        let Some(rep) = &self.rep else {
+            return;
+        };
+        for out in rep.bootstrap(id.get()) {
+            let bytes = out.body.len() as u64;
+            if self.registry.send_to(
+                ParticipantId::from_raw(out.participant),
+                &Outbound {
+                    delivery: Delivery::Reliable,
+                    envelope: Envelope::new(out.kind, out.body),
+                },
+            ) {
+                self.metrics.record_message_out(bytes);
+            }
+        }
     }
 
     /// Unregister a session on disconnect and drop the `sessions_active` gauge.

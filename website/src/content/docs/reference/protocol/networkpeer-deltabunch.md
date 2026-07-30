@@ -69,23 +69,36 @@ diff against the last **acked** baseline (cumulative), so a dropped intermediate
 delta still carries the change. A newly-relevant receiver, an ack timeout, or a
 capped/overflowed baseline falls back to a full snapshot.
 
-## Client `schema_hash` + encoder (C ABI)
+### Missing-base recovery status
 
-Native SDKs compute the class identity and encode a `DeltaBunch` through the
-**one** shared implementation, so their bits are byte-identical to the server's:
+The currently specified NetworkPeer transport has only `KIND_REP_DELTA`,
+`KIND_REP_ACK`, and `KIND_REP_SCHEMA`; it has **no client-to-server
+full-recovery/resend request**. On a missing base, a client must reject the
+whole bunch atomically, send no ACK for it, and keep no invented baseline. It
+then waits for the server's existing full-baseline, relevance re-entry, or ACK
+-timeout policy. This is not a prompt resend guarantee. A future prompt
+recovery feature must add a named wire kind, its body, gateway handling, and
+interoperability tests before SDKs may claim to request a full snapshot.
+
+## Client `schema_hash` + typed authoring (C ABI v3 and Rust)
+
+C ABI **v3** and the Rust client author packets through the one canonical wire
+implementation, so their bits match the server codec:
 
 - `citadel_schema_hash(layout_version, fields[], count, out_hash[16])` computes the
   wide 128-bit digest over the ordered field tuples (the `bounds_shape` FNV fold is
-  reproduced natively; only the BLAKE3-128 digest crosses the ABI). This closes the
-  earlier gap where the Unreal `SchemaHash` was zeroed.
-- `citadel_rep_encoder_*` (a `new` → `add_bool`/`add_int`/`add_scalar`/`add_bytes`
-  (+ `set_schema` for a full snapshot) → `finish` → `free` builder) encodes a
-  client→server `DeltaBunch` of changed **ClientOwned** scalar fields without
-  reimplementing the `BitWriter` or codecs. See the [C ABI reference](/reference/client-sdk/c-abi/).
+  reproduced natively; only the BLAKE3-128 digest crosses the ABI).
+- `citadel_rep_encoder_*` is a transactional builder: `new` → optional
+  `set_schema` for a full snapshot → typed `add_*` calls → `finish` → `free`.
+  ABI v3 adds `add_vector3`, `add_quat`, and `add_collection` alongside bool,
+  int, scalar, and bytes. Collection item codecs support those same scalar/vector/
+  quaternion kinds; a validation failure makes `finish` emit no partial bunch.
+- Rust `NetworkPeerAuthor` binds a `RepSchema` and exposes typed draft methods for
+  bool, int, scalar, vector3, quaternion, bytes, and `CollectionDelta`.
 
-On Unreal, `FCitadelRepLayout::GetOrBuild` now fills a real `SchemaHash`, and
-`UCitadelNetworkPeer::BuildDeltaBunch(is_full, result_id, base_id)` returns the
-bytes to send under `KIND_REP_DELTA`.
+These authoring APIs create bytes only. They do not register a client, class, or
+object; send an envelope; activate the server authority; or prove an engine
+binding works at runtime. See the [C ABI reference](/reference/client-sdk/c-abi/).
 
 ## Contract & parity
 
@@ -96,13 +109,13 @@ Tier-A parity; the new C ABI functions are bound in the Tier-B signature check.
 
 ## Status and limits
 
-- Implemented: the `DeltaBunch` codec + coalescing, keyed collections, the
-  per-connection baseline/ack orchestration, and the client `schema_hash` +
-  scalar-field encoder over the C ABI.
-- The server validate/apply/rebroadcast pipeline (ownership, bounds, rate) and the
-  receiver-side apply guard now ship — see
+- Implemented: the `DeltaBunch` codec + coalescing, keyed collections,
+  per-connection baseline/ack, C ABI v3 typed authoring, and the Rust typed
+  authoring facade.
+- Gateway authority activation is separately opt-in; it needs trusted lifecycle
+  registration and is not automatic match/room AOI integration. See
   [NetworkPeer Server Authority](/reference/server-sdk/networkpeer-authority/).
-- Not yet shipped: client collection and vector/quat field encode over the C ABI;
-  the server retains full support. Schema evolution is available as the explicit
+- Engine runtime verification is deferred because Unity, Unreal, and Godot were
+  unavailable in this environment. Schema evolution remains the explicit
   server-side append-only compatibility contract described in the
   [NetworkPeer schema evolution reference](/reference/server-sdk/networkpeer-schema-evolution/).

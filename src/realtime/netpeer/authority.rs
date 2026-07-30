@@ -49,7 +49,8 @@ use citadel_wire::interest::{InterestGrid, RelevanceSet};
 use citadel_wire::netpeer::{
     DeltaBunch, FieldDelta, MAX_ENVELOPE_ALLOC, PreparedDeltaValues, RepAck, RepSchema, RepValue,
 };
-use citadel_wire::protocol::KIND_REP_DELTA;
+use citadel_wire::netpeer::{RepSchemaEntry, RepSchemaTable};
+use citadel_wire::protocol::{KIND_REP_DELTA, KIND_REP_SCHEMA};
 
 use super::delta::{ObjectReplicator, RepSnapshot};
 use super::layout::{FieldAuthority, FieldBounds, RepCondition, RepLayout, TypeTag};
@@ -86,8 +87,6 @@ pub enum RepReject {
     SchemaBinding,
     /// The owner epoch changed between validate and apply (ownership transferred).
     Toctou,
-    /// A client-owned collection delta (unsupported on the inbound path this phase).
-    UnsupportedCollection,
 }
 
 /// Per-connection aggregate rate/budget caps (design §7.1 step 5, finding 27). All
@@ -200,14 +199,14 @@ impl Bucket {
     }
 }
 
-/// Per-connection budget: one bucket per aggregate dimension. The `items` bucket
-/// is reserved for the inbound-collection path (rejected this phase, +);
-/// its cap still participates in [`RateLimits`] so the contract is stable.
+/// Per-connection budget: one bucket per aggregate dimension, including keyed
+/// collection operations across every object owned by this connection.
 #[derive(Debug, Clone, Copy)]
 struct ConnBudget {
     bunches: Bucket,
     bytes: Bucket,
     fields: Bucket,
+    items: Bucket,
 }
 
 impl ConnBudget {
@@ -216,6 +215,7 @@ impl ConnBudget {
             bunches: Bucket::new(limits.bunches_per_sec, now_ms),
             bytes: Bucket::new(limits.bytes_per_sec, now_ms),
             fields: Bucket::new(limits.fields_per_sec, now_ms),
+            items: Bucket::new(limits.items_per_sec, now_ms),
         }
     }
 }
@@ -236,7 +236,9 @@ pub struct RepVetoContext<'a> {
     pub conn: u64,
     /// The target object.
     pub object_id: u32,
-    /// The proposed, already bounds-validated `(field_id, value)` changes.
+    /// The proposed, already bounds-validated scalar `(field_id, value)` changes.
+    /// Collection operations are authoritative transactions and are therefore not
+    /// exposed to the scalar veto hook.
     pub proposed: &'a [(u16, RepValue)],
 }
 
@@ -361,13 +363,13 @@ pub struct Validated {
     result_id: u64,
     owner_epoch: u64,
     now_ms: u64,
-    fields: Vec<(u16, RepValue)>,
+    fields: Vec<(u16, FieldDelta)>,
 }
 
 impl Validated {
-    /// The validated `(field_id, value)` proposals (bounds-checked/clamped).
+    /// The validated `(field_id, delta)` proposals (bounds-checked/clamped).
     #[must_use]
-    pub fn fields(&self) -> &[(u16, RepValue)] {
+    pub fn fields(&self) -> &[(u16, FieldDelta)] {
         &self.fields
     }
 
@@ -543,17 +545,114 @@ impl RepAuthority {
         if let Ok(mut g) = self.inner.lock() {
             let now = 0;
             let limits = g.limits;
+            // A reconnect (or trusted match reassignment) must not retain a
+            // baseline or schema binding from the previous connection/match.
+            if let Some(previous) = g.conns.remove(&conn) {
+                if let Some(members) = g.matches.get_mut(&previous.match_id) {
+                    members.remove(&conn);
+                }
+                for object in g.objects.values_mut() {
+                    object.replicator.remove_receiver(conn);
+                }
+            }
             g.matches.entry(match_id).or_default().insert(conn);
-            g.conns.entry(conn).or_insert_with(|| ConnEntry {
-                match_id,
-                is_guest,
-                budget: ConnBudget::new(&limits, now),
-                bindings: BTreeMap::new(),
-                highest_applied: BTreeMap::new(),
-                viewer_pos: [0.0; 3],
-                relevance: RelevanceSet::new(),
-            });
+            g.conns.insert(
+                conn,
+                ConnEntry {
+                    match_id,
+                    is_guest,
+                    budget: ConnBudget::new(&limits, now),
+                    bindings: BTreeMap::new(),
+                    highest_applied: BTreeMap::new(),
+                    viewer_pos: [0.0; 3],
+                    relevance: RelevanceSet::new(),
+                },
+            );
+            refresh_relevance(&mut g);
         }
+    }
+
+    /// Whether trusted lifecycle code has already assigned this connection to a
+    /// replication match. Used by transport registration to preserve an
+    /// admission assignment made before the socket completed its handshake.
+    #[must_use]
+    pub fn is_joined(&self, conn: u64) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|state| state.conns.contains_key(&conn))
+    }
+
+    /// Build the reliable join bootstrap in wire order: one exact schema table,
+    /// then a full baseline for every currently relevant object in the joined
+    /// match. This is server-only lifecycle work; no client input can invoke it.
+    #[must_use]
+    pub fn bootstrap(&self, conn: u64) -> Vec<RepOutbound> {
+        let Ok(mut g) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let Some(entry) = g.conns.get(&conn) else {
+            return Vec::new();
+        };
+        let match_id = entry.match_id;
+        let table = RepSchemaTable {
+            entries: g
+                .classes
+                .iter()
+                .map(|(&class_id, class)| RepSchemaEntry {
+                    class_id,
+                    schema_hash: class.schema.schema_hash().bytes,
+                    layout_version: class.layout.layout_version(),
+                })
+                .collect(),
+        };
+        let Ok(schema_body) = table.encode() else {
+            return Vec::new();
+        };
+        let mut out = vec![RepOutbound {
+            participant: conn,
+            kind: KIND_REP_SCHEMA,
+            body: schema_body,
+            reliable: true,
+        }];
+        refresh_relevance(&mut g);
+        let objects: Vec<u32> = g
+            .objects
+            .iter()
+            .filter_map(|(&id, object)| (object.match_id == match_id).then_some(id))
+            .collect();
+        for object_id in objects {
+            let relevant = g
+                .conns
+                .get(&conn)
+                .is_some_and(|receiver| receiver.relevance.contains(u64::from(object_id)));
+            if !relevant {
+                continue;
+            }
+            let Some(class_id) = g.objects.get(&object_id).map(|object| object.class_id) else {
+                continue;
+            };
+            let Some(schema) = g.classes.get(&class_id).map(|class| class.schema.clone()) else {
+                continue;
+            };
+            let Inner { objects, alloc, .. } = &mut *g;
+            let Some(object) = objects.get_mut(&object_id) else {
+                continue;
+            };
+            object.replicator.add_receiver(conn);
+            object.replicator.force_full(conn);
+            if let Some(built) = object.replicator.build_delta(conn, alloc)
+                && built.is_full
+                && let Ok(body) = built.bunch.encode(&schema)
+            {
+                out.push(RepOutbound {
+                    participant: conn,
+                    kind: KIND_REP_DELTA,
+                    body,
+                    reliable: true,
+                });
+            }
+        }
+        out
     }
 
     /// Drop a connection (disconnect / relevancy exit).
@@ -784,7 +883,7 @@ impl RepAuthority {
             .map(|c| c.match_id)
             .ok_or(RepReject::NoMatch)?;
         let conn_guest = g.conns.get(&conn).map(|c| c.is_guest).unwrap_or(true);
-        let (class_id, obj_owner, obj_persistent, owner_epoch, generation, last_change) = {
+        let (class_id, obj_owner, obj_persistent, owner_epoch, generation, last_change, obj_state) = {
             let obj = g.objects.get(&object_id).ok_or(RepReject::UnknownObject)?;
             if obj.match_id != conn_match {
                 return Err(RepReject::CrossMatch);
@@ -796,6 +895,7 @@ impl RepAuthority {
                 obj.owner_epoch,
                 obj.generation,
                 obj.field_last_change_ms.clone(),
+                obj.authoritative.clone(),
             )
         };
 
@@ -862,16 +962,6 @@ impl RepAuthority {
             if desc.authority != FieldAuthority::ClientOwned {
                 return Err(RepReject::ServerOnlyField);
             }
-            // Reject collection-coded fields BEFORE any value/collection decode
-            // (finding 3): inbound client collections are unsupported this phase, so
-            // an attacker cannot force collection allocation work then be rejected.
-            if schema
-                .field(fid)
-                .map(|c| c.is_collection())
-                .unwrap_or(false)
-            {
-                return Err(RepReject::UnsupportedCollection);
-            }
         }
 
         // Schema binding + stale guard.
@@ -915,11 +1005,32 @@ impl RepAuthority {
             DeltaBunch::decode(body, &schema, &mut alloc_budget).map_err(|_| RepReject::Frame)?;
 
         let cooldown_ms = g.limits.field_cooldown_ms;
-        let mut fields: Vec<(u16, RepValue)> = Vec::with_capacity(bunch.changes.len());
+        let mut fields: Vec<(u16, FieldDelta)> = Vec::with_capacity(bunch.changes.len());
+        let mut collection_ops = 0usize;
         for (&fid, delta) in &bunch.changes {
             let desc = layout.field(fid).ok_or(RepReject::Frame)?;
             match delta {
-                FieldDelta::Collection(_) => return Err(RepReject::UnsupportedCollection),
+                FieldDelta::Collection(collection) => {
+                    let codec = schema.field(fid).ok_or(RepReject::Frame)?;
+                    let item_codec = match codec {
+                        citadel_wire::netpeer::RepFieldCodec::Collection { item, .. } => {
+                            item.as_ref()
+                        }
+                        _ => return Err(RepReject::Frame),
+                    };
+                    let validated = validate_collection(
+                        collection,
+                        item_codec,
+                        desc.bounds,
+                        obj_state.collections.get(&fid),
+                    )?;
+                    collection_ops = collection_ops
+                        .checked_add(validated.removed.len())
+                        .and_then(|n| n.checked_add(validated.added.len()))
+                        .and_then(|n| n.checked_add(validated.changed.len()))
+                        .ok_or(RepReject::Rate)?;
+                    fields.push((fid, FieldDelta::Collection(validated)));
+                }
                 FieldDelta::Value(v) => {
                     let validated = validate_bounds(v, desc.bounds, desc.type_tag)?;
                     // Cooldown: a ClientOwned field must not change faster than its
@@ -930,8 +1041,19 @@ impl RepAuthority {
                     {
                         return Err(RepReject::Cooldown);
                     }
-                    fields.push((fid, validated));
+                    fields.push((fid, FieldDelta::Value(validated)));
                 }
+            }
+        }
+
+        if collection_ops > 0 {
+            let conn_entry = g.conns.get_mut(&conn).ok_or(RepReject::NoMatch)?;
+            if !conn_entry
+                .budget
+                .items
+                .charge(now_ms, collection_ops as f64)
+            {
+                return Err(RepReject::Rate);
             }
         }
 
@@ -1006,7 +1128,14 @@ impl RepAuthority {
         // (finding 8).
         let vetoed: BTreeSet<u16> = match g.veto.clone() {
             Some(hook) => {
-                let ctx_fields = v.fields.clone();
+                let ctx_fields: Vec<(u16, RepValue)> = v
+                    .fields
+                    .iter()
+                    .filter_map(|(fid, delta)| match delta {
+                        FieldDelta::Value(value) => Some((*fid, value.clone())),
+                        FieldDelta::Collection(_) => None,
+                    })
+                    .collect();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     hook.veto(RepVetoContext {
                         conn: v.conn,
@@ -1018,7 +1147,7 @@ impl RepAuthority {
                     Ok(vetoed) => vetoed.into_iter().collect(),
                     Err(_) => {
                         tracing::warn!("rep veto hook panicked; failing closed (veto all)");
-                        v.fields.iter().map(|(fid, _)| *fid).collect()
+                        ctx_fields.iter().map(|(fid, _)| *fid).collect()
                     }
                 }
             }
@@ -1037,18 +1166,33 @@ impl RepAuthority {
                 .objects
                 .get_mut(&v.object_id)
                 .ok_or(RepReject::UnknownObject)?;
-            for (fid, value) in &v.fields {
-                if vetoed.contains(fid) {
-                    continue;
-                }
-                obj.authoritative.set_scalar(*fid, value.clone());
-                obj.field_last_change_ms.insert(*fid, v.now_ms);
-                if layout
-                    .field(*fid)
-                    .map(|d| peer_visible(d.cond))
-                    .unwrap_or(false)
-                {
-                    obj.replicator.current_mut().set_scalar(*fid, value.clone());
+            for (fid, delta) in &v.fields {
+                match delta {
+                    FieldDelta::Value(value) => {
+                        if vetoed.contains(fid) {
+                            continue;
+                        }
+                        obj.authoritative.set_scalar(*fid, value.clone());
+                        obj.field_last_change_ms.insert(*fid, v.now_ms);
+                        if layout
+                            .field(*fid)
+                            .map(|d| peer_visible(d.cond))
+                            .unwrap_or(false)
+                        {
+                            obj.replicator.current_mut().set_scalar(*fid, value.clone());
+                        }
+                    }
+                    FieldDelta::Collection(collection) => {
+                        apply_collection(&mut obj.authoritative, *fid, collection);
+                        obj.field_last_change_ms.insert(*fid, v.now_ms);
+                        if layout
+                            .field(*fid)
+                            .map(|d| peer_visible(d.cond))
+                            .unwrap_or(false)
+                        {
+                            apply_collection(obj.replicator.current_mut(), *fid, collection);
+                        }
+                    }
                 }
             }
         }
@@ -1240,9 +1384,13 @@ impl RepAuthority {
         };
         for entry in ack.entries {
             if let Some(obj) = g.objects.get_mut(&entry.object_id) {
-                let mut field = AckField::new();
-                field.ack(entry.acked_result_id);
-                obj.replicator.on_ack(conn, &field);
+                // Preserve the peer's complete sliding window. Reducing this to
+                // only `acked_result_id` drops a valid older acknowledgement
+                // whenever the newest result is unknown or was superseded.
+                // Malformed `latest = 0, history != 0` windows fail closed.
+                if let Ok(field) = AckField::from_wire(entry.acked_result_id, entry.history) {
+                    obj.replicator.on_ack(conn, &field);
+                }
             }
         }
     }
@@ -1352,6 +1500,116 @@ fn validate_bounds(
     }
 }
 
+/// Validate one keyed collection transaction against the compiled item bounds and
+/// the authoritative pre-transaction state. The wire decoder has already rejected
+/// duplicate ids; this layer enforces stateful add/change/remove and generation
+/// invariants before any authoritative mutation occurs.
+fn validate_collection(
+    delta: &citadel_wire::netpeer::CollectionDelta,
+    item_codec: &citadel_wire::netpeer::RepFieldCodec,
+    bounds: FieldBounds,
+    existing: Option<&super::delta::CollectionState>,
+) -> Result<citadel_wire::netpeer::CollectionDelta, RepReject> {
+    let FieldBounds::MaxCardinality { max_items } = bounds else {
+        return Err(RepReject::Bounds);
+    };
+    let existing = existing.cloned().unwrap_or_default();
+    let mut next = existing.clone();
+
+    // Removes name an exact generation-tagged live id. A stale remove must not
+    // erase a reused slot, and an operation cannot silently become a no-op.
+    for id in &delta.removed {
+        if next.remove(id).is_none() {
+            return Err(RepReject::Bounds);
+        }
+    }
+
+    let mut added = Vec::with_capacity(delta.added.len());
+    for item in &delta.added {
+        if item.key == 0 || next.contains_key(&item.id) {
+            return Err(RepReject::Bounds);
+        }
+        // An index cannot be live in two generations simultaneously.
+        if next.keys().any(|id| id.index == item.id.index) {
+            return Err(RepReject::Bounds);
+        }
+        let value = validate_collection_item(&item.value, item_codec)?;
+        next.insert(item.id, (item.key, value.clone()));
+        added.push(citadel_wire::netpeer::CollItem {
+            id: item.id,
+            key: item.key,
+            value,
+        });
+    }
+
+    let mut changed = Vec::with_capacity(delta.changed.len());
+    for item in &delta.changed {
+        let Some((old_key, _)) = next.get(&item.id) else {
+            return Err(RepReject::Bounds);
+        };
+        // A change must advance the per-item key, rejecting stale/replayed edits.
+        if item.key == 0 || item.key <= *old_key {
+            return Err(RepReject::Bounds);
+        }
+        let value = validate_collection_item(&item.value, item_codec)?;
+        next.insert(item.id, (item.key, value.clone()));
+        changed.push(citadel_wire::netpeer::CollItem {
+            id: item.id,
+            key: item.key,
+            value,
+        });
+    }
+
+    if next.len() > max_items as usize {
+        return Err(RepReject::Bounds);
+    }
+    Ok(citadel_wire::netpeer::CollectionDelta {
+        removed: delta.removed.clone(),
+        added,
+        changed,
+    })
+}
+
+fn validate_collection_item(
+    value: &RepValue,
+    codec: &citadel_wire::netpeer::RepFieldCodec,
+) -> Result<RepValue, RepReject> {
+    let (bounds, type_tag) = match codec {
+        citadel_wire::netpeer::RepFieldCodec::Bool => (FieldBounds::None, TypeTag::Bool),
+        citadel_wire::netpeer::RepFieldCodec::IntRange { min, max } => (
+            FieldBounds::IntRange {
+                min: *min,
+                max: *max,
+            },
+            TypeTag::Int,
+        ),
+        // The wire decoder has already reconstructed this from the exact bounded
+        // quantizer. `validate_bounds` still checks finiteness and the declared
+        // item type below; the collection field's layout bound is cardinality.
+        citadel_wire::netpeer::RepFieldCodec::Scalar(_) => (FieldBounds::None, TypeTag::Scalar),
+        citadel_wire::netpeer::RepFieldCodec::Vector3(_) => (FieldBounds::None, TypeTag::Vector3),
+        citadel_wire::netpeer::RepFieldCodec::Quat(_) => (FieldBounds::None, TypeTag::Quat),
+        citadel_wire::netpeer::RepFieldCodec::Bytes { max_len } => {
+            (FieldBounds::MaxLen { max_len: *max_len }, TypeTag::Bytes)
+        }
+        citadel_wire::netpeer::RepFieldCodec::Collection { .. } => return Err(RepReject::Bounds),
+    };
+    validate_bounds(value, bounds, type_tag)
+}
+
+fn apply_collection(
+    snapshot: &mut RepSnapshot,
+    field_id: u16,
+    delta: &citadel_wire::netpeer::CollectionDelta,
+) {
+    for id in &delta.removed {
+        snapshot.remove_item(field_id, *id);
+    }
+    for item in delta.added.iter().chain(&delta.changed) {
+        snapshot.set_item(field_id, item.id, item.key, item.value.clone());
+    }
+}
+
 fn validate_schema_binding(layout: &RepLayout, schema: &RepSchema) -> Result<(), RepReject> {
     // Bind schema <-> layout: same identity, same field count.
     if schema.schema_hash() != layout.schema_hash() || schema.num_fields() != layout.len() {
@@ -1370,6 +1628,26 @@ fn validate_schema_binding(layout: &RepLayout, schema: &RepSchema) -> Result<(),
             _ => {}
         }
     }
+    for field in layout.fields() {
+        let codec = schema.field(field.id).ok_or(RepReject::SchemaBinding)?;
+        match (field.type_tag, field.bounds, codec) {
+            (
+                TypeTag::Collection,
+                FieldBounds::MaxCardinality { max_items },
+                citadel_wire::netpeer::RepFieldCodec::Collection {
+                    item,
+                    max_items: codec_max,
+                },
+            ) if max_items == *codec_max && !item.is_collection() => {}
+            (TypeTag::Collection, _, _)
+            | (_, _, citadel_wire::netpeer::RepFieldCodec::Collection { .. }) => {
+                // A collection can never masquerade as a Bytes/scalar field (or
+                // vice versa); its declared cardinality is part of the contract.
+                return Err(RepReject::SchemaBinding);
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -1379,7 +1657,9 @@ mod tests {
     use super::*;
     use crate::realtime::netpeer::layout::{RepLayoutBuilder, TypeTag};
     use citadel_wire::codec::{ScalarQuant, codec_id};
-    use citadel_wire::netpeer::{RepAck, RepAckEntry, RepFieldCodec};
+    use citadel_wire::netpeer::{
+        CollItem, CollectionDelta, RepAck, RepAckEntry, RepFieldCodec, RepId,
+    };
     use std::sync::OnceLock;
 
     const OBJ: u32 = 100;
@@ -1409,7 +1689,7 @@ mod tests {
                 .field(
                     "health",
                     TypeTag::Int,
-                    codec_id::SCALAR_QUANT,
+                    0,
                     RepCondition::None,
                     FieldAuthority::ClientOwned,
                     FieldBounds::IntRange { min: 0, max: 100 },
@@ -1418,7 +1698,7 @@ mod tests {
                 .field(
                     "team",
                     TypeTag::Int,
-                    codec_id::SCALAR_QUANT,
+                    0,
                     RepCondition::None,
                     FieldAuthority::ServerOnly,
                     FieldBounds::IntRange { min: 0, max: 8 },
@@ -2345,6 +2625,33 @@ mod tests {
     }
 
     #[test]
+    fn ack_history_commits_an_outstanding_result_when_latest_is_unknown() {
+        let a = authority();
+        let first = outgoing_by_receiver(&a.handle_delta(OWNER, &full_health(10, 80), 1000));
+        let full = first[&PEER].clone();
+
+        // `full` is acknowledged through the history bit while a newer token is
+        // deliberately unknown to this server. The authority must process the
+        // full ack window and commit the known outstanding result.
+        a.handle_ack(
+            PEER,
+            &RepAck {
+                entries: vec![RepAckEntry {
+                    object_id: OBJ,
+                    acked_result_id: full.result_id + 1,
+                    history: 1,
+                }],
+            }
+            .encode()
+            .unwrap(),
+        );
+
+        let next = outgoing_by_receiver(&a.handle_delta(OWNER, &full_health(11, 70), 1001));
+        assert!(!next[&PEER].is_full);
+        assert_eq!(next[&PEER].base_id, full.result_id);
+    }
+
+    #[test]
     fn interest_grid_only_fans_out_to_relevant_receivers() {
         let a = authority();
         a.join_match(FAR_PEER, MATCH, false);
@@ -2533,16 +2840,16 @@ mod tests {
     }
 
     #[test]
-    fn collection_from_client_is_rejected() {
-        // A class whose only field is a client-owned collection: an inbound
-        // collection delta is rejected this phase (documented gap).
+    fn client_keyed_collection_add_change_remove_is_authoritatively_applied() {
+        // A client-owned keyed collection is decoded, validated against the
+        // authoritative item map, then re-derived by the server (never relayed).
         static CL: OnceLock<RepLayout> = OnceLock::new();
         let cl = CL.get_or_init(|| {
             RepLayoutBuilder::new(9, 1)
                 .field(
                     "items",
-                    TypeTag::Int,
-                    codec_id::SCALAR_QUANT,
+                    TypeTag::Collection,
+                    0,
                     RepCondition::None,
                     FieldAuthority::ClientOwned,
                     FieldBounds::MaxCardinality { max_items: 16 },
@@ -2583,9 +2890,188 @@ mod tests {
             }),
         );
         let body = b.encode(&sch).unwrap();
-        assert_eq!(
-            a.validate(OWNER, &body, 1000).unwrap_err(),
-            RepReject::UnsupportedCollection
+        let validated = a.validate(OWNER, &body, 1000).unwrap();
+        assert!(matches!(validated.fields()[0].1, FieldDelta::Collection(_)));
+        a.apply_and_rebroadcast(validated).unwrap();
+
+        let id = RepId {
+            index: 0,
+            generation: 0,
+        };
+        {
+            let g = a.inner.lock().unwrap();
+            assert_eq!(
+                g.objects[&200].authoritative.collections[&0].get(&id),
+                Some(&(1, RepValue::Int(5)))
+            );
+        }
+
+        let mut change = DeltaBunch::new(200, false, 11, 10);
+        change.set(
+            0,
+            FieldDelta::Collection(CollectionDelta {
+                removed: vec![],
+                added: vec![],
+                changed: vec![CollItem {
+                    id,
+                    key: 2,
+                    value: RepValue::Int(9),
+                }],
+            }),
         );
+        a.apply_and_rebroadcast(
+            a.validate(OWNER, &change.encode(&sch).unwrap(), 1001)
+                .unwrap(),
+        )
+        .unwrap();
+        {
+            let g = a.inner.lock().unwrap();
+            assert_eq!(
+                g.objects[&200].authoritative.collections[&0].get(&id),
+                Some(&(2, RepValue::Int(9)))
+            );
+        }
+
+        let mut remove = DeltaBunch::new(200, false, 12, 11);
+        remove.set(
+            0,
+            FieldDelta::Collection(CollectionDelta {
+                removed: vec![id],
+                added: vec![],
+                changed: vec![],
+            }),
+        );
+        a.apply_and_rebroadcast(
+            a.validate(OWNER, &remove.encode(&sch).unwrap(), 1002)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            a.inner.lock().unwrap().objects[&200]
+                .authoritative
+                .collections[&0]
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn client_collection_rejects_stale_change_and_live_index_reuse() {
+        static CL: OnceLock<RepLayout> = OnceLock::new();
+        let cl = CL.get_or_init(|| {
+            RepLayoutBuilder::new(10, 1)
+                .field(
+                    "items",
+                    TypeTag::Collection,
+                    0,
+                    RepCondition::None,
+                    FieldAuthority::ClientOwned,
+                    FieldBounds::MaxCardinality { max_items: 1 },
+                    true,
+                )
+                .build()
+                .unwrap()
+        });
+        let sch = RepSchema::new(
+            *cl.schema_hash(),
+            vec![RepFieldCodec::Collection {
+                item: Box::new(RepFieldCodec::IntRange { min: 0, max: 10 }),
+                max_items: 1,
+            }],
+        )
+        .unwrap();
+        let a = RepAuthority::new(RateLimits::default());
+        a.register_class(10, cl, sch.clone()).unwrap();
+        let mut state = RepSnapshot::new();
+        let id = RepId {
+            index: 7,
+            generation: 1,
+        };
+        state.set_item(0, id, 4, RepValue::Int(4));
+        a.spawn_object(201, MATCH, 10, Some(OWNER), false, state)
+            .unwrap();
+        a.join_match(OWNER, MATCH, false);
+
+        // Full establishes the schema binding but the stale key makes the
+        // transaction invalid before it can mutate the object.
+        let mut stale = DeltaBunch::new(201, true, 20, 0);
+        stale.set(
+            0,
+            FieldDelta::Collection(CollectionDelta {
+                removed: vec![],
+                added: vec![],
+                changed: vec![CollItem {
+                    id,
+                    key: 4,
+                    value: RepValue::Int(5),
+                }],
+            }),
+        );
+        assert!(matches!(
+            a.validate(OWNER, &stale.encode(&sch).unwrap(), 2000),
+            Err(RepReject::Bounds)
+        ));
+
+        let mut reuse = DeltaBunch::new(201, true, 21, 0);
+        reuse.set(
+            0,
+            FieldDelta::Collection(CollectionDelta {
+                removed: vec![],
+                added: vec![CollItem {
+                    id: RepId {
+                        index: 7,
+                        generation: 2,
+                    },
+                    key: 1,
+                    value: RepValue::Int(1),
+                }],
+                changed: vec![],
+            }),
+        );
+        assert!(matches!(
+            a.validate(OWNER, &reuse.encode(&sch).unwrap(), 2001),
+            Err(RepReject::Bounds)
+        ));
+    }
+
+    #[test]
+    fn collection_items_validate_every_supported_scalar_vector_and_quat_kind() {
+        use citadel_wire::codec::{DEFAULT_WORLD_BOUNDS, QuatMode, VectorQuant};
+
+        let scalar = RepFieldCodec::Scalar(ScalarQuant::new(-1.0, 1.0, 16).unwrap());
+        let vector = RepFieldCodec::Vector3(VectorQuant::new(DEFAULT_WORLD_BOUNDS).unwrap());
+        let cases = [
+            (RepFieldCodec::Bool, RepValue::Bool(true)),
+            (
+                RepFieldCodec::IntRange { min: -2, max: 2 },
+                RepValue::Int(1),
+            ),
+            (scalar.clone(), RepValue::Scalar(0.5)),
+            (vector, RepValue::Vector3([1.0, 2.0, 3.0])),
+            (
+                RepFieldCodec::Quat(QuatMode::Bits10),
+                RepValue::Quat([0.0, 0.0, 0.0, 1.0]),
+            ),
+            (
+                RepFieldCodec::Bytes { max_len: 3 },
+                RepValue::Bytes(vec![1, 2, 3]),
+            ),
+        ];
+        for (codec, value) in cases {
+            assert_eq!(validate_collection_item(&value, &codec).unwrap(), value);
+        }
+        assert!(matches!(
+            validate_collection_item(
+                &RepValue::Bytes(vec![0; 4]),
+                &RepFieldCodec::Bytes { max_len: 3 }
+            ),
+            Err(RepReject::Bounds)
+        ));
+        assert!(matches!(
+            validate_collection_item(
+                &RepValue::Int(3),
+                &RepFieldCodec::IntRange { min: -2, max: 2 }
+            ),
+            Err(RepReject::Bounds)
+        ));
     }
 }

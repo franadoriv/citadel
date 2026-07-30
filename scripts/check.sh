@@ -19,6 +19,9 @@ bash scripts/check-client-doc-tabs.sh
 # Tier-A client-SDK contract parity: fails if any SDK's declared wire/ABI
 # constants drift from the canonical contract.json (see check-sdk-parity.sh).
 bash scripts/check-sdk-parity.sh
+# Cross-engine NetworkPeer structural fixture/binding gate. Editor and browser
+# two-client gameplay runs are explicitly an external-environment matrix.
+python3 scripts/check-networkpeer-cross-engine.py
 # Public player features must declare every released SDK binding and its
 # frontend reference before the backend contract can be considered shipped.
 bash scripts/check-client-feature-completion.sh

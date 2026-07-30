@@ -292,7 +292,7 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
     <tr><td>Local realtime parties</td><td>Invite/accept/leader/remove and atomic party tickets ship on one node only.</td><td>🚧</td></tr>
     <tr><td>Distributed parties, party data, presence, failover</td><td>No persistence, party data messages, leader failover, or cross-node ownership.</td><td>📋</td></tr>
     <tr><td>Transform sync, prediction, reconciliation, rewind</td><td>Authoritative snapshots and owner modes; browser WebSocket cannot use the unreliable hot path.</td><td>✅</td></tr>
-    <tr><td>NetworkPeer property replication</td><td>Authoritative DeltaBunch pipeline ships; engine authoring support differs.</td><td>🚧</td></tr>
+    <tr><td>NetworkPeer property replication</td><td>Opt-in gateway authority, trusted schema/object lifecycle seam, shared-grid relevance, ABI v3 typed scalar/vector/quaternion and keyed-collection authoring, and Rust authoring ship. The C ABI cannot yet iterate decoded keyed-collection operations; Unreal receive/apply/ACK/full-recovery and match/room AOI remain separate.</td><td>🚧</td></tr>
     <tr><td>CMAP static collision, server navmesh, and map queries</td><td>Static cooked collision feeds navmesh, map_info, raycasts, overlap, and ground queries.</td><td>✅</td></tr>
     <tr><td>Server-simulated kinematic physics</td><td>Deterministic static-map collision, gravity, impulse, movement intent, and state; no dynamic rigid bodies.</td><td>✅</td></tr>
   </tbody>
@@ -414,7 +414,7 @@ Each engine cell lists the OSes with a released/tested delivery path: `🪟` Win
     <tr><td>Local party management and party tickets</td><td>🪟 🚧</td><td>🪟 🚧</td><td>🪟 🚧</td><td>🪟 🍎 🐧 🚧</td><td>🪟 🚧</td><td>All use generic RPC; feature itself remains local-node only.</td></tr>
     <tr><td>Transform sync snapshots and interpolation</td><td>🪟</td><td>🪟</td><td>🪟</td><td>—</td><td>🪟 🚧</td><td>Unity/Unreal/Godot have engine surfaces; WebSocket lacks unreliable snapshot path.</td></tr>
     <tr><td>Owner prediction, reconciliation, and rewind</td><td>🪟 🚧</td><td>🪟</td><td>🪟 🚧</td><td>—</td><td>🪟 🚧</td><td>Unreal is the fully documented owner integration; other surfaces are bounded.</td></tr>
-    <tr><td>NetworkPeer property replication authoring</td><td>🪟 🚧</td><td>🪟</td><td>🪟 🚧</td><td>—</td><td>🪟 🚧</td><td>Unreal has declaration API; Unity/Godot share native codec access.</td></tr>
+    <tr><td>NetworkPeer property replication authoring</td><td>🪟 🚧</td><td>🪟 🚧</td><td>🪟 🚧</td><td>🪟 🍎 🐧 🚧</td><td>🪟</td><td>Rust ships canonical typed authoring. C ABI v3 encodes typed keyed-collection operations but cannot yet iterate decoded collection operations; Unity has a managed v3 wrapper, while Unreal/Godot bindings are source-level only. Engine runtime verification is deferred because those engines are unavailable.</td></tr>
     <tr><td>Networked-actor presence/spawn integration</td><td>🪟 🚧</td><td>🪟</td><td>🪟 🚧</td><td>—</td><td>🪟 🚧</td><td>Unreal is end-to-end; Unity/Godot have transform layers but not full spawn integration.</td></tr>
     <tr><td>Authoritative server physics replication</td><td>🪟 🚧</td><td>🪟</td><td>🪟 🚧</td><td>—</td><td>🪟 🚧</td><td>Replicates through transform/actor layers; no WebSocket binary gameplay helper.</td></tr>
   </tbody>
@@ -424,7 +424,7 @@ Each engine cell lists the OSes with a released/tested delivery path: `🪟` Win
     <tr><td>Godot CMAP map exporter</td><td>—</td><td>—</td><td>🪟</td><td>—</td><td>—</td><td>Static-body mesh extraction plus explicit terrain-provider interface.</td></tr>
     <tr><td>Distributable Godot WebAssembly SDK package</td><td>—</td><td>—</td><td>🪟</td><td>—</td><td>—</td><td>The ZIP installs the public addons/citadel WebSocketPeer client with no GDExtension and includes a matched Godot Web .html/.js/.pck/.wasm verification export; CI opens that real WebAssembly app in Chromium against a running Citadel listener and validates guest auth, relay, receive/poll, close and payload integrity.</td></tr>
     <tr><td>Unreal CMAP map exporter</td><td>—</td><td>🪟 🚧</td><td>—</td><td>—</td><td>—</td><td>Static mesh and Landscape source ship; UE 5.8 editor compile/terrain smoke is pending.</td></tr>
-    <tr><td>Browser-native binary netcode helpers</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>Browser SDK remains WebSocket-oriented; no QUIC datagram/NetworkPeer/transform helper.</td></tr>
+    <tr><td>Browser-native binary netcode helpers</td><td>—</td><td>—</td><td>—</td><td>🪟 🍎 🐧 🚧</td><td>—</td><td>Browser JS ships schema-bound reliable NetworkPeer DeltaBunch author/decode/ack helpers over WebSocket/WebTransport with deterministic structural fixture/binding validation. Browser and native engine two-client gameplay runs remain deferred external-environment verification.</td></tr>
     <tr><td>Published npm package</td><td>—</td><td>—</td><td>—</td><td>🪟 🍎 🐧 🚧</td><td>—</td><td>Source package exists; registry publication is still tracked work.</td></tr>
   </tbody>
 </table>

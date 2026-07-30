@@ -159,7 +159,7 @@ namespace CitadelWire
     // canonical header's CITADEL_FFI_ABI_VERSION below so a header bump that this
     // SDK has not caught up to is a compile error (belt) and a Tier-A drift
     // against contract.json (braces).
-    constexpr uint32 ABI_VERSION = 2;
+    constexpr uint32 ABI_VERSION = 3;
 }
 
 // Compile-time ABI cross-check: fires wherever CitadelWire.h is compiled,

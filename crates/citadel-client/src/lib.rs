@@ -15,6 +15,7 @@
 //! Endpoints and certificates are parameters; no credentials are embedded.
 
 pub mod http;
+pub mod networkpeer;
 pub mod quic;
 pub mod websocket;
 
@@ -22,6 +23,9 @@ pub use citadel_wire::Envelope;
 pub use http::{
     CitadelHttpClient, EmailAuthenticationRequest, LookupUsersRequest, LookupUsersResponse,
     PublicProfile, SessionTokenPair, UpdateAccountRequest,
+};
+pub use networkpeer::{
+    NetworkPeerAuthor, NetworkPeerDraft, NetworkPeerReceive, NetworkPeerSession,
 };
 pub use quic::{ClientTls, QuicClient};
 pub use websocket::WsClient;

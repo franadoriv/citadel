@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  EXPECTED_ABI_VERSION,
   AUTH_STATUS_AUTHENTICATED,
   AUTH_STATUS_GUEST,
   AUTH_STATUS_REJECTED,
@@ -21,6 +22,10 @@ import {
   decodeRoomJoined,
   decodeRoomId,
 } from "../src/protocol.js";
+
+test("protocol bindings target ABI v3", () => {
+  assert.equal(EXPECTED_ABI_VERSION, 3);
+});
 
 test("encodeRpcRequest layout: [id u64][len u16][method][payload]", () => {
   const payload = new Uint8Array([9, 9]);

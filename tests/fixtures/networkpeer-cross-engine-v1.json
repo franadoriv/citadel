@@ -1,0 +1,140 @@
+{
+  "fixture_version": 1,
+  "purpose": "Deterministic NetworkPeer cross-engine semantic golden vectors. Valid encoded bodies are emitted by the canonical Rust citadel-wire encoder and are decoded by each adapter against the same expected logical results. Runtime two-client gameplay remains an external-environment gate.",
+  "schema": {
+    "hash_hex": "07070707070707070707070707070707",
+    "layout_version": 3,
+    "fields": [
+      "bool",
+      "int[-10,10]",
+      "scalar[-100,100]@10",
+      "vector3[-100,100]@10",
+      "quat-smallest3-10",
+      "bytes<=32",
+      "collection<int[0,100],4>"
+    ]
+  },
+  "cases": [
+    "canonical_full_all_value_families",
+    "canonical_delta_u32_rep_id_boundaries",
+    "reject_rep_id_index_above_u32",
+    "reject_rep_id_generation_above_u32",
+    "invalid_duplicate_rep_id_rejected",
+    "stale_result_rejected",
+    "missing_base_no_ack_needs_full"
+  ],
+  "required_adapters": {
+    "rust": "crates/citadel-client/src/networkpeer.rs",
+    "javascript": "clients/js/src/networkpeer.js",
+    "unity": "clients/unity/Citadel/CitadelNetworkPeer.cs",
+    "godot": "clients/godot/citadel/client.gd",
+    "unreal": "clients/unreal/Plugin/Citadel/Source/CitadelClient/Private/CitadelNetworkPeer.cpp"
+  },
+  "runtime_matrix": {
+    "status": "deferred_external_environment",
+    "required_later_evidence": [
+      "runtime/engine and version",
+      "platform",
+      "exact command",
+      "fixture_version",
+      "two-client author-server validate/rebroadcast-remote apply result",
+      "logs/artifacts"
+    ]
+  },
+  "golden_vectors": [
+    {
+      "id": "canonical_full_all_value_families",
+      "canonical_source": "citadel-wire DeltaBunch encoder (Rust)",
+      "encoded_hex": "00000009818383838383838383838383838383838380000001ffb9fa3f27a901b802008001d8da5d1859195b0040408040c042038082008488",
+      "expected": {
+        "object_id": 9,
+        "is_full": true,
+        "result_id": "3",
+        "base_id": "0",
+        "changes": {
+          "0": true,
+          "1": 4,
+          "2": 1.2,
+          "3": [
+            1,
+            -2,
+            3
+          ],
+          "4": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "5": {
+            "bytes_hex": "6369746164656c"
+          },
+          "6": {
+            "removed": [
+              {
+                "index": 1,
+                "generation": 2
+              }
+            ],
+            "added": [
+              {
+                "id": {
+                  "index": 3,
+                  "generation": 1
+                },
+                "key": "8",
+                "value": 7
+              }
+            ],
+            "changed": [
+              {
+                "id": {
+                  "index": 4,
+                  "generation": 1
+                },
+                "key": "9",
+                "value": 8
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "canonical_delta_u32_rep_id_boundaries",
+      "canonical_source": "citadel-wire DeltaBunch encoder (Rust)",
+      "encoded_hex": "000000090281c100ffffffff87ffffffff87800000",
+      "expected": {
+        "object_id": 9,
+        "is_full": false,
+        "result_id": "5",
+        "base_id": "3",
+        "changes": {
+          "0": false,
+          "6": {
+            "removed": [
+              {
+                "index": 4294967295,
+                "generation": 4294967295
+              }
+            ],
+            "added": [],
+            "changed": []
+          }
+        }
+      }
+    },
+    {
+      "id": "reject_rep_id_index_above_u32",
+      "canonical_source": "hand-crafted bit-packed malformed vector; canonical Rust decoder rejects with VarintOverflow",
+      "encoded_hex": "000000090281c100c04040400800000000",
+      "expected_error": "rep id index must fit u32"
+    },
+    {
+      "id": "reject_rep_id_generation_above_u32",
+      "canonical_source": "hand-crafted bit-packed malformed vector; canonical Rust decoder rejects generation with VarintOverflow",
+      "encoded_hex": "000000090281c100ffffffff87c040404008000000",
+      "expected_error": "rep id generation must fit u32"
+    }
+  ]
+}

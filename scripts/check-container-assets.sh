@@ -75,7 +75,7 @@ require_text examples/docker/citadel.toml 'hot_reload = true'
 require_text examples/docker/citadel.toml 'language = "lua"'
 require_text src/http/mod.rs 'tokio::signal::unix::SignalKind::terminate()'
 
-require_text .github/workflows/release.yml 'needs: [package, godot-web]'
+require_text .github/workflows/release.yml 'needs: [validate-release-version, package, godot-web, js-sdk]'
 # QEMU user-mode references are allowed exclusively for ARM smoke tests, never
 # to build, test, or publish containers.
 for forbidden in 'packages: write' 'Docker' 'docker' 'Buildx' 'buildx' \
