@@ -1,0 +1,71 @@
+---
+title: SQLite operations
+description: Operate Citadel's embedded, durable SQLite backend safely.
+---
+
+SQLite is Citadel's zero-infrastructure durable backend. It stores the shipped
+domain contracts in one database file, creates that file when needed, and
+applies Citadel's embedded migrations at startup. It is the practical default
+for one self-hosted node, local development that must survive restarts, and
+small deployments with durable storage mounted beside the server.
+
+## Configure and validate
+
+Use a `sqlite:` URL (or a bare filesystem path) in `[database]`:
+
+```toml
+[database]
+url = "sqlite:data.sqlite"
+connect_timeout_ms = 5000
+acquire_timeout_ms = 5000
+```
+
+Keep the database file on a persistent filesystem, not a temporary directory or
+ephemeral container layer. Validate the static configuration before opening
+listeners:
+
+```bash
+citadel check --config /etc/citadel/citadel.toml
+citadel serve --config /etc/citadel/citadel.toml
+```
+
+`citadel check` does not connect to the database. During `citadel serve`,
+Citadel opens the file and applies migrations before it accepts traffic. On a
+successful start, `/status` reports `backend: "sqlite"`. If Citadel cannot open
+the file or apply a migration, it fails startup; it never falls back to
+in-memory data when a SQLite URL is configured.
+
+## File ownership and deployment shape
+
+Give the Citadel service account read/write access to the database file and its
+parent directory. Use one Citadel writer process per database file unless your
+deployment has been deliberately designed and tested for SQLite's locking model.
+For containers, mount a dedicated persistent volume and configure the SQLite
+path inside that volume; the [container reference](/reference/operations/container-images/)
+uses `/citadel/data` for this purpose.
+
+Watch free disk space, filesystem errors, backup success, and lock/contention
+errors in the Citadel logs. The Dashboard Database Explorer can inspect the
+configured SQLite schema and bounded, redacted rows; it is diagnostic only and
+does not provide SQL, DDL, import, or export access.
+
+## Backup and restore
+
+Back up a consistent copy of the SQLite database file using an operator-owned
+procedure appropriate to the filesystem and deployment. Coordinate the backup
+with the Citadel process or use a storage snapshot mechanism that guarantees a
+consistent database image; copying an actively changing file without such a
+guarantee is not a recovery plan.
+
+Restore into an isolated path or host first. Use `citadel check` to validate the
+restored configuration, then start an isolated Citadel node against it so the
+server can connect and apply any required migrations. Verify the expected
+schema and application data with the authenticated Database Explorer before
+switching production traffic. Keep backup storage encrypted and limit access to
+the database file: its contents can include player data and password hashes.
+
+Citadel does not migrate data automatically between SQLite and another backend.
+Use an approved export/import project when moving to
+[PostgreSQL](/reference/operations/postgresql/),
+[CockroachDB](/reference/operations/cockroachdb/), or
+[MongoDB](/reference/operations/mongodb/).

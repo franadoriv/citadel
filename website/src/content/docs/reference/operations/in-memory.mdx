@@ -1,0 +1,43 @@
+---
+title: In-memory mode
+description: Run Citadel without a durable database for local development and disposable tests.
+---
+
+Citadel runs with its in-memory backend when `database.url` is absent. It is
+the zero-configuration mode: no database server, connection pool, schema
+migration, database file, or backup job is created.
+
+```toml
+# Omit [database] entirely, or omit database.url.
+```
+
+`/status` reports the non-secret backend class as `in-memory`. This is a
+functional reference implementation of Citadel's repository contracts, not a
+degraded network mode: player, storage, social, chat, notification, wallet,
+leaderboard, and purchase APIs behave normally while the process is alive.
+
+## Lifecycle and limits
+
+All data belongs to one Citadel process and is lost when that process exits.
+It is therefore appropriate for local development, examples, smoke tests, and
+fully disposable environments only. Do not use it for a server that must retain
+players, sessions, game data, or audit-relevant state after restart.
+
+There is no database to back up, restore, or inspect through the Dashboard
+Database Explorer. The explorer returns an explicit error for in-memory nodes
+because no durable schema exists.
+
+## Move to durable storage deliberately
+
+To retain data, set a durable `database.url` for
+[SQLite](/reference/operations/sqlite/),
+[PostgreSQL](/reference/operations/postgresql/),
+[CockroachDB](/reference/operations/cockroachdb/), or
+[MongoDB](/reference/operations/mongodb/), then restart Citadel. The configured
+backend connects and applies its migrations during startup; a failed connection
+or migration stops startup rather than silently falling back to in-memory data.
+
+Citadel does not automatically transfer existing data between in-memory and a
+durable backend. Treat a move as an application-level export/import or a fresh
+environment decision. The [configuration reference](/reference/operations/configuration/)
+lists the accepted URL schemes and shared connection options.

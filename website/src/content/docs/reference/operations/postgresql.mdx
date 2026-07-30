@@ -1,0 +1,77 @@
+---
+title: PostgreSQL operations
+description: Configure, operate, back up, and recover Citadel on PostgreSQL.
+---
+
+PostgreSQL is Citadel's conventional networked SQL backend. Citadel connects to
+the configured database, applies its embedded migrations during startup, and
+uses the shared repository contracts for accounts, sessions, storage, social
+features, chat, notifications, wallets, leaderboards, and purchases.
+
+## Configure and validate
+
+Use a database-qualified PostgreSQL URL and keep credentials outside source
+control:
+
+```toml
+[database]
+url = "postgres://citadel:<password>@db.example/citadel"
+max_connections = 10
+connect_timeout_ms = 5000
+acquire_timeout_ms = 5000
+```
+
+For production, require TLS according to the PostgreSQL service or provider's
+connection policy and use a least-privilege application role. The migration
+phase must have the permissions required to create or update Citadel's schema;
+do not deploy a role that can connect but cannot complete the initial migration.
+
+Validate the static configuration, then start Citadel before accepting players:
+
+```bash
+citadel check --config /etc/citadel/citadel.toml
+citadel serve --config /etc/citadel/citadel.toml
+```
+
+`citadel check` does not connect to PostgreSQL. During `citadel serve`, Citadel
+connects and applies its migrations before it accepts traffic. `/status` reports
+`backend: "postgres"` after a successful start. A failed connection, timeout,
+credential check, or migration stops startup instead of serving a partially
+persistent node.
+
+## Monitor and operate
+
+Monitor PostgreSQL availability, connection-pool pressure, transaction latency,
+lock waits, storage growth, and backup/replica health alongside Citadel's own
+structured logs. The Dashboard Database Explorer provides bounded, redacted,
+read-only inspection of Citadel's `public` objects; it is not a SQL console and
+cannot modify schema or rows.
+
+Size `max_connections` with the database's total connection budget in mind.
+Citadel owns only its configured pool; leave capacity for migrations, backup,
+monitoring, and operational access rather than assigning every server slot to
+the application.
+
+## Backup and recovery
+
+Use your PostgreSQL provider's supported physical or logical backup procedure
+and retain backups according to the deployment RPO/RTO. Protect database
+credentials and backup artifacts as secrets. Restore into an isolated database
+first, run `citadel check` against that configuration, then start an isolated
+Citadel node against it. Inspect the expected schema and application records
+with the authenticated Database Explorer before promoting it to production.
+
+Practice a restore drill rather than assuming a successful backup is usable.
+Citadel does not provide automatic cross-backend data migration; a move to
+[SQLite](/reference/operations/sqlite/),
+[CockroachDB](/reference/operations/cockroachdb/), or
+[MongoDB](/reference/operations/mongodb/) needs an approved export/import
+workflow.
+
+## Compatibility coverage
+
+The repository contains PostgreSQL contract suites, but their live run is
+opt-in: set `DATABASE_URL` or `CITADEL_TEST_DATABASE_URL` for those tests.
+This keeps the ordinary local suite self-contained while allowing an operator or
+CI environment with PostgreSQL to validate the same durable contracts against a
+real server.

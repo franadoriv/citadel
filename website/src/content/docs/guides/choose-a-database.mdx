@@ -51,6 +51,9 @@ server to provision. It is the friendly default for a single node. Back up the
 file according to your deployment's recovery plan, and make sure the process
 has durable storage and exclusive access appropriate for SQLite.
 
+See [SQLite operations](/reference/operations/sqlite/) for startup checks, file
+ownership, backup, and restore guidance.
+
 ### PostgreSQL
 
 PostgreSQL is the familiar choice when your team already has SQL operations,
@@ -58,6 +61,9 @@ managed Postgres, or standard relational backup and monitoring practices. Use a
 least-privilege application role, TLS in production, and the provider's tested
 backup/restore procedure. Citadel applies its schema migrations when it
 connects.
+
+See [PostgreSQL operations](/reference/operations/postgresql/) for connection,
+pool, monitoring, and recovery guidance.
 
 ### CockroachDB
 
@@ -67,6 +73,9 @@ migration flavor. Its stronger serializable transaction model can retry
 contentious work, so plan for normal database retry behavior. Read
 [Running on CockroachDB](/guides/cockroachdb/) before choosing it; it explains
 the compatibility details and a local fixture.
+
+For production operations, backup/restore, and live compatibility coverage,
+see [CockroachDB operations](/reference/operations/cockroachdb/).
 
 ### MongoDB
 
