@@ -11,6 +11,18 @@ export default defineConfig({
 			description:
 				'Developer documentation for Citadel: authoritative game logic, realtime multiplayer, durable game services, and client SDKs.',
 			customCss: ['./src/styles/citadel.css'],
+			social: [
+				{
+					icon: 'github',
+					label: 'Citadel on GitHub',
+					href: 'https://github.com/franadoriv/citadel',
+				},
+				{
+					icon: 'discord',
+					label: 'Join the Citadel Discord community',
+					href: 'https://discord.gg/79mpfygtQ',
+				},
+			],
 			components: {
 				SiteTitle: './src/components/SiteTitle.astro',
 			},
