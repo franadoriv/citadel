@@ -6,7 +6,7 @@ description: Separate a socket connection, temporary realtime participant, and a
 One player can have several identities at the same time. They answer different
 questions, and mixing them creates subtle reconnect and security bugs.
 
-![The same hero passes through a connection portal, receives a temporary realtime badge, and reaches a durable account identity.](../../../assets/docs/three-identities-one-hero.png)
+![A player connection becomes a temporary realtime session and then resolves to a durable account identity.](../../../assets/docs/three-identities-one-hero.svg)
 
 *One hero, three identities: the connection and participant change on reconnect;
 the account remains the durable player identity.*

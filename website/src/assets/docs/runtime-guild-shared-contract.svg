@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">One game logic host API</title><desc id="desc">Lua, Python and JavaScript runtimes use the same host API before invoking Citadel core.</desc>
+  <defs><linearGradient id="bg" x1="0" x2="1"><stop stop-color="#1a1835"/><stop offset="1" stop-color="#12293b"/></linearGradient><style>text{font-family:Inter,ui-sans-serif,system-ui,sans-serif;fill:#f7f3ff}.title{font-size:36px;font-weight:750}.label{font-size:24px;font-weight:700}.small{font-size:16px;fill:#c8bfdc}.card{fill:#21213c;stroke:#77708e;stroke-width:2}</style></defs>
+  <rect width="1200" height="675" rx="28" fill="url(#bg)"/><text x="600" y="78" text-anchor="middle" class="title">One host API for every trusted runtime</text>
+  <g transform="translate(65 170)"><rect width="220" height="94" rx="18" class="card"/><text x="110" y="46" text-anchor="middle" class="label">Lua</text><text x="110" y="72" text-anchor="middle" class="small">game rules</text></g>
+  <g transform="translate(65 290)"><rect width="220" height="94" rx="18" class="card"/><text x="110" y="46" text-anchor="middle" class="label">Python</text><text x="110" y="72" text-anchor="middle" class="small">game rules</text></g>
+  <g transform="translate(65 410)"><rect width="220" height="94" rx="18" class="card"/><text x="110" y="46" text-anchor="middle" class="label">JavaScript</text><text x="110" y="72" text-anchor="middle" class="small">game rules</text></g>
+  <g stroke="#8cc8ff" stroke-width="4"><path d="M300 217h128"/><path d="M300 337h128"/><path d="M300 457h128"/></g>
+  <g transform="translate(450 202)"><rect width="295" height="270" rx="26" fill="#58448d" stroke="#cab8ff" stroke-width="3"/><text x="147" y="73" text-anchor="middle" class="label">Citadel host API</text><path d="M57 111h181M57 151h181M57 191h181" stroke="#cfc5e9" stroke-width="3"/><text x="147" y="239" text-anchor="middle" class="small">events · storage · rooms</text></g>
+  <path d="M760 337h106" stroke="#edc76b" stroke-width="5"/><path d="M856 328l16 9-16 9" fill="#edc76b"/>
+  <g transform="translate(890 238)"><rect width="240" height="198" rx="24" fill="#274858" stroke="#78d3e6" stroke-width="3"/><text x="120" y="80" text-anchor="middle" class="label">Citadel core</text><text x="120" y="112" text-anchor="middle" class="small">authoritative services</text><text x="120" y="145" text-anchor="middle" class="small">transport · state · rules</text></g>
+  <path d="M450 548h680" stroke="#ef9d62" stroke-dasharray="12 10" stroke-width="3"/><text x="790" y="583" text-anchor="middle" class="small">future hardened runtime boundary</text>
+</svg>
