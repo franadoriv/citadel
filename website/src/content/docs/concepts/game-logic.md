@@ -10,7 +10,7 @@ shared world.
 
 That is Citadel's central game-logic model.
 
-![Lua, Python, and JavaScript mages follow one host API spellbook and send their actions into the same Citadel core, while a future hardened tier waits behind a barrier.](../../../assets/docs/runtime-guild-shared-contract.png)
+![Lua, Python, and JavaScript game logic use one host API before reaching the Citadel core, with a future hardened tier separated by a boundary.](../../../assets/docs/runtime-guild-shared-contract.svg)
 
 *Different languages, one guild contract. Scoped parity gaps are documented
 below; the hardened WASM tier remains a future quest.*

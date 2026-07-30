@@ -7,7 +7,7 @@ A **transport** is the road between a game client and Citadel. All three roads
 carry the same Citadel message envelope. They differ in which platforms can use
 them and whether they offer a fast, loss-tolerant lane.
 
-![Three anime couriers reach the same Citadel server using two-lane native QUIC, two-lane browser WebTransport, or one dependable WebSocket bridge.](../../../assets/docs/three-couriers-transports.png)
+![Three transport paths reach the same Citadel server: native QUIC, browser WebTransport, and a dependable WebSocket bridge.](../../../assets/docs/three-couriers-transports.svg)
 
 *Three couriers, one destination: choose the road that fits the client and the
 kind of message you need to deliver.*
