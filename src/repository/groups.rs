@@ -561,8 +561,8 @@ pub struct InMemoryGroupsRepository {
     inner: Mutex<GroupsState>,
 }
 
-#[derive(Debug, Default)]
-struct GroupsState {
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GroupsState {
     next_id: GroupId,
     groups: GroupStore,
     admissions: HashMap<(GroupId, String), PendingAdmission>,
@@ -579,6 +579,19 @@ impl InMemoryGroupsRepository {
         self.inner
             .lock()
             .map_err(|_| AppError::internal("groups repository mutex poisoned"))
+    }
+
+    /// Capture all groups, memberships, admissions, and the id sequence for an
+    /// enclosing in-memory transaction.
+    pub(crate) fn snapshot_for_rollback(&self) -> AppResult<GroupsState> {
+        Ok(self.guard()?.clone())
+    }
+
+    /// Restore a transaction snapshot without applying domain transitions.
+    pub(crate) fn restore_for_rollback(&self, snapshot: GroupsState) {
+        if let Ok(mut state) = self.inner.lock() {
+            *state = snapshot;
+        }
     }
 }
 

@@ -4,9 +4,9 @@
 //! [`PurchasesRepository`] implementation must honor — the atomic ledger-append +
 //! balance-update, the non-negative/overflow guards, the ledger capacity
 //! eviction, replay rejection, and the newest-first / subscription-derivation
-//! reads — plus a **no-lost-credit concurrency** scenario proving the
-//! read-modify-write is serialized (never two separate autocommit writes). Each
-//! scenario runs against every backend:
+//! reads — plus concurrency scenarios proving that read-modify-write is
+//! serialized (never two separate autocommit writes) and a duplicated purchase
+//! transaction is recorded exactly once. Each scenario runs against every backend:
 //!
 //! - always against the in-memory reference impls,
 //! - always against a real embedded SQLite backend (un-gated; no server), and
@@ -194,6 +194,45 @@ async fn scenario_concurrent_credits_never_lose(repo: Arc<dyn WalletRepository>)
     );
 }
 
+/// Concurrent replay delivery: exactly one submission may create the purchase;
+/// every competing delivery must receive a conflict and no duplicate record.
+async fn scenario_concurrent_duplicate_purchase_is_deduplicated(
+    repo: Arc<dyn PurchasesRepository>,
+) {
+    const N: usize = 16;
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let repo = Arc::clone(&repo);
+        handles.push(tokio::spawn(async move {
+            repo.record(purchase("tx-concurrent-dup", "u-1", 1, None))
+                .await
+        }));
+    }
+
+    let mut successes = 0;
+    let mut conflicts = 0;
+    for handle in handles {
+        match handle.await.expect("join") {
+            Ok(_) => successes += 1,
+            Err(error) => {
+                assert_eq!(
+                    error.category(),
+                    ErrorCategory::Conflict,
+                    "replay is a conflict"
+                );
+                conflicts += 1;
+            }
+        }
+    }
+    assert_eq!(successes, 1, "only one concurrent purchase delivery wins");
+    assert_eq!(conflicts, N - 1, "every replay is rejected");
+    assert_eq!(
+        repo.list(None, 10).await.expect("list").len(),
+        1,
+        "the transaction id is durable exactly once"
+    );
+}
+
 // --- Purchases scenarios (backend-agnostic) ---------------------------------
 
 async fn scenario_record_and_get_purchase(repo: &dyn PurchasesRepository) {
@@ -322,6 +361,10 @@ async fn in_memory_backend_satisfies_the_contract() {
         run(&InMemoryPurchasesRepository::new()).await;
     }
     scenario_concurrent_credits_never_lose(Arc::new(InMemoryWalletRepository::new())).await;
+    scenario_concurrent_duplicate_purchase_is_deduplicated(Arc::new(
+        InMemoryPurchasesRepository::new(),
+    ))
+    .await;
 }
 
 // --- SQLite run (always; embedded, no server) -------------------------------
@@ -356,6 +399,8 @@ mod sqlite {
         }
         db.reset_storage_for_tests().await.expect("reset");
         scenario_concurrent_credits_never_lose(db.wallet_repository()).await;
+        db.reset_storage_for_tests().await.expect("reset");
+        scenario_concurrent_duplicate_purchase_is_deduplicated(db.purchases_repository()).await;
     }
 }
 
@@ -403,5 +448,55 @@ mod postgres {
         }
         db.reset_storage_for_tests().await.expect("reset");
         scenario_concurrent_credits_never_lose(db.wallet_repository()).await;
+        db.reset_storage_for_tests().await.expect("reset");
+        scenario_concurrent_duplicate_purchase_is_deduplicated(db.purchases_repository()).await;
+    }
+}
+
+// --- MongoDB run (opt-in; real rs0 only) -----------------------------------
+
+mod mongodb {
+    use super::*;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{Backend, MongoDatabase};
+
+    async fn connect() -> Option<MongoDatabase> {
+        let url = std::env::var("CITADEL_TEST_MONGODB_URL").ok()?;
+        MongoDatabase::connect(&DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn mongodb_replica_set_satisfies_the_contract() {
+        let Some(db) = connect().await else {
+            eprintln!("skipping MongoDB wallet contract: CITADEL_TEST_MONGODB_URL is unset");
+            return;
+        };
+        for (name, run) in all_wallet_scenarios() {
+            db.clear_wallet_purchases_data_for_tests()
+                .await
+                .expect("reset");
+            eprintln!("mongodb wallet scenario: {name}");
+            run(db.wallet_repository().as_ref()).await;
+        }
+        for (name, run) in all_purchases_scenarios() {
+            db.clear_wallet_purchases_data_for_tests()
+                .await
+                .expect("reset");
+            eprintln!("mongodb purchases scenario: {name}");
+            run(db.purchases_repository().as_ref()).await;
+        }
+        db.clear_wallet_purchases_data_for_tests()
+            .await
+            .expect("reset");
+        scenario_concurrent_credits_never_lose(db.wallet_repository()).await;
+        db.clear_wallet_purchases_data_for_tests()
+            .await
+            .expect("reset");
+        scenario_concurrent_duplicate_purchase_is_deduplicated(db.purchases_repository()).await;
     }
 }

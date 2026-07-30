@@ -183,6 +183,8 @@ pub struct PgDatabase {
 /// coverage test below makes a new entry fail fast unless its table is also
 /// present in the CRDB migration set.
 const TEST_RESET_TABLES: &[&str] = &[
+    "storage_index_memberships",
+    "storage_index_definitions",
     "storage_objects",
     "sessions",
     "auth_identities",
@@ -497,6 +499,22 @@ impl PgUnitOfWork {
         ))))
     }
 
+    /// A friends repository bound to this transaction.
+    #[must_use]
+    pub fn friends_repository(&self) -> Arc<dyn FriendsRepository> {
+        Arc::new(PgFriendsRepository::new(PgExecutor::Tx(Arc::clone(
+            &self.cell,
+        ))))
+    }
+
+    /// A groups repository bound to this transaction.
+    #[must_use]
+    pub fn groups_repository(&self) -> Arc<dyn GroupsRepository> {
+        Arc::new(PgGroupsRepository::new(PgExecutor::Tx(Arc::clone(
+            &self.cell,
+        ))))
+    }
+
     /// Commit the transaction, making its writes durable.
     ///
     /// # Errors
@@ -610,6 +628,14 @@ impl UnitOfWork for PgUnitOfWork {
         PgUnitOfWork::session_repository(self)
     }
 
+    fn friends_repository(&self) -> Arc<dyn FriendsRepository> {
+        PgUnitOfWork::friends_repository(self)
+    }
+
+    fn groups_repository(&self) -> Arc<dyn GroupsRepository> {
+        PgUnitOfWork::groups_repository(self)
+    }
+
     async fn commit(self: Box<Self>) -> AppResult<()> {
         PgUnitOfWork::commit(*self).await
     }
@@ -644,6 +670,9 @@ mod tests {
     );
     const CRDB_CHAT_DELIVERY_OUTBOX: &str =
         include_str!("../../../migrations-crdb/20260726130000_create_chat_delivery_outbox.sql");
+    const CRDB_STORAGE_INDEX_MEMBERSHIPS: &str = include_str!(
+        "../../../migrations-crdb/20260713150000_create_storage_index_memberships.sql"
+    );
     const CRDB_NOTIFICATIONS: &str =
         include_str!("../../../migrations-crdb/20260709160000_create_notifications.sql");
     const CRDB_WALLET: &str =
@@ -677,6 +706,8 @@ mod tests {
     #[test]
     fn cockroach_migrations_cover_every_contract_reset_table() {
         let coverage = [
+            ("storage_index_memberships", CRDB_STORAGE_INDEX_MEMBERSHIPS),
+            ("storage_index_definitions", CRDB_STORAGE_INDEX_MEMBERSHIPS),
             ("storage_objects", CRDB_STORAGE),
             ("sessions", CRDB_IDENTITY_SESSION),
             ("auth_identities", CRDB_IDENTITY_SESSION),
@@ -714,6 +745,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cockroach_migration_versions_match_postgres() {
+        fn migration_versions(directory: &str) -> Vec<String> {
+            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+            let mut versions = std::fs::read_dir(directory)
+                .expect("read migration directory")
+                .map(|entry| entry.expect("read migration entry"))
+                .filter_map(|entry| {
+                    entry
+                        .file_type()
+                        .expect("read migration entry type")
+                        .is_file()
+                        .then(|| entry.file_name().to_string_lossy().into_owned())
+                })
+                .collect::<Vec<_>>();
+            versions.sort();
+            versions
+        }
+
+        assert_eq!(
+            migration_versions("migrations-crdb"),
+            migration_versions("migrations"),
+            "CockroachDB must have a migration for every PostgreSQL schema version"
+        );
     }
 
     #[test]

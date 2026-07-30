@@ -37,9 +37,17 @@ max_entries = 2000
 # Persistence backend, selected by URL scheme:
 #   sqlite://<file>            -> embedded single-file SQLite (created on first run)
 #   postgres://user:pass@host/db -> PostgreSQL
+#   mongodb://user:pass@host/citadel?replicaSet=rs0 -> MongoDB replica set
+#   mongodb+srv://user:pass@cluster/citadel -> MongoDB SRV deployment
 # Remove this key entirely to run non-durably on the in-memory backend.
 # The standalone default is a single `data.sqlite` file next to the binary.
 url = "sqlite://data.sqlite"
+# MongoDB uses the official driver's URI TLS/authentication support (SCRAM and
+# X.509). For the transactional contract keep these explicit majority/primary
+# values; MongoDB must be a replica set or sharded cluster, never standalone.
+mongodb_read_preference = "primary"
+mongodb_write_concern = "majority"
+mongodb_read_concern = "majority"
 # Connection pool size and timeouts (milliseconds).
 max_connections = 10
 connect_timeout_ms = 5000

@@ -138,6 +138,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
     "macros",
 ] }
+# Official MongoDB Rust driver. Its defaults use Rustls and include the DNS
+# resolver required by secure `mongodb+srv://` deployments; no OpenSSL surface.
+mongodb = "3.8"
 
 [dev-dependencies]
 # URL parsing for the in-process WebTransport client used in integration tests.

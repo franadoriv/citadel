@@ -15,8 +15,8 @@ use citadel::realtime::{
     ChatPresenceRegistry, DomainRpcServices, Gateway, Outbound, ParticipantId,
 };
 use citadel::repository::{
-    InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository, InMemoryGroupsRepository,
-    InMemoryLeaderboardsRepository, InMemoryWalletRepository,
+    ChatRepository, InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
+    InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryWalletRepository,
 };
 use citadel::services::{
     ChatChannelAuthorizer, ChatRateLimitPolicy, ChatService, FriendsService, GroupsService,
@@ -101,16 +101,16 @@ async fn rpc_response(receiver: &mut mpsc::Receiver<Outbound>) -> (u64, u8, Vec<
     )
 }
 
-#[tokio::test]
-async fn two_nodes_deliver_durable_chat_but_never_route_typing() {
+async fn two_nodes_deliver_durable_chat_but_never_route_typing(
+    chat_repository: Arc<dyn ChatRepository>,
+) {
     let friends = Arc::new(FriendsService::new(Arc::new(
         InMemoryFriendsRepository::new(),
     )));
     let groups = Arc::new(GroupsService::new(
         Arc::new(InMemoryGroupsRepository::new()),
     ));
-    let chat_repository = Arc::new(InMemoryChatRepository::new());
-    let chat = Arc::new(ChatService::new(chat_repository.clone()));
+    let chat = Arc::new(ChatService::new(Arc::clone(&chat_repository)));
     let node_a = gateway("node-a", friends.clone(), groups.clone(), chat.clone());
     let node_b = Arc::new(gateway("node-b", friends, groups, chat));
     let (alice, mut alice_rx) = register(&node_a, "alice");
@@ -246,4 +246,41 @@ async fn two_nodes_deliver_durable_chat_but_never_route_typing() {
             .loaded,
         0
     );
+}
+
+#[tokio::test]
+async fn two_nodes_deliver_durable_chat_but_never_route_typing_in_memory_reference() {
+    two_nodes_deliver_durable_chat_but_never_route_typing(Arc::new(InMemoryChatRepository::new()))
+        .await;
+}
+
+#[tokio::test]
+async fn two_nodes_deliver_durable_chat_but_never_route_typing_over_mongodb_rs0() {
+    let Some(url) = std::env::var("CITADEL_TEST_MONGODB_URL").ok() else {
+        eprintln!("skipping MongoDB multi-node chat: CITADEL_TEST_MONGODB_URL is unset");
+        return;
+    };
+    let db = citadel::repository::MongoDatabase::connect(&citadel::config::DatabaseConfig {
+        url: Some(url),
+        ..citadel::config::DatabaseConfig::default()
+    })
+    .await
+    .expect("connect + reconcile MongoDB replica set");
+    for collection in [
+        "chat_channels",
+        "chat_access_epochs",
+        "chat_messages",
+        "chat_events",
+        "chat_moderation_audit",
+        "chat_rate_limits",
+        "chat_delivery_outbox",
+    ] {
+        db.database_for_tests()
+            .collection::<mongodb::bson::Document>(collection)
+            .delete_many(mongodb::bson::doc! {})
+            .await
+            .expect("clear MongoDB multi-node chat fixture");
+    }
+    two_nodes_deliver_durable_chat_but_never_route_typing(Arc::new(db.mongo_chat_repository()))
+        .await;
 }

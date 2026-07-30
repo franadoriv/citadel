@@ -176,8 +176,10 @@ impl App {
     /// - selects the persistence backend from `[database]` by URL scheme. A
     ///   `sqlite:`/bare-path URL opens (creating the file on first run) and
     ///   migrates a single-file SQLite database; a `postgres://` URL connects and
-    ///   migrates Postgres, **failing fast** if it is unreachable — the node must
-    ///   not start half-persistent; an absent URL runs the in-memory backend.
+    ///   migrates Postgres; a `mongodb://`/`mongodb+srv://` URL verifies a
+    ///   transaction-capable deployment and reconciles its foundation schema.
+    ///   Every configured durable backend fails fast if unreachable or invalid —
+    ///   the node must not start half-persistent; an absent URL runs in-memory.
     ///
     /// The selected backend class is logged (never the connection string).
     ///

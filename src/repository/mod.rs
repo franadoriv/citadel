@@ -24,6 +24,7 @@ pub mod friends;
 pub mod groups;
 pub mod identity;
 pub mod leaderboards;
+pub mod mongodb;
 pub mod notifications;
 pub mod pg;
 pub mod purchases;
@@ -55,6 +56,7 @@ pub use leaderboards::{
     LeaderboardRecord, LeaderboardSummary, LeaderboardsRepository, Operator, RankedRecord,
     RecordsPage, SortOrder,
 };
+pub use mongodb::{MongoChatRepository, MongoDatabase, MongoSchemaPlan, MongoUnitOfWork};
 pub use notifications::{
     DEFAULT_NOTIFICATION_CAPACITY, InMemoryNotificationsRepository, Notification, NotificationPage,
     NotificationsRepository, Recipient,

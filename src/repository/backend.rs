@@ -41,6 +41,9 @@ use crate::storage::{
 };
 use crate::time::TimestampMillis;
 
+use super::MongoDatabase;
+use super::friends::EdgeStore;
+use super::groups::GroupsState;
 use super::pg::PgDatabase;
 use super::sqlite::SqliteDatabase;
 use super::{
@@ -69,6 +72,8 @@ pub enum BackendKind {
     Cockroach,
     /// Durable, embedded, single-file SQLite backend.
     Sqlite,
+    /// Durable MongoDB backend foundation.
+    MongoDb,
 }
 
 impl BackendKind {
@@ -80,6 +85,7 @@ impl BackendKind {
             Self::Postgres => "postgres",
             Self::Cockroach => "cockroach",
             Self::Sqlite => "sqlite",
+            Self::MongoDb => "mongodb",
         }
     }
 }
@@ -109,6 +115,10 @@ pub trait UnitOfWork: Send {
     fn auth_identity_repository(&self) -> Arc<dyn AuthIdentityRepository>;
     /// A session repository bound to this transaction.
     fn session_repository(&self) -> Arc<dyn SessionRepository>;
+    /// A friends repository bound to this transaction.
+    fn friends_repository(&self) -> Arc<dyn FriendsRepository>;
+    /// A groups repository bound to this transaction.
+    fn groups_repository(&self) -> Arc<dyn GroupsRepository>;
 
     /// Commit the transaction, making its writes durable.
     ///
@@ -235,6 +245,10 @@ pub async fn select_backend(config: &DatabaseConfig) -> AppResult<Arc<dyn Backen
             let db = SqliteDatabase::connect(config).await?;
             Ok(Arc::new(db))
         }
+        Some(crate::config::DatabaseBackend::MongoDb) => {
+            let db = MongoDatabase::connect(config).await?;
+            Ok(Arc::new(db))
+        }
         None => Ok(Arc::new(InMemoryBackend::new())),
     }
 }
@@ -353,6 +367,8 @@ impl Backend for InMemoryBackend {
             Arc::clone(&self.identities),
             Arc::clone(&self.sessions),
             Arc::clone(&self.storage),
+            Arc::clone(&self.friends),
+            Arc::clone(&self.groups),
         )))
     }
 }
@@ -364,6 +380,8 @@ enum Undo {
     UnlinkCredential(AuthCredential),
     RemoveSession(SessionId),
     RemoveStorage(ObjectId),
+    RestoreFriends(EdgeStore),
+    RestoreGroups(GroupsState),
 }
 
 /// The undo log shared between a [`InMemoryUnitOfWork`] and the repository
@@ -392,6 +410,8 @@ pub struct InMemoryUnitOfWork {
     identities: Arc<InMemoryAuthIdentityRepository>,
     sessions: Arc<InMemorySessionRepository>,
     storage: Arc<InMemoryStorageRepository>,
+    friends: Arc<InMemoryFriendsRepository>,
+    groups: Arc<InMemoryGroupsRepository>,
     log: Arc<StdMutex<UndoLog>>,
 }
 
@@ -402,6 +422,8 @@ impl InMemoryUnitOfWork {
         identities: Arc<InMemoryAuthIdentityRepository>,
         sessions: Arc<InMemorySessionRepository>,
         storage: Arc<InMemoryStorageRepository>,
+        friends: Arc<InMemoryFriendsRepository>,
+        groups: Arc<InMemoryGroupsRepository>,
     ) -> Self {
         Self {
             _guard: guard,
@@ -409,6 +431,8 @@ impl InMemoryUnitOfWork {
             identities,
             sessions,
             storage,
+            friends,
+            groups,
             log: Arc::new(StdMutex::new(UndoLog::default())),
         }
     }
@@ -437,6 +461,8 @@ impl InMemoryUnitOfWork {
                 }
                 Undo::RemoveSession(id) => self.sessions.remove_session_for_rollback(&id),
                 Undo::RemoveStorage(id) => self.storage.remove_object_for_rollback(&id),
+                Undo::RestoreFriends(snapshot) => self.friends.restore_for_rollback(snapshot),
+                Undo::RestoreGroups(snapshot) => self.groups.restore_for_rollback(snapshot),
             }
         }
     }
@@ -488,6 +514,20 @@ impl UnitOfWork for InMemoryUnitOfWork {
         })
     }
 
+    fn friends_repository(&self) -> Arc<dyn FriendsRepository> {
+        Arc::new(TxFriendsRepository {
+            inner: Arc::clone(&self.friends),
+            log: Arc::clone(&self.log),
+        })
+    }
+
+    fn groups_repository(&self) -> Arc<dyn GroupsRepository> {
+        Arc::new(TxGroupsRepository {
+            inner: Arc::clone(&self.groups),
+            log: Arc::clone(&self.log),
+        })
+    }
+
     async fn commit(self: Box<Self>) -> AppResult<()> {
         self.mark_committed();
         Ok(())
@@ -506,6 +546,19 @@ fn record(log: &Arc<StdMutex<UndoLog>>, undo: Undo) {
     {
         log.entries.push(undo);
     }
+}
+
+/// Refuse mutations through a repository handle after its UoW has resolved.
+fn ensure_active(log: &Arc<StdMutex<UndoLog>>) -> AppResult<()> {
+    let log = log.lock().map_err(|_| {
+        crate::error::AppError::internal("in-memory transaction log mutex poisoned")
+    })?;
+    if log.resolved {
+        return Err(crate::error::AppError::internal(
+            "in-memory transaction is already resolved",
+        ));
+    }
+    Ok(())
 }
 
 // The transaction-bound repository handles: each delegates to the shared store
@@ -637,6 +690,196 @@ impl SessionRepository for TxSessionRepository {
     }
 }
 
+struct TxFriendsRepository {
+    inner: Arc<InMemoryFriendsRepository>,
+    log: Arc<StdMutex<UndoLog>>,
+}
+
+#[async_trait]
+impl FriendsRepository for TxFriendsRepository {
+    async fn add(
+        &self,
+        user: &str,
+        other: &str,
+        now: TimestampMillis,
+    ) -> AppResult<crate::repository::FriendState> {
+        ensure_active(&self.log)?;
+        let snapshot = self.inner.snapshot_for_rollback()?;
+        let result = self.inner.add(user, other, now).await;
+        if result.is_ok() {
+            record(&self.log, Undo::RestoreFriends(snapshot));
+        }
+        result
+    }
+
+    async fn remove(&self, user: &str, other: &str) -> AppResult<bool> {
+        ensure_active(&self.log)?;
+        let snapshot = self.inner.snapshot_for_rollback()?;
+        let result = self.inner.remove(user, other).await;
+        if result.is_ok() {
+            record(&self.log, Undo::RestoreFriends(snapshot));
+        }
+        result
+    }
+
+    async fn block(&self, user: &str, other: &str, now: TimestampMillis) -> AppResult<()> {
+        ensure_active(&self.log)?;
+        let snapshot = self.inner.snapshot_for_rollback()?;
+        let result = self.inner.block(user, other, now).await;
+        if result.is_ok() {
+            record(&self.log, Undo::RestoreFriends(snapshot));
+        }
+        result
+    }
+
+    async fn list(&self, user: &str) -> AppResult<Vec<crate::repository::FriendRow>> {
+        self.inner.list(user).await
+    }
+}
+
+struct TxGroupsRepository {
+    inner: Arc<InMemoryGroupsRepository>,
+    log: Arc<StdMutex<UndoLog>>,
+}
+
+macro_rules! tx_groups_mutation {
+    ($self:expr, $call:expr) => {{
+        ensure_active(&$self.log)?;
+        let snapshot = $self.inner.snapshot_for_rollback()?;
+        let result = $call.await;
+        if result.is_ok() {
+            record(&$self.log, Undo::RestoreGroups(snapshot));
+        }
+        result
+    }};
+}
+
+#[async_trait]
+impl GroupsRepository for TxGroupsRepository {
+    async fn create(
+        &self,
+        request: crate::repository::CreateGroupRequest,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.create(request))
+    }
+
+    async fn list(
+        &self,
+        filter: &crate::repository::GroupFilter,
+    ) -> AppResult<crate::repository::GroupsPage> {
+        self.inner.list(filter).await
+    }
+
+    async fn get(
+        &self,
+        id: crate::repository::GroupId,
+    ) -> AppResult<Option<crate::repository::Group>> {
+        self.inner.get(id).await
+    }
+
+    async fn update(
+        &self,
+        id: crate::repository::GroupId,
+        request: crate::repository::UpdateGroupRequest,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.update(id, request))
+    }
+
+    async fn delete(&self, id: crate::repository::GroupId) -> AppResult<bool> {
+        tx_groups_mutation!(self, self.inner.delete(id))
+    }
+
+    async fn add_member(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+        now: TimestampMillis,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.add_member(id, user_id, now))
+    }
+
+    async fn kick_member(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.kick_member(id, user_id))
+    }
+
+    async fn promote(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.promote(id, user_id))
+    }
+
+    async fn demote(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.demote(id, user_id))
+    }
+
+    async fn join(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+        now: TimestampMillis,
+    ) -> AppResult<crate::repository::groups::AdmissionOutcome> {
+        tx_groups_mutation!(self, self.inner.join(id, user_id, now))
+    }
+
+    async fn invite(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+        inviter_user_id: &str,
+        now: TimestampMillis,
+    ) -> AppResult<crate::repository::groups::AdmissionOutcome> {
+        tx_groups_mutation!(self, self.inner.invite(id, user_id, inviter_user_id, now))
+    }
+
+    async fn approve_request(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+        now: TimestampMillis,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.approve_request(id, user_id, now))
+    }
+
+    async fn accept_invitation(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+        now: TimestampMillis,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(self, self.inner.accept_invitation(id, user_id, now))
+    }
+
+    async fn cancel_admission(
+        &self,
+        id: crate::repository::GroupId,
+        user_id: &str,
+    ) -> AppResult<()> {
+        tx_groups_mutation!(self, self.inner.cancel_admission(id, user_id))
+    }
+
+    async fn transfer_ownership(
+        &self,
+        id: crate::repository::GroupId,
+        from_user_id: &str,
+        to_user_id: &str,
+    ) -> AppResult<crate::repository::Group> {
+        tx_groups_mutation!(
+            self,
+            self.inner.transfer_ownership(id, from_user_id, to_user_id)
+        )
+    }
+}
+
 struct TxStorageRepository {
     inner: Arc<InMemoryStorageRepository>,
     log: Arc<StdMutex<UndoLog>>,
@@ -756,6 +999,7 @@ mod tests {
         assert_eq!(BackendKind::Postgres.as_str(), "postgres");
         assert_eq!(BackendKind::Postgres.to_string(), "postgres");
         assert_eq!(BackendKind::Cockroach.as_str(), "cockroach");
+        assert_eq!(BackendKind::MongoDb.as_str(), "mongodb");
         assert_eq!(BackendKind::Cockroach.to_string(), "cockroach");
     }
 
@@ -878,6 +1122,125 @@ mod tests {
                 .is_some(),
             "an idempotent re-link must not be undone by a later rollback"
         );
+    }
+
+    #[tokio::test]
+    async fn rolled_back_unit_of_work_removes_both_friendship_edges() {
+        let backend = InMemoryBackend::new();
+        let uow = backend.begin().await.expect("begin");
+        let friends = uow.friends_repository();
+        friends.add("alice", "bob", ts(1)).await.expect("invite");
+        friends.add("bob", "alice", ts(2)).await.expect("accept");
+        uow.rollback().await.expect("rollback");
+
+        assert!(
+            backend
+                .friends_repository()
+                .list("alice")
+                .await
+                .expect("list")
+                .is_empty(),
+            "rollback must remove alice's reciprocal edge"
+        );
+        assert!(
+            backend
+                .friends_repository()
+                .list("bob")
+                .await
+                .expect("list")
+                .is_empty(),
+            "rollback must remove bob's reciprocal edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_unit_of_work_keeps_reciprocal_friendship() {
+        let backend = InMemoryBackend::new();
+        let uow = backend.begin().await.expect("begin");
+        let friends = uow.friends_repository();
+        friends.add("alice", "bob", ts(1)).await.expect("invite");
+        friends.add("bob", "alice", ts(2)).await.expect("accept");
+        uow.commit().await.expect("commit");
+
+        assert_eq!(
+            backend
+                .friends_repository()
+                .list("alice")
+                .await
+                .expect("list")[0]
+                .state,
+            crate::repository::FriendState::Friend
+        );
+        assert_eq!(
+            backend
+                .friends_repository()
+                .list("bob")
+                .await
+                .expect("list")[0]
+                .state,
+            crate::repository::FriendState::Friend
+        );
+    }
+
+    fn group_request(name: &str) -> crate::repository::CreateGroupRequest {
+        crate::repository::CreateGroupRequest {
+            name: name.to_owned(),
+            description: "transaction test".to_owned(),
+            open: true,
+            max_size: 0,
+            creator_user_id: "owner".to_owned(),
+            now: ts(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn rolled_back_unit_of_work_removes_group_and_membership() {
+        let backend = InMemoryBackend::new();
+        let uow = backend.begin().await.expect("begin");
+        let groups = uow.groups_repository();
+        let group = groups
+            .create(group_request("rollback-group"))
+            .await
+            .expect("create");
+        groups
+            .add_member(group.id, "member", ts(2))
+            .await
+            .expect("add member");
+        uow.rollback().await.expect("rollback");
+
+        assert!(
+            backend
+                .groups_repository()
+                .get(group.id)
+                .await
+                .expect("get")
+                .is_none(),
+            "rollback must remove the group and its member roll"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_unit_of_work_keeps_group_membership() {
+        let backend = InMemoryBackend::new();
+        let uow = backend.begin().await.expect("begin");
+        let groups = uow.groups_repository();
+        let group = groups
+            .create(group_request("committed-group"))
+            .await
+            .expect("create");
+        groups
+            .add_member(group.id, "member", ts(2))
+            .await
+            .expect("add member");
+        uow.commit().await.expect("commit");
+
+        let persisted = backend
+            .groups_repository()
+            .get(group.id)
+            .await
+            .expect("get")
+            .expect("persisted group");
+        assert!(persisted.find_member("member").is_some());
     }
 
     #[test]

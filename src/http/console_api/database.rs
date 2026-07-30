@@ -31,7 +31,7 @@ pub struct TablesResponse {
 
 fn explorer(app: &App) -> Result<std::sync::Arc<dyn DatabaseExplorer>, ApiError> {
     app.backend().database_explorer().ok_or_else(|| {
-        AppError::validation("database explorer requires a durable SQL backend").into()
+        AppError::validation("database explorer requires a durable database backend").into()
     })
 }
 

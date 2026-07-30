@@ -9,6 +9,7 @@
 //! - always against a real embedded SQLite backend (un-gated; no server), and
 //! - against a real Postgres backend when `DATABASE_URL` (or
 //!   `CITADEL_TEST_DATABASE_URL`) is set, proving all three behave identically.
+//! - against a real MongoDB replica set when `CITADEL_TEST_MONGODB_URL` is set.
 //!   The Postgres run is skipped when neither variable is set, so
 //!   `bash scripts/check.sh` stays green without a database.
 //!
@@ -310,5 +311,214 @@ mod postgres {
             eprintln!("postgres scenario: {name}");
             run(repo.as_ref()).await;
         }
+    }
+}
+
+// --- MongoDB run (opt-in via CITADEL_TEST_MONGODB_URL) ---------------------
+
+mod mongodb {
+    use super::*;
+    use ::mongodb::Client;
+    use ::mongodb::bson::{Document, doc};
+    use ::mongodb::options::ClientOptions;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{Backend, MongoDatabase};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+    use tokio::time::{Duration, timeout};
+
+    fn test_database_url() -> Option<String> {
+        std::env::var("CITADEL_TEST_MONGODB_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    }
+
+    #[tokio::test]
+    async fn mongodb_backend_satisfies_the_contract() {
+        let Some(url) = test_database_url() else {
+            eprintln!("skipping MongoDB notifications contract: set CITADEL_TEST_MONGODB_URL");
+            return;
+        };
+        let config = DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        };
+        let db = MongoDatabase::connect(&config)
+            .await
+            .expect("connect + reconcile against MongoDB replica set");
+        let repo = db.notifications_repository();
+
+        for (name, run) in all_scenarios() {
+            db.clear_notifications_data_for_tests()
+                .await
+                .expect("reset notifications between scenarios");
+            eprintln!("mongodb scenario: {name}");
+            run(repo.as_ref()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mongodb_concurrent_mark_read_is_one_cas_transition_and_idempotent() {
+        const CONTENDERS: u64 = 32;
+        const FIRST_READ_AT: u64 = 10_000;
+
+        let Some(url) = test_database_url() else {
+            eprintln!(
+                "skipping MongoDB notification mark-read race contract: set CITADEL_TEST_MONGODB_URL"
+            );
+            return;
+        };
+        let config = DatabaseConfig {
+            url: Some(url.clone()),
+            ..DatabaseConfig::default()
+        };
+        let db = MongoDatabase::connect(&config).await.expect("connect");
+        db.clear_notifications_data_for_tests()
+            .await
+            .expect("reset");
+        let repo = Arc::new(db.notifications_repository());
+        let id = repo
+            .enqueue(Recipient::Broadcast, "race target", &obj(), 0, CAP, ts(1))
+            .await
+            .expect("enqueue race target");
+
+        // Observe the real collection's update events.  Because this is a
+        // replica-set test, a change stream lets the contract prove that the
+        // concurrent API calls cause exactly one write transition, rather than
+        // merely converging on a final value after multiple overwrites.
+        let options = ClientOptions::parse(&url)
+            .await
+            .expect("parse test MongoDB URL");
+        let database_name = options
+            .default_database
+            .clone()
+            .expect("test MongoDB URL includes a database name");
+        let client = Client::with_options(options).expect("construct MongoDB client");
+        let notifications = client
+            .database(&database_name)
+            .collection::<Document>("notifications");
+        let target = notifications
+            .find_one(doc! { "id": i64::try_from(id).expect("small id") })
+            .await
+            .expect("read race target")
+            .expect("race target exists");
+        let target_object_id = target
+            .get_object_id("_id")
+            .expect("race target has an object id")
+            .to_owned();
+        let mut updates = notifications
+            .watch()
+            .pipeline(vec![doc! {
+                "$match": {
+                    "operationType": "update",
+                    "documentKey._id": target_object_id,
+                }
+            }])
+            .await
+            .expect("open notification update stream");
+
+        let barrier = Arc::new(Barrier::new(
+            usize::try_from(CONTENDERS + 1).expect("small count"),
+        ));
+        let mut tasks = Vec::new();
+        for offset in 0..CONTENDERS {
+            let repo = Arc::clone(&repo);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                repo.mark_read(id, ts(FIRST_READ_AT + offset)).await
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            task.await
+                .expect("mark-read task joins")
+                .expect("mark-read succeeds");
+        }
+
+        timeout(Duration::from_secs(5), updates.next())
+            .await
+            .expect("the winning CAS update is observed")
+            .expect("change stream remains open")
+            .expect("change-stream update succeeds");
+        assert!(
+            timeout(Duration::from_millis(500), updates.next())
+                .await
+                .is_err(),
+            "only one contender may transition read_at_unix_ms"
+        );
+
+        let stored = notifications
+            .find_one(doc! { "id": i64::try_from(id).expect("small id") })
+            .await
+            .expect("read persisted race target")
+            .expect("race target persists");
+        let read_at = stored
+            .get_i64("read_at_unix_ms")
+            .expect("CAS stored a read timestamp");
+        assert!(
+            (i64::try_from(FIRST_READ_AT).expect("small timestamp")
+                ..i64::try_from(FIRST_READ_AT + CONTENDERS).expect("small timestamp"))
+                .contains(&read_at),
+            "the sole transition keeps one contender's timestamp"
+        );
+        assert_eq!(
+            repo.count().await.expect("count"),
+            1,
+            "race retains one document"
+        );
+        let page = repo.list(None, 10, None).await.expect("list");
+        assert_eq!(page.total, 1, "race does not create or delete documents");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, id);
+        assert_eq!(page.items[0].subject, "race target");
+        assert!(page.items[0].read, "winning transition is durable");
+    }
+
+    #[tokio::test]
+    async fn mongodb_concurrent_enqueues_are_atomic_and_sequential() {
+        let Some(url) = test_database_url() else {
+            eprintln!(
+                "skipping MongoDB notification concurrency contract: set CITADEL_TEST_MONGODB_URL"
+            );
+            return;
+        };
+        let config = DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        };
+        let db = MongoDatabase::connect(&config).await.expect("connect");
+        db.clear_notifications_data_for_tests()
+            .await
+            .expect("reset");
+        let repo = Arc::new(db.notifications_repository());
+
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.enqueue(
+                    Recipient::Broadcast,
+                    &format!("concurrent-{i}"),
+                    &obj(),
+                    0,
+                    CAP,
+                    ts(u64::try_from(i).expect("small index")),
+                )
+                .await
+            }));
+        }
+        let mut ids = tasks
+            .into_iter()
+            .map(|task| async move { task.await.expect("task joins").expect("enqueue") })
+            .collect::<Vec<_>>();
+        let mut assigned = Vec::new();
+        for task in ids.drain(..) {
+            assigned.push(task.await);
+        }
+        assigned.sort_unstable();
+        assert_eq!(assigned, (1..=16).collect::<Vec<_>>());
+        assert_eq!(repo.count().await.expect("count"), 16);
     }
 }

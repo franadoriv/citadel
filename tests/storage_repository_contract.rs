@@ -696,3 +696,139 @@ mod postgres {
         }
     }
 }
+
+// --- MongoDB run (opt-in via the authenticated replica-set harness) --------
+
+mod mongodb {
+    use super::*;
+    use ::mongodb::bson::{Document, doc};
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{Backend, MongoDatabase};
+
+    async fn connect() -> Option<MongoDatabase> {
+        let url = std::env::var("CITADEL_TEST_MONGODB_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        MongoDatabase::connect(&DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .ok()
+    }
+
+    async fn fail_next(db: &MongoDatabase, command: &str) {
+        db.admin_database_for_tests()
+            .run_command(doc! {
+                "configureFailPoint": "failCommand",
+                "mode": { "times": 1 },
+                "data": {
+                    "failCommands": [command],
+                    "errorCode": 2_i32,
+                    "failInternalCommands": true,
+                },
+            })
+            .await
+            .expect("enable one-shot storage failure");
+    }
+
+    #[tokio::test]
+    async fn mongodb_backend_satisfies_the_contract() {
+        let Some(db) = connect().await else {
+            eprintln!("skipping MongoDB storage contract: set CITADEL_TEST_MONGODB_URL");
+            return;
+        };
+        let repo = db.storage_repository();
+        for (name, run) in all_scenarios() {
+            db.clear_storage_data_for_tests()
+                .await
+                .expect("clear Mongo storage projections");
+            eprintln!("mongodb scenario: {name}");
+            run(repo.as_ref()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mongodb_storage_transactions_rollback_intermediate_projection_failures() {
+        let Some(db) = connect().await else {
+            eprintln!(
+                "skipping MongoDB storage rollback contract: CITADEL_TEST_MONGODB_URL is unset"
+            );
+            return;
+        };
+        db.clear_storage_data_for_tests()
+            .await
+            .expect("clear isolated storage projections");
+        let repo = db.storage_repository();
+        let alice = user("alice");
+        let object_id = id(Owner::user(alice.clone()), "profiles", "atomic");
+        let index = score_index();
+        repo.install_index(&index).await.expect("install index");
+        repo.write(
+            &Accessor::User(alice.clone()),
+            WriteRequest::upsert(object_id.clone(), value(1), Permissions::public_read()),
+        )
+        .await
+        .expect("seed object + membership");
+
+        // The object replacement succeeds before the injected membership insert
+        // fails. The transaction must abort both projection changes.
+        fail_next(&db, "insert").await;
+        let error = repo
+            .write(
+                &Accessor::User(alice.clone()),
+                WriteRequest::upsert(object_id.clone(), value(2), Permissions::public_read()),
+            )
+            .await
+            .expect_err("injected membership insert fails the write");
+        assert_eq!(error.category(), ErrorCategory::Database);
+        assert_eq!(
+            repo.read(&Accessor::Runtime, &object_id)
+                .await
+                .expect("read after aborted write")
+                .expect("seed object remains")
+                .value
+                .as_json(),
+            &json!({ "score": 1 }),
+            "object replacement rolled back with its memberships"
+        );
+        assert_eq!(
+            db.database_for_tests()
+                .collection::<Document>("storage_index_memberships")
+                .count_documents(doc! { "object_key": "atomic" })
+                .await
+                .expect("count memberships after aborted write"),
+            1,
+            "prior index membership remains intact"
+        );
+
+        // Membership removal succeeds before the injected CAS object removal
+        // fails. A failed delete therefore proves rollback in the other order.
+        fail_next(&db, "findAndModify").await;
+        let error = repo
+            .delete(
+                &Accessor::User(alice.clone()),
+                &object_id,
+                Precondition::Any,
+            )
+            .await
+            .expect_err("injected object CAS deletion fails");
+        assert_eq!(error.category(), ErrorCategory::Database);
+        assert!(
+            repo.read(&Accessor::Runtime, &object_id)
+                .await
+                .expect("read after aborted delete")
+                .is_some(),
+            "object survives an aborted delete"
+        );
+        assert_eq!(
+            db.database_for_tests()
+                .collection::<Document>("storage_index_memberships")
+                .count_documents(doc! { "object_key": "atomic" })
+                .await
+                .expect("count memberships after aborted delete"),
+            1,
+            "membership removal rolled back with the object"
+        );
+    }
+}

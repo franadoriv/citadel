@@ -1,680 +1,680 @@
 {
   "_comment": " cross-SDK bit-level ground truth. Regenerate with CITADEL_REGEN_VECTORS=1 cargo test -p citadel-wire --test wire_vectors",
-  "ack": [
+  "bit_order": "msb-first-within-byte",
+  "padding": "zero-fill-to-byte-boundary; non-canonical (nonzero pad or trailing byte) rejected on decode",
+  "endianness_note": "multi-byte values are packed as big-endian bit runs by the MSB-first bit writer, not byte-wise LE/BE",
+  "quat_component_order": {
+    "index_meaning": "0=x,1=y,2=z,3=w; the dropped (largest) component index",
+    "kept_order": "the three non-dropped components in ascending source index",
+    "sqrt_half": 0.7071067811865476
+  },
+  "schema_hash": {
+    "algorithm": "blake3-128/citadel.schema.v1",
+    "vectors": [
+      {
+        "layout_version": 1,
+        "fields": [],
+        "digest_hex": "25ed07bf54d4a1f85bd5bac50d6be206"
+      },
+      {
+        "layout_version": 1,
+        "fields": [
+          {
+            "field_id": 0,
+            "type_tag": 4660,
+            "codec_id": 1,
+            "cond": 0,
+            "authority": 0,
+            "bounds_shape": 85
+          },
+          {
+            "field_id": 1,
+            "type_tag": 4659,
+            "codec_id": 2,
+            "cond": 1,
+            "authority": 1,
+            "bounds_shape": 341
+          },
+          {
+            "field_id": 2,
+            "type_tag": 4666,
+            "codec_id": 3,
+            "cond": 2,
+            "authority": 0,
+            "bounds_shape": 597
+          },
+          {
+            "field_id": 3,
+            "type_tag": 4641,
+            "codec_id": 5,
+            "cond": 3,
+            "authority": 1,
+            "bounds_shape": 853
+          }
+        ],
+        "digest_hex": "d51af9875460e1b0ab0fcde2a6038a50"
+      },
+      {
+        "layout_version": 2,
+        "fields": [
+          {
+            "field_id": 0,
+            "type_tag": 4660,
+            "codec_id": 1,
+            "cond": 0,
+            "authority": 0,
+            "bounds_shape": 85
+          },
+          {
+            "field_id": 1,
+            "type_tag": 4659,
+            "codec_id": 2,
+            "cond": 1,
+            "authority": 1,
+            "bounds_shape": 341
+          },
+          {
+            "field_id": 2,
+            "type_tag": 4666,
+            "codec_id": 3,
+            "cond": 2,
+            "authority": 0,
+            "bounds_shape": 597
+          },
+          {
+            "field_id": 3,
+            "type_tag": 4641,
+            "codec_id": 5,
+            "cond": 3,
+            "authority": 1,
+            "bounds_shape": 853
+          }
+        ],
+        "digest_hex": "428c54c47f4f74a55b1592ddcd869437"
+      }
+    ]
+  },
+  "scalar": [
     {
-      "acks": [
-        10
-      ],
-      "history": 0,
-      "history_hex": "00000000",
-      "latest": 10
+      "min": 0.0,
+      "max": 4.0,
+      "values_per_unit": 1,
+      "bits": 3,
+      "code_count": 5,
+      "value": 0.0,
+      "code": 0,
+      "bit_len": 3,
+      "bytes_hex": "00",
+      "decoded": 0.0,
+      "error_max": 0.5
     },
     {
-      "acks": [
-        10,
-        8
-      ],
-      "history": 2,
-      "history_hex": "00000002",
-      "latest": 10
+      "min": 0.0,
+      "max": 4.0,
+      "values_per_unit": 1,
+      "bits": 3,
+      "code_count": 5,
+      "value": 4.0,
+      "code": 4,
+      "bit_len": 3,
+      "bytes_hex": "80",
+      "decoded": 4.0,
+      "error_max": 0.5
     },
     {
-      "acks": [
-        5,
-        6
-      ],
-      "history": 1,
-      "history_hex": "00000001",
-      "latest": 6
+      "min": 0.0,
+      "max": 4.0,
+      "values_per_unit": 1,
+      "bits": 3,
+      "code_count": 5,
+      "value": 2.5,
+      "code": 3,
+      "bit_len": 3,
+      "bytes_hex": "60",
+      "decoded": 3.0,
+      "error_max": 0.5
     },
     {
-      "acks": [
-        1,
-        32
-      ],
-      "history": 1073741824,
-      "history_hex": "40000000",
-      "latest": 32
+      "min": 0.0,
+      "max": 4.0,
+      "values_per_unit": 1,
+      "bits": 3,
+      "code_count": 5,
+      "value": 100.0,
+      "code": 4,
+      "bit_len": 3,
+      "bytes_hex": "80",
+      "decoded": 4.0,
+      "error_max": 0.5
     },
     {
-      "acks": [
-        1,
-        33
-      ],
-      "history": 2147483648,
-      "history_hex": "80000000",
-      "latest": 33
+      "min": 0.0,
+      "max": 4.0,
+      "values_per_unit": 1,
+      "bits": 3,
+      "code_count": 5,
+      "value": -100.0,
+      "code": 0,
+      "bit_len": 3,
+      "bytes_hex": "00",
+      "decoded": 0.0,
+      "error_max": 0.5
     },
     {
-      "acks": [
-        1,
-        34
-      ],
-      "history": 0,
-      "history_hex": "00000000",
-      "latest": 34
+      "min": -100.0,
+      "max": 100.0,
+      "values_per_unit": 10,
+      "bits": 11,
+      "code_count": 2001,
+      "value": 0.0,
+      "code": 1000,
+      "bit_len": 11,
+      "bytes_hex": "7d00",
+      "decoded": 0.0,
+      "error_max": 0.05
+    },
+    {
+      "min": -100.0,
+      "max": 100.0,
+      "values_per_unit": 10,
+      "bits": 11,
+      "code_count": 2001,
+      "value": 37.29999923706055,
+      "code": 1373,
+      "bit_len": 11,
+      "bytes_hex": "aba0",
+      "decoded": 37.29999923706055,
+      "error_max": 0.05
+    },
+    {
+      "min": -100.0,
+      "max": 100.0,
+      "values_per_unit": 10,
+      "bits": 11,
+      "code_count": 2001,
+      "value": -100.0,
+      "code": 0,
+      "bit_len": 11,
+      "bytes_hex": "0000",
+      "decoded": -100.0,
+      "error_max": 0.05
+    },
+    {
+      "min": -100.0,
+      "max": 100.0,
+      "values_per_unit": 10,
+      "bits": 11,
+      "code_count": 2001,
+      "value": 100.0,
+      "code": 2000,
+      "bit_len": 11,
+      "bytes_hex": "fa00",
+      "decoded": 100.0,
+      "error_max": 0.05
+    },
+    {
+      "min": -262144.0,
+      "max": 262144.0,
+      "values_per_unit": 8,
+      "bits": 23,
+      "code_count": 4194305,
+      "value": 0.0,
+      "code": 2097152,
+      "bit_len": 23,
+      "bytes_hex": "400000",
+      "decoded": 0.0,
+      "error_max": 0.0625
+    },
+    {
+      "min": -32768.0,
+      "max": 32768.0,
+      "values_per_unit": 8,
+      "bits": 20,
+      "code_count": 524289,
+      "value": 12345.0,
+      "code": 360904,
+      "bit_len": 20,
+      "bytes_hex": "581c80",
+      "decoded": 12345.0,
+      "error_max": 0.0625
     }
   ],
-  "bit_order": "msb-first-within-byte",
-  "endianness_note": "multi-byte values are packed as big-endian bit runs by the MSB-first bit writer, not byte-wise LE/BE",
-  "padding": "zero-fill-to-byte-boundary; non-canonical (nonzero pad or trailing byte) rejected on decode",
+  "vector": [
+    {
+      "bounds_min": [
+        -262144.0,
+        -262144.0,
+        -32768.0
+      ],
+      "bounds_max": [
+        262144.0,
+        262144.0,
+        32768.0
+      ],
+      "values_per_unit": 8,
+      "bits": 66,
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bit_len": 66,
+      "bytes_hex": "400000800001000000",
+      "decoded": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bounds_min": [
+        -262144.0,
+        -262144.0,
+        -32768.0
+      ],
+      "bounds_max": [
+        262144.0,
+        262144.0,
+        32768.0
+      ],
+      "values_per_unit": 8,
+      "bits": 66,
+      "position": [
+        -262144.0,
+        -262144.0,
+        -32768.0
+      ],
+      "bit_len": 66,
+      "bytes_hex": "000000000000000000",
+      "decoded": [
+        -262144.0,
+        -262144.0,
+        -32768.0
+      ]
+    },
+    {
+      "bounds_min": [
+        -262144.0,
+        -262144.0,
+        -32768.0
+      ],
+      "bounds_max": [
+        262144.0,
+        262144.0,
+        32768.0
+      ],
+      "values_per_unit": 8,
+      "bits": 66,
+      "position": [
+        262144.0,
+        262144.0,
+        32768.0
+      ],
+      "bit_len": 66,
+      "bytes_hex": "800001000002000000",
+      "decoded": [
+        262144.0,
+        262144.0,
+        32768.0
+      ]
+    },
+    {
+      "bounds_min": [
+        -262144.0,
+        -262144.0,
+        -32768.0
+      ],
+      "bounds_max": [
+        262144.0,
+        262144.0,
+        32768.0
+      ],
+      "values_per_unit": 8,
+      "bits": 66,
+      "position": [
+        1234.5,
+        -9876.25,
+        42.0
+      ],
+      "bit_len": 66,
+      "bytes_hex": "404d287b2d79005400",
+      "decoded": [
+        1234.5,
+        -9876.25,
+        42.0
+      ]
+    }
+  ],
   "quat": [
     {
-      "bit_len": 29,
-      "bytes_hex": "e0100800",
+      "mode": "Bits9",
       "codec_id": 4,
+      "total_bits": 29,
+      "input": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "dropped_index": 3,
       "component_codes": [
         256,
         256,
         256
       ],
+      "bit_len": 29,
+      "bytes_hex": "e0100800",
       "decoded": [
         0.0013837706064805388,
         0.0013837706064805388,
         0.0013837706064805388,
         0.9999971389770508
-      ],
-      "dropped_index": 3,
+      ]
+    },
+    {
+      "mode": "Bits10",
+      "codec_id": 5,
+      "total_bits": 32,
       "input": [
         0.0,
         0.0,
         0.0,
         1.0
       ],
-      "mode": "Bits9",
-      "total_bits": 29
-    },
-    {
-      "bit_len": 32,
-      "bytes_hex": "e0080200",
-      "codec_id": 5,
+      "dropped_index": 3,
       "component_codes": [
         512,
         512,
         512
       ],
+      "bit_len": 32,
+      "bytes_hex": "e0080200",
       "decoded": [
         0.0006912089884281158,
         0.0006912089884281158,
         0.0006912089884281158,
         0.9999992847442627
-      ],
-      "dropped_index": 3,
+      ]
+    },
+    {
+      "mode": "Bits15",
+      "codec_id": 6,
+      "total_bits": 47,
       "input": [
         0.0,
         0.0,
         0.0,
         1.0
       ],
-      "mode": "Bits10",
-      "total_bits": 32
-    },
-    {
-      "bit_len": 47,
-      "bytes_hex": "e00040008000",
-      "codec_id": 6,
+      "dropped_index": 3,
       "component_codes": [
         16384,
         16384,
         16384
       ],
+      "bit_len": 47,
+      "bytes_hex": "e00040008000",
       "decoded": [
         0.000021579844542429782,
         0.000021579844542429782,
         0.000021579844542429782,
         1.0
-      ],
-      "dropped_index": 3,
-      "input": [
-        0.0,
-        0.0,
-        0.0,
-        1.0
-      ],
-      "mode": "Bits15",
-      "total_bits": 47
+      ]
     },
     {
-      "bit_len": 32,
-      "bytes_hex": "31480200",
+      "mode": "Bits10",
       "codec_id": 5,
-      "component_codes": [
-        788,
-        512,
-        512
-      ],
-      "decoded": [
-        0.9240631461143494,
-        0.38223856687545776,
-        0.0006912089884281158,
-        0.0006912089884281158
+      "total_bits": 32,
+      "input": [
+        0.9239000082015991,
+        0.38269999623298645,
+        0.0,
+        0.0
       ],
       "dropped_index": 0,
-      "input": [
-        0.9239000082015991,
-        0.38269999623298645,
-        0.0,
-        0.0
+      "component_codes": [
+        788,
+        512,
+        512
       ],
-      "mode": "Bits10",
-      "total_bits": 32
+      "bit_len": 32,
+      "bytes_hex": "31480200",
+      "decoded": [
+        0.9240631461143494,
+        0.38223856687545776,
+        0.0006912089884281158,
+        0.0006912089884281158
+      ]
     },
     {
-      "bit_len": 32,
-      "bytes_hex": "600c5200",
+      "mode": "Bits10",
       "codec_id": 5,
+      "total_bits": 32,
+      "input": [
+        0.0,
+        0.9239000082015991,
+        0.38269999623298645,
+        0.0
+      ],
+      "dropped_index": 1,
       "component_codes": [
         512,
         788,
         512
       ],
+      "bit_len": 32,
+      "bytes_hex": "600c5200",
       "decoded": [
         0.0006912089884281158,
         0.9240631461143494,
         0.38223856687545776,
         0.0006912089884281158
-      ],
-      "dropped_index": 1,
-      "input": [
-        0.0,
-        0.9239000082015991,
-        0.38269999623298645,
-        0.0
-      ],
-      "mode": "Bits10",
-      "total_bits": 32
+      ]
     },
     {
-      "bit_len": 32,
-      "bytes_hex": "a0080314",
+      "mode": "Bits10",
       "codec_id": 5,
-      "component_codes": [
-        512,
-        512,
-        788
-      ],
-      "decoded": [
-        0.0006912089884281158,
-        0.0006912089884281158,
-        0.9240631461143494,
-        0.38223856687545776
-      ],
-      "dropped_index": 2,
+      "total_bits": 32,
       "input": [
         0.0,
         0.0,
         0.9239000082015991,
         0.38269999623298645
       ],
-      "mode": "Bits10",
-      "total_bits": 32
+      "dropped_index": 2,
+      "component_codes": [
+        512,
+        512,
+        788
+      ],
+      "bit_len": 32,
+      "bytes_hex": "a0080314",
+      "decoded": [
+        0.0006912089884281158,
+        0.0006912089884281158,
+        0.9240631461143494,
+        0.38223856687545776
+      ]
     },
     {
-      "bit_len": 32,
-      "bytes_hex": "f1480200",
+      "mode": "Bits10",
       "codec_id": 5,
-      "component_codes": [
-        788,
-        512,
-        512
-      ],
-      "decoded": [
-        0.38223856687545776,
-        0.0006912089884281158,
-        0.0006912089884281158,
-        0.9240631461143494
-      ],
-      "dropped_index": 3,
+      "total_bits": 32,
       "input": [
         0.38269999623298645,
         0.0,
         0.0,
         0.9239000082015991
       ],
-      "mode": "Bits10",
-      "total_bits": 32
+      "dropped_index": 3,
+      "component_codes": [
+        788,
+        512,
+        512
+      ],
+      "bit_len": 32,
+      "bytes_hex": "f1480200",
+      "decoded": [
+        0.38223856687545776,
+        0.0006912089884281158,
+        0.0006912089884281158,
+        0.9240631461143494
+      ]
     },
     {
-      "bit_len": 47,
-      "bytes_hex": "36a06d40da80",
+      "mode": "Bits15",
       "codec_id": 6,
-      "component_codes": [
-        27968,
-        27968,
-        27968
-      ],
-      "decoded": [
-        0.5000497102737427,
-        0.49998342990875244,
-        0.49998342990875244,
-        0.49998342990875244
-      ],
-      "dropped_index": 0,
+      "total_bits": 47,
       "input": [
         0.5,
         0.5,
         0.5,
         0.5
       ],
-      "mode": "Bits15",
-      "total_bits": 47
+      "dropped_index": 0,
+      "component_codes": [
+        27968,
+        27968,
+        27968
+      ],
+      "bit_len": 47,
+      "bytes_hex": "36a06d40da80",
+      "decoded": [
+        0.5000497102737427,
+        0.49998342990875244,
+        0.49998342990875244,
+        0.49998342990875244
+      ]
     },
     {
-      "bit_len": 47,
-      "bytes_hex": "db73b6e76dce",
+      "mode": "Bits15",
       "codec_id": 6,
-      "component_codes": [
-        14055,
-        14055,
-        14055
-      ],
-      "decoded": [
-        -0.10049733519554138,
-        -0.10049733519554138,
-        -0.10049733519554138,
-        0.9847338795661926
-      ],
-      "dropped_index": 3,
+      "total_bits": 47,
       "input": [
         0.10000000149011612,
         0.10000000149011612,
         0.10000000149011612,
         -0.9797000288963318
       ],
-      "mode": "Bits15",
-      "total_bits": 47
+      "dropped_index": 3,
+      "component_codes": [
+        14055,
+        14055,
+        14055
+      ],
+      "bit_len": 47,
+      "bytes_hex": "db73b6e76dce",
+      "decoded": [
+        -0.10049733519554138,
+        -0.10049733519554138,
+        -0.10049733519554138,
+        0.9847338795661926
+      ]
     },
     {
-      "bit_len": 32,
-      "bytes_hex": "e0080200",
+      "mode": "Bits10",
       "codec_id": 5,
-      "component_codes": [
-        512,
-        512,
-        512
-      ],
-      "decoded": [
-        0.0006912089884281158,
-        0.0006912089884281158,
-        0.0006912089884281158,
-        0.9999992847442627
-      ],
-      "dropped_index": 3,
+      "total_bits": 32,
       "input": [
         null,
         0.0,
         0.0,
         1.0
       ],
-      "mode": "Bits10",
-      "total_bits": 32
-    },
-    {
-      "bit_len": 32,
-      "bytes_hex": "e0080200",
-      "codec_id": 5,
+      "dropped_index": 3,
       "component_codes": [
         512,
         512,
         512
       ],
+      "bit_len": 32,
+      "bytes_hex": "e0080200",
       "decoded": [
         0.0006912089884281158,
         0.0006912089884281158,
         0.0006912089884281158,
         0.9999992847442627
-      ],
-      "dropped_index": 3,
+      ]
+    },
+    {
+      "mode": "Bits10",
+      "codec_id": 5,
+      "total_bits": 32,
       "input": [
         0.0,
         0.0,
         0.0,
         0.0
       ],
-      "mode": "Bits10",
-      "total_bits": 32
+      "dropped_index": 3,
+      "component_codes": [
+        512,
+        512,
+        512
+      ],
+      "bit_len": 32,
+      "bytes_hex": "e0080200",
+      "decoded": [
+        0.0006912089884281158,
+        0.0006912089884281158,
+        0.0006912089884281158,
+        0.9999992847442627
+      ]
     }
   ],
-  "quat_component_order": {
-    "index_meaning": "0=x,1=y,2=z,3=w; the dropped (largest) component index",
-    "kept_order": "the three non-dropped components in ascending source index",
-    "sqrt_half": 0.7071067811865476
-  },
-  "scalar": [
+  "ack": [
     {
-      "bit_len": 3,
-      "bits": 3,
-      "bytes_hex": "00",
-      "code": 0,
-      "code_count": 5,
-      "decoded": 0.0,
-      "error_max": 0.5,
-      "max": 4.0,
-      "min": 0.0,
-      "value": 0.0,
-      "values_per_unit": 1
+      "acks": [
+        10
+      ],
+      "latest": 10,
+      "history": 0,
+      "history_hex": "00000000"
     },
     {
-      "bit_len": 3,
-      "bits": 3,
-      "bytes_hex": "80",
-      "code": 4,
-      "code_count": 5,
-      "decoded": 4.0,
-      "error_max": 0.5,
-      "max": 4.0,
-      "min": 0.0,
-      "value": 4.0,
-      "values_per_unit": 1
+      "acks": [
+        10,
+        8
+      ],
+      "latest": 10,
+      "history": 2,
+      "history_hex": "00000002"
     },
     {
-      "bit_len": 3,
-      "bits": 3,
-      "bytes_hex": "60",
-      "code": 3,
-      "code_count": 5,
-      "decoded": 3.0,
-      "error_max": 0.5,
-      "max": 4.0,
-      "min": 0.0,
-      "value": 2.5,
-      "values_per_unit": 1
+      "acks": [
+        5,
+        6
+      ],
+      "latest": 6,
+      "history": 1,
+      "history_hex": "00000001"
     },
     {
-      "bit_len": 3,
-      "bits": 3,
-      "bytes_hex": "80",
-      "code": 4,
-      "code_count": 5,
-      "decoded": 4.0,
-      "error_max": 0.5,
-      "max": 4.0,
-      "min": 0.0,
-      "value": 100.0,
-      "values_per_unit": 1
+      "acks": [
+        1,
+        32
+      ],
+      "latest": 32,
+      "history": 1073741824,
+      "history_hex": "40000000"
     },
     {
-      "bit_len": 3,
-      "bits": 3,
-      "bytes_hex": "00",
-      "code": 0,
-      "code_count": 5,
-      "decoded": 0.0,
-      "error_max": 0.5,
-      "max": 4.0,
-      "min": 0.0,
-      "value": -100.0,
-      "values_per_unit": 1
+      "acks": [
+        1,
+        33
+      ],
+      "latest": 33,
+      "history": 2147483648,
+      "history_hex": "80000000"
     },
     {
-      "bit_len": 11,
-      "bits": 11,
-      "bytes_hex": "7d00",
-      "code": 1000,
-      "code_count": 2001,
-      "decoded": 0.0,
-      "error_max": 0.05,
-      "max": 100.0,
-      "min": -100.0,
-      "value": 0.0,
-      "values_per_unit": 10
-    },
-    {
-      "bit_len": 11,
-      "bits": 11,
-      "bytes_hex": "aba0",
-      "code": 1373,
-      "code_count": 2001,
-      "decoded": 37.29999923706055,
-      "error_max": 0.05,
-      "max": 100.0,
-      "min": -100.0,
-      "value": 37.29999923706055,
-      "values_per_unit": 10
-    },
-    {
-      "bit_len": 11,
-      "bits": 11,
-      "bytes_hex": "0000",
-      "code": 0,
-      "code_count": 2001,
-      "decoded": -100.0,
-      "error_max": 0.05,
-      "max": 100.0,
-      "min": -100.0,
-      "value": -100.0,
-      "values_per_unit": 10
-    },
-    {
-      "bit_len": 11,
-      "bits": 11,
-      "bytes_hex": "fa00",
-      "code": 2000,
-      "code_count": 2001,
-      "decoded": 100.0,
-      "error_max": 0.05,
-      "max": 100.0,
-      "min": -100.0,
-      "value": 100.0,
-      "values_per_unit": 10
-    },
-    {
-      "bit_len": 23,
-      "bits": 23,
-      "bytes_hex": "400000",
-      "code": 2097152,
-      "code_count": 4194305,
-      "decoded": 0.0,
-      "error_max": 0.0625,
-      "max": 262144.0,
-      "min": -262144.0,
-      "value": 0.0,
-      "values_per_unit": 8
-    },
-    {
-      "bit_len": 20,
-      "bits": 20,
-      "bytes_hex": "581c80",
-      "code": 360904,
-      "code_count": 524289,
-      "decoded": 12345.0,
-      "error_max": 0.0625,
-      "max": 32768.0,
-      "min": -32768.0,
-      "value": 12345.0,
-      "values_per_unit": 8
-    }
-  ],
-  "schema_hash": {
-    "algorithm": "blake3-128/citadel.schema.v1",
-    "vectors": [
-      {
-        "digest_hex": "25ed07bf54d4a1f85bd5bac50d6be206",
-        "fields": [],
-        "layout_version": 1
-      },
-      {
-        "digest_hex": "d51af9875460e1b0ab0fcde2a6038a50",
-        "fields": [
-          {
-            "authority": 0,
-            "bounds_shape": 85,
-            "codec_id": 1,
-            "cond": 0,
-            "field_id": 0,
-            "type_tag": 4660
-          },
-          {
-            "authority": 1,
-            "bounds_shape": 341,
-            "codec_id": 2,
-            "cond": 1,
-            "field_id": 1,
-            "type_tag": 4659
-          },
-          {
-            "authority": 0,
-            "bounds_shape": 597,
-            "codec_id": 3,
-            "cond": 2,
-            "field_id": 2,
-            "type_tag": 4666
-          },
-          {
-            "authority": 1,
-            "bounds_shape": 853,
-            "codec_id": 5,
-            "cond": 3,
-            "field_id": 3,
-            "type_tag": 4641
-          }
-        ],
-        "layout_version": 1
-      },
-      {
-        "digest_hex": "428c54c47f4f74a55b1592ddcd869437",
-        "fields": [
-          {
-            "authority": 0,
-            "bounds_shape": 85,
-            "codec_id": 1,
-            "cond": 0,
-            "field_id": 0,
-            "type_tag": 4660
-          },
-          {
-            "authority": 1,
-            "bounds_shape": 341,
-            "codec_id": 2,
-            "cond": 1,
-            "field_id": 1,
-            "type_tag": 4659
-          },
-          {
-            "authority": 0,
-            "bounds_shape": 597,
-            "codec_id": 3,
-            "cond": 2,
-            "field_id": 2,
-            "type_tag": 4666
-          },
-          {
-            "authority": 1,
-            "bounds_shape": 853,
-            "codec_id": 5,
-            "cond": 3,
-            "field_id": 3,
-            "type_tag": 4641
-          }
-        ],
-        "layout_version": 2
-      }
-    ]
-  },
-  "vector": [
-    {
-      "bit_len": 66,
-      "bits": 66,
-      "bounds_max": [
-        262144.0,
-        262144.0,
-        32768.0
+      "acks": [
+        1,
+        34
       ],
-      "bounds_min": [
-        -262144.0,
-        -262144.0,
-        -32768.0
-      ],
-      "bytes_hex": "400000800001000000",
-      "decoded": [
-        0.0,
-        0.0,
-        0.0
-      ],
-      "position": [
-        0.0,
-        0.0,
-        0.0
-      ],
-      "values_per_unit": 8
-    },
-    {
-      "bit_len": 66,
-      "bits": 66,
-      "bounds_max": [
-        262144.0,
-        262144.0,
-        32768.0
-      ],
-      "bounds_min": [
-        -262144.0,
-        -262144.0,
-        -32768.0
-      ],
-      "bytes_hex": "000000000000000000",
-      "decoded": [
-        -262144.0,
-        -262144.0,
-        -32768.0
-      ],
-      "position": [
-        -262144.0,
-        -262144.0,
-        -32768.0
-      ],
-      "values_per_unit": 8
-    },
-    {
-      "bit_len": 66,
-      "bits": 66,
-      "bounds_max": [
-        262144.0,
-        262144.0,
-        32768.0
-      ],
-      "bounds_min": [
-        -262144.0,
-        -262144.0,
-        -32768.0
-      ],
-      "bytes_hex": "800001000002000000",
-      "decoded": [
-        262144.0,
-        262144.0,
-        32768.0
-      ],
-      "position": [
-        262144.0,
-        262144.0,
-        32768.0
-      ],
-      "values_per_unit": 8
-    },
-    {
-      "bit_len": 66,
-      "bits": 66,
-      "bounds_max": [
-        262144.0,
-        262144.0,
-        32768.0
-      ],
-      "bounds_min": [
-        -262144.0,
-        -262144.0,
-        -32768.0
-      ],
-      "bytes_hex": "404d287b2d79005400",
-      "decoded": [
-        1234.5,
-        -9876.25,
-        42.0
-      ],
-      "position": [
-        1234.5,
-        -9876.25,
-        42.0
-      ],
-      "values_per_unit": 8
+      "latest": 34,
+      "history": 0,
+      "history_hex": "00000000"
     }
   ]
 }

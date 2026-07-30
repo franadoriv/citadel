@@ -9,6 +9,7 @@
 //! - always against a real embedded SQLite backend (un-gated; no server), and
 //! - against a real Postgres backend when `DATABASE_URL` (or
 //!   `CITADEL_TEST_DATABASE_URL`) is set, proving all three behave identically.
+//! - against a real MongoDB replica set when `CITADEL_TEST_MONGODB_URL` is set.
 //!   The Postgres run is skipped when neither variable is set, so
 //!   `bash scripts/check.sh` stays green without a database.
 //!
@@ -247,6 +248,37 @@ mod postgres {
                 .await
                 .expect("reset storage between scenarios");
             eprintln!("postgres scenario: {name}");
+            run(repo.as_ref()).await;
+        }
+    }
+}
+
+// --- MongoDB run (opt-in via CITADEL_TEST_MONGODB_URL) ----------------------
+
+mod mongodb {
+    use super::*;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{Backend, MongoDatabase};
+
+    #[tokio::test]
+    async fn mongodb_backend_satisfies_the_contract() {
+        let Some(url) = std::env::var("CITADEL_TEST_MONGODB_URL").ok() else {
+            eprintln!("skipping MongoDB friends contract: CITADEL_TEST_MONGODB_URL is unset");
+            return;
+        };
+        let db = MongoDatabase::connect(&DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect + reconcile against a MongoDB replica set");
+        let repo = db.friends_repository();
+
+        for (name, run) in all_scenarios() {
+            db.clear_friends_data_for_tests()
+                .await
+                .expect("clear friend edges between scenarios");
+            eprintln!("mongodb scenario: {name}");
             run(repo.as_ref()).await;
         }
     }

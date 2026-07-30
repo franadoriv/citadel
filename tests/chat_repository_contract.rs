@@ -525,3 +525,59 @@ mod postgres {
         }
     }
 }
+
+// MongoDB conversation/message parity is intentionally a subset here: audit,
+// rate-limit, and outbox scenarios belong to the follow-on delivery task.
+mod mongodb {
+    use super::*;
+    use ::mongodb::bson::{Document, doc};
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::MongoDatabase;
+
+    #[tokio::test]
+    async fn mongodb_conversations_and_messages_satisfy_the_contract() {
+        let Some(url) = std::env::var("CITADEL_TEST_MONGODB_URL").ok() else {
+            eprintln!("skipping MongoDB chat contract: set CITADEL_TEST_MONGODB_URL");
+            return;
+        };
+        let db = MongoDatabase::connect(&DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect + reconcile MongoDB replica set");
+        let scenarios = scenarios![
+            scenario_append_creates_channel_and_summarizes,
+            // MongoDB rejects a conflicting append type (covered by the real
+            // rs0 remediation test); legacy reference backends preserve their
+            // original type while accepting that append.
+            scenario_history_newest_first_with_before_cursor,
+            scenario_bounded_history_evicts_oldest_but_ids_keep_incrementing,
+            scenario_history_for_unknown_channel_is_empty,
+            scenario_delete_tombstones_durably_and_is_idempotent,
+            scenario_delete_unknown_channel_or_id_is_not_found,
+            scenario_edit_and_tombstone_advance_per_channel_event_order,
+            scenario_channels_filter_sort_and_limit,
+            scenario_canonical_descriptors_and_access_epochs_are_durable,
+        ];
+        for (name, run) in scenarios {
+            for collection in [
+                "chat_channels",
+                "chat_access_epochs",
+                "chat_messages",
+                "chat_events",
+                "chat_moderation_audit",
+                "chat_rate_limits",
+                "chat_delivery_outbox",
+            ] {
+                db.database_for_tests()
+                    .collection::<Document>(collection)
+                    .delete_many(doc! {})
+                    .await
+                    .expect("clear MongoDB chat fixture");
+            }
+            eprintln!("mongodb chat scenario: {name}");
+            run(&db.mongo_chat_repository()).await;
+        }
+    }
+}

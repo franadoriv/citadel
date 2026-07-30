@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::TryStreamExt;
+use mongodb::Database;
+use mongodb::bson::{Bson, Document, doc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::sqlite::SqliteRow;
@@ -585,6 +588,303 @@ pub struct PgMetadataExplorer {
     pool: PgPool,
     cursor_store: Arc<ExplorerCursorStore>,
     row_store: Arc<ExplorerRowStore>,
+}
+
+/// MongoDB adapter for the administrative explorer. It deliberately uses only
+/// driver read APIs (`list_collection_names`, `list_indexes`, `find`, and
+/// `find_one`); it never accepts a command document or exposes a mutation.
+/// Mongo collections have no SQL schema, so the `mongodb` logical schema and
+/// observed top-level fields are an honest, bounded metadata projection.
+#[derive(Debug, Clone)]
+pub struct MongoMetadataExplorer {
+    database: Database,
+    cursor_store: Arc<ExplorerCursorStore>,
+    row_store: Arc<ExplorerRowStore>,
+}
+
+impl MongoMetadataExplorer {
+    #[must_use]
+    pub fn new(database: Database) -> Self {
+        Self {
+            database,
+            cursor_store: Arc::new(ExplorerCursorStore::new()),
+            row_store: Arc::new(ExplorerRowStore::new()),
+        }
+    }
+
+    async fn resolve_collection(&self, requested: &TableRef) -> AppResult<String> {
+        requested.validate()?;
+        if requested.schema != "mongodb" || !mongo_name_is_safe(&requested.table) {
+            return Err(AppError::not_found(
+                "database explorer collection is not available",
+            ));
+        }
+        let names = tokio::time::timeout(QUERY_TIMEOUT, self.database.list_collection_names())
+            .await
+            .map_err(|_| AppError::database("database explorer metadata query timed out"))?
+            .map_err(mongo_explorer_error)?;
+        names
+            .into_iter()
+            .find(|name| name == &requested.table && mongo_name_is_safe(name))
+            .ok_or_else(|| AppError::not_found("database explorer collection is not available"))
+    }
+
+    async fn fields(&self, collection: &str) -> AppResult<Vec<String>> {
+        let mut fields = std::collections::BTreeSet::from(["_id".to_owned()]);
+        let mut cursor = tokio::time::timeout(QUERY_TIMEOUT, async {
+            self.database
+                .collection::<Document>(collection)
+                .find(doc! {})
+                .limit(100)
+                .await
+        })
+        .await
+        .map_err(|_| AppError::database("database explorer metadata query timed out"))?
+        .map_err(mongo_explorer_error)?;
+        while let Some(document) = tokio::time::timeout(QUERY_TIMEOUT, cursor.try_next())
+            .await
+            .map_err(|_| AppError::database("database explorer metadata query timed out"))?
+            .map_err(mongo_explorer_error)?
+        {
+            fields.extend(
+                document
+                    .keys()
+                    .filter(|name| mongo_field_is_safe(name))
+                    .cloned(),
+            );
+        }
+        Ok(fields.into_iter().collect())
+    }
+
+    async fn indexes(&self, collection: &str) -> AppResult<Vec<IndexDescription>> {
+        let mut cursor = tokio::time::timeout(QUERY_TIMEOUT, async {
+            self.database
+                .collection::<Document>(collection)
+                .list_indexes()
+                .await
+        })
+        .await
+        .map_err(|_| AppError::database("database explorer metadata query timed out"))?
+        .map_err(mongo_explorer_error)?;
+        let mut indexes = Vec::new();
+        while let Some(index) = tokio::time::timeout(QUERY_TIMEOUT, cursor.try_next())
+            .await
+            .map_err(|_| AppError::database("database explorer metadata query timed out"))?
+            .map_err(mongo_explorer_error)?
+        {
+            let options = index.options.unwrap_or_default();
+            let Some(name) = options.name else {
+                continue;
+            };
+            let columns = index
+                .keys
+                .keys()
+                .filter(|field| mongo_field_is_safe(field))
+                .cloned()
+                .collect::<Vec<_>>();
+            indexes.push(IndexDescription {
+                name: sanitize_metadata_label(&name),
+                columns,
+                unique: options.unique.unwrap_or(false),
+            });
+        }
+        indexes.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(indexes)
+    }
+
+    async fn description(&self, table: &TableRef) -> AppResult<TableDescription> {
+        let collection = self.resolve_collection(table).await?;
+        let columns = self
+            .fields(&collection)
+            .await?
+            .into_iter()
+            .map(|name| ColumnDescription {
+                sensitive: is_sensitive_column(&name),
+                data_type: if name == "_id" {
+                    "object_id"
+                } else {
+                    "document_field"
+                }
+                .to_owned(),
+                nullable: name != "_id",
+                name,
+            })
+            .collect();
+        let description = TableDescription {
+            table: table.clone(),
+            capabilities: ExplorerCapabilities::stable(false, true, false),
+            columns,
+            primary_key: vec!["_id".to_owned()],
+            indexes: self.indexes(&collection).await?,
+            // MongoDB has no foreign-key catalog. Do not infer relations from
+            // field names or application conventions.
+            relations: Vec::new(),
+        };
+        description.validate()?;
+        Ok(description)
+    }
+
+    fn row_from_document(
+        &self,
+        table: &TableRef,
+        description: &TableDescription,
+        document: Document,
+    ) -> AppResult<DatabaseRow> {
+        let id = document
+            .get("_id")
+            .cloned()
+            .ok_or_else(|| AppError::database("MongoDB explorer document has no _id"))?;
+        let mut values = BTreeMap::new();
+        for column in &description.columns {
+            let value = if column.sensitive {
+                DatabaseValue::Redacted
+            } else {
+                document
+                    .get(&column.name)
+                    .map_or(DatabaseValue::Null, bson_database_value)
+            };
+            values.insert(column.name.clone(), value);
+        }
+        Ok(DatabaseRow {
+            values,
+            row_ref: self.row_store.issue(table.clone(), bson_to_json(&id)?)?,
+        })
+    }
+}
+
+#[async_trait]
+impl DatabaseExplorer for MongoMetadataExplorer {
+    async fn list_tables(&self) -> AppResult<Vec<TableSummary>> {
+        let names = tokio::time::timeout(QUERY_TIMEOUT, self.database.list_collection_names())
+            .await
+            .map_err(|_| AppError::database("database explorer metadata query timed out"))?
+            .map_err(mongo_explorer_error)?;
+        let mut tables = names
+            .into_iter()
+            .filter(|name| mongo_name_is_safe(name))
+            .map(|table| TableSummary {
+                table: TableRef {
+                    schema: "mongodb".to_owned(),
+                    table,
+                },
+                kind: TableKind::Table,
+            })
+            .collect::<Vec<_>>();
+        tables.sort_by(|left, right| left.table.table.cmp(&right.table.table));
+        Ok(tables)
+    }
+
+    async fn describe_table(&self, table: &TableRef) -> AppResult<TableDescription> {
+        self.description(table).await
+    }
+
+    async fn list_rows(&self, request: &ListRowsRequest) -> AppResult<RowsPage> {
+        let description = self.description(&request.table).await?;
+        validate_row_request_metadata(request, &description)?;
+        let collection = self.resolve_collection(&request.table).await?;
+        let position = request
+            .cursor
+            .as_deref()
+            .map(|token| {
+                self.cursor_store
+                    .position(token, &request.table, &request.sort)
+            })
+            .transpose()?
+            .flatten();
+        let filter = mongo_filter(request, position.as_ref())?;
+        let mut sort = Document::new();
+        let direction = match request.sort.direction {
+            SortDirection::Asc => 1_i32,
+            SortDirection::Desc => -1_i32,
+        };
+        sort.insert(&request.sort.column, direction);
+        if request.sort.column != "_id" {
+            sort.insert("_id", direction);
+        }
+        let requested = request.limit.unwrap_or(50);
+        let limit = i64::try_from(
+            requested
+                .checked_add(1)
+                .ok_or_else(|| AppError::internal("database explorer page limit overflow"))?,
+        )
+        .map_err(|_| AppError::internal("database explorer page limit overflow"))?;
+        let mut cursor = tokio::time::timeout(QUERY_TIMEOUT, async {
+            self.database
+                .collection::<Document>(&collection)
+                .find(filter)
+                .sort(sort)
+                .limit(limit)
+                .await
+        })
+        .await
+        .map_err(|_| AppError::database("database explorer row query timed out"))?
+        .map_err(mongo_explorer_error)?;
+        let mut documents = Vec::new();
+        while let Some(document) = tokio::time::timeout(QUERY_TIMEOUT, cursor.try_next())
+            .await
+            .map_err(|_| AppError::database("database explorer row query timed out"))?
+            .map_err(mongo_explorer_error)?
+        {
+            documents.push(document);
+        }
+        let next = if documents.len() > requested {
+            documents.pop();
+            let last = documents.last().ok_or_else(|| {
+                AppError::internal("database explorer keyset page unexpectedly has no last row")
+            })?;
+            let mut key = Document::new();
+            key.insert(
+                &request.sort.column,
+                last.get(&request.sort.column)
+                    .cloned()
+                    .unwrap_or(Bson::Null),
+            );
+            key.insert(
+                "_id",
+                last.get("_id")
+                    .cloned()
+                    .ok_or_else(|| AppError::database("MongoDB explorer document has no _id"))?,
+            );
+            Some(self.cursor_store.issue_at_position(
+                request.table.clone(),
+                request.sort.clone(),
+                bson_to_json(&Bson::Document(key))?,
+            )?)
+        } else {
+            None
+        };
+        let rows = documents
+            .into_iter()
+            .map(|document| self.row_from_document(&request.table, &description, document))
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok(RowsPage {
+            table: request.table.clone(),
+            rows,
+            next,
+        })
+    }
+
+    async fn get_row(&self, request: &RowDetailRequest) -> AppResult<DatabaseRow> {
+        request.validate()?;
+        let description = self.description(&request.table).await?;
+        let collection = self.resolve_collection(&request.table).await?;
+        let id = json_to_bson(
+            &self
+                .row_store
+                .primary_key(&request.row_ref, &request.table)?,
+        )?;
+        let document = tokio::time::timeout(QUERY_TIMEOUT, async {
+            self.database
+                .collection::<Document>(&collection)
+                .find_one(doc! { "_id": id })
+                .await
+        })
+        .await
+        .map_err(|_| AppError::database("database explorer row query timed out"))?
+        .map_err(mongo_explorer_error)?
+        .ok_or_else(|| AppError::not_found("database explorer row is no longer available"))?;
+        self.row_from_document(&request.table, &description, document)
+    }
 }
 
 impl PgMetadataExplorer {
@@ -1166,6 +1466,12 @@ fn explorer_db_error(error: impl std::fmt::Display) -> AppError {
     AppError::database("database explorer metadata query failed").with_detail(error.to_string())
 }
 
+fn mongo_explorer_error(_error: mongodb::error::Error) -> AppError {
+    // MongoDB errors can embed server replies and URI details; keep this
+    // diagnostic surface credential-free just like startup and repositories.
+    AppError::database("MongoDB explorer query failed")
+}
+
 /// Convert a SQLite result row into safe explorer values. The caller supplies
 /// the metadata snapshot that selected the projection; a sensitive column is
 /// replaced before its raw database value is decoded or serialized.
@@ -1264,10 +1570,225 @@ fn sqlite_string_literal(value: &str) -> String {
 }
 
 fn is_sensitive_column(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    ["password", "secret", "token", "api_key", "credential"]
+    // Field names are metadata, not an API contract. Treat case and punctuation
+    // as cosmetic so APIKEY, apiKey, api-key, and api_key receive the same
+    // protection. BSON permits arbitrary strings as keys, therefore only ASCII
+    // alphanumerics participate in this comparison rather than attempting to
+    // interpret punctuation as an operator or identifier.
+    let normalized = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    ["password", "secret", "token", "apikey", "credential"]
         .iter()
         .any(|needle| normalized.contains(needle))
+}
+
+/// Mongo field and collection names are never interpreted as a Mongo operator.
+/// Metadata that does not meet this deliberately small grammar stays invisible
+/// rather than becoming an identifier or `$` expression in a query document.
+fn mongo_name_is_safe(name: &str) -> bool {
+    !name.starts_with("system.")
+        && !name.is_empty()
+        && name.len() <= MAX_IDENTIFIER_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn mongo_field_is_safe(name: &str) -> bool {
+    name == "_id"
+        || (!name.is_empty()
+            && name.len() <= MAX_IDENTIFIER_BYTES
+            && name
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+}
+
+fn sanitize_metadata_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_IDENTIFIER_BYTES)
+        .collect()
+}
+
+fn bson_to_json(value: &Bson) -> AppResult<serde_json::Value> {
+    serde_json::to_value(value)
+        .map_err(|_| AppError::database("MongoDB explorer value cannot be encoded"))
+}
+
+fn json_to_bson(value: &serde_json::Value) -> AppResult<Bson> {
+    serde_json::from_value(value.clone())
+        .map_err(|_| AppError::validation("invalid database explorer row reference"))
+}
+
+fn bson_database_value(value: &Bson) -> DatabaseValue {
+    match value {
+        Bson::Null | Bson::Undefined => DatabaseValue::Null,
+        Bson::Boolean(value) => DatabaseValue::Boolean(*value),
+        Bson::Int32(value) => DatabaseValue::Integer(i64::from(*value)),
+        Bson::Int64(value) => DatabaseValue::Integer(*value),
+        Bson::Double(value) => DatabaseValue::Decimal(value.to_string()),
+        Bson::Decimal128(value) => DatabaseValue::Decimal(value.to_string()),
+        Bson::String(value) | Bson::Symbol(value) => DatabaseValue::Text(value.clone()),
+        Bson::DateTime(value) => DatabaseValue::Timestamp(
+            value
+                .try_to_rfc3339_string()
+                .unwrap_or_else(|_| value.to_string()),
+        ),
+        Bson::Binary(value) => DatabaseValue::BinaryBase64(URL_SAFE_NO_PAD.encode(&value.bytes)),
+        other => bson_to_json(&redact_bson(other)).map_or_else(
+            |_| DatabaseValue::Text("<unrepresentable MongoDB value>".to_owned()),
+            DatabaseValue::Json,
+        ),
+    }
+}
+
+/// Redact sensitive fields throughout BSON before its extended-JSON encoding.
+///
+/// A top-level sensitive field is represented by [`DatabaseValue::Redacted`]
+/// by the row adapter. Complex BSON values, however, are rendered as JSON, so
+/// documents and arrays must be traversed here as well, including BSON's
+/// JavaScript-with-scope variant. Sensitive field names are replaced too: an
+/// extended-JSON response must not disclose either a protected key spelling or
+/// its value. Non-sensitive values retain their original BSON type and shape.
+fn redact_bson(value: &Bson) -> Bson {
+    match value {
+        Bson::Document(document) => Bson::Document(redact_bson_document(document)),
+        Bson::Array(values) => Bson::Array(values.iter().map(redact_bson).collect()),
+        Bson::JavaScriptCodeWithScope(code_with_scope) => {
+            Bson::JavaScriptCodeWithScope(mongodb::bson::JavaScriptCodeWithScope {
+                code: code_with_scope.code.clone(),
+                scope: redact_bson_document(&code_with_scope.scope),
+            })
+        }
+        value => value.clone(),
+    }
+}
+
+fn redact_bson_document(document: &Document) -> Document {
+    let mut redacted = Document::new();
+    let mut redacted_field_index = 0;
+    for (key, value) in document {
+        if is_sensitive_column(key) {
+            // Do not retain the original key: it can itself identify a secret
+            // class (or contain tenant-specific secret naming) in serialized
+            // Extended JSON. Generate a deterministic collision-free label so
+            // multiple protected fields do not overwrite one another.
+            let replacement = loop {
+                redacted_field_index += 1;
+                let candidate = if redacted_field_index == 1 {
+                    "<redacted_field>".to_owned()
+                } else {
+                    format!("<redacted_field_{redacted_field_index}>")
+                };
+                if !document.contains_key(&candidate) && !redacted.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            redacted.insert(replacement, Bson::String("<redacted>".to_owned()));
+        } else {
+            redacted.insert(key, redact_bson(value));
+        }
+    }
+    redacted
+}
+
+fn mongo_filter(
+    request: &ListRowsRequest,
+    position: Option<&serde_json::Value>,
+) -> AppResult<Document> {
+    let mut predicates = Vec::new();
+    for filter in &request.filters {
+        let value = filter.value.as_ref().map(json_filter_bson).transpose()?;
+        let condition = match filter.operator {
+            FilterOperator::IsNull => doc! { "$eq": Bson::Null },
+            FilterOperator::Eq => doc! { "$eq": value.expect("validated") },
+            FilterOperator::Neq => doc! { "$ne": value.expect("validated") },
+            FilterOperator::Lt => doc! { "$lt": value.expect("validated") },
+            FilterOperator::Lte => doc! { "$lte": value.expect("validated") },
+            FilterOperator::Gt => doc! { "$gt": value.expect("validated") },
+            FilterOperator::Gte => doc! { "$gte": value.expect("validated") },
+            // Regex syntax is never user supplied: quote the literal before
+            // asking MongoDB for a bounded substring match.
+            FilterOperator::Contains => {
+                doc! { "$regex": mongo_regex_escape(value.expect("validated").as_str().ok_or_else(|| AppError::validation("contains filter requires a string"))?) }
+            }
+        };
+        predicates.push(Bson::Document(doc! { filter.column.clone(): condition }));
+    }
+    if let Some(position) = position {
+        let Bson::Document(position) = json_to_bson(position)? else {
+            return Err(AppError::validation(
+                "database explorer cursor has no valid keyset position",
+            ));
+        };
+        let sort_value = position.get(&request.sort.column).cloned().ok_or_else(|| {
+            AppError::validation("database explorer cursor has no valid keyset position")
+        })?;
+        let id = position.get("_id").cloned().ok_or_else(|| {
+            AppError::validation("database explorer cursor has no valid keyset position")
+        })?;
+        let comparison = match request.sort.direction {
+            SortDirection::Asc => "$gt",
+            SortDirection::Desc => "$lt",
+        };
+        let mut later_sort = Document::new();
+        later_sort.insert(
+            &request.sort.column,
+            doc! { comparison: sort_value.clone() },
+        );
+        let mut equal_sort_later_id = Document::new();
+        equal_sort_later_id.insert(&request.sort.column, sort_value);
+        equal_sort_later_id.insert("_id", doc! { comparison: id });
+        predicates.push(Bson::Document(
+            doc! { "$or": [Bson::Document(later_sort), Bson::Document(equal_sort_later_id)] },
+        ));
+    }
+    match predicates.len() {
+        0 => Ok(Document::new()),
+        1 => predicates
+            .pop()
+            .and_then(|item| item.as_document().cloned())
+            .ok_or_else(|| AppError::internal("invalid MongoDB explorer filter")),
+        _ => Ok(doc! { "$and": predicates }),
+    }
+}
+
+fn mongo_regex_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                ['\\', character].into_iter().collect::<Vec<_>>()
+            }
+            _ => vec![character],
+        })
+        .collect()
+}
+
+fn json_filter_bson(value: &serde_json::Value) -> AppResult<Bson> {
+    match value {
+        serde_json::Value::Null => Ok(Bson::Null),
+        serde_json::Value::Bool(value) => Ok(Bson::Boolean(*value)),
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(Bson::Int64)
+            .or_else(|| value.as_f64().map(Bson::Double))
+            .ok_or_else(|| AppError::validation("invalid MongoDB filter number")),
+        serde_json::Value::String(value) => Ok(Bson::String(value.clone())),
+        // Document/array input could carry Mongo query operators. The explorer
+        // intentionally supports scalar comparisons only.
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(AppError::validation(
+            "MongoDB explorer filters must be scalar values",
+        )),
+    }
 }
 
 fn table_kind_from_information_schema(value: &str) -> Option<TableKind> {
@@ -2108,6 +2629,155 @@ mod tests {
             value: Some(serde_json::json!("x".repeat(MAX_FILTER_VALUE_BYTES + 1))),
         };
         assert!(filter.validate().is_err());
+    }
+
+    #[test]
+    fn mongodb_json_values_recursively_redact_sensitive_keys_in_documents_and_arrays() {
+        let value = Bson::Document(doc! {
+            "profile": {
+                "display_name": "Ada",
+                "Api_KeY": "nested-secret",
+                "devices": [
+                    { "name": "phone", "TOKEN": "array-secret" },
+                    { "name": "laptop", "preferences": { "theme": "dark" } },
+                ],
+            },
+            "flags": [true, 7_i32],
+        });
+
+        let rendered = bson_database_value(&value);
+        assert!(matches!(rendered, DatabaseValue::Json(_)));
+        let DatabaseValue::Json(json) = rendered else {
+            return;
+        };
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "profile": {
+                    "display_name": "Ada",
+                    "<redacted_field>": "<redacted>",
+                    "devices": [
+                        { "name": "phone", "<redacted_field>": "<redacted>" },
+                        { "name": "laptop", "preferences": { "theme": "dark" } },
+                    ],
+                },
+                "flags": [true, 7],
+            })
+        );
+    }
+
+    #[test]
+    fn mongodb_extended_json_redacts_key_and_value_in_javascript_scope() {
+        use mongodb::bson::JavaScriptCodeWithScope;
+
+        let value = Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+            code: "return safe_value;".to_owned(),
+            scope: doc! {
+                "apiKey": "camel-case-secret",
+                "APIKEY": "upper-case-secret",
+                "nested": {
+                    "api-key": "separator-secret",
+                    "items": [{ "api_key": "array-secret" }],
+                },
+            },
+        });
+
+        let rendered = bson_database_value(&value);
+        let serialized = serde_json::to_string(&rendered).unwrap();
+
+        for leaked in [
+            "apiKey",
+            "APIKEY",
+            "api-key",
+            "api_key",
+            "camel-case-secret",
+            "upper-case-secret",
+            "separator-secret",
+            "array-secret",
+        ] {
+            assert!(
+                !serialized.contains(leaked),
+                "extended JSON leaked protected key or value: {leaked}"
+            );
+        }
+        assert!(serialized.contains("<redacted_field>"));
+        assert!(serialized.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sensitive_key_detection_normalizes_case_and_separators() {
+        for name in ["api_key", "apiKey", "APIKEY", "api-key", "api key"] {
+            assert!(is_sensitive_column(name), "{name} must be sensitive");
+        }
+        assert!(!is_sensitive_column("application_keynote"));
+    }
+
+    #[test]
+    fn mongodb_cursor_and_row_references_round_trip_object_ids() {
+        let table = TableRef::new("mongodb", "players").unwrap();
+        let sort = SortSpec {
+            column: "_id".to_owned(),
+            direction: SortDirection::Asc,
+        };
+        let id = mongodb::bson::oid::ObjectId::new();
+        let position = bson_to_json(&Bson::Document(doc! { "_id": id })).unwrap();
+        let cursor_store = ExplorerCursorStore::new();
+        let cursor = cursor_store
+            .issue_at_position(table.clone(), sort.clone(), position.clone())
+            .unwrap();
+        let restored_position = cursor_store
+            .position(&cursor, &table, &sort)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            json_to_bson(&restored_position).unwrap(),
+            Bson::Document(doc! { "_id": id })
+        );
+
+        let row_store = ExplorerRowStore::new();
+        let row_ref = row_store
+            .issue(table.clone(), bson_to_json(&Bson::ObjectId(id)).unwrap())
+            .unwrap();
+        let restored_id = row_store.primary_key(&row_ref, &table).unwrap();
+        assert_eq!(json_to_bson(&restored_id).unwrap(), Bson::ObjectId(id));
+    }
+
+    #[test]
+    fn mongodb_contains_filters_are_literal_scalar_and_bounded() {
+        let needle = ".*[$]\\unsafe";
+        let request = ListRowsRequest {
+            table: TableRef::new("mongodb", "players").unwrap(),
+            filters: vec![RowFilter {
+                column: "display_name".to_owned(),
+                operator: FilterOperator::Contains,
+                value: Some(serde_json::json!(needle)),
+            }],
+            sort: SortSpec {
+                column: "_id".to_owned(),
+                direction: SortDirection::Asc,
+            },
+            cursor: None,
+            limit: Some(MAX_PAGE_SIZE),
+        };
+        request.validate().unwrap();
+        let filter = mongo_filter(&request, None).unwrap();
+        assert_eq!(
+            filter
+                .get_document("display_name")
+                .unwrap()
+                .get_str("$regex")
+                .unwrap(),
+            mongo_regex_escape(needle)
+        );
+
+        let non_scalar = ListRowsRequest {
+            filters: vec![RowFilter {
+                value: Some(serde_json::json!({"$regex": ".*"})),
+                ..request.filters[0].clone()
+            }],
+            ..request
+        };
+        assert!(mongo_filter(&non_scalar, None).is_err());
     }
 
     #[test]

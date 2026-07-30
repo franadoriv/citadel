@@ -128,9 +128,14 @@ registration_source = { limit = 10, window_ms = 3600000 }
 #   Postgres:    url = "postgres://citadel:citadel@localhost:5432/citadel"
 #   CockroachDB: url = "cockroach://root@localhost:26257/citadel?sslmode=disable"
 #   SQLite:      url = "sqlite:data.sqlite"   # one embedded file, created on first run
+#   MongoDB:     url = "mongodb://user:password@db-1,db-2/citadel?replicaSet=rs0"
 max_connections = 10
 connect_timeout_ms = 5000
 acquire_timeout_ms = 5000
+# MongoDB consistency policy; the transactional foundation requires these values.
+mongodb_read_preference = "primary"
+mongodb_write_concern = "majority"
+mongodb_read_concern = "majority"
 
 # Disabled by default. Enabling this starts the durable multi-node matchmaker
 # control listener and requires the database and certificate paths below.
@@ -278,26 +283,36 @@ diagnostics. The **backend is chosen by the URL scheme**:
 - `sqlite:` URL or a bare file path (e.g. `sqlite:data.sqlite`,
   `sqlite::memory:`, `./data.sqlite`) → the embedded **SQLite** backend: one
   self-contained file, created on first run, with no server to operate.
+- `mongodb://` / `mongodb+srv://` → the durable **MongoDB backend**. The URI is
+  parsed by MongoDB's official Rust driver, so standard TLS, SCRAM, and X.509
+  URI options remain supported. It requires a replica set or sharded cluster;
+  standalone `mongod` is rejected because it cannot meet the transaction
+  contract. Citadel never falls back to in-memory state when a MongoDB URL is
+  configured: an unreachable, non-transactional, or incompatible deployment
+  fails startup clearly.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `url` | string | *(unset)* | `postgres://` / `postgresql://` (Postgres), `cockroach://` / `cockroachdb://` (CockroachDB), or `sqlite:` / a file path (SQLite). Unset runs in-memory. Also settable via `CITADEL_DATABASE_URL`. |
+| `url` | string | *(unset)* | `postgres://` / `postgresql://` (Postgres), `cockroach://` / `cockroachdb://` (CockroachDB), `mongodb://` / `mongodb+srv://` (MongoDB), or `sqlite:` / a file path (SQLite). Unset runs in-memory. Also settable via `CITADEL_DATABASE_URL`. |
 | `max_connections` | integer | `10` | Connection pool size. Must be `>= 1` when a `url` is set. SQLite in-memory databases are forced to a single connection. |
 | `connect_timeout_ms` | integer | `5000` | Timeout for the initial connection. Must be `>= 1` when a `url` is set. |
 | `acquire_timeout_ms` | integer | `5000` | Timeout for acquiring a pooled connection. Must be `>= 1` when a `url` is set. |
+| `mongodb_read_preference` | string | `"primary"` | Must remain `primary` for MongoDB transactional consistency. |
+| `mongodb_write_concern` | string | `"majority"` | Must remain `majority` for MongoDB transactional consistency. |
+| `mongodb_read_concern` | string | `"majority"` | Must remain `majority` for MongoDB transactional consistency. |
 
-Migrations are embedded in the binary and applied on connect. For Postgres, run a
+Schema reconciliation is applied on connect. For Postgres, run a
 throwaway local database and migrate it with `make db-up` (Windows cmd: `make
 db-up`; PowerShell: `.\make db-up`); SQLite needs no setup — the file is
 created and migrated automatically.
 See the persistence feature docs for the schema and transaction model.
 
 On `citadel serve`, the node **selects** its backend from this section before it
-starts serving: it picks Postgres, CockroachDB, or SQLite by URL scheme
+starts serving: it picks Postgres, CockroachDB, SQLite, or MongoDB by URL scheme
 (connecting, applying migrations), or runs in-memory with no `url`. If a
 configured database is **unreachable** (or a migration fails), startup **fails
 fast** with a clear error — the node never starts on a silent in-memory fallback.
-The selected backend (`in-memory`, `postgres`, `cockroach`, or `sqlite`, never
+The selected backend (`in-memory`, `postgres`, `cockroach`, `sqlite`, or `mongodb`, never
 the URL) is reported in the `backend` field of the `/status` endpoint and shown on
 the `/dashboard` console.
 

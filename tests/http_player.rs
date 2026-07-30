@@ -279,3 +279,36 @@ mod postgres {
         .await;
     }
 }
+
+mod mongodb {
+    use super::*;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{Backend, MongoDatabase};
+
+    #[tokio::test]
+    async fn player_account_lifecycle_uses_the_mongodb_backend_when_configured() {
+        let Some(url) = std::env::var("CITADEL_TEST_MONGODB_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            eprintln!("skipping MongoDB player lifecycle: set CITADEL_TEST_MONGODB_URL");
+            return;
+        };
+        let config = DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        };
+        let db = MongoDatabase::connect(&config)
+            .await
+            .expect("connect + reconcile");
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset identity/session projections");
+        let backend: Arc<dyn Backend> = Arc::new(db);
+        run_player_lifecycle_scenario(
+            App::with_backend(Config::default(), backend),
+            "mongodb-lifecycle",
+        )
+        .await;
+    }
+}

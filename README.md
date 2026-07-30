@@ -79,8 +79,10 @@ to see the full startup trace.
 ### First-run wizard
 
 On a new interactive install, Citadel can scaffold a game script and choose
-SQLite or PostgreSQL. CI, `--config`, `--yes`, and `--non-interactive` skip the
-wizard; this repository already includes a working `citadel.toml` and Lua game.
+SQLite, PostgreSQL, or a transaction-capable MongoDB deployment. CI, `--config`,
+`--yes`, and `--non-interactive` skip the wizard; this repository already
+includes a working `citadel.toml` and Lua game. See [Choose a database](website/src/content/docs/guides/choose-a-database.mdx)
+for the practical trade-offs.
 
 ### Drop-and-run standalone server
 
@@ -249,8 +251,8 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
     <tr><td>SQLite backend</td><td>Single-file durable default for self-hosted nodes.</td><td>✅</td></tr>
     <tr><td>PostgreSQL backend</td><td>Durable production backend with migrations.</td><td>✅</td></tr>
     <tr><td>CockroachDB backend</td><td>Postgres-wire backend with the shipped domain tables.</td><td>✅</td></tr>
-    <tr><td>Read-only console database explorer</td><td>Viewer/admin dashboard browsing for the configured SQLite, PostgreSQL, or CockroachDB database: allowlisted metadata, structured bound filters, opaque keyset/row handles, server-side redaction, audit records, deadlines and per-operator node limits. No SQL text, mutation, export, system schemas, or portable PostgreSQL/Cockroach index/relation metadata.</td><td>✅</td></tr>
-    <tr><td>SurrealDB backend</td><td>Research-first roadmap item.</td><td>📋</td></tr>
+    <tr><td>MongoDB backend</td><td>Durable full-parity backend for transaction-capable replica sets or sharded clusters; standalone MongoDB is rejected. CI validates an authenticated disposable rs0 plus backup/restore integrity.</td><td>✅</td></tr>
+    <tr><td>Read-only console database explorer</td><td>Viewer/admin dashboard browsing for the configured SQLite, PostgreSQL, CockroachDB, or MongoDB database: allowlisted metadata, structured bound filters, opaque keyset/row handles, server-side redaction, audit records, deadlines and per-operator node limits. No SQL text, MongoDB commands, mutation, export, or system schemas.</td><td>✅</td></tr>
     <tr><td>Wallet balances and ledger</td><td>Clients read balances/ledger; trusted logic adjusts under invariants.</td><td>✅</td></tr>
     <tr><td>Purchase record persistence and replay rejection</td><td>Durable receipts are hashed; transaction ids cannot be replayed.</td><td>✅</td></tr>
     <tr><td>Production store receipt validation</td><td>Only a deterministic development validator ships; provider integrations are pending.</td><td>📋</td></tr>

@@ -37,8 +37,8 @@ use citadel::identity::{AccountState, AuthCredential, AuthIdentity, DeviceId, Us
 use citadel::repository::{Backend, BackendKind, PgDatabase};
 use citadel::session::{NodeId, RevocationReason, Session, SessionId, SessionTokenRef};
 use citadel::storage::{
-    Accessor, Collection, Key, ObjectId, Owner, Permissions, Precondition, StorageValue, UserId,
-    WriteRequest,
+    Accessor, Collection, Key, ObjectId, Owner, Permissions, Precondition, StorageIndexDefinition,
+    StorageIndexField, StorageIndexName, StorageIndexQuery, StorageValue, UserId, WriteRequest,
 };
 use citadel::time::TimestampMillis;
 use serde_json::json;
@@ -169,10 +169,62 @@ async fn cockroach_backend_compatibility_matrix() {
     cockroach_storage_repository_matches_the_contract(&db).await;
 
     db.reset_storage_for_tests().await.expect("reset");
+    cockroach_storage_index_migration_survives_reconnect(&db).await;
+
+    db.reset_storage_for_tests().await.expect("reset");
     cockroach_identity_and_session_repositories_match_the_contract(&db).await;
 
     db.reset_storage_for_tests().await.expect("reset");
     cockroach_account_creation_unit_of_work_is_atomic(&db).await;
+}
+
+/// Storage-index DDL is part of the Cockroach migration set. Exercise both the
+/// ordinary write path (which reads index definitions) and durable projection
+/// query, then reconnect so an existing database re-runs migrations idempotently.
+async fn cockroach_storage_index_migration_survives_reconnect(db: &PgDatabase) {
+    let repo = db.storage_repository();
+    let alice = user_id("index-alice");
+    let object = object_id(Owner::user(alice.clone()), "profiles", "primary");
+
+    repo.write(
+        &Accessor::User(alice.clone()),
+        WriteRequest::upsert(object.clone(), value(42), Permissions::public_read()),
+    )
+    .await
+    .expect("storage write reads the migrated index definitions table");
+
+    let index = StorageIndexDefinition::new(
+        StorageIndexName::new("profiles_by_score").expect("index name"),
+        Collection::new("profiles").expect("collection"),
+        None,
+        vec![StorageIndexField::new("score").expect("field")],
+    )
+    .expect("index definition");
+    repo.install_index(&index)
+        .await
+        .expect("install index projection");
+    let filters = json!({"score": 42});
+    let query = StorageIndexQuery::from_json_filters(
+        index.clone(),
+        filters.as_object().expect("object filters"),
+        10,
+    )
+    .expect("index query");
+    let results = repo
+        .query_index(&Accessor::Runtime, &query)
+        .await
+        .expect("query installed index");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, object);
+
+    let reconnected = connect().await.expect("CockroachDB still configured");
+    let results = reconnected
+        .storage_repository()
+        .query_index(&Accessor::Runtime, &query)
+        .await
+        .expect("query after idempotent reconnect migration");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, object);
 }
 
 /// The storage repository behaves identically on CockroachDB: owner CRUD,

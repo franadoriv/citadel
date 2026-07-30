@@ -101,7 +101,8 @@ The banner shows:
 
 - a `CITADEL` wordmark,
 - a summary line: the version, node id, and the selected database backend
-  (`in-memory`, `sqlite`, or `postgres` — never the database URL), and
+  (`in-memory`, `sqlite`, `postgres`, `cockroach`, or `mongodb` — never the
+  database URL), and
 - an aligned list of links.
 
 The links always include the HTTP endpoints, followed by one line per **enabled**

@@ -441,3 +441,33 @@ mod postgres {
         }
     }
 }
+
+// --- MongoDB run (opt-in via rs0) -------------------------------------------
+
+mod mongodb {
+    use super::*;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{Backend, MongoDatabase};
+
+    #[tokio::test]
+    async fn mongodb_backend_satisfies_the_contract() {
+        let Some(url) = std::env::var("CITADEL_TEST_MONGODB_URL").ok() else {
+            eprintln!("skipping MongoDB groups contract: CITADEL_TEST_MONGODB_URL is unset");
+            return;
+        };
+        let db = MongoDatabase::connect(&DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect + reconcile against MongoDB replica set");
+        let repo = db.groups_repository();
+        for (name, run) in all_scenarios() {
+            db.clear_groups_data_for_tests()
+                .await
+                .expect("clear groups between scenarios");
+            eprintln!("mongodb scenario: {name}");
+            run(repo.as_ref()).await;
+        }
+    }
+}

@@ -13,10 +13,13 @@ tokens, keys, and secrets); role does not bypass redaction.
 
 ## Availability and limits
 
-The explorer is available for durable SQLite, PostgreSQL, and CockroachDB
-backends. It lists only application objects: SQLite `main` objects excluding
-`sqlite_` internals, and the PostgreSQL/CockroachDB `public` schema. In-memory
-nodes return `400` because they have no SQL metadata to inspect.
+The explorer is available for durable SQLite, PostgreSQL, CockroachDB, and
+MongoDB backends. It lists only application objects: SQLite `main` objects
+excluding `sqlite_` internals, PostgreSQL/CockroachDB `public` objects, and
+MongoDB collections under the logical `mongodb` schema. MongoDB's metadata is a
+bounded projection of observed top-level document fields; it does not infer
+relations. In-memory nodes return `400` because they have no durable metadata to
+inspect.
 
 Each query is bounded to 100 rows and a 1 MiB serialized response, uses a
 five-second database deadline, and accepts at most eight scalar filters. A
@@ -24,9 +27,10 @@ node also admits at most 60 explorer requests per authenticated operator per
 minute; excess requests return `429 rate_limited` with `Retry-After`. This
 small per-node guard is not a distributed quota.
 
-Tables without a primary key remain visible as metadata but cannot be browsed.
-PostgreSQL/CockroachDB index and relation metadata are intentionally omitted
-until their separate adapters have live compatibility coverage.
+SQL tables without a primary key remain visible as metadata but cannot be
+browsed. MongoDB documents use `_id` as their row identity. PostgreSQL/CockroachDB
+index and relation metadata are intentionally omitted until their separate
+adapters have live compatibility coverage; MongoDB has no foreign-key catalog.
 
 ## Routes
 
