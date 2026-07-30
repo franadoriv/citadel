@@ -132,7 +132,7 @@ const RPC_RESPONSE_MIN_BYTES := RPC_REQUEST_ID_BYTES + 1
 ## The ABI version these bindings were written against
 ## (CITADEL_FFI_ABI_VERSION in citadel_client.h / contract.json abi_version).
 ## The native GDExtension binding must report the same value at startup.
-const EXPECTED_ABI_VERSION := 2
+const EXPECTED_ABI_VERSION := 3
 
 
 ## Encode a 2D position as a KIND_POSITION body: two little-endian f32 (x, y).

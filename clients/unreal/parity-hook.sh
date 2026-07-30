@@ -25,6 +25,8 @@ repo_root="$(cd "$hook_dir/../.." && pwd)"
 tu="$hook_dir/tier_b/citadel_parity_tu.cpp"
 sdk_public="$hook_dir/Plugin/Citadel/Source/CitadelClient/Public"
 ffi_include="$repo_root/crates/citadel-client-ffi/include"
+static_contract="$hook_dir/test_networkpeer_abi_v3.py"
+real_ffi_gate="$hook_dir/test_real_ffi_gate.py"
 
 if [[ ! -f "$tu" ]]; then
   echo "unreal Tier-B: translation unit not found at $tu" >&2
@@ -34,6 +36,16 @@ if [[ ! -f "$ffi_include/citadel_client.h" ]]; then
   echo "unreal Tier-B: canonical header not found at $ffi_include/citadel_client.h" >&2
   exit 1
 fi
+if [[ ! -f "$static_contract" ]]; then
+  echo "unreal Tier-B: ABI-v3 static contract test not found at $static_contract" >&2
+  exit 1
+fi
+python3 "$static_contract"
+if [[ ! -f "$real_ffi_gate" ]]; then
+  echo "unreal Tier-B: real-FFI negative gate test not found at $real_ffi_gate" >&2
+  exit 1
+fi
+python3 "$real_ffi_gate"
 
 # Runtime-load guard: a UE module DLL must contain exactly one
 # IMPLEMENT_MODULE, or it compiles + links (the gated UE build passes) but the

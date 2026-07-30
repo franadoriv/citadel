@@ -16,11 +16,11 @@
 #   * else D:/Games/UE_5.8 if it exists;
 #   * else SKIP cleanly (exit 0) — a machine without UE must not fail.
 #
-# Native lib: to verify a clean COMPILE + LINK without the real citadel-client-ffi
-# library present, the plugin module compiles an in-tree C ABI stub
-# (CITADEL_FFI_STUB=1; see CitadelClient.Build.cs / CitadelFfiStub.cpp). Real
-# behavior (linking the built native lib) is a downstream/consumer step and an
-# in-editor manual verification; both are out of scope for this compile gate.
+# Native lib: this gate builds/uses the real ABI-v3 citadel-client-ffi static
+# library and links the UE module against it. `CITADEL_FFI_STUB=1` remains only
+# for the fast structural check; it is never selected by this real-link gate.
+# Gameplay remains an external in-editor verification, but a missing or stale
+# Rust archive must fail this compile/link path rather than being masked by a stub.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,15 +141,31 @@ cat > "$host_dir/Source/CitadelHost/CitadelHost.cpp" <<'CPP'
 IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, CitadelHost, "CitadelHost");
 CPP
 
-# --- Build the editor target (compiles the plugin) -----------------------------
-# CITADEL_FFI_STUB=1 => the plugin compiles the in-tree C ABI stub so the module
-# links without the real native lib present.
-export CITADEL_FFI_STUB=1
+# --- Build the editor target (compiles and links the real ABI v3 plugin) -------
+# A caller may provide an already-built target-compatible archive via
+# CITADEL_FFI_LIB. Otherwise bundle-ffi builds and stages the host archive.
+# `CITADEL_FFI_STUB` is explicitly disabled so unresolved real symbols cannot be
+# hidden by the test-only stub.
+if [[ -z "${CITADEL_FFI_LIB:-}" ]]; then
+  bash "$script_dir/bundle-ffi.sh"
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) CITADEL_FFI_LIB="$script_dir/Plugin/Citadel/Source/CitadelClient/ThirdParty/Win64/citadel_client_ffi.lib" ;;
+    Darwin)                          CITADEL_FFI_LIB="$script_dir/Plugin/Citadel/Source/CitadelClient/ThirdParty/Mac/libcitadel_client_ffi.a" ;;
+    Linux)                           CITADEL_FFI_LIB="$script_dir/Plugin/Citadel/Source/CitadelClient/ThirdParty/Linux/libcitadel_client_ffi.a" ;;
+  esac
+fi
+if [[ ! -f "$CITADEL_FFI_LIB" ]]; then
+  echo "unreal UE-compile: FAILED — real CITADEL_FFI_LIB is missing: $CITADEL_FFI_LIB" >&2
+  exit 1
+fi
+export CITADEL_FFI_LIB
+export CITADEL_FFI_STUB=0
 uproject_win="$host_dir_win/CitadelHost.uproject"
 
 echo "unreal UE-compile: building CitadelHostEditor (Win64 Development)"
 echo "unreal UE-compile:   project = $uproject_win"
 echo "unreal UE-compile:   plugin  = $plugin_dir_win"
+echo "unreal UE-compile:   ffi     = $CITADEL_FFI_LIB (real ABI v3)"
 
 # Invoke Build.bat directly (Git Bash runs .bat via cmd). MSYS must not rewrite
 # the D:/ paths or the -project= argument.

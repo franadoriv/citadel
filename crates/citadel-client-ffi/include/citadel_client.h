@@ -15,7 +15,7 @@
 /**
  * Stable ABI version. Bump on any breaking change to the C surface.
  */
-#define CITADEL_FFI_ABI_VERSION 2
+#define CITADEL_FFI_ABI_VERSION 3
 
 /**
  * Status codes returned by the C ABI. Stable, `#[repr(C)]`.
@@ -130,8 +130,8 @@ typedef struct {
 } CitadelSchemaField;
 
 /**
- * A C-friendly schema entry for the scalar NetworkPeer codecs exposed by this
- * ABI. `kind`: 0=bool, 1=int range, 2=scalar, 3=bytes.
+ * Legacy v2 scalar decode descriptor. Its 40-byte layout is frozen because
+ * `citadel_rep_decode` accepts caller-owned arrays of this exact type.
  */
 typedef struct {
     uint8_t kind;
@@ -144,6 +144,37 @@ typedef struct {
 } CitadelRepCodec;
 
 /**
+ * ABI-v3 typed codec descriptor. This is deliberately distinct from
+ * [`CitadelRepCodec`]: vector/quaternion fields must never extend the legacy
+ * descriptor consumed by `citadel_rep_decode`.
+ */
+typedef struct {
+    uint8_t kind;
+    int64_t int_min;
+    int64_t int_max;
+    float scalar_min;
+    float scalar_max;
+    uint32_t values_per_unit;
+    uint32_t max_len;
+    float vector_bounds;
+    uint32_t quat_bits;
+} CitadelRepCodecV3;
+
+/**
+ * ABI-v3 decode-table field. `codec` describes scalar/vector/quaternion
+ * fields. For a collection field, set `is_collection` and supply the explicit
+ * item codec and cardinality. This type is accepted only by the additive v3
+ * `citadel_rep_decode_with_collections` entrypoint.
+ */
+typedef struct {
+    CitadelRepCodecV3 codec;
+    CitadelRepCodecV3 collection_item_codec;
+    uint32_t collection_max_items;
+    bool is_collection;
+    uint8_t _reserved[3];
+} CitadelRepDecodeFieldCodecV3;
+
+/**
  * One decoded scalar value. `kind` uses the same tags as [`CitadelRepCodec`].
  */
 typedef struct {
@@ -154,6 +185,42 @@ typedef struct {
     float scalar_value;
     uintptr_t bytes_len;
 } CitadelRepFieldValue;
+
+/**
+ * One owned-value-free view of a decoded keyed collection operation. Use
+ * [`citadel_rep_decoded_collection_op_bytes`] to copy a bytes value. `op` is
+ * 0=remove, 1=add, 2=change; remove has no value (`value_kind` is zero).
+ */
+typedef struct {
+    uint8_t op;
+    uint8_t value_kind;
+    uint8_t _reserved[6];
+    uint32_t rep_index;
+    uint32_t rep_generation;
+    uint64_t rep_key;
+    int64_t int_value;
+    float floats[4];
+    uintptr_t bytes_len;
+} CitadelRepDecodedCollectionOp;
+
+/**
+ * One keyed collection operation. `op`: 0=remove, 1=add, 2=change.
+ * Add/change `value_kind` must match the item codec kind. Bool uses a nonzero
+ * `int_value`; scalar uses `floats[0]`; vector/quaternion use `floats`;
+ * bytes use `bytes`/`bytes_len`. Input bytes are copied before return.
+ */
+typedef struct {
+    uint8_t op;
+    uint8_t value_kind;
+    uint8_t _reserved[6];
+    uint32_t rep_index;
+    uint32_t rep_generation;
+    uint64_t rep_key;
+    int64_t int_value;
+    float floats[4];
+    const uint8_t *bytes;
+    uintptr_t bytes_len;
+} CitadelRepCollectionOp;
 
 /**
  * A transform returned by the shared runtime, in Citadel world units (cm).
@@ -392,6 +459,23 @@ CitadelStatus citadel_rep_decode(const uint8_t *body,
                                  CitadelRepDecoded **out_decoded);
 
 /**
+ * Decode one authoritative DeltaBunch with scalar and keyed-collection field
+ * descriptors. This additive entrypoint leaves [`citadel_rep_decode`] intact
+ * for existing scalar-only consumers.
+ *
+ * # Safety
+ * `body`, `schema_hash`, and `codecs` must point to their declared readable
+ * ranges (or be null only for a zero length); `out_decoded` must be writable.
+ */
+CitadelStatus citadel_rep_decode_with_collections(const uint8_t *body,
+                                                  uintptr_t body_len,
+                                                  const uint8_t *schema_hash,
+                                                  uint32_t layout_version,
+                                                  const CitadelRepDecodeFieldCodecV3 *codecs,
+                                                  uintptr_t codec_count,
+                                                  CitadelRepDecoded **out_decoded);
+
+/**
  * # Safety
  * `decoded` must be a live decoded handle and every output pointer writable.
  */
@@ -416,6 +500,16 @@ CitadelStatus citadel_rep_decoded_field_at(const CitadelRepDecoded *decoded,
                                            CitadelRepFieldValue *out);
 
 /**
+ * Read a decoded Vector3 or quaternion field into `out_values`.
+ *
+ * # Safety
+ * `decoded` must be live and `out_values` must point to four writable floats.
+ */
+CitadelStatus citadel_rep_decoded_field_floats(const CitadelRepDecoded *decoded,
+                                               uintptr_t index,
+                                               float *out_values);
+
+/**
  * # Safety
  * `decoded` must be live; `buf` and `out_len` must cover their declared ranges.
  */
@@ -424,6 +518,58 @@ CitadelStatus citadel_rep_decoded_field_bytes(const CitadelRepDecoded *decoded,
                                               uint8_t *buf,
                                               uintptr_t cap,
                                               uintptr_t *out_len);
+
+/**
+ * Return the number of keyed operations for the decoded collection at the
+ * changed-field index. Operations are ordered remove, add, then change.
+ *
+ * # Safety
+ * `decoded` must be live and `out_count` writable.
+ */
+CitadelStatus citadel_rep_decoded_collection_count(const CitadelRepDecoded *decoded,
+                                                   uintptr_t field_index,
+                                                   uintptr_t *out_count);
+
+/**
+ * Return the schema field id for a decoded collection at the changed-field
+ * index. This value-free ABI-v3 accessor lets engine bindings associate a
+ * keyed collection operation with its reflected property without inferring an
+ * id from the sparse changed-field ordinal.
+ *
+ * # Safety
+ * `decoded` must be live and `out_field_id` writable.
+ */
+CitadelStatus citadel_rep_decoded_collection_field_id(const CitadelRepDecoded *decoded,
+                                                      uintptr_t field_index,
+                                                      uint16_t *out_field_id);
+
+/**
+ * Copy one decoded keyed collection operation's metadata/value into `out`.
+ * Bytes remain in the decoded handle and are copied with
+ * [`citadel_rep_decoded_collection_op_bytes`].
+ *
+ * # Safety
+ * `decoded` must be live and `out` writable.
+ */
+CitadelStatus citadel_rep_decoded_collection_at(const CitadelRepDecoded *decoded,
+                                                uintptr_t field_index,
+                                                uintptr_t operation_index,
+                                                CitadelRepDecodedCollectionOp *out);
+
+/**
+ * Copy bytes for one decoded add/change collection operation. `out_len` is
+ * always set to the required length; `Again` means the caller buffer was too
+ * small. Non-bytes operations fail closed.
+ *
+ * # Safety
+ * `decoded` must be live; `buf` and `out_len` must cover their declared ranges.
+ */
+CitadelStatus citadel_rep_decoded_collection_op_bytes(const CitadelRepDecoded *decoded,
+                                                      uintptr_t field_index,
+                                                      uintptr_t operation_index,
+                                                      uint8_t *buf,
+                                                      uintptr_t cap,
+                                                      uintptr_t *out_len);
 
 /**
  * # Safety
@@ -501,6 +647,49 @@ CitadelStatus citadel_rep_encoder_add_bytes(CitadelRepEncoder *enc,
                                             uint32_t max_len,
                                             const uint8_t *data,
                                             uintptr_t len);
+
+/**
+ * Add a Vector3 `[x, y, z]` in Citadel world units. `bounds` is symmetric;
+ * pass zero for the canonical protocol default. Inputs must be finite and are
+ * validated by the shared encoder when finishing.
+ *
+ * # Safety
+ * `enc` must be a live encoder handle; `value` must point to 3 readable floats.
+ */
+CitadelStatus citadel_rep_encoder_add_vector3(CitadelRepEncoder *enc,
+                                              uint16_t field_id,
+                                              float bounds,
+                                              const float *value);
+
+/**
+ * Add a smallest-three quaternion `[x, y, z, w]`. Degenerate/non-finite input
+ * follows the shared codec's canonical identity normalization.
+ *
+ * # Safety
+ * `enc` must be a live encoder handle; `value` must point to 4 readable floats.
+ */
+CitadelStatus citadel_rep_encoder_add_quat(CitadelRepEncoder *enc,
+                                           uint16_t field_id,
+                                           uint32_t bits_per_component,
+                                           const float *value);
+
+/**
+ * Add a keyed collection field using the shared NetworkPeer collection codec.
+ * `op`: 0=remove, 1=add, 2=change. Add/change values use the kind described
+ * by [`CitadelRepCollectionOp`]. All input is copied; no pointer is retained.
+ * Invalid operation kinds, mismatched item codecs, duplicate ids, or caps make
+ * the encoder fail as one transaction and `finish` emits no partial bunch.
+ *
+ * # Safety
+ * `enc` must be live. `ops` must reference `op_count` readable operations (or
+ * be null iff zero); bytes values must reference `bytes_len` readable bytes.
+ */
+CitadelStatus citadel_rep_encoder_add_collection(CitadelRepEncoder *enc,
+                                                 uint16_t field_id,
+                                                 CitadelRepCodecV3 item_codec,
+                                                 uint32_t max_items,
+                                                 const CitadelRepCollectionOp *ops,
+                                                 uintptr_t op_count);
 
 /**
  * Finish the bunch, encoding it into the caller's `buf` (capacity `cap`). Writes

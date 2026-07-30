@@ -54,9 +54,11 @@ leaving it out. `ServerOnly` fields remain rejected for every client version.
 
 Keep compatibility registrations short-lived and explicit during an upgrade. Once
 the old layout is no longer deployed, return to the one-version `register_class`
-path. The authority exposes `metrics` for object-count and rebroadcast fan-out
-sampling; use those measurements—not a guessed actor count—to decide whether the
-optional shared-state optimization is worth enabling.
+path. Compatibility registration remains trusted server lifecycle work; enabling
+the gateway authority does not discover classes or negotiate layouts for clients.
+The authority exposes `metrics` for object-count and rebroadcast fan-out sampling;
+use those measurements—not a guessed actor count—to decide whether the optional
+shared-state optimization is worth enabling.
 
 ## Opt-in shared quantized state
 
@@ -68,10 +70,11 @@ let authority = RepAuthority::new(RateLimits::default)
     .with_shared_quantized_state(true);
 ```
 
-The toggle is **off by default**. Enable it only after `authority.metrics` shows
-roughly 100–300 concurrently replicated actors in an interest scope with enough
-actual fan-out to make per-receiver quantization measurable. It is a server-only
-implementation choice: no wire contract or client SDK behavior changes.
+The toggle is **off by default** (`transport.network_peer.shared_quantized_state =
+false`). Enable it only after `authority.metrics` shows roughly 100–300
+concurrently replicated actors in an interest scope with enough actual fan-out to
+make per-receiver quantization measurable. It is a server-only implementation
+choice: no wire contract or client SDK behavior changes.
 
 Each receiver still gets its own `result_id`, pending/acked baseline, ack-timeout
 handling, pending cap, and body-level amplification charge. Shared state reuses

@@ -71,6 +71,15 @@ enabled = false
 bind = "127.0.0.1:7353"
 outbound_queue_capacity = 1024
 
+[transport.network_peer]
+# Optional authoritative property replication. This attaches the gateway authority
+# only; trusted server lifecycle code still registers classes and spawns objects.
+enabled = false
+shared_quantized_state = false
+interest_cell_size = 100
+interest_inner = 100
+interest_outer = 125
+
 [runtime]
 # Embedded game-logic runtime. With language unset, Citadel autodetects by
 # priority in scripts_dir: main.lua (default build), main.py
@@ -232,6 +241,24 @@ Notes:
 - A transport's `bind` and `outbound_queue_capacity` are only validated when that
   transport is `enabled`.
 - All enabled transports share one [gateway room](/concepts/gateway/).
+
+### `[transport.network_peer]`
+
+This optional section activates the NetworkPeer authority at the production
+gateway. It is **off by default**. Enabling it routes replication delta/ack
+frames and sends schema/full-baseline bootstrap at gateway admission, but it does
+not let a client register a class or object. Trusted server lifecycle code must
+use the gateway registration/spawn/despawn seams. The authority-level shared grid
+uses the three distance values below; this is not automatic room or matchmaker
+AOI integration.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Attach the NetworkPeer authority to the gateway. |
+| `shared_quantized_state` | bool | `false` | Reuse prepared quantized payloads only for equivalent per-receiver bunches. Enable after measuring real fan-out; tokens/baselines remain receiver-specific. |
+| `interest_cell_size` | integer | `100` | Uniform shared-grid cell size in world units; must be positive. |
+| `interest_inner` | integer | `100` | Enter-relevance distance in world units; must be positive. |
+| `interest_outer` | integer | `125` | Exit-relevance distance in world units; must be at least `interest_inner`. |
 
 ### `[transport.tls]`
 

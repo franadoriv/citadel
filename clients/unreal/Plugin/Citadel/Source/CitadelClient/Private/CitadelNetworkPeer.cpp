@@ -6,6 +6,9 @@
 // with src/realtime/netpeer/*.rs.
 
 #include "CitadelNetworkPeer.h"
+#include "CitadelClientSubsystem.h"
+#include "CitadelWire.h"
+#include "Engine/World.h"
 
 // The canonical, cbindgen-generated C ABI: citadel_schema_hash +
 // citadel_rep_encoder_*. Included verbatim (never re-declared).
@@ -24,6 +27,44 @@
 // --- FNV-1a fold: MUST match src/realtime/netpeer/layout.rs::fnv1a exactly -----
 namespace
 {
+    TArray<TWeakObjectPtr<UCitadelNetworkPeer>>& BoundPeers()
+    {
+        static TArray<TWeakObjectPtr<UCitadelNetworkPeer>> Peers;
+        return Peers;
+    }
+
+    // KIND_REP_ACK uses the shared MSB-first bit layout: one entry, object id,
+    // bit-varint result token, and a zero history window.
+    void WriteBits(TArray<uint8>& Out, uint64 Value, uint32 Bits, uint8& BitInByte)
+    {
+        while (Bits--)
+        {
+            if (BitInByte == 0) { Out.Add(0); }
+            const uint8 Bit = static_cast<uint8>((Value >> Bits) & 1);
+            Out.Last() |= Bit << (7 - BitInByte);
+            BitInByte = static_cast<uint8>((BitInByte + 1) % 8);
+        }
+    }
+
+    void WriteBitVarint(TArray<uint8>& Out, uint64 Value, uint8& BitInByte)
+    {
+        do {
+            const uint64 Chunk = Value & 0x7f;
+            Value >>= 7;
+            // Wire groups are [continuation:1][data:7], MSB-first in the
+            // bitstream; this is deliberately not byte-aligned LEB128.
+            WriteBits(Out, Value != 0 ? 1 : 0, 1, BitInByte);
+            WriteBits(Out, Chunk, 7, BitInByte);
+        } while (Value != 0);
+    }
+
+    uint64 CollectionIdentity(const CitadelRepDecodedCollectionOp& Op)
+    {
+        // The wire codec has already validated this tuple; fold only for the
+        // local lookup key and retain the complete tuple in the operation.
+        return (static_cast<uint64>(Op.rep_index) << 32) | Op.rep_generation;
+    }
+
     constexpr uint64 FNV_OFFSET = 0xcbf29ce484222325ULL;
     constexpr uint64 FNV_PRIME = 0x00000100000001b3ULL;
 
@@ -47,6 +88,7 @@ namespace
             Out.Add(static_cast<uint8>((Value >> (i * 8)) & 0xFF));
         }
     }
+
 }
 
 // Stable per-field key (FNV-1a over the UTF-8 property name). MUST match the Rust
@@ -174,6 +216,21 @@ namespace
             OutCodecId = 2; // SCALAR_QUANT
             return true;
         }
+        if (const FStructProperty* Struct = CastField<FStructProperty>(P))
+        {
+            if (Struct->Struct == TBaseStructure<FVector>::Get())
+            {
+                OutType = ECitadelFieldType::Vector3;
+                OutCodecId = 3; // VECTOR3_QUANT
+                return true;
+            }
+            if (Struct->Struct == TBaseStructure<FQuat>::Get())
+            {
+                OutType = ECitadelFieldType::Quat;
+                OutCodecId = 5; // QUAT_SMALLEST3_10
+                return true;
+            }
+        }
         if (P->IsA<FStrProperty>() || P->IsA<FNameProperty>())
         {
             OutType = ECitadelFieldType::Bytes;
@@ -185,12 +242,42 @@ namespace
         }
         if (P->IsA<FArrayProperty>() || P->IsA<FSetProperty>() || P->IsA<FMapProperty>())
         {
-            OutType = ECitadelFieldType::Bytes; // keyed-collection delta is
-            OutCodecId = 2;
+            // Collection contents are never serialized as an opaque Unreal
+            // container. QueueCollection supplies the explicit ABI-v3 item
+            // descriptor and generation-keyed operations; codec id zero marks
+            // this descriptor-owned field in the schema tuple.
+            OutType = ECitadelFieldType::Collection;
+            OutCodecId = 0;
             bOutPush = false;
             return true;
         }
         return false; // unsupported property type: not replicated by Citadel
+    }
+
+    // The ABI v3 collection descriptor must describe the reflected TArray
+    // element. A zeroed descriptor is Bool, so defaulting it would corrupt any
+    // non-bool keyed collection.
+    bool PopulateCollectionItemCodec(const FArrayProperty* Array,
+        const FCitadelFieldBounds& Bounds, CitadelRepCodecV3& Out)
+    {
+        if (!Array || !Array->Inner) { return false; }
+        Out = {};
+        if (Array->Inner->IsA<FBoolProperty>()) { Out.kind = 0; return true; }
+        if (Array->Inner->IsA<FFloatProperty>())
+        {
+            if (Bounds.ValuesPerUnit == 0 || Bounds.ScalarMin >= Bounds.ScalarMax) { return false; }
+            Out.kind = 2; Out.scalar_min = Bounds.ScalarMin; Out.scalar_max = Bounds.ScalarMax;
+            Out.values_per_unit = Bounds.ValuesPerUnit;
+            return true;
+        }
+        if (Array->Inner->IsA<FIntProperty>() || Array->Inner->IsA<FInt64Property>()
+            || Array->Inner->IsA<FInt16Property>())
+        {
+            if (Bounds.IntMin > Bounds.IntMax) { return false; }
+            Out.kind = 1; Out.int_min = Bounds.IntMin; Out.int_max = Bounds.IntMax;
+            return true;
+        }
+        return false; // receive/apply has no typed setter for other TArray inners.
     }
 }
 
@@ -327,7 +414,18 @@ void UCitadelNetworkPeer::InitializeComponent()
         CachedLayout = &FCitadelRepLayout::GetOrBuild(Owner->GetClass());
         DirtyMask.Init(false, CachedLayout->Num());
         SnapshotShadow();
+        BoundPeers().AddUnique(this);
     }
+}
+
+void UCitadelNetworkPeer::OnComponentDestroyed(bool bDestroyingHierarchy)
+{
+    BoundPeers().RemoveAll([this](const TWeakObjectPtr<UCitadelNetworkPeer>& Peer)
+    {
+        return !Peer.IsValid() || Peer.Get() == this;
+    });
+    CollectionIndices.Reset();
+    Super::OnComponentDestroyed(bDestroyingHierarchy);
 }
 
 void UCitadelNetworkPeer::SnapshotShadow()
@@ -433,7 +531,38 @@ bool UCitadelNetworkPeer::AuditUnmarkedChanges(TArray<uint16>& OutOffenders) con
 void UCitadelNetworkPeer::AdvanceAfterEncode()
 {
     DirtyMask.Init(false, CachedLayout ? CachedLayout->Num() : 0);
+    PendingCollections.Reset();
+    PendingCollectionCodecs.Reset();
     SnapshotShadow();
+}
+
+bool UCitadelNetworkPeer::AcceptBaseline(uint64 ResultId)
+{
+    if (ResultId == 0 || ResultId <= AcceptedBaselineId)
+    {
+        return false; // stale acknowledgements never regress the base token
+    }
+    AcceptedBaselineId = ResultId;
+    return true;
+}
+
+bool UCitadelNetworkPeer::QueueCollection(uint16 FieldId,
+    const FCitadelCollectionCodec& Codec, const TArray<FCitadelCollectionOp>& Operations)
+{
+    if (!CachedLayout || FieldId >= CachedLayout->Num() || Codec.MaxItems == 0)
+    {
+        return false;
+    }
+    const FCitadelFieldDesc& Field = CachedLayout->Fields[FieldId];
+    if (Field.Authority != ECitadelFieldAuthority::ClientOwned
+        || Field.TypeTag != ECitadelFieldType::Collection)
+    {
+        return false; // ownership is enforced before data reaches the C ABI
+    }
+    PendingCollectionCodecs.Add(FieldId, Codec);
+    PendingCollections.Add(FieldId, Operations); // deep-copy bytes and operation identities
+    MarkDirty(FieldId);
+    return true;
 }
 
 // --- DeltaBunch encode via the shared C ABI ------------------------
@@ -500,6 +629,33 @@ bool UCitadelNetworkPeer::AppendFieldToEncoder(CitadelRepEncoder* Encoder,
             Field.Bounds.ScalarMin, Field.Bounds.ScalarMax, Field.Bounds.ValuesPerUnit,
             Value) == CITADEL_STATUS_OK;
     }
+    case ECitadelFieldType::Vector3:
+    {
+        const FStructProperty* P = CastField<FStructProperty>(Field.Property);
+        if (!P || P->Struct != TBaseStructure<FVector>::Get())
+        {
+            return false;
+        }
+        const FVector& Value = *static_cast<const FVector*>(ValuePtr);
+        const float Components[3] = { static_cast<float>(Value.X), static_cast<float>(Value.Y), static_cast<float>(Value.Z) };
+        const float Bounds = Field.Bounds.Kind == ECitadelBoundsKind::ScalarRange
+            ? Field.Bounds.ScalarMax : 0.f;
+        return citadel_rep_encoder_add_vector3(Encoder, Field.FieldId, Bounds, Components)
+            == CITADEL_STATUS_OK;
+    }
+    case ECitadelFieldType::Quat:
+    {
+        const FStructProperty* P = CastField<FStructProperty>(Field.Property);
+        if (!P || P->Struct != TBaseStructure<FQuat>::Get())
+        {
+            return false;
+        }
+        const FQuat& Value = *static_cast<const FQuat*>(ValuePtr);
+        const float Components[4] = { Value.X, Value.Y, Value.Z, Value.W };
+        const uint32 Bits = Field.CodecId == 4 ? 9u : Field.CodecId == 6 ? 15u : 10u;
+        return citadel_rep_encoder_add_quat(Encoder, Field.FieldId, Bits, Components)
+            == CITADEL_STATUS_OK;
+    }
     case ECitadelFieldType::Bytes:
     {
         FString Text;
@@ -535,8 +691,21 @@ TArray<uint8> UCitadelNetworkPeer::BuildDeltaBunch(bool bIsFull, uint64 ResultId
         return Out;
     }
 
+    // Baseline ownership/control is local and fail-closed: a full cannot carry
+    // a base, and a delta must be rooted at the last server-accepted token.
+    if (ResultId == 0 || (bIsFull && BaseId != 0)
+        || (!bIsFull && (BaseId == 0 || BaseId != AcceptedBaselineId)))
+    {
+        return Out;
+    }
+
+    const uint32 BoundId = BoundObjectId();
+    if (BoundId == 0)
+    {
+        return Out; // object_id=0 is never a valid actor binding.
+    }
     CitadelRepEncoder* Encoder = citadel_rep_encoder_new(
-        /*object_id*/ 0, bIsFull, ResultId, BaseId,
+        BoundId, bIsFull, ResultId, BaseId,
         static_cast<uintptr_t>(CachedLayout->Num()));
     if (!Encoder)
     {
@@ -569,7 +738,52 @@ TArray<uint8> UCitadelNetworkPeer::BuildDeltaBunch(bool bIsFull, uint64 ResultId
             {
                 continue;
             }
-            AppendFieldToEncoder(Encoder, Field);
+            if (const TArray<FCitadelCollectionOp>* Operations = PendingCollections.Find(Field.FieldId))
+            {
+                const FCitadelCollectionCodec* Codec = PendingCollectionCodecs.Find(Field.FieldId);
+                if (!Codec)
+                {
+                    bOk = false;
+                    break;
+                }
+                TArray<CitadelRepCollectionOp> NativeOps;
+                NativeOps.Reserve(Operations->Num());
+                for (const FCitadelCollectionOp& Op : *Operations)
+                {
+                    CitadelRepCollectionOp Native{};
+                    Native.op = Op.Op;
+                    Native.value_kind = Op.ValueKind;
+                    Native.rep_index = Op.RepIndex;
+                    Native.rep_generation = Op.RepGeneration;
+                    Native.rep_key = Op.RepKey;
+                    Native.int_value = Op.IntValue;
+                    FMemory::Memcpy(Native.floats, Op.Floats, sizeof(Native.floats));
+                    Native.bytes = Op.Bytes.Num() ? Op.Bytes.GetData() : nullptr;
+                    Native.bytes_len = static_cast<uintptr_t>(Op.Bytes.Num());
+                    NativeOps.Add(Native);
+                }
+                CitadelRepCodecV3 Item{};
+                Item.kind = Codec->ItemKind;
+                Item.int_min = Codec->IntMin;
+                Item.int_max = Codec->IntMax;
+                Item.scalar_min = Codec->ScalarMin;
+                Item.scalar_max = Codec->ScalarMax;
+                Item.values_per_unit = Codec->ValuesPerUnit;
+                Item.max_len = Codec->MaxLen;
+                Item.vector_bounds = Codec->VectorBounds;
+                Item.quat_bits = Codec->QuatBits;
+                bOk = citadel_rep_encoder_add_collection(Encoder, Field.FieldId, Item,
+                    Codec->MaxItems, NativeOps.GetData(), static_cast<uintptr_t>(NativeOps.Num()))
+                    == CITADEL_STATUS_OK;
+            }
+            else
+            {
+                bOk = AppendFieldToEncoder(Encoder, Field);
+            }
+            if (!bOk)
+            {
+                break; // whole-bunch failure; never silently omit a dirty field
+            }
         }
 
         // First pass sizes the buffer, second pass fills it (the encoder reports the
@@ -592,4 +806,259 @@ TArray<uint8> UCitadelNetworkPeer::BuildDeltaBunch(bool bIsFull, uint64 ResultId
 
     citadel_rep_encoder_free(Encoder);
     return Out;
+}
+
+void UCitadelNetworkPeer::RouteRepDelta(UGameInstance* GameInstance, const TArray<uint8>& Body)
+{
+    // Header parsing and schema validation happen in ReceiveDeltaBunch.  Route
+    // only to a component in this game instance; a matching numeric id in a
+    // stale world is never an object identity match.
+    for (const TWeakObjectPtr<UCitadelNetworkPeer>& Peer : BoundPeers())
+    {
+        if (Peer.IsValid() && Peer->GetWorld()
+            && Peer->GetWorld()->GetGameInstance() == GameInstance && Peer->ReceiveDeltaBunch(Body))
+        {
+            return;
+        }
+    }
+}
+
+bool UCitadelNetworkPeer::ReceiveDeltaBunch(const TArray<uint8>& Body)
+{
+    if (!CachedLayout || BoundObjectId() == 0 || Body.Num() == 0) { return false; }
+    TArray<CitadelRepDecodeFieldCodecV3> Codecs;
+    Codecs.SetNumZeroed(CachedLayout->Num());
+    for (const FCitadelFieldDesc& Field : CachedLayout->Fields)
+    {
+        CitadelRepDecodeFieldCodecV3& Codec = Codecs[Field.FieldId];
+        Codec.codec.kind = static_cast<uint8>(Field.TypeTag) - 1;
+        Codec.codec.int_min = Field.Bounds.IntMin; Codec.codec.int_max = Field.Bounds.IntMax;
+        Codec.codec.scalar_min = Field.Bounds.ScalarMin; Codec.codec.scalar_max = Field.Bounds.ScalarMax;
+        Codec.codec.values_per_unit = Field.Bounds.ValuesPerUnit; Codec.codec.max_len = Field.Bounds.MaxLenOrItems;
+        Codec.codec.vector_bounds = Field.Bounds.ScalarMax;
+        Codec.codec.quat_bits = Field.CodecId == 4 ? 9u : Field.CodecId == 6 ? 15u : 10u;
+        Codec.is_collection = Field.TypeTag == ECitadelFieldType::Collection;
+        if (Codec.is_collection)
+        {
+            const FArrayProperty* Array = CastField<FArrayProperty>(Field.Property);
+            if (!PopulateCollectionItemCodec(Array, Field.Bounds, Codec.collection_item_codec)
+                || Field.Bounds.MaxLenOrItems == 0)
+            {
+                return false; // never guess/default a keyed collection item codec.
+            }
+            Codec.collection_max_items = Field.Bounds.MaxLenOrItems;
+        }
+    }
+    CitadelRepDecoded* Decoded = nullptr;
+    if (citadel_rep_decode_with_collections(Body.GetData(), static_cast<uintptr_t>(Body.Num()),
+        CachedLayout->SchemaHash, CachedLayout->LayoutVersion, Codecs.GetData(),
+        static_cast<uintptr_t>(Codecs.Num()), &Decoded) != CITADEL_STATUS_OK || !Decoded) { return false; }
+    uint32 Object = 0; bool bFull = false; uint64 Result = 0, Base = 0;
+    const bool bHeader = citadel_rep_decoded_header(Decoded, &Object, &bFull, &Result, &Base) == CITADEL_STATUS_OK;
+    const bool bStale = Result == 0 || (!bFull && (bReceiveNeedsFullRecovery || Base != AcceptedBaselineId));
+    const bool bIdentity = Object == BoundObjectId();
+    const bool bApplied = bHeader && bIdentity && !bStale && ApplyDecodedFields(Decoded, bFull);
+    citadel_rep_decoded_free(Decoded);
+    if (!bApplied) { if (bHeader && bIdentity && !bFull) { RequestFullRecovery(); } return false; }
+    AcceptedBaselineId = Result;
+    bReceiveNeedsFullRecovery = false;
+    SendRepAck(Result);
+    return true;
+}
+
+bool UCitadelNetworkPeer::ValidateDecodedFields(const CitadelRepDecoded* Decoded, bool bIsFull) const
+{
+    if (!Decoded || !CachedLayout || !GetOwner()) { return false; }
+    const uintptr_t Count = citadel_rep_decoded_field_count(Decoded);
+    TSet<uint16> FullCollectionFields;
+    for (uintptr_t Changed = 0; Changed < Count; ++Changed)
+    {
+        uint16 CollectionFieldId = 0;
+        if (citadel_rep_decoded_collection_field_id(Decoded, Changed, &CollectionFieldId) == CITADEL_STATUS_OK)
+        {
+            if (!ValidateCollectionField(Decoded, Changed, CollectionFieldId, bIsFull)) { return false; }
+            FullCollectionFields.Add(CollectionFieldId);
+            continue;
+        }
+        CitadelRepFieldValue Value{};
+        if (citadel_rep_decoded_field_at(Decoded, Changed, &Value) != CITADEL_STATUS_OK
+            || Value.field_id >= CachedLayout->Num()) { return false; }
+        const FProperty* Property = CachedLayout->Fields[Value.field_id].Property;
+        if ((CastField<FBoolProperty>(Property) && Value.kind == 0)
+            || (CastField<FFloatProperty>(Property) && Value.kind == 2)
+            || (CastField<FNumericProperty>(Property) && Value.kind == 1)) { continue; }
+        return false;
+    }
+    // A full snapshot is authoritative for every schema keyed collection. Do
+    // not clear local state from a legacy/defective full that omitted one.
+    if (bIsFull)
+    {
+        for (const FCitadelFieldDesc& Field : CachedLayout->Fields)
+        {
+            if (Field.TypeTag == ECitadelFieldType::Collection && !FullCollectionFields.Contains(Field.FieldId))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool UCitadelNetworkPeer::ValidateCollectionField(const CitadelRepDecoded* Decoded,
+    uintptr_t ChangedIndex, uint16 SourceFieldId, bool bIsFull) const
+{
+    if (SourceFieldId >= CachedLayout->Num()) { return false; }
+    const FCitadelFieldDesc& Field = CachedLayout->Fields[SourceFieldId];
+    const FArrayProperty* Array = CastField<FArrayProperty>(Field.Property);
+    if (!Array || Field.TypeTag != ECitadelFieldType::Collection) { return false; }
+    FScriptArrayHelper Values(Array, Array->ContainerPtrToValuePtr<void>(GetOwner()));
+    TMap<uint64, int32> Indices = bIsFull ? TMap<uint64, int32>() : CollectionIndices.FindRef(SourceFieldId);
+    int32 SimulatedNum = bIsFull ? 0 : Values.Num();
+    uintptr_t OpCount = 0;
+    if (citadel_rep_decoded_collection_count(Decoded, ChangedIndex, &OpCount) != CITADEL_STATUS_OK) { return false; }
+    for (uintptr_t OpIndex = 0; OpIndex < OpCount; ++OpIndex)
+    {
+        CitadelRepDecodedCollectionOp Op{};
+        if (citadel_rep_decoded_collection_at(Decoded, ChangedIndex, OpIndex, &Op) != CITADEL_STATUS_OK
+            || Op.op > 2) { return false; }
+        const uint64 Key = CollectionIdentity(Op);
+        if (Op.op == 0)
+        {
+            const int32* Existing = Indices.Find(Key);
+            if (!Existing) { return false; }
+            const int32 Removed = *Existing;
+            Indices.Remove(Key);
+            --SimulatedNum;
+            for (TPair<uint64, int32>& Pair : Indices) { if (Pair.Value > Removed) { --Pair.Value; } }
+            continue;
+        }
+        const bool bSupported = (CastField<FBoolProperty>(Array->Inner) && Op.value_kind == 0)
+            || (CastField<FFloatProperty>(Array->Inner) && Op.value_kind == 2)
+            || (CastField<FNumericProperty>(Array->Inner) && Op.value_kind == 1);
+        if (!bSupported) { return false; }
+        if (!Indices.Contains(Key)) { Indices.Add(Key, SimulatedNum++); }
+    }
+    return true;
+}
+
+bool UCitadelNetworkPeer::ApplyDecodedFields(const CitadelRepDecoded* Decoded, bool bIsFull)
+{
+    // Validate all later fields before touching the actor. This prevents a bad
+    // trailing delta from leaving an earlier scalar/collection change behind.
+    if (!ValidateDecodedFields(Decoded, bIsFull)) { return false; }
+
+    struct FPropertySnapshot { FProperty* Property = nullptr; TArray<uint8> Value; };
+    TArray<FPropertySnapshot> Snapshots;
+    Snapshots.Reserve(CachedLayout->Num());
+    for (const FCitadelFieldDesc& Field : CachedLayout->Fields)
+    {
+        if (!Field.Property) { continue; }
+        FPropertySnapshot& Snapshot = Snapshots.AddDefaulted_GetRef();
+        Snapshot.Property = Field.Property;
+        Snapshot.Value.SetNumUninitialized(Field.Property->GetSize());
+        Field.Property->InitializeValue(Snapshot.Value.GetData());
+        Field.Property->CopyCompleteValue(Snapshot.Value.GetData(),
+            Field.Property->ContainerPtrToValuePtr<void>(GetOwner()));
+    }
+    const TMap<uint16, TMap<uint64, int32>> OriginalCollectionIndices = CollectionIndices;
+    const auto Restore = [&]()
+    {
+        for (FPropertySnapshot& Snapshot : Snapshots)
+        {
+            Snapshot.Property->CopyCompleteValue(
+                Snapshot.Property->ContainerPtrToValuePtr<void>(GetOwner()), Snapshot.Value.GetData());
+        }
+        CollectionIndices = OriginalCollectionIndices;
+    };
+    const auto DestroySnapshots = [&]()
+    {
+        for (FPropertySnapshot& Snapshot : Snapshots) { Snapshot.Property->DestroyValue(Snapshot.Value.GetData()); }
+    };
+
+    // Server fulls are encoded as diff(empty, current). Reset every reflected
+    // keyed collection before adding those authoritative entries, including a
+    // zero-op collection delta. Incremental deltas retain their keyed state.
+    if (bIsFull)
+    {
+        for (const FCitadelFieldDesc& Field : CachedLayout->Fields)
+        {
+            if (Field.TypeTag != ECitadelFieldType::Collection) { continue; }
+            const FArrayProperty* Array = CastField<FArrayProperty>(Field.Property);
+            if (!Array) { Restore(); DestroySnapshots(); return false; }
+            FScriptArrayHelper Values(Array, Array->ContainerPtrToValuePtr<void>(GetOwner()));
+            Values.EmptyValues();
+        }
+        CollectionIndices.Reset();
+    }
+
+    const uintptr_t Count = citadel_rep_decoded_field_count(Decoded);
+    for (uintptr_t Changed = 0; Changed < Count; ++Changed)
+    {
+        uint16 CollectionFieldId = 0;
+        if (citadel_rep_decoded_collection_field_id(Decoded, Changed, &CollectionFieldId) == CITADEL_STATUS_OK)
+        {
+            if (!ApplyCollectionField(Decoded, Changed, CollectionFieldId)) { Restore(); DestroySnapshots(); return false; }
+            continue;
+        }
+        CitadelRepFieldValue Value{};
+        if (citadel_rep_decoded_field_at(Decoded, Changed, &Value) != CITADEL_STATUS_OK
+            || Value.field_id >= CachedLayout->Num()) { Restore(); DestroySnapshots(); return false; }
+        const FCitadelFieldDesc& Field = CachedLayout->Fields[Value.field_id];
+        void* Ptr = Field.Property->ContainerPtrToValuePtr<void>(GetOwner());
+        if (const FBoolProperty* P = CastField<FBoolProperty>(Field.Property)) { P->SetPropertyValue(Ptr, Value.bool_value); }
+        else if (const FFloatProperty* P = CastField<FFloatProperty>(Field.Property)) { P->SetPropertyValue(Ptr, Value.scalar_value); }
+        else if (const FNumericProperty* P = CastField<FNumericProperty>(Field.Property)) { P->SetIntPropertyValue(Ptr, Value.int_value); }
+        else { Restore(); DestroySnapshots(); return false; }
+    }
+    DestroySnapshots();
+    return true;
+}
+
+bool UCitadelNetworkPeer::ApplyCollectionField(const CitadelRepDecoded* Decoded, uintptr_t ChangedIndex, uint16 SourceFieldId)
+{
+    if (!ValidateCollectionField(Decoded, ChangedIndex, SourceFieldId, false)) { return false; }
+    const FCitadelFieldDesc& Field = CachedLayout->Fields[SourceFieldId];
+    const FArrayProperty* Array = CastField<FArrayProperty>(Field.Property);
+    FScriptArrayHelper Values(Array, Array->ContainerPtrToValuePtr<void>(GetOwner()));
+    TMap<uint64, int32>& Indices = CollectionIndices.FindOrAdd(SourceFieldId);
+    uintptr_t OpCount = 0;
+    if (citadel_rep_decoded_collection_count(Decoded, ChangedIndex, &OpCount) != CITADEL_STATUS_OK) { return false; }
+    for (uintptr_t OpIndex = 0; OpIndex < OpCount; ++OpIndex)
+    {
+        CitadelRepDecodedCollectionOp Op{};
+        if (citadel_rep_decoded_collection_at(Decoded, ChangedIndex, OpIndex, &Op) != CITADEL_STATUS_OK) { return false; }
+        const uint64 Key = CollectionIdentity(Op);
+        if (Op.op == 0) { const int32 Removed = *Indices.Find(Key); Values.RemoveValues(Removed, 1); Indices.Remove(Key); for (TPair<uint64, int32>& Pair : Indices) if (Pair.Value > Removed) --Pair.Value; continue; }
+        int32* Existing = Indices.Find(Key);
+        const int32 Slot = Existing ? *Existing : Values.AddValue();
+        if (FBoolProperty* P = CastField<FBoolProperty>(Array->Inner)) { P->SetPropertyValue(Values.GetRawPtr(Slot), Op.int_value != 0); }
+        else if (FFloatProperty* P = CastField<FFloatProperty>(Array->Inner)) { P->SetPropertyValue(Values.GetRawPtr(Slot), Op.floats[0]); }
+        else if (FNumericProperty* P = CastField<FNumericProperty>(Array->Inner)) { P->SetIntPropertyValue(Values.GetRawPtr(Slot), Op.int_value); }
+        else { return false; }
+        Indices.Add(Key, Slot);
+    }
+    return true;
+}
+
+void UCitadelNetworkPeer::SendRepAck(uint64 ResultId)
+{
+    UWorld* World = GetWorld();
+    UGameInstance* GI = World ? World->GetGameInstance() : nullptr;
+    if (!GI || ResultId == 0) { return; }
+    UCitadelClientSubsystem* Client = GI->GetSubsystem<UCitadelClientSubsystem>(); if (!Client) { return; }
+    TArray<uint8> Body; uint8 Bit = 0;
+    WriteBitVarint(Body, 1, Bit); WriteBits(Body, BoundObjectId(), 32, Bit);
+    WriteBitVarint(Body, ResultId, Bit); WriteBits(Body, 0, 32, Bit);
+    Client->Send(CitadelWire::KIND_REP_ACK, Body, /*bReliable=*/true);
+}
+
+void UCitadelNetworkPeer::RequestFullRecovery()
+{
+    // KIND_REP_DELTA/ACK/SCHEMA define no client->server full-recovery request.
+    // This is therefore receive-local fail-closed state, not an undocumented
+    // resend request: reject without mutation or ACK and wait for the server's
+    // existing full-baseline/timeout policy. A prompt request requires a new
+    // protocol kind plus gateway handling before it can be claimed.
+    AcceptedBaselineId = 0;
+    bReceiveNeedsFullRecovery = true;
 }

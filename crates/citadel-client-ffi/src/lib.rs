@@ -41,7 +41,7 @@ pub mod codec_ffi;
 pub mod transform_ffi;
 
 /// Stable ABI version. Bump on any breaking change to the C surface.
-pub const CITADEL_FFI_ABI_VERSION: u32 = 2;
+pub const CITADEL_FFI_ABI_VERSION: u32 = 3;
 
 /// Capacity of the inbound envelope queue (envelopes buffered before poll).
 const INBOUND_CAPACITY: usize = 4096;

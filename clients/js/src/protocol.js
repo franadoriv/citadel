@@ -10,7 +10,7 @@
 // --- ABI ---------------------------------------------------------------------
 
 /** Client ABI version these bindings target (contract `abi_version`). */
-export const EXPECTED_ABI_VERSION = 2;
+export const EXPECTED_ABI_VERSION = 3;
 
 // --- Envelope kinds ----------------------------------------------------------
 

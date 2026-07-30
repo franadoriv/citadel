@@ -15,7 +15,8 @@
     },
     "./protocol": "./src/protocol.js",
     "./envelope": "./src/envelope.js",
-    "./client": "./src/client.js"
+    "./client": "./src/client.js",
+    "./networkpeer": "./src/networkpeer.js"
   },
   "files": [
     "src/",

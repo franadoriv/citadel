@@ -14,6 +14,16 @@
 
 export { CitadelClient, RpcError } from "./client.js";
 export { webTransportCertificateHash } from "./transport.js";
+export {
+  NetworkPeerAuthor,
+  NetworkPeerSession,
+  encodeDeltaBunch,
+  decodeDeltaBunch,
+  encodeDeltaBunches,
+  decodeDeltaBunches,
+  encodeRepAck,
+  decodeRepAck,
+} from "./networkpeer.js";
 export { CitadelHttpClient, HttpApiError } from "./http.js";
 export {
   Envelope,

@@ -26,9 +26,10 @@ use citadel::realtime::registry::{Outbound, SessionHandle};
 use citadel::transport::TransportKind;
 use citadel_wire::codec::{ScalarQuant, codec_id};
 use citadel_wire::netpeer::{
-    DeltaBunch, FieldDelta, MAX_ENVELOPE_ALLOC, RepFieldCodec, RepSchema, RepValue,
+    DeltaBunch, FieldDelta, MAX_ENVELOPE_ALLOC, RepAck, RepAckEntry, RepFieldCodec, RepSchema,
+    RepSchemaTable, RepValue,
 };
-use citadel_wire::protocol::KIND_REP_DELTA;
+use citadel_wire::protocol::{KIND_REP_ACK, KIND_REP_DELTA, KIND_REP_SCHEMA};
 use tokio::sync::mpsc;
 
 const CLASS: u32 = 42;
@@ -88,6 +89,147 @@ fn client_health_bunch(result_id: u64, health: i64) -> Vec<u8> {
 fn decode(body: &[u8]) -> DeltaBunch {
     let mut budget = MAX_ENVELOPE_ALLOC;
     DeltaBunch::decode(body, &schema(), &mut budget).expect("server bunch decodes")
+}
+
+#[tokio::test]
+async fn gateway_lifecycle_bootstraps_schema_full_then_authoritative_delta() {
+    let rep = Arc::new(RepAuthority::new(
+        citadel::realtime::netpeer::RateLimits::default(),
+    ));
+    let gw = Gateway::new().with_rep_authority(Arc::clone(&rep));
+    // Registration and spawning are server-only Gateway lifecycle APIs; no
+    // NetworkPeer frame exposes either operation to a client.
+    gw.register_rep_class(CLASS, layout(), schema())
+        .expect("approved class registers");
+
+    let owner = gw.next_participant_id();
+    let receiver = gw.next_participant_id();
+    let (owner_tx, mut owner_rx) = mpsc::channel::<Outbound>(16);
+    let (receiver_tx, mut receiver_rx) = mpsc::channel::<Outbound>(16);
+    let mut initial = RepSnapshot::new();
+    initial.set_scalar(F_HEALTH, RepValue::Int(10));
+    gw.spawn_rep_object(OBJ, 0, CLASS, Some(owner), false, initial)
+        .expect("trusted lifecycle spawns object");
+
+    gw.register_session(SessionHandle {
+        id: owner,
+        kind: TransportKind::Quic,
+        outbound: owner_tx,
+        identity: None,
+    });
+    // The owner also gets a bootstrap; draining it keeps this test focused on
+    // the joining receiver's exact order.
+    owner_rx.recv().await.expect("owner schema");
+    owner_rx.recv().await.expect("owner full");
+    gw.register_session(SessionHandle {
+        id: receiver,
+        kind: TransportKind::Quic,
+        outbound: receiver_tx,
+        identity: None,
+    });
+
+    let schema_out = receiver_rx.recv().await.expect("schema bootstrap");
+    assert_eq!(schema_out.envelope.kind, KIND_REP_SCHEMA);
+    let table = RepSchemaTable::decode(&schema_out.envelope.body).expect("schema table");
+    assert_eq!(table.entries.len(), 1);
+    assert_eq!(table.entries[0].class_id, CLASS);
+    assert_eq!(table.entries[0].schema_hash, layout().schema_hash().bytes);
+
+    let full_out = receiver_rx
+        .recv()
+        .await
+        .expect("full baseline after schema");
+    assert_eq!(full_out.envelope.kind, KIND_REP_DELTA);
+    let full = decode(&full_out.envelope.body);
+    assert!(full.is_full);
+    assert_eq!(
+        full.changes.get(&F_HEALTH),
+        Some(&FieldDelta::Value(RepValue::Int(10)))
+    );
+
+    let ack = RepAck {
+        entries: vec![RepAckEntry {
+            object_id: OBJ,
+            acked_result_id: full.result_id,
+            history: 0,
+        }],
+    }
+    .encode()
+    .expect("ack encodes");
+    assert_eq!(
+        gw.handle_inbound(
+            receiver,
+            &citadel::transport::Envelope::new(KIND_REP_ACK, ack)
+        ),
+        0
+    );
+    assert_eq!(
+        gw.handle_inbound(
+            owner,
+            &citadel::transport::Envelope::new(KIND_REP_DELTA, client_health_bunch(1, 37)),
+        ),
+        1
+    );
+    let delta_out = receiver_rx.recv().await.expect("authoritative delta");
+    let delta = decode(&delta_out.envelope.body);
+    assert!(!delta.is_full, "acked bootstrap permits a delta");
+    assert_eq!(
+        delta.changes.get(&F_HEALTH),
+        Some(&FieldDelta::Value(RepValue::Int(37)))
+    );
+}
+
+#[tokio::test]
+async fn reconnect_gets_fresh_schema_and_full_bootstrap() {
+    let rep = Arc::new(RepAuthority::new(
+        citadel::realtime::netpeer::RateLimits::default(),
+    ));
+    let gw = Gateway::new().with_rep_authority(Arc::clone(&rep));
+    gw.register_rep_class(CLASS, layout(), schema())
+        .expect("class registers");
+    gw.spawn_rep_object(OBJ, 0, CLASS, None, false, RepSnapshot::new())
+        .expect("object spawns");
+    let peer = gw.next_participant_id();
+    for _ in 0..2 {
+        let (tx, mut rx) = mpsc::channel::<Outbound>(8);
+        gw.register_session(SessionHandle {
+            id: peer,
+            kind: TransportKind::Quic,
+            outbound: tx,
+            identity: None,
+        });
+        assert_eq!(
+            rx.recv().await.expect("schema").envelope.kind,
+            KIND_REP_SCHEMA
+        );
+        assert!(decode(&rx.recv().await.expect("full").envelope.body).is_full);
+        gw.unregister_session(peer);
+    }
+}
+
+#[test]
+fn disabled_gateway_drops_rep_and_invalid_server_schema_is_rejected() {
+    let disabled = Gateway::new();
+    let peer = disabled.next_participant_id();
+    assert_eq!(
+        disabled.handle_inbound(
+            peer,
+            &citadel::transport::Envelope::new(KIND_REP_DELTA, vec![0])
+        ),
+        0
+    );
+    let enabled = Gateway::new().with_rep_authority(Arc::new(RepAuthority::new(
+        citadel::realtime::netpeer::RateLimits::default(),
+    )));
+    let bad = RepSchema::new(
+        citadel_wire::schema::schema_hash(99, &[]).expect("hash"),
+        vec![RepFieldCodec::IntRange { min: 0, max: 100 }],
+    )
+    .expect("well-formed but mismatched schema");
+    assert_eq!(
+        enabled.register_rep_class(CLASS, layout(), bad),
+        Err(citadel::realtime::netpeer::RepReject::SchemaBinding)
+    );
 }
 
 #[tokio::test]
@@ -264,18 +406,28 @@ async fn rep_delta_traverses_real_quic_and_peer_sees_authoritative_value() {
         .expect("write delta");
     send.finish().expect("finish delta stream");
 
-    // B reads the server's authoritative rebroadcast off a reliable uni stream.
-    let mut recv = tokio::time::timeout(Duration::from_secs(5), conn_b.accept_uni())
-        .await
-        .expect("rebroadcast did not time out")
-        .expect("rebroadcast stream");
-    let data = recv.read_to_end(64 * 1024).await.expect("read rebroadcast");
-    let mut buf = bytes::BytesMut::from(&data[..]);
-    let env = citadel::transport::codec::decode_framed(&mut buf)
-        .expect("decode framed")
-        .expect("one frame");
-    assert_eq!(env.kind, KIND_REP_DELTA);
-    let bunch = decode(&env.body);
+    // B first receives the join schema/full bootstrap; then it reads the
+    // server's authoritative rebroadcast off a reliable uni stream.
+    let mut bunch = None;
+    for _ in 0..3 {
+        let mut recv = tokio::time::timeout(Duration::from_secs(5), conn_b.accept_uni())
+            .await
+            .expect("outbound frame did not time out")
+            .expect("outbound stream");
+        let data = recv.read_to_end(64 * 1024).await.expect("read outbound");
+        let mut buf = bytes::BytesMut::from(&data[..]);
+        let env = citadel::transport::codec::decode_framed(&mut buf)
+            .expect("decode framed")
+            .expect("one frame");
+        if env.kind == KIND_REP_DELTA {
+            let decoded = decode(&env.body);
+            if decoded.changes.get(&F_HEALTH) == Some(&FieldDelta::Value(RepValue::Int(100))) {
+                bunch = Some(decoded);
+                break;
+            }
+        }
+    }
+    let bunch = bunch.expect("authoritative rebroadcast after bootstrap");
     assert_eq!(
         bunch.changes.get(&F_HEALTH),
         Some(&FieldDelta::Value(RepValue::Int(100))),

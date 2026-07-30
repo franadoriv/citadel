@@ -2,7 +2,7 @@
 #
 # This mirrors the Unity `CitadelClient` wrapper and the native `demo-client`:
 # connect over QUIC/WebSocket, send envelopes, and drain the non-blocking poll
-# queue. It drives the SAME C ABI (`crates/citadel-client-ffi`, ABI v2) that
+# queue. It drives the SAME C ABI (`crates/citadel-client-ffi`, ABI v3) that
 # Unity and Unreal use, exposed to GDScript through a native GDExtension object
 # named `CitadelClientNative` (see README "Where the native library comes from").
 # The extension source is shipped in `native/`; when its package artifact is not
@@ -40,6 +40,7 @@ enum AuthStatus {
 # The native GDExtension handle (a `CitadelClientNative` object).
 var _native: Object = null
 var last_error: String = ""
+var _rep_result_tokens: Dictionary = {}
 
 
 func _init() -> void:
@@ -190,9 +191,36 @@ func decode_rep_delta(body: PackedByteArray, schema_hash: PackedByteArray,
 	return decoded
 
 
-## Encode client-owned NetworkPeer scalar fields through the shared Rust codec.
-## Field dictionaries use `kind` 0=bool, 1=int, 2=scalar, 3=bytes and the
-## matching bounds keys expected by the C ABI.
+## Decode and apply authoritative NetworkPeer lifecycle rules. Deltas whose
+## base token is not the last accepted token are rejected; a full snapshot
+## establishes/replaces that baseline. The returned fields stay engine-native.
+func apply_rep_delta(body: PackedByteArray, schema_hash: PackedByteArray,
+		layout_version: int, codecs: Array) -> Dictionary:
+	var decoded := decode_rep_delta(body, schema_hash, layout_version, codecs)
+	if decoded.is_empty():
+		return {}
+	var object_id := int(decoded.get("object_id", -1))
+	if object_id < 0:
+		last_error = "NetworkPeer delta omitted object id"
+		return {}
+	if not bool(decoded.get("is_full", false)) and int(decoded.get("base_id", 0)) != int(_rep_result_tokens.get(object_id, 0)):
+		last_error = "Stale NetworkPeer delta baseline"
+		return {}
+	_rep_result_tokens[object_id] = int(decoded.get("result_id", 0))
+	return decoded
+
+
+## The result token to acknowledge after an authoritative apply. A missing
+## object returns zero and must not be sent as an acknowledgement.
+func rep_ack_token(object_id: int) -> int:
+	return int(_rep_result_tokens.get(object_id, 0))
+
+
+## Encode client-owned NetworkPeer fields through the shared ABI v3 codec.
+## Field dictionaries use `kind` 0=bool, 1=int, 2=scalar, 3=PackedByteArray,
+## 4=Vector3, 5=Quaternion, 6=keyed collection. Collection fields provide
+## `item_codec`, `max_items`, and `operations`; operations preserve
+## `rep_index`, `rep_generation`, and `rep_key`. Values are copied natively.
 func encode_rep_delta(object_id: int, is_full: bool, result_id: int, base_id: int,
 		field_count: int, schema_hash: PackedByteArray, layout_version: int,
 		fields: Array) -> PackedByteArray:

@@ -1,5 +1,5 @@
 {
-  "abi_version": 2,
+  "abi_version": 3,
   "wire": {
     "KIND_POSITION": 1,
     "KIND_PEER_POSITION": 2,
