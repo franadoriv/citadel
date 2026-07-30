@@ -63,7 +63,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Optional Sentry-compatible incident delivery. It stays inactive until the
 # operator provides CITADEL_BUGSINK_DSN; local journal writes never depend on it.
-sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "reqwest", "rustls"] }
+sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "reqwest", "rustls-no-provider"] }
 # Zero-copy byte buffers for transport framing.
 bytes = "1"
 # QUIC transport: unreliable datagrams + reliable streams + TLS 1.3.
