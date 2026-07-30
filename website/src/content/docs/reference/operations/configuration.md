@@ -38,6 +38,11 @@ level = "info"
 # "pretty" (human-readable) or "json" (structured).
 format = "pretty"
 
+[errors]
+# The journal file is always citadel-errors.jsonl beside the executable.
+max_bytes = 8388608
+max_entries = 2000
+
 [transport.quic]
 # QUIC is the primary realtime transport (datagrams + reliable streams, TLS 1.3).
 enabled = false
@@ -178,6 +183,20 @@ fields = ["score", "region"]
 | --- | --- | --- | --- |
 | `level` | string | `"info"` | Tracing directive. Must not be empty. |
 | `format` | enum | `"pretty"` | `"pretty"` or `"json"`. |
+
+### `[errors]`
+
+The local incident journal is always enabled. It writes redacted failure and
+panic summaries to `citadel-errors.jsonl` beside the running executable, so a
+standalone deployment keeps its diagnostics with the binary. It never stores
+panic payloads, internal error detail, connection strings, tokens, or passwords.
+The Error Journal section in `/dashboard` reads the retained summaries through
+the authenticated console API.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `max_bytes` | integer | `8388608` | Journal size cap. Must be between `65536` and `1073741824`; oldest entries are pruned when reached. |
+| `max_entries` | integer | `2000` | Maximum retained entries. Must be between `1` and `100000`. |
 
 ### `[transport.quic]`, `[transport.websocket]`, `[transport.webtransport]`
 
@@ -495,8 +514,16 @@ its `/console/v1` API. Passwords are never echoed in diagnostics or the
 | `CITADEL_DATABASE_URL` | `database.url` |
 | `CITADEL_CONSOLE_PASSWORD` | `console.password` |
 
-Unknown `CITADEL_` variables are ignored so future keys do not break older
-binaries. CLI flags (see the [CLI reference](/reference/operations/cli/)) override these.
+`CITADEL_BUGSINK_DSN` is deliberately not a TOML field or config-browser value:
+when set, it enables optional external incident delivery through a
+Sentry-compatible Bugsink endpoint. The server starts and the local journal
+continues normally when the variable is absent or the endpoint is unavailable.
+Set `CITADEL_ENVIRONMENT` to label those external events; it defaults to
+`production`.
+
+Unknown `CITADEL_` variables are ignored by configuration loading so future
+keys do not break older binaries. CLI flags (see the
+[CLI reference](/reference/operations/cli/)) override these.
 
 ## Validation
 

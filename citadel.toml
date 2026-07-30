@@ -27,6 +27,12 @@ bind = "127.0.0.1:7350"
 level = "info"
 format = "pretty"
 
+[errors]
+# Redacted server failures and panics are retained in citadel-errors.jsonl next
+# to the server binary. Oldest entries are pruned when either bound is reached.
+max_bytes = 8388608
+max_entries = 2000
+
 [database]
 # Persistence backend, selected by URL scheme:
 #   sqlite://<file>            -> embedded single-file SQLite (created on first run)
