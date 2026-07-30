@@ -51,6 +51,88 @@ Set `citadel_units_per_pixel` on the map to change that scale. Isometric,
 infinite, rotated/flipped, and unsupported collision shapes are rejected rather
 than silently losing authoritative collision.
 
+### Tiled workflow: collision in five minutes
+
+Use this recipe for a map that Citadel can validate and load without any custom
+exporter.
+
+1. In **File → New → New Map**, choose **Orthogonal** and leave **Infinite**
+   disabled. Set the tile dimensions to the same size as the tileset you plan to
+   render (for example `32 × 32`). Save the map as `GlobalGrove.tmx`.
+2. Add the tileset as an external `.tsx` where possible. This keeps tile metadata
+   (including collision properties) shared between every map that uses it.
+3. Pick one collision authoring method below. The object-layer method is usually
+   the quickest for walls, cliffs and irregular blockers; the tile-property method
+   is best for grid-aligned solid tiles.
+4. Select the **map** in Tiled's Properties panel and add a `float` property named
+   `citadel_units_per_pixel` when your world scale is not one centimetre per pixel.
+   For example, set it to `0.01` when one Tiled pixel represents one centimetre in
+   a metre-based game world.
+5. Run the cook command below during CI or before copying the map to the server.
+   The command fails loudly for unsupported content, so a broken collision map is
+   caught before it reaches players.
+
+![The Tiled Properties panel, where map and tile custom properties are edited.](https://doc.mapeditor.org/en/stable/_images/properties-dock.png)
+
+*Screenshot from the [official Tiled Custom Properties documentation](https://doc.mapeditor.org/en/stable/manual/custom-properties/), used here as a visual reference for the editor UI.*
+
+#### Option A: collision object layer (recommended)
+
+Create an **Object Layer** named exactly `collision`. Draw visible rectangles or
+convex polygons for walls and blockers. Citadel turns each shape into a vertical
+collision prism; it does not render the layer or send its geometry to clients.
+
+You may use another layer name if you give that layer the Boolean property
+`citadel_collision=true`. Keep collision shapes axis-aligned: rotated objects,
+ellipses, points, polylines and concave polygons are rejected.
+
+![The Tiled Layers panel shows visibility and lock controls for a layer.](https://doc.mapeditor.org/en/stable/_images/lock-visibility-toggle.png)
+
+*Screenshot from the [official Tiled Layers documentation](https://doc.mapeditor.org/en/stable/manual/layers/). Lock the `collision` layer once authored to avoid accidental edits.*
+
+#### Option B: solid tiles
+
+Select each solid tile in the tileset and add the Boolean tile property
+`citadel_collision=true`. Every placement of that tile produces a collision prism.
+Do **not** flip collision tiles in a tile layer: horizontal, vertical and diagonal
+flips are deliberately rejected, because they can silently change authoritative
+geometry.
+
+Tile collision objects embedded in a tileset are also supported when they are
+rectangles or convex polygons. This is useful when the blocking area occupies only
+part of a decorative tile.
+
+#### Supported subset
+
+| TMX feature | Citadel behaviour |
+| --- | --- |
+| Finite, orthogonal map | Supported |
+| External TSX tileset | Supported; resolved relative to the TMX file |
+| `collision` object layer or layer property | Supported |
+| Rectangles and convex polygons | Supported |
+| `citadel_collision=true` tile property | Supported |
+| Isometric or infinite map | Rejected |
+| Rotated/flipped collision content | Rejected |
+| Ellipse, point, polyline or concave polygon collision | Rejected |
+
+### Validate and deploy
+
+Start with the [minimal collision-only example](/examples/tmx/citadel-collision-example.tmx).
+It contains one rectangle and one convex polygon, so it can be cooked without a
+tileset:
+
+```sh
+citadel cook-tmx \
+  --input citadel-collision-example.tmx \
+  --output maps/GlobalGrove.map
+```
+
+For production, prefer the cooked `.map`: it makes startup input deterministic and
+avoids parsing editor assets on the server. Direct `.tmx` loading is useful during
+iteration; copy either the `.tmx` (and its relative `.tsx`/image assets) or the
+cooked `.map` into `runtime.maps_dir`, then restart the server. The map filename
+stem must match the `map` returned by `on_room_create`.
+
 ## Cook a `.map` from your level
 
 The cook tools ship as **editor-only** tools (they are never compiled into a

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<map version="1.10" tiledversion="1.10.2" orientation="orthogonal" renderorder="right-down" width="32" height="18" tilewidth="32" tileheight="32" infinite="0" nextlayerid="2" nextobjectid="3">
+ <properties>
+  <property name="citadel_units_per_pixel" type="float" value="0.01"/>
+ </properties>
+ <objectgroup id="1" name="collision">
+  <object id="1" name="outer-wall" x="0" y="0" width="1024" height="32"/>
+  <object id="2" name="rock" x="384" y="256">
+   <polygon points="0,64 48,0 112,20 128,80 56,112"/>
+  </object>
+ </objectgroup>
+</map>
