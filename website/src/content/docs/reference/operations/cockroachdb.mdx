@@ -1,0 +1,75 @@
+---
+title: CockroachDB operations
+description: Operate Citadel on CockroachDB's PostgreSQL-wire backend safely.
+---
+
+Citadel supports CockroachDB through its PostgreSQL-wire backend with a
+CockroachDB-specific flavor. The game-facing API and durable repository
+contracts are the same as PostgreSQL, but the URL scheme selects compatible
+migrations and runtime behavior for CockroachDB's SQL dialect.
+
+## Configure the CockroachDB flavor
+
+Use `cockroach://` or `cockroachdb://`, never a plain `postgres://` URL pointed
+at a CockroachDB cluster:
+
+```toml
+[database]
+url = "cockroach://citadel@db.example:26257/citadel?sslmode=verify-full"
+max_connections = 10
+connect_timeout_ms = 5000
+acquire_timeout_ms = 5000
+```
+
+The scheme is significant. It selects CockroachDB-compatible migrations and
+skips PostgreSQL-only advisory locking. A `postgres://` URL against CockroachDB
+is treated as PostgreSQL and can fail because PostgreSQL migrations use features
+that CockroachDB does not accept.
+
+Validate the static configuration, then start a node before serving traffic:
+
+```bash
+citadel check --config /etc/citadel/citadel.toml
+citadel serve --config /etc/citadel/citadel.toml
+```
+
+`citadel check` does not connect to CockroachDB. During `citadel serve`, Citadel
+connects and applies its migrations before it accepts traffic. After a
+successful start, `/status` reports `backend: "cockroach"`. Connection or
+migration failure is fatal at startup; Citadel never switches to in-memory data
+while a CockroachDB URL is configured.
+
+## Cluster operations
+
+Operate the CockroachDB cluster according to its supported production guidance:
+use TLS, a least-privilege application role, monitored backups, and tested
+restore procedures. Monitor node liveness, ranges/replication, SQL connection
+pressure, transaction retries, latency, disk capacity, and backup health. The
+Dashboard Database Explorer can read bounded, redacted application metadata and
+rows in the configured `public` schema, but it is not a SQL console.
+
+CockroachDB does not support the PostgreSQL advisory lock used by SQLx
+migrations, so Citadel disables that migration lock for the CockroachDB flavor.
+Serialize the first Citadel startup or migration rollout: bring up one node to
+complete migrations before scaling additional replicas.
+
+CockroachDB's default serializable isolation can restart a contended
+transaction. Citadel handles the documented backend differences for its durable
+contracts, including its CockroachDB migration set and bounded retry behavior
+where applicable; operators should still monitor sustained retry pressure as a
+capacity or contention signal.
+
+## Backup, restore, and compatibility testing
+
+Use CockroachDB's supported backup/restore procedure and restore into an
+isolated target before a production cutover. Validate the restored
+configuration with `citadel check`, then start an isolated Citadel node so it
+can connect to the restore. Inspect expected application records with the
+authenticated Database Explorer before accepting players. Citadel does not
+automatically migrate data between CockroachDB and other backend families.
+
+For a local fixture and the exact PostgreSQL-versus-CockroachDB differences,
+see [Running Citadel on CockroachDB](/guides/cockroachdb/). The live
+compatibility suite is opt-in through `CITADEL_TEST_COCKROACH_URL`; it exercises
+the CockroachDB flavor against a real cluster rather than claiming that a
+PostgreSQL-only test proves compatibility.
