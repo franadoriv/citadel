@@ -107,7 +107,7 @@ Edit `citadel.toml` (or pass `--config`) to point at PostgreSQL, change bind
 addresses, or toggle transports. See
 [docs/features/persistence.md](docs/features/persistence.md) for the full flow.
 
-### Error journal and optional external reporting
+### Error journal and Sentry telemetry
 
 Server failures and unexpected process panics are captured in a bounded,
 redacted `citadel-errors.jsonl` beside the binary. Open **Error Journal** in
@@ -115,10 +115,15 @@ the authenticated dashboard to review recurring incidents, including their
 component, category, first/last-seen time, and count. Raw panic payloads,
 internal details, connection strings, passwords, and tokens are excluded.
 
-For a self-hosted external view, set `CITADEL_BUGSINK_DSN` to a Bugsink
-Sentry-compatible DSN (and optionally `CITADEL_ENVIRONMENT`). It is disabled
-by default; an absent or unreachable endpoint never blocks local capture or
-server startup. Retention is configured under `[errors]` in `citadel.toml`.
+To enable Sentry telemetry, set `CITADEL_SENTRY_DSN` (and optionally
+`CITADEL_ENVIRONMENT`). The Sentry SDK sends redacted incident metadata only:
+the component, error category, incident class, generic message, release, and
+environment. [Bugsink](https://www.bugsink.com/) is a lightweight,
+self-hosted Sentry-compatible alternative: use its DSN with
+`CITADEL_SENTRY_DSN`. The older `CITADEL_BUGSINK_DSN` name remains a
+compatibility alias. Telemetry is disabled by default; an absent or unreachable
+endpoint never blocks local capture or server startup. Retention is configured
+under `[errors]` in `citadel.toml`.
 
 ### Download a release
 
@@ -229,7 +234,7 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
     <tr><td>Server bootstrap, CLI, TOML config, and first-run setup</td><td>Run a standalone node with generated config, game directory, and SQLite defaults.</td><td>✅</td></tr>
     <tr><td>Portable server releases and Linux deployment</td><td>Versioned Windows, Linux x86_64 musl, and Linux ARM64 musl archives ship with SHA-256 checksums, CI package validation, and a systemd deployment template.</td><td>✅</td></tr>
     <tr><td>Dockerfile and editable Docker workflow</td><td>Dockerfile and Compose development assets remain available, but release CI/CD no longer builds, tests, attests, or publishes OCI images. Historical GHCR images are not updated by releases.</td><td>🚧</td></tr>
-    <tr><td>Health, live status, observability, audit logs</td><td>Health/status endpoints, structured logs, redacted local incident journaling, optional external error reporting, tracing seams, and operator audit records.</td><td>✅</td></tr>
+    <tr><td>Health, live status, observability, audit logs</td><td>Health/status endpoints, structured logs, redacted local incident journaling, optional Sentry telemetry (including Bugsink), tracing seams, and operator audit records.</td><td>✅</td></tr>
     <tr><td>Device authentication</td><td>Creates or authenticates a device identity and issues a session.</td><td>✅</td></tr>
     <tr><td>Custom-id authentication</td><td>Application-owned identifiers map to accounts and sessions.</td><td>✅</td></tr>
     <tr><td>Email/password authentication</td><td>Transactional email/password registration and sign-in at /v1/auth/email; Argon2id PHC verifiers, durable hashed multi-key admission limits, and existing session tokens ship. Email verification, recovery/change-password, and linking remain pending.</td><td>✅</td></tr>

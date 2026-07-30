@@ -453,13 +453,13 @@ configured `[errors]` retention limits prune its oldest records.
 Each entry contains `fingerprint`, `kind` (`error` or `panic`), `category`
 when applicable, `component`, a generic redacted `message`, first/last-seen
 timestamps, and `count`. Raw panic payloads, internal error detail, request
-data, credentials, and the external reporting DSN are never returned. Matching
+data, credentials, and the Sentry telemetry DSN are never returned. Matching
 incidents are aggregated by fingerprint so recurring failures remain readable.
 
 The response is `{ "entries": [...], "total": <number>, "next_offset": <number|null> }`.
 The console's **Error Journal** page presents this data. See the
 [configuration reference](/reference/operations/configuration/#errors) for
-retention and optional external reporting.
+retention and optional Sentry telemetry.
 
 ## Audit Logs
 

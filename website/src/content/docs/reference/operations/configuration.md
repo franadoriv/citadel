@@ -541,12 +541,13 @@ its `/console/v1` API. Passwords are never echoed in diagnostics or the
 | `CITADEL_DATABASE_URL` | `database.url` |
 | `CITADEL_CONSOLE_PASSWORD` | `console.password` |
 
-`CITADEL_BUGSINK_DSN` is deliberately not a TOML field or config-browser value:
-when set, it enables optional external incident delivery through a
-Sentry-compatible Bugsink endpoint. The server starts and the local journal
-continues normally when the variable is absent or the endpoint is unavailable.
-Set `CITADEL_ENVIRONMENT` to label those external events; it defaults to
-`production`.
+`CITADEL_SENTRY_DSN` is deliberately not a TOML field or config-browser value:
+when set, it enables optional Sentry telemetry. The server starts and the local
+journal continues normally when the variable is absent or the endpoint is
+unavailable. Set `CITADEL_ENVIRONMENT` to label those telemetry events; it
+defaults to `production`. `CITADEL_BUGSINK_DSN` remains a lower-priority
+compatibility alias; see [Telemetry](/reference/operations/telemetry/) for
+Sentry and Bugsink setup.
 
 Unknown `CITADEL_` variables are ignored by configuration loading so future
 keys do not break older binaries. CLI flags (see the
