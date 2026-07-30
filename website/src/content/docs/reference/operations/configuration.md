@@ -60,6 +60,10 @@ outbound_queue_capacity = 1024
 enabled = false
 bind = "127.0.0.1:7352"
 outbound_queue_capacity = 1024
+# Native WebSocket Ping/Pong liveness after authentication. Set the interval to
+# 0 only when an upstream proxy owns equivalent liveness handling.
+heartbeat_interval_ms = 15000
+heartbeat_timeout_ms = 45000
 
 [transport.webtransport]
 # Browser path: QUIC-grade datagrams + streams over HTTP/3 (own UDP endpoint).
@@ -212,6 +216,14 @@ All three share the same shape:
 | `enabled` | bool | `false` | Whether the listener starts. |
 | `bind` | socket address | `7351` / `7352` / `7353` on `127.0.0.1` | Validated **only when enabled**. |
 | `outbound_queue_capacity` | integer | `1024` | Per-connection outbound queue in envelopes; must be `>= 1` when enabled. A full or closed queue drops the current outbound attempt rather than blocking realtime routing. |
+
+WebSocket additionally supports `heartbeat_interval_ms` (default `15000`) and
+`heartbeat_timeout_ms` (default `45000`). After authentication Citadel sends
+native Ping control frames, not game envelopes. A peer that misses the Pong
+deadline is closed normally, which runs the usual session cleanup and `on_leave`
+hooks. Set `heartbeat_interval_ms = 0` to disable probes; when enabled, the
+timeout must be at least `1` ms. The `/status` metrics include aggregate ping,
+pong, and liveness-timeout totals.
 
 Notes:
 

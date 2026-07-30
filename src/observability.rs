@@ -40,6 +40,9 @@ pub struct NodeMetrics {
     bytes_out_total: AtomicU64,
     notification_live_delivered_total: AtomicU64,
     notification_live_dropped_total: AtomicU64,
+    websocket_pings_sent_total: AtomicU64,
+    websocket_pongs_received_total: AtomicU64,
+    websocket_liveness_timeouts_total: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -120,6 +123,24 @@ impl NodeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a native WebSocket Ping control frame sent by the transport.
+    pub fn record_websocket_ping_sent(&self) {
+        self.websocket_pings_sent_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a native WebSocket Pong control frame received from a peer.
+    pub fn record_websocket_pong_received(&self) {
+        self.websocket_pongs_received_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a WebSocket connection closed after a missed Pong deadline.
+    pub fn record_websocket_liveness_timeout(&self) {
+        self.websocket_liveness_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a consistent-enough snapshot for reporting.
     ///
     /// Values are read independently, so a snapshot may interleave concurrent
@@ -141,6 +162,13 @@ impl NodeMetrics {
                 .load(Ordering::Relaxed),
             notification_live_dropped_total: self
                 .notification_live_dropped_total
+                .load(Ordering::Relaxed),
+            websocket_pings_sent_total: self.websocket_pings_sent_total.load(Ordering::Relaxed),
+            websocket_pongs_received_total: self
+                .websocket_pongs_received_total
+                .load(Ordering::Relaxed),
+            websocket_liveness_timeouts_total: self
+                .websocket_liveness_timeouts_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -174,6 +202,12 @@ pub struct NodeMetricsSnapshot {
     pub notification_live_delivered_total: u64,
     /// Notification envelopes dropped because a local bounded queue was full or closed.
     pub notification_live_dropped_total: u64,
+    /// Native WebSocket Ping control frames sent by the server.
+    pub websocket_pings_sent_total: u64,
+    /// Native WebSocket Pong control frames received by the server.
+    pub websocket_pongs_received_total: u64,
+    /// WebSocket sessions closed after their Pong deadline elapsed.
+    pub websocket_liveness_timeouts_total: u64,
 }
 
 /// Build the [`EnvFilter`] for the given level directive.

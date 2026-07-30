@@ -425,7 +425,11 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         let bind = parse_bind("transport.websocket.bind", &cfg.websocket.bind)?;
         let server = websocket::WebSocketServer::bind_with_gateway(bind, Arc::clone(&gateway))
             .await?
-            .with_handshake_timeout(handshake_timeout);
+            .with_handshake_timeout(handshake_timeout)
+            .with_liveness(
+                Duration::from_millis(cfg.websocket.heartbeat_interval_ms),
+                Duration::from_millis(cfg.websocket.heartbeat_timeout_ms.max(1)),
+            );
         tracing::info!(addr = %server.local_addr(), "starting WebSocket fallback transport");
         supervisor.spawn(server);
     }
