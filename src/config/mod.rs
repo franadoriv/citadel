@@ -58,6 +58,8 @@ pub struct Config {
     pub http: HttpConfig,
     /// Logging and tracing settings.
     pub logging: LoggingConfig,
+    /// Local incident-journal retention settings.
+    pub errors: ErrorJournalConfig,
     /// Realtime transport listener settings.
     pub transport: TransportConfig,
     /// Embedded game-logic runtime settings.
@@ -1256,6 +1258,49 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Retention settings for the local, redacted incident journal.
+///
+/// The journal path is intentionally not configurable here: by default its
+/// files live beside the running executable, which keeps a standalone install
+/// self-contained. Operators can tune only bounded retention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ErrorJournalConfig {
+    /// Maximum size of the JSONL journal before its oldest incidents are pruned.
+    pub max_bytes: u64,
+    /// Maximum retained incident records, independent of byte size.
+    pub max_entries: usize,
+}
+
+impl Default for ErrorJournalConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: 8 * 1024 * 1024,
+            max_entries: 2_000,
+        }
+    }
+}
+
+impl ErrorJournalConfig {
+    fn validate(&self) -> AppResult<()> {
+        const MIN_BYTES: u64 = 64 * 1024;
+        const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+        const MAX_ENTRIES: usize = 100_000;
+
+        if !(MIN_BYTES..=MAX_BYTES).contains(&self.max_bytes) {
+            return Err(AppError::config(format!(
+                "errors.max_bytes must be between {MIN_BYTES} and {MAX_BYTES}"
+            )));
+        }
+        if self.max_entries == 0 || self.max_entries > MAX_ENTRIES {
+            return Err(AppError::config(format!(
+                "errors.max_entries must be between 1 and {MAX_ENTRIES}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Narrow CLI flag overrides applied last in the precedence chain.
 ///
 /// Only high-signal startup options are exposed as flags; most settings belong
@@ -1435,6 +1480,7 @@ impl Config {
         if self.logging.level.trim().is_empty() {
             return Err(AppError::config("logging.level must not be empty"));
         }
+        self.errors.validate()?;
         self.cluster
             .validate(&self.server.node_id, &self.database)?;
         self.transport.tls.validate()?;
@@ -1698,6 +1744,8 @@ mod tests {
         assert_eq!(config.http.bind, "127.0.0.1:7350");
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.format, LogFormat::Pretty);
+        assert_eq!(config.errors.max_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.errors.max_entries, 2_000);
     }
 
     #[test]
@@ -1743,6 +1791,19 @@ mod tests {
     #[test]
     fn default_config_validates() {
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn error_journal_retention_bounds_are_validated() {
+        let mut config = Config::default();
+        config.errors.max_bytes = 1;
+        let err = config.validate().expect_err("too-small journal must fail");
+        assert!(err.message().contains("errors.max_bytes"));
+
+        let mut config = Config::default();
+        config.errors.max_entries = 0;
+        let err = config.validate().expect_err("zero entries must fail");
+        assert!(err.message().contains("errors.max_entries"));
     }
 
     #[test]
