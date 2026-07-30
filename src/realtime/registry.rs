@@ -7,11 +7,13 @@
 //! purely over abstract outbound sinks and never depends on a concrete
 //! transport.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
+
+use citadel_wire::protocol::KIND_PEER_POSITION;
 
 use crate::session::SessionId;
 use crate::storage::UserId;
@@ -109,6 +111,153 @@ impl Outbound {
     }
 }
 
+/// A coalescing mailbox for ephemeral transport state. Sender-tagged peer
+/// positions retain one pending envelope per `(kind, sender)`; other state
+/// retains one per kind. A slow recipient therefore receives the newest state
+/// instead of replaying a stale FIFO backlog.
+///
+/// Reliable/control envelopes deliberately remain on the bounded Tokio mpsc
+/// channel owned by [`SessionHandle`].
+#[derive(Debug, Clone)]
+pub struct LatestOutboundSender {
+    inner: Arc<LatestOutboundInner>,
+}
+
+/// Receive the next latest-wins outbound envelope for a transport writer.
+#[derive(Debug)]
+pub struct LatestOutboundReceiver {
+    inner: Arc<LatestOutboundInner>,
+}
+
+#[derive(Debug)]
+struct LatestOutboundInner {
+    pending: Mutex<LatestMailbox>,
+    notify: Notify,
+}
+
+/// Preserve a pending latest position for every possible peer in the stress
+/// simulator while still bounding memory for a slow session.
+const MAX_PENDING_UNRELIABLE_KEYS: usize = 1_024;
+/// The stress simulator uses a separate position kind while it exercises its
+/// authoritative Lua gameplay. Its body has the same sender-tagged layout as
+/// the wire protocol's `KIND_PEER_POSITION`, so it needs the same coalescing
+/// key to retain one fresh state per peer.
+const KIND_STRESS_PEER_POSITION: u16 = 201;
+/// The simulator batches its position fan-out into datagram-sized chunks. The
+/// first two bytes identify the stable chunk index, so each chunk keeps its
+/// own latest state in a slow recipient's mailbox.
+const KIND_STRESS_PEER_SNAPSHOT: u16 = 204;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LatestKey {
+    kind: u16,
+    source: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct LatestMailbox {
+    values: HashMap<LatestKey, Outbound>,
+    order: VecDeque<LatestKey>,
+}
+
+/// Construct the sender stored by the registry and the receiver owned by one
+/// transport write task.
+#[must_use]
+pub fn latest_outbound_channel() -> (LatestOutboundSender, LatestOutboundReceiver) {
+    let inner = Arc::new(LatestOutboundInner {
+        pending: Mutex::new(LatestMailbox::default()),
+        notify: Notify::new(),
+    });
+    (
+        LatestOutboundSender {
+            inner: Arc::clone(&inner),
+        },
+        LatestOutboundReceiver { inner },
+    )
+}
+
+impl LatestOutboundSender {
+    /// Replace an older pending message of the same state key, preserving only
+    /// the latest state. Peer positions use the tagged sender ID as part of the
+    /// key, so every visible player retains an independent latest position.
+    pub fn replace(&self, outbound: Outbound) -> bool {
+        let Ok(mut pending) = self.inner.pending.lock() else {
+            return false;
+        };
+        let key = latest_key(&outbound);
+        if let Some(existing) = pending.values.get_mut(&key) {
+            *existing = outbound;
+        } else {
+            if pending.values.len() == MAX_PENDING_UNRELIABLE_KEYS
+                && let Some(oldest) = pending.order.pop_front()
+            {
+                pending.values.remove(&oldest);
+            }
+            pending.order.push_back(key);
+            pending.values.insert(key, outbound);
+        }
+        drop(pending);
+        self.inner.notify.notify_one();
+        true
+    }
+}
+
+impl LatestOutboundReceiver {
+    /// Wait for and remove one coalesced envelope. The notification is created
+    /// before checking the queue so a concurrent producer cannot be missed.
+    pub async fn recv(&self) -> Outbound {
+        loop {
+            let notified = self.inner.notify.notified();
+            if let Ok(mut pending) = self.inner.pending.lock() {
+                while let Some(key) = pending.order.pop_front() {
+                    if let Some(outbound) = pending.values.remove(&key) {
+                        return outbound;
+                    }
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Return one coalesced envelope without waiting. This is primarily useful
+    /// for deterministic in-process tests; production writers should use
+    /// [`Self::recv`] so they sleep efficiently until state is available.
+    pub fn try_recv(&self) -> Result<Outbound, mpsc::error::TryRecvError> {
+        let Ok(mut pending) = self.inner.pending.lock() else {
+            return Err(mpsc::error::TryRecvError::Disconnected);
+        };
+        while let Some(key) = pending.order.pop_front() {
+            if let Some(outbound) = pending.values.remove(&key) {
+                return Ok(outbound);
+            }
+        }
+        Err(mpsc::error::TryRecvError::Empty)
+    }
+}
+
+fn latest_key(outbound: &Outbound) -> LatestKey {
+    let source = match outbound.envelope.kind {
+        KIND_PEER_POSITION | KIND_STRESS_PEER_POSITION => outbound
+            .envelope
+            .body
+            .get(0..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes),
+        KIND_STRESS_PEER_SNAPSHOT => outbound
+            .envelope
+            .body
+            .get(0..2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_be_bytes)
+            .map(u64::from),
+        _ => None,
+    };
+    LatestKey {
+        kind: outbound.envelope.kind,
+        source,
+    }
+}
+
 /// The authenticated account bound to a participant by the realtime handshake
 ///.
 ///
@@ -160,7 +309,8 @@ impl SessionHandle {
 /// session/presence directories. Fan-out delivers to abstract outbound sinks.
 #[derive(Debug, Clone, Default)]
 pub struct SessionRegistry {
-    sessions: std::sync::Arc<Mutex<HashMap<ParticipantId, SessionHandle>>>,
+    sessions: Arc<Mutex<HashMap<ParticipantId, SessionHandle>>>,
+    unreliable: Arc<Mutex<HashMap<ParticipantId, LatestOutboundSender>>>,
 }
 
 impl SessionRegistry {
@@ -171,10 +321,15 @@ impl SessionRegistry {
     }
 
     /// Register a session handle.
-    pub fn register(&self, handle: SessionHandle) {
+    pub fn register(&self, handle: SessionHandle) -> LatestOutboundReceiver {
+        let (sender, receiver) = latest_outbound_channel();
+        if let Ok(mut map) = self.unreliable.lock() {
+            map.insert(handle.id, sender);
+        }
         if let Ok(mut map) = self.sessions.lock() {
             map.insert(handle.id, handle);
         }
+        receiver
     }
 
     /// Unregister a session (on disconnect), returning the removed handle.
@@ -183,10 +338,14 @@ impl SessionRegistry {
     /// session ended (so the authenticated-session gauge is decremented exactly
     /// when it was incremented) versus a guest participant.
     pub fn unregister(&self, id: ParticipantId) -> Option<SessionHandle> {
-        match self.sessions.lock() {
+        let removed = match self.sessions.lock() {
             Ok(mut map) => map.remove(&id),
             Err(_) => None,
+        };
+        if let Ok(mut map) = self.unreliable.lock() {
+            map.remove(&id);
         }
+        removed
     }
 
     /// Clone the outbound sink for a participant, if registered.
@@ -269,18 +428,21 @@ impl SessionRegistry {
 
     /// Deliver `outbound` to every session except `sender`.
     ///
-    /// Best-effort: a full per-session channel drops the message for that
-    /// session (the transport's own backpressure policy applies downstream).
+    /// Reliable traffic uses the bounded per-session channel. Unreliable state
+    /// replaces the older message of the same state key for that recipient.
     /// Returns the number of sessions the message was queued to.
     pub fn broadcast_except(&self, sender: ParticipantId, outbound: &Outbound) -> usize {
-        let handles: Vec<SessionHandle> = match self.sessions.lock() {
-            Ok(map) => map.values().filter(|h| h.id != sender).cloned().collect(),
+        let recipients: Vec<ParticipantId> = match self.sessions.lock() {
+            Ok(map) => map
+                .values()
+                .filter(|h| h.id != sender)
+                .map(|h| h.id)
+                .collect(),
             Err(_) => return 0,
         };
         let mut delivered = 0;
-        for handle in handles {
-            // `try_send` is non-blocking; a full or closed channel is skipped.
-            if handle.outbound.try_send(outbound.clone()).is_ok() {
+        for recipient in recipients {
+            if self.send_to(recipient, outbound) {
                 delivered += 1;
             }
         }
@@ -294,13 +456,13 @@ impl SessionRegistry {
     ///
     /// [`broadcast_except`]: SessionRegistry::broadcast_except
     pub fn broadcast_all(&self, outbound: &Outbound) -> usize {
-        let handles: Vec<SessionHandle> = match self.sessions.lock() {
-            Ok(map) => map.values().cloned().collect(),
+        let recipients: Vec<ParticipantId> = match self.sessions.lock() {
+            Ok(map) => map.values().map(|handle| handle.id).collect(),
             Err(_) => return 0,
         };
         let mut delivered = 0;
-        for handle in handles {
-            if handle.outbound.try_send(outbound.clone()).is_ok() {
+        for recipient in recipients {
+            if self.send_to(recipient, outbound) {
                 delivered += 1;
             }
         }
@@ -320,17 +482,18 @@ impl SessionRegistry {
         exclude: Option<ParticipantId>,
         outbound: &Outbound,
     ) -> usize {
-        let handles: Vec<SessionHandle> = match self.sessions.lock() {
+        let recipients: Vec<ParticipantId> = match self.sessions.lock() {
             Ok(map) => members
                 .iter()
                 .filter(|&&id| Some(id) != exclude)
-                .filter_map(|id| map.get(id).cloned())
+                .filter(|id| map.contains_key(id))
+                .copied()
                 .collect(),
             Err(_) => return 0,
         };
         let mut delivered = 0;
-        for handle in handles {
-            if handle.outbound.try_send(outbound.clone()).is_ok() {
+        for recipient in recipients {
+            if self.send_to(recipient, outbound) {
                 delivered += 1;
             }
         }
@@ -344,6 +507,14 @@ impl SessionRegistry {
     ///
     /// [`broadcast_except`]: SessionRegistry::broadcast_except
     pub fn send_to(&self, id: ParticipantId, outbound: &Outbound) -> bool {
+        if outbound.delivery == Delivery::Unreliable {
+            let sender = self
+                .unreliable
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&id).cloned());
+            return sender.is_some_and(|sender| sender.replace(outbound.clone()));
+        }
         let handle = match self.sessions.lock() {
             Ok(map) => map.get(&id).cloned(),
             Err(_) => None,
@@ -436,6 +607,101 @@ mod tests {
         // Only the target received it.
         assert!(r1.try_recv().is_err());
         assert_eq!(r2.recv().await.expect("recv").envelope.kind, 5);
+    }
+
+    #[tokio::test]
+    async fn unreliable_delivery_retains_latest_state_for_each_peer() {
+        let reg = SessionRegistry::new();
+        let (handle, _reliable) = handle(7, TransportKind::Quic);
+        let latest = reg.register(handle);
+
+        let peer_position = |kind, peer: u64, label: &[u8]| {
+            let mut body = peer.to_be_bytes().to_vec();
+            body.extend_from_slice(label);
+            Outbound::unreliable(Envelope::new(kind, body))
+        };
+
+        assert!(reg.send_to(
+            ParticipantId(7),
+            &peer_position(KIND_PEER_POSITION, 11, b"old")
+        ));
+        assert!(reg.send_to(
+            ParticipantId(7),
+            &peer_position(KIND_PEER_POSITION, 22, b"peer-two")
+        ));
+        assert!(reg.send_to(
+            ParticipantId(7),
+            &peer_position(KIND_PEER_POSITION, 11, b"new")
+        ));
+        assert!(reg.send_to(
+            ParticipantId(7),
+            &peer_position(KIND_STRESS_PEER_POSITION, 33, b"sim-old")
+        ));
+        assert!(reg.send_to(
+            ParticipantId(7),
+            &peer_position(KIND_STRESS_PEER_POSITION, 33, b"sim-new")
+        ));
+
+        let first = latest.recv().await;
+        let second = latest.recv().await;
+        let third = latest.recv().await;
+        assert_eq!(&first.envelope.body[0..8], &11_u64.to_be_bytes());
+        assert_eq!(&first.envelope.body[8..], b"new");
+        assert_eq!(&second.envelope.body[0..8], &22_u64.to_be_bytes());
+        assert_eq!(&second.envelope.body[8..], b"peer-two");
+        assert_eq!(third.envelope.kind, KIND_STRESS_PEER_POSITION);
+        assert_eq!(&third.envelope.body[0..8], &33_u64.to_be_bytes());
+        assert_eq!(&third.envelope.body[8..], b"sim-new");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), latest.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unreliable_delivery_retains_the_latest_state_for_each_snapshot_chunk() {
+        let reg = SessionRegistry::new();
+        let (handle, _reliable) = handle(9, TransportKind::Quic);
+        let latest = reg.register(handle);
+        let chunk = |index: u16, label: &[u8]| {
+            let mut body = index.to_be_bytes().to_vec();
+            body.extend_from_slice(label);
+            Outbound::unreliable(Envelope::new(KIND_STRESS_PEER_SNAPSHOT, body))
+        };
+
+        assert!(reg.send_to(ParticipantId(9), &chunk(0, b"old")));
+        assert!(reg.send_to(ParticipantId(9), &chunk(1, b"chunk-one")));
+        assert!(reg.send_to(ParticipantId(9), &chunk(0, b"new")));
+
+        let first = latest.recv().await;
+        let second = latest.recv().await;
+        assert_eq!(&first.envelope.body[0..2], &0_u16.to_be_bytes());
+        assert_eq!(&first.envelope.body[2..], b"new");
+        assert_eq!(&second.envelope.body[0..2], &1_u16.to_be_bytes());
+        assert_eq!(&second.envelope.body[2..], b"chunk-one");
+    }
+
+    #[tokio::test]
+    async fn unreliable_mailbox_evicts_the_oldest_state_key_at_its_bound() {
+        let reg = SessionRegistry::new();
+        let (handle, _reliable) = handle(8, TransportKind::Quic);
+        let latest = reg.register(handle);
+
+        for kind in 1..=u16::try_from(MAX_PENDING_UNRELIABLE_KEYS + 1).expect("kind range") {
+            assert!(reg.send_to(
+                ParticipantId(8),
+                &Outbound::unreliable(Envelope::new(kind, b"state".to_vec()))
+            ));
+        }
+
+        let first = latest.recv().await;
+        assert_eq!(first.envelope.kind, 2, "the oldest key was evicted");
+        let mut delivered = 1;
+        while latest.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, MAX_PENDING_UNRELIABLE_KEYS);
     }
 
     #[test]

@@ -27,7 +27,8 @@ pub use gateway::{
     KIND_POSITION, shared,
 };
 pub use registry::{
-    Outbound, ParticipantId, ParticipantIdGen, ParticipantIdentity, SessionHandle, SessionRegistry,
+    LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen, ParticipantIdentity,
+    SessionHandle, SessionRegistry,
 };
 pub use reload::LuaReloadService;
 pub use rooms::{JoinError, RoomId, RoomLabel, RoomRegistry, RoomSnapshot};

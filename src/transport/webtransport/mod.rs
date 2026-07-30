@@ -32,7 +32,7 @@ use web_transport_quinn::{Server, Session};
 
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::lifecycle::{AsyncService, CancellationToken};
-use crate::realtime::{Gateway, Outbound, ParticipantId, SessionHandle};
+use crate::realtime::{Gateway, LatestOutboundReceiver, Outbound, ParticipantId, SessionHandle};
 use crate::transport::codec::{decode_datagram, decode_framed};
 use crate::transport::metrics::TransportMetrics;
 use crate::transport::{Delivery, Listener, TransportKind};
@@ -243,7 +243,7 @@ async fn handle_session(
         ));
         let _ = tx.try_send(ack);
     }
-    gateway.register_session(SessionHandle {
+    let unreliable = gateway.register_session(SessionHandle {
         id: session_id,
         kind: TransportKind::WebTransport,
         outbound: tx,
@@ -264,7 +264,7 @@ async fn handle_session(
     let write_metrics = metrics.clone();
     let write_cancel = cancel.clone();
     let writer = tokio::spawn(async move {
-        outbound_writer(write_session, rx, write_metrics, write_cancel).await;
+        outbound_writer(write_session, rx, unreliable, write_metrics, write_cancel).await;
     });
 
     loop {
@@ -431,6 +431,7 @@ async fn send_reliable_envelope(session: &Session, env: &Envelope) {
 async fn outbound_writer(
     session: Session,
     mut rx: mpsc::Receiver<Outbound>,
+    unreliable: LatestOutboundReceiver,
     metrics: TransportMetrics,
     cancel: CancellationToken,
 ) {
@@ -439,27 +440,35 @@ async fn outbound_writer(
             () = cancel.cancelled() => break,
             next = rx.recv() => {
                 let Some(out) = next else { break };
-                match out.delivery {
-                    Delivery::Unreliable => {
-                        if session.send_datagram(out.envelope.encode_datagram()).is_ok() {
-                            metrics.envelope_sent();
-                        }
-                    }
-                    Delivery::Reliable => {
-                        match session.open_uni().await {
-                            Ok(mut send) => {
-                                let frame = out.envelope.encode_framed();
-                                if send.write_all(&frame).await.is_ok() {
-                                    let _ = send.finish();
-                                    metrics.envelope_sent();
-                                }
-                            }
-                            Err(e) => tracing::debug!(error = %e, "failed to open WebTransport uni stream"),
-                        }
-                    }
-                }
+                write_outbound(&session, out, &metrics).await;
+            }
+            out = unreliable.recv() => {
+                write_outbound(&session, out, &metrics).await;
             }
         }
+    }
+}
+
+async fn write_outbound(session: &Session, out: Outbound, metrics: &TransportMetrics) {
+    match out.delivery {
+        Delivery::Unreliable => {
+            if session
+                .send_datagram(out.envelope.encode_datagram())
+                .is_ok()
+            {
+                metrics.envelope_sent();
+            }
+        }
+        Delivery::Reliable => match session.open_uni().await {
+            Ok(mut send) => {
+                let frame = out.envelope.encode_framed();
+                if send.write_all(&frame).await.is_ok() {
+                    let _ = send.finish();
+                    metrics.envelope_sent();
+                }
+            }
+            Err(error) => tracing::debug!(%error, "failed to open WebTransport uni stream"),
+        },
     }
 }
 

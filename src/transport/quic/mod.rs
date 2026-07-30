@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::lifecycle::{AsyncService, CancellationToken};
-use crate::realtime::{Gateway, Outbound, SessionHandle};
+use crate::realtime::{Gateway, LatestOutboundReceiver, Outbound, SessionHandle};
 use crate::transport::codec::{Envelope, decode_datagram, decode_framed};
 use crate::transport::metrics::TransportMetrics;
 use crate::transport::{
@@ -296,7 +296,7 @@ async fn handle_connection(
         ));
         let _ = tx.try_send(ack);
     }
-    gateway.register_session(SessionHandle {
+    let unreliable = gateway.register_session(SessionHandle {
         id: session_id,
         kind: TransportKind::Quic,
         outbound: tx,
@@ -322,7 +322,7 @@ async fn handle_connection(
     let write_metrics = metrics.clone();
     let write_cancel = cancel.clone();
     let writer = tokio::spawn(async move {
-        outbound_writer(write_conn, rx, write_metrics, write_cancel).await;
+        outbound_writer(write_conn, rx, unreliable, write_metrics, write_cancel).await;
     });
 
     // Inbound: datagrams + accepted bi/uni streams routed to the gateway.
@@ -501,6 +501,7 @@ async fn send_reliable_envelope(connection: &QuinnConnection, env: &Envelope) {
 async fn outbound_writer(
     connection: QuinnConnection,
     mut rx: mpsc::Receiver<Outbound>,
+    unreliable: LatestOutboundReceiver,
     metrics: TransportMetrics,
     cancel: CancellationToken,
 ) {
@@ -509,28 +510,36 @@ async fn outbound_writer(
             () = cancel.cancelled() => break,
             next = rx.recv() => {
                 let Some(out) = next else { break };
-                match out.delivery {
-                    Delivery::Unreliable => {
-                        if connection.send_datagram(out.envelope.encode_datagram()).is_ok() {
-                            metrics.envelope_sent();
-                        }
-                    }
-                    Delivery::Reliable => {
-                        match connection.open_uni().await {
-                            Ok(mut send) => {
-                                let frame = out.envelope.encode_framed();
-                                if send.write_all(&frame).await.is_ok() && send.finish().is_ok() {
-                                    metrics.envelope_sent();
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "failed to open QUIC uni stream");
-                            }
-                        }
-                    }
-                }
+                write_outbound(&connection, out, &metrics).await;
+            }
+            out = unreliable.recv() => {
+                write_outbound(&connection, out, &metrics).await;
             }
         }
+    }
+}
+
+async fn write_outbound(connection: &QuinnConnection, out: Outbound, metrics: &TransportMetrics) {
+    match out.delivery {
+        Delivery::Unreliable => {
+            if connection
+                .send_datagram(out.envelope.encode_datagram())
+                .is_ok()
+            {
+                metrics.envelope_sent();
+            }
+        }
+        Delivery::Reliable => match connection.open_uni().await {
+            Ok(mut send) => {
+                let frame = out.envelope.encode_framed();
+                if send.write_all(&frame).await.is_ok() && send.finish().is_ok() {
+                    metrics.envelope_sent();
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "failed to open QUIC uni stream");
+            }
+        },
     }
 }
 
