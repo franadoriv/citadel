@@ -753,7 +753,8 @@ pre.code {
     { label: 'System', items: [
       { id: 'configuration', title: 'Configuration', icon: 'settings' },
       { id: 'api', title: 'API Explorer / Runtime', icon: 'terminal' },
-      { id: 'audit', title: 'Audit Logs', icon: 'scroll' }
+      { id: 'audit', title: 'Audit Logs', icon: 'scroll' },
+      { id: 'errors', title: 'Error Journal', icon: 'alert' }
     ]}
   ];
 
@@ -2107,6 +2108,47 @@ pre.code {
     }).catch(fail);
   }
 
+  // ==== Error Journal ==========================================================
+  var incidents = { offset: 0, limit: 100, next: null };
+
+  function renderErrors() {
+    ACT = {}; FORM = {};
+    incidents.offset = 0;
+    setPage(pageHead('Error Journal', 'Redacted server failures and process panics retained beside the executable.')
+      + '<div class="toolbar"><div class="grow"></div>'
+      + '<button class="btn" data-act="err-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Incidents</h2><span class="sub" id="err-meta"></span></div>'
+      + '<div id="err-table">' + loadingRows(7) + '</div>'
+      + '<div class="pager" id="err-pages"></div></div>');
+    ACT['err-refresh'] = loadErrors;
+    loadErrors();
+  }
+
+  function loadErrors() {
+    api('GET', '/console/v1/errors?offset=' + incidents.offset + '&limit=' + incidents.limit).then(function (d) {
+      incidents.next = d.next_offset;
+      var rows = '';
+      d.entries.forEach(function (e) {
+        rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(e.last_seen_ms)) + '</td>'
+          + '<td><span class="tag-soft' + (e.kind === 'panic' ? ' bad' : '') + '">' + esc(e.kind) + '</span></td>'
+          + '<td class="mono">' + esc(e.component) + '</td>'
+          + '<td class="mono">' + esc(e.category || '—') + '</td>'
+          + '<td>' + esc(e.message) + '</td>'
+          + '<td>' + esc(fmtNum(e.count)) + '</td>'
+          + '<td class="mono" title="' + esc(e.fingerprint) + '">' + esc(e.fingerprint.slice(0, 12)) + '</td></tr>';
+      });
+      if (!d.entries.length) rows = emptyRowHtml(7, 'No retained server failures or panics.');
+      setHtml('err-table', tableHtml(['Last seen', 'Kind', 'Component', 'Category', 'Summary', 'Count', 'Fingerprint'], rows));
+      setText('err-meta', fmtNum(d.total) + ' retained');
+      var pages = '';
+      if (incidents.offset > 0) pages += '<button class="btn" data-act="err-prev">' + svg('back') + 'Newer</button> ';
+      if (incidents.next != null) pages += '<button class="btn" data-act="err-next">Older</button>';
+      setHtml('err-pages', pages);
+      ACT['err-prev'] = function () { incidents.offset = Math.max(0, incidents.offset - incidents.limit); loadErrors(); };
+      ACT['err-next'] = function () { if (incidents.next != null) { incidents.offset = incidents.next; loadErrors(); } };
+    }).catch(fail);
+  }
+
   // ---- Section dispatch -------------------------------------------------------
   var SECTIONS = {
     status: renderStatusShell,
@@ -2121,7 +2163,8 @@ pre.code {
     purchases: renderPurchases,
     configuration: renderConfiguration,
     api: renderApi,
-    audit: renderAudit
+    audit: renderAudit,
+    errors: renderErrors
   };
 
   // ---- Login / logout / boot ---------------------------------------------------

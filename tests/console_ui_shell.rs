@@ -7,15 +7,22 @@
 //! authenticated operator — proving the UI's data sources exist end to end.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use citadel::App;
 use citadel::config::Config;
+use citadel::error::AppError;
+use citadel::error_journal::{ErrorJournal, JournalIncident};
 use citadel::http;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+
+static NEXT_JOURNAL_PATH: AtomicU64 = AtomicU64::new(0);
 
 /// A parsed HTTP response: status code and the raw (decoded) body text.
 struct RawResponse {
@@ -108,6 +115,14 @@ fn console_config() -> Config {
     config
 }
 
+fn test_journal_path() -> PathBuf {
+    let nonce = NEXT_JOURNAL_PATH.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "citadel-console-errors-{}-{nonce}.jsonl",
+        std::process::id()
+    ))
+}
+
 #[tokio::test]
 async fn dashboard_serves_the_fully_live_console_spa() {
     let (addr, tx, server) = spawn_server(App::new(console_config())).await;
@@ -164,6 +179,61 @@ async fn console_spa_data_sources_answer_an_authenticated_operator() {
         "audit trail should record the SPA-style login"
     );
 
+    let errors = get(addr, "/console/v1/errors?limit=10", Some(&token)).await;
+    assert_eq!(errors.status, 200);
+    let errors_body: Value = serde_json::from_str(errors.body.trim()).expect("errors JSON");
+    assert!(errors_body["entries"].is_array());
+    assert!(errors_body["total"].is_u64());
+
     let _ = tx.send(());
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn error_journal_is_redacted_and_viewer_readable_end_to_end() {
+    let mut config = console_config();
+    config.console.viewer_password = Some("viewer-secret".to_string());
+    let journal_path = test_journal_path();
+    let journal = Arc::new(ErrorJournal::new(&journal_path));
+    assert!(
+        journal
+            .append(JournalIncident::from_app_error(
+                "repository.pg",
+                &AppError::database("postgres://operator:very-secret@db.example/citadel")
+                    .with_detail("token=very-secret"),
+            ))
+            .is_written()
+    );
+    let app = App::new(config).with_error_journal(Arc::clone(&journal));
+    let (addr, tx, server) = spawn_server(app).await;
+
+    let login = post_json(
+        addr,
+        http::LOGIN_PATH,
+        r#"{"username":"ops","password":"viewer-secret"}"#,
+    )
+    .await;
+    assert_eq!(login.status, 200);
+    let token =
+        serde_json::from_str::<Value>(login.body.trim()).expect("viewer login JSON")["token"]
+            .as_str()
+            .expect("viewer token")
+            .to_string();
+
+    let response = get(addr, "/console/v1/errors?offset=0&limit=9999", Some(&token)).await;
+    assert_eq!(response.status, 200);
+    assert!(!response.body.contains("very-secret"));
+    assert!(!response.body.contains("postgres://"));
+    let body: Value = serde_json::from_str(response.body.trim()).expect("errors JSON");
+    let entry = body["entries"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .expect("one redacted incident");
+    assert_eq!(entry["category"], "database");
+    assert_eq!(entry["component"], "repository.pg");
+    assert_eq!(entry["message"], "database failure");
+
+    let _ = tx.send(());
+    let _ = server.await;
+    let _ = std::fs::remove_file(journal_path);
 }

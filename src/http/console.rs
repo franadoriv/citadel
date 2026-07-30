@@ -51,6 +51,7 @@ pub const NAV_LABELS: &[&str] = &[
     "Configuration",
     "API Explorer / Runtime",
     "Audit Logs",
+    "Error Journal",
 ];
 
 /// HTML console handler: serves the embedded single-page app.

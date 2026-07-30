@@ -8,8 +8,8 @@ HTML document served by the node itself (no build step, no CDN, works
 offline). **Every sidebar section is live**: the SPA signs in against
 `/console/v1/login`, drives the operator-only **console API** under
 **`/console/v1`** for accounts, groups, chat, notifications, storage,
-leaderboards, matches, purchases, configuration, runtime, audit logs, and the
-read-only Database Explorer, and
+leaderboards, matches, purchases, configuration, runtime, audit logs, the error
+journal, and the read-only Database Explorer, and
 its **Status** section renders live node gauges from the public `/status`
 endpoint (no login required for that data source).
 
@@ -69,6 +69,7 @@ exposing a node beyond localhost.
 | `/status` | GET | none | Public machine-readable node status (Status section data source). |
 | `/console/v1/login` | POST | none | Exchange credentials for a bearer token. |
 | `/console/v1/me` | GET | bearer | The authenticated operator identity. |
+| `/console/v1/errors` | GET | bearer | Redacted server failures and process panics retained locally (live). |
 | `/console/v1/config` | GET | bearer | Effective node configuration, secrets redacted (live — see below). |
 | `/console/v1/audit` | GET | bearer | Console action audit trail (live — see below). |
 | `/console/v1/storage` | GET | bearer | Storage object browser (live — see below). |
@@ -441,6 +442,24 @@ recorded follow-up (they need outbound HTTPS and store credentials).
 
 The raw receipt is **never stored** — only its SHA-256 digest — and records
 are in-process (a restart clears them; recorded technical debt).
+
+## Error Journal
+
+`GET /console/v1/errors?offset=0&limit=100` returns retained local incident
+summaries newest first. Both `admin` and `viewer` roles can inspect it. The
+backing `citadel-errors.jsonl` file lives beside the server executable; the
+configured `[errors]` retention limits prune its oldest records.
+
+Each entry contains `fingerprint`, `kind` (`error` or `panic`), `category`
+when applicable, `component`, a generic redacted `message`, first/last-seen
+timestamps, and `count`. Raw panic payloads, internal error detail, request
+data, credentials, and the external reporting DSN are never returned. Matching
+incidents are aggregated by fingerprint so recurring failures remain readable.
+
+The response is `{ "entries": [...], "total": <number>, "next_offset": <number|null> }`.
+The console's **Error Journal** page presents this data. See the
+[configuration reference](/reference/operations/configuration/#errors) for
+retention and optional external reporting.
 
 ## Audit Logs
 

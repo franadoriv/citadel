@@ -107,6 +107,19 @@ Edit `citadel.toml` (or pass `--config`) to point at PostgreSQL, change bind
 addresses, or toggle transports. See
 [docs/features/persistence.md](docs/features/persistence.md) for the full flow.
 
+### Error journal and optional external reporting
+
+Server failures and unexpected process panics are captured in a bounded,
+redacted `citadel-errors.jsonl` beside the binary. Open **Error Journal** in
+the authenticated dashboard to review recurring incidents, including their
+component, category, first/last-seen time, and count. Raw panic payloads,
+internal details, connection strings, passwords, and tokens are excluded.
+
+For a self-hosted external view, set `CITADEL_BUGSINK_DSN` to a Bugsink
+Sentry-compatible DSN (and optionally `CITADEL_ENVIRONMENT`). It is disabled
+by default; an absent or unreachable endpoint never blocks local capture or
+server startup. Retention is configured under `[errors]` in `citadel.toml`.
+
 ### Download a release
 
 Milestone downloads and their included quickstarts are published with each
@@ -216,7 +229,7 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
     <tr><td>Server bootstrap, CLI, TOML config, and first-run setup</td><td>Run a standalone node with generated config, game directory, and SQLite defaults.</td><td>✅</td></tr>
     <tr><td>Portable server releases and Linux deployment</td><td>Versioned Windows, Linux x86_64 musl, and Linux ARM64 musl archives ship with SHA-256 checksums, CI package validation, and a systemd deployment template.</td><td>✅</td></tr>
     <tr><td>Dockerfile and editable Docker workflow</td><td>Dockerfile and Compose development assets remain available, but release CI/CD no longer builds, tests, attests, or publishes OCI images. Historical GHCR images are not updated by releases.</td><td>🚧</td></tr>
-    <tr><td>Health, live status, observability, audit logs</td><td>Health/status endpoints, structured logs, errors, tracing seams, and operator audit records.</td><td>✅</td></tr>
+    <tr><td>Health, live status, observability, audit logs</td><td>Health/status endpoints, structured logs, redacted local incident journaling, optional external error reporting, tracing seams, and operator audit records.</td><td>✅</td></tr>
     <tr><td>Device authentication</td><td>Creates or authenticates a device identity and issues a session.</td><td>✅</td></tr>
     <tr><td>Custom-id authentication</td><td>Application-owned identifiers map to accounts and sessions.</td><td>✅</td></tr>
     <tr><td>Email/password authentication</td><td>Transactional email/password registration and sign-in at /v1/auth/email; Argon2id PHC verifiers, durable hashed multi-key admission limits, and existing session tokens ship. Email verification, recovery/change-password, and linking remain pending.</td><td>✅</td></tr>
@@ -283,7 +296,7 @@ Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planne
     <tr><td>Before/after API and realtime interception hooks</td><td>Post-handshake before hooks can veto eligible envelopes; after hooks observe the synchronous local delivery outcome without mutation or side effects.</td><td>✅</td></tr>
     <tr><td>Matchmaker callbacks, leaderboard/tournament reset callbacks</td><td>Schedulers and callback contracts are not shipped.</td><td>📋</td></tr>
     <tr><td>Runtime outbound HTTP, custom HTTP endpoints, events, shared cache</td><td>Trusted Lua, Python, and JavaScript expose bounded Rust-owned http.fetch; custom endpoints, events, shared cache, and hardened per-capability grants remain planned.</td><td>🚧</td></tr>
-    <tr><td>Dashboard and authenticated operator API</td><td>Accounts, storage, groups, chat, notifications, leaderboards, matches, runtime, config, purchases, and audit.</td><td>✅</td></tr>
+    <tr><td>Dashboard and authenticated operator API</td><td>Accounts, storage, groups, chat, notifications, leaderboards, matches, runtime, config, purchases, audit, and the error journal.</td><td>✅</td></tr>
     <tr><td>Console MFA, user lifecycle, password reset, ACL templates</td><td>Operator authentication roles ship; these advanced controls do not.</td><td>📋</td></tr>
     <tr><td>Cluster discovery, load balancing, generalized node routing</td><td>Ownership and fencing groundwork is not a deployable cluster product.</td><td>📋</td></tr>
   </tbody>
