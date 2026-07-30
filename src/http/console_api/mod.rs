@@ -27,6 +27,7 @@ pub mod audit;
 pub mod chat;
 pub mod config;
 pub mod database;
+pub mod errors;
 pub mod groups;
 pub mod leaderboards;
 pub mod matches;
@@ -55,6 +56,7 @@ pub use audit::AUDIT_PATH;
 pub use chat::CHAT_PATH;
 pub use config::CONFIG_PATH;
 pub use database::DATABASE_PATH;
+pub use errors::ERRORS_PATH;
 pub use groups::GROUPS_PATH;
 pub use leaderboards::LEADERBOARDS_PATH;
 pub use matches::MATCHES_PATH;
@@ -79,6 +81,7 @@ pub const ME_PATH: &str = "/console/v1/me";
 pub const SECTION_PATHS: &[&str] = &[
     "/console/v1/config",
     "/console/v1/audit",
+    "/console/v1/errors",
     "/console/v1/storage",
     "/console/v1/database",
     "/console/v1/matches",
@@ -100,6 +103,7 @@ pub const SECTION_PATHS: &[&str] = &[
 /// router build (duplicate route), which is the desired failure mode.
 pub const IMPLEMENTED_SECTION_PATHS: &[&str] = &[
     audit::AUDIT_PATH,
+    errors::ERRORS_PATH,
     config::CONFIG_PATH,
     storage::STORAGE_PATH,
     database::DATABASE_PATH,
@@ -210,6 +214,7 @@ pub(super) fn routes() -> Router<App> {
         .route(LOGIN_PATH, post(login_handler))
         .route(ME_PATH, get(me_handler))
         .route(audit::AUDIT_PATH, get(audit::list_handler))
+        .route(errors::ERRORS_PATH, get(errors::list_handler))
         .route(config::CONFIG_PATH, get(config::get_handler))
         .route(
             accounts::ACCOUNTS_PATH,
@@ -426,7 +431,7 @@ mod tests {
         assert_eq!(unique.len(), SECTION_PATHS.len());
         // One route per placeholder sidebar section (purchases splits into
         // purchases + subscriptions, and Status stays on the public /status).
-        assert_eq!(SECTION_PATHS.len(), 13);
+        assert_eq!(SECTION_PATHS.len(), 14);
     }
 
     #[test]
