@@ -23,6 +23,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::error::{AppError, ErrorCategory};
+use crate::error_reporting;
 
 /// A JSON error body: a stable machine-readable `code` and a human-readable,
 /// sanitized `message`. Never carries internal detail or secrets.
@@ -130,6 +131,7 @@ impl IntoResponse for ApiError {
         // (4xx) failures are logged at debug and never include the raw request.
         if status.is_server_error() {
             tracing::error!(error = %self.error.operator_log(), "auth request failed");
+            error_reporting::report_app_error("http.api", &self.error);
         } else {
             tracing::debug!(
                 category = %self.error.category().code(),

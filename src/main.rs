@@ -16,9 +16,14 @@ use clap::Parser;
 use citadel::cli::{self, Cli, Command};
 use citadel::config::Config;
 use citadel::startup::{self, StdioPrompt, WizardPaths, WizardReport};
-use citadel::{App, http, observability};
+use citadel::{App, error_reporting, http, observability};
 
 fn main() -> Result<()> {
+    // Install the local panic hook before configuration, logging, or the
+    // first-run wizard can panic. Resolved retention replaces its defaults
+    // just before serving begins.
+    error_reporting::install_early_panic_capture();
+
     #[cfg(feature = "runtime-python")]
     let _python_bundle = citadel::runtime::configure_bundled_python_runtime();
 
@@ -65,6 +70,12 @@ fn main() -> Result<()> {
             // the existing silent auto-defaults apply.
             run_wizard_if_interactive(&cli, &mut config).context("first-run setup failed")?;
 
+            // Local incident capture is always active. External delivery stays
+            // dormant unless CITADEL_BUGSINK_DSN is configured, and the guard
+            // remains alive through the whole serving lifetime to flush events
+            // during shutdown.
+            let _reporting = error_reporting::initialize(&config.errors);
+
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -72,10 +83,14 @@ fn main() -> Result<()> {
             runtime.block_on(async {
                 // Select and connect the persistence backend before serving so
                 // a configured-but-unreachable database fails fast at startup.
-                let app = App::bootstrap(config)
-                    .await
-                    .context("failed to initialize persistence backend")?;
-                http::run(app).await.context("HTTP server failed")
+                let app = App::bootstrap(config).await.map_err(|error| {
+                    error_reporting::report_app_error("bootstrap", &error);
+                    anyhow::Error::new(error).context("failed to initialize persistence backend")
+                })?;
+                http::run(app).await.map_err(|error| {
+                    error_reporting::report_app_error("http.server", &error);
+                    anyhow::Error::new(error).context("HTTP server failed")
+                })
             })?;
             Ok(())
         }
