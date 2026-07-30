@@ -27,6 +27,12 @@ pub struct TransportMetricsSnapshot {
     pub envelopes_sent: u64,
     /// Inbound payloads that failed to decode.
     pub decode_errors: u64,
+    /// Native WebSocket Ping control frames sent.
+    pub pings_sent: u64,
+    /// Native WebSocket Pong control frames received.
+    pub pongs_received: u64,
+    /// Connections closed after a missed Pong deadline.
+    pub liveness_timeouts: u64,
 }
 
 /// Shared, atomic-backed transport counters.
@@ -44,6 +50,9 @@ struct Inner {
     envelopes_received: AtomicU64,
     envelopes_sent: AtomicU64,
     decode_errors: AtomicU64,
+    pings_sent: AtomicU64,
+    pongs_received: AtomicU64,
+    liveness_timeouts: AtomicU64,
 }
 
 impl TransportMetrics {
@@ -100,6 +109,19 @@ impl TransportMetrics {
         self.inner.decode_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a native Ping control frame sent.
+    pub fn ping_sent(&self) {
+        self.inner.pings_sent.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a native Pong control frame received.
+    pub fn pong_received(&self) {
+        self.inner.pongs_received.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a connection closed after its liveness deadline.
+    pub fn liveness_timeout(&self) {
+        self.inner.liveness_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a snapshot of the current counter values.
     #[must_use]
     pub fn snapshot(&self) -> TransportMetricsSnapshot {
@@ -109,6 +131,9 @@ impl TransportMetrics {
             envelopes_received: self.inner.envelopes_received.load(Ordering::Relaxed),
             envelopes_sent: self.inner.envelopes_sent.load(Ordering::Relaxed),
             decode_errors: self.inner.decode_errors.load(Ordering::Relaxed),
+            pings_sent: self.inner.pings_sent.load(Ordering::Relaxed),
+            pongs_received: self.inner.pongs_received.load(Ordering::Relaxed),
+            liveness_timeouts: self.inner.liveness_timeouts.load(Ordering::Relaxed),
         }
     }
 }
@@ -125,6 +150,9 @@ mod tests {
         m.envelope_received();
         m.envelope_sent();
         m.decode_error();
+        m.ping_sent();
+        m.pong_received();
+        m.liveness_timeout();
         m.connection_closed();
 
         let snap = m.snapshot();
@@ -133,6 +161,9 @@ mod tests {
         assert_eq!(snap.envelopes_received, 1);
         assert_eq!(snap.envelopes_sent, 1);
         assert_eq!(snap.decode_errors, 1);
+        assert_eq!(snap.pings_sent, 1);
+        assert_eq!(snap.pongs_received, 1);
+        assert_eq!(snap.liveness_timeouts, 1);
     }
 
     #[test]

@@ -53,6 +53,8 @@ pub struct WebSocketServer {
     gateway: Arc<Gateway>,
     /// How long to wait for the client's `KIND_AUTH` handshake frame.
     handshake_timeout: Duration,
+    heartbeat_interval: Option<Duration>,
+    heartbeat_timeout: Duration,
 }
 
 impl WebSocketServer {
@@ -86,6 +88,8 @@ impl WebSocketServer {
             metrics: TransportMetrics::new(),
             gateway,
             handshake_timeout: Duration::from_millis(5_000),
+            heartbeat_interval: Some(Duration::from_secs(15)),
+            heartbeat_timeout: Duration::from_secs(45),
         })
     }
 
@@ -94,6 +98,15 @@ impl WebSocketServer {
     #[must_use]
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Configure native Ping/Pong liveness after authentication. A zero
+    /// interval disables probing; timeout is clamped to one millisecond.
+    #[must_use]
+    pub fn with_liveness(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.heartbeat_interval = (!interval.is_zero()).then_some(interval);
+        self.heartbeat_timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -140,8 +153,10 @@ impl AsyncService for WebSocketServer {
                             let metrics = self.metrics.clone();
                             let gateway = Arc::clone(&self.gateway);
                             let handshake_timeout = self.handshake_timeout;
+                            let heartbeat_interval = self.heartbeat_interval;
+                            let heartbeat_timeout = self.heartbeat_timeout;
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(id, stream, peer, conn_cancel, metrics, gateway, handshake_timeout).await {
+                                if let Err(e) = handle_connection(id, stream, peer, conn_cancel, metrics, gateway, handshake_timeout, heartbeat_interval, heartbeat_timeout).await {
                                     tracing::debug!(conn = %id, error = %e, "WebSocket connection ended");
                                 }
                             });
@@ -191,6 +206,8 @@ async fn handle_connection(
     metrics: TransportMetrics,
     gateway: Arc<Gateway>,
     handshake_timeout: Duration,
+    heartbeat_interval: Option<Duration>,
+    heartbeat_timeout: Duration,
 ) -> AppResult<()> {
     let _conn = WebSocketConnection {
         id,
@@ -303,9 +320,44 @@ async fn handle_connection(
             gateway.handle_inbound(session_id, env);
         }
 
+        let mut heartbeat = heartbeat_interval.map(tokio::time::interval);
+        if let Some(ticker) = &mut heartbeat {
+            // Tokio intervals tick immediately; consume that instant so the
+            // first probe occurs after a full configured interval.
+            ticker.tick().await;
+        }
+        let mut pong_deadline = None;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
+                () = async {
+                    match pong_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    metrics.liveness_timeout();
+                    gateway.node_metrics().record_websocket_liveness_timeout();
+                    tracing::warn!(conn = %id, %session_id, "WebSocket liveness timeout; closing unresponsive peer");
+                    break;
+                }
+                () = async {
+                    match &mut heartbeat {
+                        Some(ticker) => {
+                            ticker.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // At most one probe is outstanding. The deadline branch
+                    // above owns failure, so no probe queue can accumulate.
+                    if pong_deadline.is_none() {
+                        writer.send(Message::Ping(Vec::new())).await.map_err(send_err)?;
+                        metrics.ping_sent();
+                        gateway.node_metrics().record_websocket_ping_sent();
+                        pong_deadline = Some(tokio::time::Instant::now() + heartbeat_timeout);
+                    }
+                }
                 // Outbound: relay messages from the gateway to this peer.
                 out = rx.recv() => {
                     let Some(out) = out else { break };
@@ -343,6 +395,12 @@ async fn handle_connection(
                         Message::Close(_) => break,
                         Message::Ping(payload) => {
                             writer.send(Message::Pong(payload)).await.map_err(send_err)?;
+                        }
+                        Message::Pong(_) => {
+                            if pong_deadline.take().is_some() {
+                                metrics.pong_received();
+                                gateway.node_metrics().record_websocket_pong_received();
+                            }
                         }
                         // Text and other frames are ignored in the binary-only MVP.
                         _ => {}

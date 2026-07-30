@@ -1111,6 +1111,11 @@ pub struct WebSocketConfig {
     pub bind: String,
     /// Per-connection outbound queue capacity (envelopes).
     pub outbound_queue_capacity: usize,
+    /// Interval between native WebSocket Ping control frames after authentication.
+    /// Set to `0` to disable transport liveness probing.
+    pub heartbeat_interval_ms: u64,
+    /// Maximum time to wait for the matching Pong before closing a connection.
+    pub heartbeat_timeout_ms: u64,
 }
 
 impl Default for WebSocketConfig {
@@ -1119,6 +1124,8 @@ impl Default for WebSocketConfig {
             enabled: false,
             bind: "127.0.0.1:7352".to_string(),
             outbound_queue_capacity: 1024,
+            heartbeat_interval_ms: 15_000,
+            heartbeat_timeout_ms: 45_000,
         }
     }
 }
@@ -1534,6 +1541,13 @@ impl Config {
             if self.transport.websocket.outbound_queue_capacity == 0 {
                 return Err(AppError::config(
                     "transport.websocket.outbound_queue_capacity must be >= 1",
+                ));
+            }
+            if self.transport.websocket.heartbeat_interval_ms > 0
+                && self.transport.websocket.heartbeat_timeout_ms == 0
+            {
+                return Err(AppError::config(
+                    "transport.websocket.heartbeat_timeout_ms must be >= 1 when heartbeat_interval_ms is enabled",
                 ));
             }
         }
