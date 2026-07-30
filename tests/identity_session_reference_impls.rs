@@ -660,6 +660,235 @@ mod sqlite {
     }
 }
 
+// --- MongoDB run (opt-in via CITADEL_TEST_MONGODB_URL) ---------------------
+//
+// Run with `bash scripts/test-mongodb.sh`. The script starts a temporary,
+// authenticated single-node replica set, exports an isolated URL, waits for a
+// PRIMARY, then removes all credentials, key material, and the container.
+mod mongodb {
+    use super::*;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{MongoDatabase, UnitOfWork};
+
+    fn test_database_url() -> Option<String> {
+        std::env::var("CITADEL_TEST_MONGODB_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    }
+
+    async fn connect() -> Option<MongoDatabase> {
+        let url = test_database_url()?;
+        let config = DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        };
+        Some(
+            MongoDatabase::connect(&config)
+                .await
+                .expect("connect + reconcile against the MongoDB replica set"),
+        )
+    }
+
+    #[tokio::test]
+    async fn mongodb_backend_satisfies_identity_session_contracts() {
+        let Some(db) = connect().await else {
+            eprintln!("skipping MongoDB identity/session contracts: set CITADEL_TEST_MONGODB_URL");
+            return;
+        };
+
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset identity/session projections");
+        user_repository_contract(db.user_repository().as_ref()).await;
+
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset identity/session projections");
+        auth_identity_repository_contract(db.auth_identity_repository().as_ref()).await;
+
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset identity/session projections");
+        session_repository_contract(db.session_repository().as_ref()).await;
+        mongo_session_cas_race_never_resurrects_after_revoke(&db).await;
+        mongo_uow_cas_never_commits_a_stale_refresh(&db).await;
+
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset identity/session projections");
+        account_creation_is_atomic(&db).await;
+
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset identity/session projections");
+        let backend: Arc<dyn Backend> = Arc::new(db);
+        full_stack_register_validate_refresh_revoke_contract(
+            Arc::clone(&backend),
+            "mongodb-device-full",
+            "mongodb_full_player",
+        )
+        .await;
+        disabled_and_unknown_indistinguishable_contract(
+            Arc::clone(&backend),
+            "mongodb-device-disabled",
+            "mongodb_disabled_player",
+        )
+        .await;
+    }
+
+    async fn account_creation_is_atomic(db: &MongoDatabase) {
+        let uow = db.begin().await.expect("begin");
+        uow.user_repository()
+            .create_user(user("acct-1", "atomic"))
+            .await
+            .expect("create user in tx");
+        uow.auth_identity_repository()
+            .link_auth_identity(device_identity("dev-1", "acct-1"))
+            .await
+            .expect("link identity in tx");
+        uow.commit().await.expect("commit");
+
+        assert!(
+            db.user_repository()
+                .get_user(&uid("acct-1"))
+                .await
+                .expect("get")
+                .is_some()
+        );
+        assert!(
+            db.auth_identity_repository()
+                .get_auth_identity(&AuthCredential::Device(
+                    DeviceId::new("dev-1").expect("device")
+                ))
+                .await
+                .expect("get")
+                .is_some()
+        );
+
+        let uow = db.begin().await.expect("begin");
+        uow.user_repository()
+            .create_user(user("acct-2", "atomic2"))
+            .await
+            .expect("create user in tx");
+        assert!(
+            uow.auth_identity_repository()
+                .link_auth_identity(device_identity("dev-1", "acct-2"))
+                .await
+                .is_err()
+        );
+        uow.rollback().await.expect("rollback");
+        assert!(
+            db.user_repository()
+                .get_user(&uid("acct-2"))
+                .await
+                .expect("get")
+                .is_none()
+        );
+    }
+
+    /// Exercise the physical Mongo CAS rather than only the trait-level
+    /// sequential contract. A stale refresh and a revoke race from the same
+    /// document version; bulk revocation retries its CAS and the stored state
+    /// must remain terminal.
+    async fn mongo_session_cas_race_never_resurrects_after_revoke(db: &MongoDatabase) {
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset");
+        let repo = db.session_repository();
+        repo.create_session(session("race-1", "race-user", "race-token"))
+            .await
+            .expect("create");
+
+        let mut stale = repo
+            .get_session(&SessionId::new("race-1").expect("id"))
+            .await
+            .expect("read")
+            .expect("present");
+        stale
+            .refresh_at(ts(150), ts(500), Some(ts(800)), None)
+            .expect("stale refresh");
+
+        let refresh_repo = Arc::clone(&repo);
+        let refresh = tokio::spawn(async move { refresh_repo.update_session(stale).await });
+        let revoke_repo = Arc::clone(&repo);
+        let revoke = tokio::spawn(async move {
+            revoke_repo
+                .revoke_user_sessions(
+                    &UserId::new("race-user").expect("user"),
+                    ts(150),
+                    RevocationReason::Logout,
+                )
+                .await
+        });
+        let _ = refresh.await.expect("refresh task");
+        revoke
+            .await
+            .expect("revoke task")
+            .expect("revoke wins eventually");
+
+        let stored = repo
+            .get_session(&SessionId::new("race-1").expect("id"))
+            .await
+            .expect("read")
+            .expect("present");
+        assert!(stored.state().is_terminal(), "CAS race must not resurrect");
+    }
+
+    /// The transaction-bound repository has the same protection: a snapshot
+    /// that read an active session cannot commit a refresh after an external
+    /// revoke. MongoDB reports the write conflict at the write or commit, and
+    /// the terminal session remains authoritative.
+    async fn mongo_uow_cas_never_commits_a_stale_refresh(db: &MongoDatabase) {
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset");
+        let pooled = db.session_repository();
+        pooled
+            .create_session(session("uow-race-1", "uow-race-user", "uow-race-token"))
+            .await
+            .expect("create");
+
+        let uow = db.begin().await.expect("begin");
+        let tx_repo = uow.session_repository();
+        let mut stale = tx_repo
+            .get_session(&SessionId::new("uow-race-1").expect("id"))
+            .await
+            .expect("read")
+            .expect("present");
+        pooled
+            .revoke_user_sessions(
+                &UserId::new("uow-race-user").expect("user"),
+                ts(150),
+                RevocationReason::Logout,
+            )
+            .await
+            .expect("external revoke");
+        stale
+            .refresh_at(ts(150), ts(500), Some(ts(800)), None)
+            .expect("stale refresh");
+        let write = tx_repo.update_session(stale).await;
+        if write.is_ok() {
+            assert!(
+                uow.commit().await.is_err(),
+                "stale transaction must not commit"
+            );
+        } else {
+            uow.rollback().await.expect("abort rejected stale write");
+        }
+
+        assert!(
+            pooled
+                .get_session(&SessionId::new("uow-race-1").expect("id"))
+                .await
+                .expect("read")
+                .expect("present")
+                .state()
+                .is_terminal(),
+            "transactional stale refresh must not resurrect"
+        );
+    }
+}
+
 // --- Postgres runs (opt-in via DATABASE_URL) --------------------------------
 //
 // Runs the same reusable contracts against a real Postgres backend when

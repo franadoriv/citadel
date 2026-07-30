@@ -360,3 +360,41 @@ mod postgres {
         run_auth_scenarios(app, "pg-device-1", "pg-custom-1", "pg_player").await;
     }
 }
+
+// Opt-in real MongoDB path; `scripts/test-mongodb.sh` supplies a disposable
+// authenticated replica-set URL and runs this target.
+mod mongodb {
+    use super::*;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::MongoDatabase;
+
+    #[tokio::test]
+    async fn device_and_custom_auth_over_mongodb_backend_when_configured() {
+        let Some(url) = std::env::var("CITADEL_TEST_MONGODB_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            eprintln!("skipping MongoDB HTTP auth: set CITADEL_TEST_MONGODB_URL");
+            return;
+        };
+        let config = DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        };
+        let db = MongoDatabase::connect(&config)
+            .await
+            .expect("connect + reconcile against the MongoDB replica set");
+        db.clear_identity_session_data_for_tests()
+            .await
+            .expect("reset identity/session projections");
+
+        let backend: Arc<dyn Backend> = Arc::new(db);
+        run_auth_scenarios(
+            App::with_backend(Config::default(), backend),
+            "mongodb-device-1",
+            "mongodb-custom-1",
+            "mongodb_player",
+        )
+        .await;
+    }
+}

@@ -238,6 +238,16 @@ async fn scenario_records_are_ranked_and_paged(repo: &dyn LeaderboardsRepository
     assert_eq!(page.items[0].rank, 2);
 }
 
+async fn scenario_zero_limit_is_an_empty_bounded_page(repo: &dyn LeaderboardsRepository) {
+    make_board(repo, "board", SortOrder::Desc, Operator::Set).await;
+    repo.submit("board", "u1", 10, 0, None, ts(1))
+        .await
+        .expect("submit");
+    let page = repo.records("board", 0, 0).await.expect("records");
+    assert!(page.items.is_empty(), "zero limit never means unbounded");
+    assert_eq!(page.total, 1);
+}
+
 async fn scenario_records_against_unknown_board_is_not_found(repo: &dyn LeaderboardsRepository) {
     assert_eq!(
         repo.records("ghost", 10, 0)
@@ -323,6 +333,7 @@ fn all_scenarios() -> Vec<Scenario> {
         scenario_best_operator_asc_keeps_lower,
         scenario_submit_against_unknown_board_is_not_found,
         scenario_records_are_ranked_and_paged,
+        scenario_zero_limit_is_an_empty_bounded_page,
         scenario_records_against_unknown_board_is_not_found,
         scenario_delete_board_cascades_records,
         scenario_delete_record_semantics,
@@ -408,5 +419,83 @@ mod postgres {
             eprintln!("postgres scenario: {name}");
             run(repo.as_ref()).await;
         }
+    }
+}
+
+// --- MongoDB run (opt-in via CITADEL_TEST_MONGODB_URL) ---------------------
+
+mod mongodb {
+    use super::*;
+    use citadel::config::DatabaseConfig;
+    use citadel::repository::{Backend, MongoDatabase};
+    use std::sync::Arc;
+
+    fn test_database_url() -> Option<String> {
+        std::env::var("CITADEL_TEST_MONGODB_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    }
+
+    #[tokio::test]
+    async fn mongodb_backend_satisfies_the_contract() {
+        let Some(url) = test_database_url() else {
+            eprintln!("skipping MongoDB leaderboards contract: set CITADEL_TEST_MONGODB_URL");
+            return;
+        };
+        let config = DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        };
+        let db = MongoDatabase::connect(&config)
+            .await
+            .expect("connect + reconcile against MongoDB replica set");
+        let repo = db.leaderboards_repository();
+
+        for (name, run) in all_scenarios() {
+            db.clear_leaderboards_data_for_tests()
+                .await
+                .expect("reset leaderboards between scenarios");
+            eprintln!("mongodb scenario: {name}");
+            run(repo.as_ref()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mongodb_concurrent_increments_are_serializable() {
+        let Some(url) = test_database_url() else {
+            eprintln!(
+                "skipping MongoDB leaderboard concurrency contract: set CITADEL_TEST_MONGODB_URL"
+            );
+            return;
+        };
+        let config = DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        };
+        let db = MongoDatabase::connect(&config).await.expect("connect");
+        db.clear_leaderboards_data_for_tests().await.expect("reset");
+        let repo = Arc::new(db.leaderboards_repository());
+        repo.create(
+            create_request("concurrent", SortOrder::Desc, Operator::Incr),
+            ts(1),
+        )
+        .await
+        .expect("create");
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let repo = Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.submit("concurrent", "u1", 1, 0, None, ts(2)).await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("task joins")
+                .expect("submit succeeds after bounded retry");
+        }
+        let page = repo.records("concurrent", 10, 0).await.expect("records");
+        assert_eq!(page.items[0].score, 8);
+        assert_eq!(page.items[0].submissions, 8);
     }
 }

@@ -474,6 +474,22 @@ impl SqliteUnitOfWork {
         )))
     }
 
+    /// A friends repository bound to this transaction.
+    #[must_use]
+    pub fn friends_repository(&self) -> Arc<dyn FriendsRepository> {
+        Arc::new(SqliteFriendsRepository::new(SqliteExecutor::Tx(
+            Arc::clone(&self.cell),
+        )))
+    }
+
+    /// A groups repository bound to this transaction.
+    #[must_use]
+    pub fn groups_repository(&self) -> Arc<dyn GroupsRepository> {
+        Arc::new(SqliteGroupsRepository::new(SqliteExecutor::Tx(Arc::clone(
+            &self.cell,
+        ))))
+    }
+
     /// Commit the transaction, making its writes durable.
     ///
     /// # Errors
@@ -578,6 +594,14 @@ impl UnitOfWork for SqliteUnitOfWork {
 
     fn session_repository(&self) -> Arc<dyn SessionRepository> {
         SqliteUnitOfWork::session_repository(self)
+    }
+
+    fn friends_repository(&self) -> Arc<dyn FriendsRepository> {
+        SqliteUnitOfWork::friends_repository(self)
+    }
+
+    fn groups_repository(&self) -> Arc<dyn GroupsRepository> {
+        SqliteUnitOfWork::groups_repository(self)
     }
 
     async fn commit(self: Box<Self>) -> AppResult<()> {

@@ -38,6 +38,12 @@ jobs:
       - name: Report disk space before Rust tests
         run: df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
       - run: cargo test --all-targets --all-features
+      - name: Run MongoDB replica-set compatibility suite
+        # The harness creates an authenticated disposable rs0 and runs every
+        # Mongo-enabled contract, HTTP flow, race/cancellation regression, and
+        # backup/restore integrity check. A standalone service cannot exercise
+        # multi-document transactions, so do not replace this with one.
+        run: bash scripts/test-mongodb.sh
       - run: bash scripts/check-docs.sh
       - run: bash scripts/check-sdk-parity.sh
       - run: python3 scripts/check-godot-web-sdk.py

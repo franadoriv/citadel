@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "released_sdk_targets": ["unreal", "unity", "godot", "rust", "javascript"],
+  "operations": [
+    {
+      "id": "account.get",
+      "backend": { "method": "GET", "path": "/v1/account" },
+      "reference": {
+        "path": "website/src/content/docs/reference/client-sdk/authentication.md",
+        "anchor": "get-v1-account"
+      },
+      "bindings": {
+        "unreal": {
+          "path": "clients/unreal/Plugin/Citadel/Source/CitadelClient/Public/CitadelClientSubsystem.h",
+          "symbol": "GetAccount"
+        },
+        "unity": {
+          "path": "clients/unity/Citadel/CitadelHttpClient.cs",
+          "symbol": "GetAccountAsync"
+        },
+        "godot": {
+          "path": "clients/godot/citadel/http_client.gd",
+          "symbol": "get_account"
+        },
+        "rust": {
+          "path": "crates/citadel-client/src/http.rs",
+          "symbol": "get_account"
+        },
+        "javascript": {
+          "path": "clients/js/src/http.js",
+          "symbol": "getAccount"
+        }
+      },
+      "exclusions": {}
+    },
+    {
+      "id": "account.update",
+      "backend": { "method": "PATCH", "path": "/v1/account" },
+      "reference": {
+        "path": "website/src/content/docs/reference/client-sdk/authentication.md",
+        "anchor": "patch-v1-account"
+      },
+      "bindings": {
+        "unreal": {
+          "path": "clients/unreal/Plugin/Citadel/Source/CitadelClient/Public/CitadelClientSubsystem.h",
+          "symbol": "UpdateAccount"
+        },
+        "unity": {
+          "path": "clients/unity/Citadel/CitadelHttpClient.cs",
+          "symbol": "UpdateAccountAsync"
+        },
+        "godot": {
+          "path": "clients/godot/citadel/http_client.gd",
+          "symbol": "update_account"
+        },
+        "rust": {
+          "path": "crates/citadel-client/src/http.rs",
+          "symbol": "update_account"
+        },
+        "javascript": {
+          "path": "clients/js/src/http.js",
+          "symbol": "updateAccount"
+        }
+      },
+      "exclusions": {}
+    },
+    {
+      "id": "users.lookup",
+      "backend": { "method": "POST", "path": "/v1/users/lookup" },
+      "reference": {
+        "path": "website/src/content/docs/reference/client-sdk/authentication.md",
+        "anchor": "post-v1-users-lookup"
+      },
+      "bindings": {
+        "unreal": {
+          "path": "clients/unreal/Plugin/Citadel/Source/CitadelClient/Public/CitadelClientSubsystem.h",
+          "symbol": "LookupUsers"
+        },
+        "unity": {
+          "path": "clients/unity/Citadel/CitadelHttpClient.cs",
+          "symbol": "LookupUsersAsync"
+        },
+        "godot": {
+          "path": "clients/godot/citadel/http_client.gd",
+          "symbol": "lookup_users"
+        },
+        "rust": {
+          "path": "crates/citadel-client/src/http.rs",
+          "symbol": "lookup_users"
+        },
+        "javascript": {
+          "path": "clients/js/src/http.js",
+          "symbol": "lookupUsers"
+        }
+      },
+      "exclusions": {}
+    },
+    {
+      "id": "session.refresh",
+      "backend": { "method": "POST", "path": "/v1/session/refresh" },
+      "reference": {
+        "path": "website/src/content/docs/reference/client-sdk/authentication.md",
+        "anchor": "post-v1-session-refresh"
+      },
+      "bindings": {
+        "unreal": {
+          "path": "clients/unreal/Plugin/Citadel/Source/CitadelClient/Public/CitadelClientSubsystem.h",
+          "symbol": "RefreshSession"
+        },
+        "unity": {
+          "path": "clients/unity/Citadel/CitadelHttpClient.cs",
+          "symbol": "RefreshSessionAsync"
+        },
+        "godot": {
+          "path": "clients/godot/citadel/http_client.gd",
+          "symbol": "refresh_session"
+        },
+        "rust": {
+          "path": "crates/citadel-client/src/http.rs",
+          "symbol": "refresh_session"
+        },
+        "javascript": {
+          "path": "clients/js/src/http.js",
+          "symbol": "refreshSession"
+        }
+      },
+      "exclusions": {}
+    },
+    {
+      "id": "session.logout",
+      "backend": { "method": "POST", "path": "/v1/session/logout" },
+      "reference": {
+        "path": "website/src/content/docs/reference/client-sdk/authentication.md",
+        "anchor": "post-v1-session-logout"
+      },
+      "bindings": {
+        "unreal": {
+          "path": "clients/unreal/Plugin/Citadel/Source/CitadelClient/Public/CitadelClientSubsystem.h",
+          "symbol": "LogoutSession"
+        },
+        "unity": {
+          "path": "clients/unity/Citadel/CitadelHttpClient.cs",
+          "symbol": "LogoutSessionAsync"
+        },
+        "godot": {
+          "path": "clients/godot/citadel/http_client.gd",
+          "symbol": "logout_session"
+        },
+        "rust": {
+          "path": "crates/citadel-client/src/http.rs",
+          "symbol": "logout_session"
+        },
+        "javascript": {
+          "path": "clients/js/src/http.js",
+          "symbol": "logoutSession"
+        }
+      },
+      "exclusions": {}
+    }
+  ]
+}

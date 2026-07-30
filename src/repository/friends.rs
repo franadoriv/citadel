@@ -179,7 +179,7 @@ pub trait FriendsRepository: Send + Sync {
 /// The directed-edge store: `(owner, other) -> (state, updated_millis)`, both
 /// directions stored explicitly. A named alias keeps the `Mutex`/guard types
 /// readable (mirrors `SessionStore` in `session.rs`).
-type EdgeStore = HashMap<(String, String), (FriendState, u64)>;
+pub(crate) type EdgeStore = HashMap<(String, String), (FriendState, u64)>;
 
 /// A contract-faithful, in-memory [`FriendsRepository`] (the reference impl).
 ///
@@ -204,6 +204,18 @@ impl InMemoryFriendsRepository {
         self.inner
             .lock()
             .map_err(|_| AppError::internal("friends repository mutex poisoned"))
+    }
+
+    /// Capture the complete edge store for an enclosing in-memory transaction.
+    pub(crate) fn snapshot_for_rollback(&self) -> AppResult<EdgeStore> {
+        Ok(self.guard()?.clone())
+    }
+
+    /// Restore a transaction snapshot without applying domain transitions.
+    pub(crate) fn restore_for_rollback(&self, snapshot: EdgeStore) {
+        if let Ok(mut state) = self.inner.lock() {
+            *state = snapshot;
+        }
     }
 }
 

@@ -6,16 +6,14 @@ description: Download, configure, and run a prebuilt Citadel server on Windows o
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Citadel server releases are standalone ZIP archives. Download the archive for
-your operating system from the [GitHub Releases](https://github.com/franadoriv/citadel/releases)
+a supported operating system shown below from the [GitHub Releases](https://github.com/franadoriv/citadel/releases)
 page, extract it, then run the included server. You do **not** need to clone
 the repository, install Rust, or compile anything.
 
 Each release also includes `SHA256SUMS.txt`. Download it beside the archive and
-verify the archive before extracting it:
-
-```bash
-sha256sum -c SHA256SUMS.txt
-```
+verify **the archive you selected** before extracting it. The manifest lists all
+release assets, so do not run `sha256sum -c SHA256SUMS.txt` unless you downloaded
+every asset from that release.
 
 :::tip[Choose the matching version]
 Use client SDK archives from the same `v{version}` release as your server. That
@@ -30,6 +28,13 @@ keeps the client and server protocol versions aligned.
 | Linux x86_64 / AMD64 | `citadel-linux-x86_64-musl-v{version}.zip` |
 | Linux ARM64 / AArch64 | `citadel-linux-aarch64-musl-v{version}.zip` |
 
+:::note[macOS public binary availability]
+No public macOS server binary archive is currently published in GitHub Releases.
+macOS is therefore not an available binary-install target in this guide; use one
+of the published Windows or Linux archives above. Do not treat local or
+developer-built macOS packages as public release assets.
+:::
+
 The Linux archive contains a statically linked `musl` executable. It is intended
 for normal x86_64 Linux distributions, including servers based on Ubuntu,
 Debian, Fedora, and RHEL, without depending on the host's glibc version.
@@ -37,34 +42,83 @@ Debian, Fedora, and RHEL, without depending on the host's glibc version.
 The ARM64 archive supports 64-bit ARM hosts such as Raspberry Pi OS 64-bit, AWS
 Graviton, and Oracle ARM. Do not use it on a 32-bit Raspberry Pi OS install.
 
-## 2. Extract and start
+## 2. Download, verify, extract, and start
+
+The examples below use the latest verified release at the time this guide was
+updated (`v0.9.11`). Replace `v0.9.11` with the release tag you selected if a
+newer release is available.
+
+### Linux — no source checkout required
+
+Choose `x86_64-musl` for AMD64/x86_64 Linux or `aarch64-musl` for 64-bit ARM.
+This downloads only a published release binary and its checksum manifest; it
+does not clone the repository or require Rust, Cargo, or a build toolchain.
+
+```bash
+VERSION=0.9.11
+ARCH=x86_64-musl # use aarch64-musl on 64-bit ARM
+ARCHIVE="citadel-linux-${ARCH}-v${VERSION}.zip"
+BASE="https://github.com/franadoriv/citadel/releases/download/v${VERSION}"
+
+curl -fLO "${BASE}/${ARCHIVE}"
+curl -fLO "${BASE}/SHA256SUMS.txt"
+grep -F "  ${ARCHIVE}" SHA256SUMS.txt | sha256sum -c -
+unzip "${ARCHIVE}"
+cd "${ARCHIVE%.zip}"
+./citadel check
+./citadel serve
+```
+
+`./citadel` and `./citadel serve` are equivalent. Run the binary from the
+extracted directory so it discovers the included `citadel.toml`, `scripts/`,
+and `maps/` directories. The first `serve` creates `data.sqlite`, applies
+migrations, and starts the configured listeners.
 
 ### Windows
 
-Extract the ZIP, open PowerShell in the extracted folder, and run:
+The published Windows asset is the x86_64/AMD64 ZIP. This PowerShell flow uses
+only the public release archive and checksum manifest—no source checkout, Rust,
+or build toolchain is required. It matches the manifest's exact
+`<sha256><two spaces><filename>` entry and stops if that entry is missing or the
+hash differs:
 
 ```powershell
-.\citadel.exe
+$version = 'v0.9.11'
+$asset = "citadel-windows-x86_64-$version.zip"
+$base = "https://github.com/franadoriv/citadel/releases/download/$version"
+
+Invoke-WebRequest "$base/$asset" -OutFile $asset
+Invoke-WebRequest "$base/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
+$assetPattern = [regex]::Escape($asset)
+$checksumLine = Get-Content SHA256SUMS.txt |
+  Where-Object { $_ -match "^[0-9A-Fa-f]{64}  $assetPattern$" } |
+  Select-Object -First 1
+if (-not $checksumLine) { throw "No SHA-256 entry found for $asset." }
+$expected = $checksumLine.Substring(0, 64).ToLowerInvariant()
+$actual = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw 'Checksum verification failed.' }
+
+Expand-Archive -LiteralPath $asset -DestinationPath .
+Set-Location $asset.Replace('.zip', '')
+.\citadel.exe check
+.\citadel.exe serve
 ```
 
-### Linux
+The default command is `serve`, so `.\citadel.exe` and `.\citadel.exe serve`
+are equivalent. Run it from the extracted directory so it discovers the
+included `citadel.toml`; use `--config <path>` only when deliberately choosing a
+different configuration file.
 
-Extract the ZIP, open a terminal in the extracted folder, and run:
-
-```bash
-./citadel
-```
-
-The default command is `serve`; `citadel` and `citadel serve` are equivalent.
 The startup banner prints the dashboard, health, and transport addresses. On a
 local install the dashboard is normally
 `http://127.0.0.1:7350/dashboard`.
 
 ## 3. Check configuration before opening it to players
 
-Each archive includes an editable `citadel.toml`, a starter Lua script under
-`scripts/main.lua`, and a `maps/` directory. Validate configuration without
-opening network listeners:
+Each archive includes an editable `citadel.toml`. The Linux archives also
+include a starter Lua script under `scripts/main.lua` and a `maps/` directory;
+choose or add the corresponding script and map locations for a Windows server.
+Validate configuration without opening network listeners:
 
 <Tabs>
 <TabItem label="Windows">

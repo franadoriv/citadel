@@ -1,0 +1,94 @@
+---
+title: MongoDB operations
+description: Deploy, monitor, back up, restore, and recover Citadel's MongoDB backend safely.
+---
+
+Citadel supports MongoDB as a durable full-parity backend **only** on a
+transaction-capable replica set or sharded cluster. A standalone `mongod` is
+not supported: Citadel verifies transaction capability at startup and refuses
+to start if logical sessions, supported wire version, and replica-set/sharded
+topology are absent. It never falls back to process-local in-memory data.
+
+Citadel does not provide automatic data migration between SQLite, PostgreSQL,
+CockroachDB, and MongoDB. Choose a backend deliberately and use an approved
+export/import migration project when moving existing production data.
+
+## Configure a transaction-capable deployment
+
+Use a database-qualified URI and explicit replica-set policy:
+
+```toml
+[database]
+url = "mongodb://citadel:<password>@mongo-1,mongo-2,mongo-3/citadel?authSource=admin&replicaSet=rs0&tls=true"
+max_connections = 10
+connect_timeout_ms = 5000
+acquire_timeout_ms = 5000
+mongodb_read_preference = "primary"
+mongodb_write_concern = "majority"
+mongodb_read_concern = "majority"
+```
+
+The official MongoDB Rust driver handles standard `mongodb://` and
+`mongodb+srv://` TLS/authentication URI options, including SCRAM and X.509.
+Use MongoDB's [connection-string reference](https://www.mongodb.com/docs/manual/reference/connection-string/)
+when composing a deployment URI. Keep credentials out of source control and logs;
+Citadel redacts database URLs.
+The read preference must be `primary`, and read/write concern must both be
+`majority`; configuration validation rejects weaker values.
+
+Before deployment, confirm that a primary is elected and sessions are enabled:
+
+```bash
+mongosh --quiet "$MONGODB_URI" --eval 'db.hello()'
+citadel check --config /etc/citadel/citadel.toml
+```
+
+Run `citadel serve` only after `citadel check` succeeds. `/status` reports the
+non-secret backend class as `mongodb`; use it to verify routing without exposing
+the URI.
+
+## Monitoring and incident response
+
+Monitor replica-set election/replication health, primary availability,
+connection-pool pressure, operation latency, and transaction abort/retry rates.
+Citadel's structured logs and status identify the backend class and sanitize
+database errors; never paste a URI or authentication error containing secrets
+into tickets. A sustained rise in transient transaction retries, unknown commit
+results, or primary elections is an operational incident: stabilize the MongoDB
+deployment before increasing application retries.
+
+If Citadel cannot connect, loses transaction support, or detects incompatible
+schema/index drift, it fails closed during startup rather than serving against
+in-memory state. Preserve logs with secrets redacted, inspect MongoDB health,
+and restore the required topology/policy before restarting Citadel.
+
+## Backup and restore
+
+Use MongoDB's supported tooling with a least-privilege backup principal. Take
+and retain backups according to the deployment's RPO/RTO policy; encrypt backup
+storage and protect the URI as a secret.
+
+```bash
+# Create a logical backup. Supply MONGODB_URI through a secret store.
+mongodump --uri="$MONGODB_URI" --db=citadel --archive=citadel-$(date +%F).archive --gzip
+
+# Restore into an isolated verification database first, never over production.
+mongorestore --uri="$MONGODB_URI" --archive=citadel-2026-07-29.archive --gzip \
+  --nsFrom='citadel.*' --nsTo='citadel_restore_verify.*'
+mongosh --quiet "$MONGODB_URI" --eval 'db.getSiblingDB("citadel_restore_verify").getCollectionNames()'
+```
+
+Choose the backup method and consistency guarantees that meet your deployment's
+RPO/RTO; for a production replica set, follow MongoDB's
+[backup guidance](https://www.mongodb.com/docs/manual/core/backups/). Perform
+and record a restore drill before each release and at the cadence set by the
+incident-response policy. CI runs the same shape of drill against a disposable
+authenticated `rs0`: it writes known data, uses `mongodump`, restores
+under a distinct database with `mongorestore`, and verifies the restored records
+byte-for-byte. CI does not replace a production recovery drill.
+
+For disaster recovery, provision a healthy transaction-capable replica set,
+restore to an isolated database, verify collection/index integrity and Citadel
+startup with `citadel check`, then switch application traffic only after the
+restore satisfies the recovery plan. Do not point a production Citadel node at
+an unverified restore or a standalone `mongod`.

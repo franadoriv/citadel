@@ -360,6 +360,8 @@ pub enum DatabaseBackend {
     Postgres,
     /// An embedded, single-file (or in-memory) SQLite database.
     Sqlite,
+    /// MongoDB, requiring a replica set or sharded cluster for transactions.
+    MongoDb,
 }
 
 /// Which PostgreSQL-wire dialect flavor a Postgres-backend URL targets
@@ -418,6 +420,12 @@ pub struct DatabaseConfig {
     pub connect_timeout_ms: u64,
     /// Timeout, in milliseconds, for acquiring a connection from the pool.
     pub acquire_timeout_ms: u64,
+    /// Transactional Mongo reads must use the primary.
+    pub mongodb_read_preference: String,
+    /// Transactional Mongo writes must be majority acknowledged.
+    pub mongodb_write_concern: String,
+    /// Transactional Mongo reads must use majority read concern.
+    pub mongodb_read_concern: String,
 }
 
 /// Redacted `Debug`: never prints the connection URL (it can carry credentials).
@@ -432,6 +440,9 @@ impl std::fmt::Debug for DatabaseConfig {
             .field("max_connections", &self.max_connections)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("acquire_timeout_ms", &self.acquire_timeout_ms)
+            .field("mongodb_read_preference", &self.mongodb_read_preference)
+            .field("mongodb_write_concern", &self.mongodb_write_concern)
+            .field("mongodb_read_concern", &self.mongodb_read_concern)
             .finish()
     }
 }
@@ -443,6 +454,9 @@ impl Default for DatabaseConfig {
             max_connections: 10,
             connect_timeout_ms: 5_000,
             acquire_timeout_ms: 5_000,
+            mongodb_read_preference: "primary".to_owned(),
+            mongodb_write_concern: "majority".to_owned(),
+            mongodb_read_concern: "majority".to_owned(),
         }
     }
 }
@@ -551,6 +565,8 @@ fn classify_url(url: &str) -> Result<DatabaseBackend, ()> {
         Ok(DatabaseBackend::Postgres)
     } else if url.starts_with("sqlite:") {
         Ok(DatabaseBackend::Sqlite)
+    } else if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
+        Ok(DatabaseBackend::MongoDb)
     } else if url.contains("://") {
         Err(())
     } else {
@@ -578,11 +594,32 @@ impl DatabaseConfig {
             Some(url) if !url.trim().is_empty() => classify_url(url).map(Some).map_err(|()| {
                 AppError::config(
                     "database.url must be a postgres://, postgresql://, cockroach://, \
-                     cockroachdb://, or sqlite: URL, or a file path",
+                     cockroachdb://, mongodb://, mongodb+srv://, or sqlite: URL, or a file path",
                 )
             }),
             _ => Ok(None),
         }
+    }
+
+    /// Validate the explicit Mongo consistency policy. URI TLS/auth options are
+    /// passed unchanged to the official driver, preserving SCRAM/X.509 support.
+    pub fn validate_mongodb_policy(&self) -> AppResult<()> {
+        if self.mongodb_read_preference != "primary" {
+            return Err(AppError::config(
+                "database.mongodb_read_preference must be `primary` for transactional consistency",
+            ));
+        }
+        if self.mongodb_write_concern != "majority" {
+            return Err(AppError::config(
+                "database.mongodb_write_concern must be `majority` for transactional consistency",
+            ));
+        }
+        if self.mongodb_read_concern != "majority" {
+            return Err(AppError::config(
+                "database.mongodb_read_concern must be `majority` for transactional consistency",
+            ));
+        }
+        Ok(())
     }
 
     /// The PostgreSQL-wire dialect flavor selected by the URL scheme.
@@ -1528,7 +1565,7 @@ impl DatabaseConfig {
                 ));
             }
             // Rejects unrecognized schemes (e.g. `mysql://`) without echoing the URL.
-            self.backend()?;
+            let backend = self.backend()?;
             if self.max_connections == 0 {
                 return Err(AppError::config("database.max_connections must be >= 1"));
             }
@@ -1537,6 +1574,9 @@ impl DatabaseConfig {
             }
             if self.acquire_timeout_ms == 0 {
                 return Err(AppError::config("database.acquire_timeout_ms must be >= 1"));
+            }
+            if backend == Some(DatabaseBackend::MongoDb) {
+                self.validate_mongodb_policy()?;
             }
         }
         Ok(())

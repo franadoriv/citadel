@@ -76,8 +76,10 @@ require_text examples/docker/citadel.toml 'language = "lua"'
 require_text src/http/mod.rs 'tokio::signal::unix::SignalKind::terminate()'
 
 require_text .github/workflows/release.yml 'needs: [package, godot-web]'
-for forbidden in 'packages: write' 'Docker' 'docker' 'Buildx' 'buildx' 'QEMU' \
-  'qemu' 'container' 'GHCR' 'ghcr' 'OCI' 'oci'; do
+# QEMU user-mode references are allowed exclusively for ARM smoke tests, never
+# to build, test, or publish containers.
+for forbidden in 'packages: write' 'Docker' 'docker' 'Buildx' 'buildx' \
+  'container' 'GHCR' 'ghcr' 'OCI' 'oci'; do
   reject_text .github/workflows/release.yml "$forbidden"
 done
 require_text scripts/smoke-container.sh 'CITADEL_SMOKE_PULL_IMAGE'

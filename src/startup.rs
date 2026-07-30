@@ -124,13 +124,19 @@ pub enum DatabaseChoice {
     Sqlite,
     /// A networked PostgreSQL server (operator supplies the URL).
     Postgres,
+    /// A transaction-capable MongoDB replica set or sharded cluster.
+    MongoDb,
 }
 
 impl DatabaseChoice {
     /// The choices offered by the wizard, in menu order (SQLite first/default).
     #[must_use]
     pub const fn all() -> &'static [DatabaseChoice] {
-        &[DatabaseChoice::Sqlite, DatabaseChoice::Postgres]
+        &[
+            DatabaseChoice::Sqlite,
+            DatabaseChoice::Postgres,
+            DatabaseChoice::MongoDb,
+        ]
     }
 
     /// Human-readable menu label.
@@ -139,6 +145,7 @@ impl DatabaseChoice {
         match self {
             DatabaseChoice::Sqlite => "SQLite (embedded, recommended)",
             DatabaseChoice::Postgres => "PostgreSQL (external server)",
+            DatabaseChoice::MongoDb => "MongoDB (replica set or sharded cluster)",
         }
     }
 }
@@ -447,6 +454,15 @@ pub fn run_first_run_wizard<P: Prompt>(
             DatabaseChoice::Postgres => {
                 let url = prompt
                     .ask("Enter the PostgreSQL connection URL", DEFAULT_POSTGRES_URL)
+                    .map_err(prompt_err)?;
+                config.database.url = Some(url);
+            }
+            DatabaseChoice::MongoDb => {
+                let url = prompt
+                    .ask(
+                        "Enter the MongoDB connection URL (transaction-capable replica set or sharded cluster)",
+                        "mongodb://localhost:27017/citadel?replicaSet=rs0",
+                    )
                     .map_err(prompt_err)?;
                 config.database.url = Some(url);
             }
@@ -944,6 +960,27 @@ mod tests {
         let mut prompt = ScriptedPrompt::new(vec![true], vec![1], vec![custom.clone()]);
         let report = run_first_run_wizard(&mut config, &paths, &mut prompt).expect("wizard runs");
         assert_eq!(report.selected_database, Some(DatabaseChoice::Postgres));
+        assert_eq!(config.database.url.as_deref(), Some(custom.as_str()));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn wizard_captures_mongodb_url() {
+        let base = unique_temp_dir("mongodb");
+        std::fs::create_dir_all(&base).expect("base");
+        let scripts = base.join("game");
+        std::fs::create_dir_all(&scripts).expect("scripts");
+        std::fs::write(scripts.join("main.lua"), "-- present").expect("script");
+        let mut config = Config::default();
+        let paths = WizardPaths {
+            config_path: base.join("citadel.toml"),
+            scripts_dir: scripts,
+        };
+        let custom = "mongodb://db-1,db-2/citadel?replicaSet=rs0".to_string();
+        // confirm: yes; choose: index 2 (MongoDB); ask: the custom URL.
+        let mut prompt = ScriptedPrompt::new(vec![true], vec![2], vec![custom.clone()]);
+        let report = run_first_run_wizard(&mut config, &paths, &mut prompt).expect("wizard runs");
+        assert_eq!(report.selected_database, Some(DatabaseChoice::MongoDb));
         assert_eq!(config.database.url.as_deref(), Some(custom.as_str()));
         std::fs::remove_dir_all(&base).ok();
     }

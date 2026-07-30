@@ -1,0 +1,125 @@
+---
+title: Choose a database
+sidebar:
+  label: Choose a database
+---
+
+Citadel gives you four durable database choices. The game-facing API stays the
+same; choose the operational shape you want to run. There is no automatic
+migration between them, so treat this as an early architecture decision rather
+than a character-select screen you can casually reopen later.
+
+## The quick pick
+
+| Choose | When it fits best | What you operate |
+| --- | --- | --- |
+| **SQLite** | One self-hosted node, local development, a small game, or the fewest moving parts. | One database file; Citadel creates and migrates it. |
+| **PostgreSQL** | A conventional production deployment that needs a proven networked SQL database. | A PostgreSQL service, credentials, backups, and migrations handled by Citadel at connect. |
+| **CockroachDB** | A distributed SQL cluster is a deliberate requirement and you accept its operational model. | A CockroachDB cluster and its PostgreSQL-wire connection. |
+| **MongoDB** | Your team already operates MongoDB and needs Citadel's durable backend on a transaction-capable Mongo deployment. | A replica set or compatible sharded cluster, plus MongoDB operations. |
+
+**Recommendation for most newcomers:** start with SQLite. Move to PostgreSQL
+when a separate production database service is the natural fit. Pick
+CockroachDB or MongoDB because their operational model solves a real requirement,
+not merely because their mascots look cool.
+
+All four durable backends are supported for Citadel's shipped domain contracts.
+A configured backend that cannot connect or pass its startup checks makes
+Citadel fail fast; it does not quietly start with in-memory data.
+
+## Configure the choice
+
+Set one URL in `citadel.toml`:
+
+```toml
+[database]
+# SQLite:     url = "sqlite:data.sqlite"
+# PostgreSQL: url = "postgres://citadel:<password>@db.example/citadel"
+# Cockroach:  url = "cockroach://citadel@db.example:26257/citadel?sslmode=verify-full"
+# MongoDB:    url = "mongodb://citadel:<password>@mongo-1,mongo-2,mongo-3/citadel?authSource=admin&replicaSet=rs0&tls=true"
+```
+
+Keep the URL in a secret manager or protected environment variable such as
+`CITADEL_DATABASE_URL`; do not commit passwords. Run `citadel check --config
+/etc/citadel/citadel.toml` before `citadel serve`. The detailed option reference
+is [Configuration](/reference/operations/configuration/).
+
+### SQLite
+
+SQLite is embedded: a file is created on first run and there is no database
+server to provision. It is the friendly default for a single node. Back up the
+file according to your deployment's recovery plan, and make sure the process
+has durable storage and exclusive access appropriate for SQLite.
+
+### PostgreSQL
+
+PostgreSQL is the familiar choice when your team already has SQL operations,
+managed Postgres, or standard relational backup and monitoring practices. Use a
+least-privilege application role, TLS in production, and the provider's tested
+backup/restore procedure. Citadel applies its schema migrations when it
+connects.
+
+### CockroachDB
+
+CockroachDB is Citadel's distributed SQL option. Use a `cockroach://` or
+`cockroachdb://` URL—not `postgres://`—so Citadel selects the compatible
+migration flavor. Its stronger serializable transaction model can retry
+contentious work, so plan for normal database retry behavior. Read
+[Running on CockroachDB](/guides/cockroachdb/) before choosing it; it explains
+the compatibility details and a local fixture.
+
+### MongoDB
+
+MongoDB is fully supported **only** when transactions are available: use a
+replica set (for example `rs0`) or a compatible sharded cluster. A standalone
+`mongod` is not enough, even for a small deployment; Citadel checks this at
+startup and rejects it rather than risking a partial transaction contract.
+
+Use a database-qualified `mongodb://` or `mongodb+srv://` URI with TLS and an
+authenticated least-privilege account. Citadel supports standard driver URI
+authentication options, including SCRAM and X.509. Keep these transaction
+policy values explicit:
+
+```toml
+[database]
+url = "mongodb://citadel:<password>@mongo-1,mongo-2,mongo-3/citadel?authSource=admin&replicaSet=rs0&tls=true"
+mongodb_read_preference = "primary"
+mongodb_write_concern = "majority"
+mongodb_read_concern = "majority"
+```
+
+The application uses MongoDB transactions for workflows that need atomicity.
+That is why the primary/majority policy and transaction-capable topology are
+requirements, not optional performance knobs. See [MongoDB
+operations](/reference/operations/mongodb/) for deployment checks, monitoring,
+backup/restore, and recovery.
+
+## Operations and recovery: the non-glamorous superpower
+
+Whichever backend you choose, practice restoring it before an incident. Define
+your recovery-point and recovery-time objectives, encrypt backups, restrict
+backup credentials, and restore into an isolated verification target before
+sending production traffic there.
+
+For MongoDB, use MongoDB's supported `mongodump`/`mongorestore` tooling and
+verify a restore separately. Citadel's CI performs an authenticated disposable
+replica-set backup/restore integrity check, but that is not a substitute for
+your production restore drill. PostgreSQL and CockroachDB should use their
+vendor-supported backup and restore path; SQLite needs a consistent copy of the
+database file.
+
+## First troubleshooting steps
+
+- **Citadel will not start:** run `citadel check` and confirm the URL scheme,
+  network reachability, credentials, and TLS settings. Do not paste a full URI
+  into a ticket or chat.
+- **MongoDB says transactions are unavailable:** confirm `db.hello()` reports a
+  healthy primary and that the URI points at the replica set or compatible
+  sharded cluster. A standalone server must be replaced or reconfigured.
+- **CockroachDB migration fails:** verify the URL uses `cockroach://` or
+  `cockroachdb://`, not `postgres://`.
+- **Recovery feels uncertain:** stop and run an isolated restore drill. A backup
+  that has never been restored is a hopeful souvenir, not a recovery plan.
+
+For backend-specific configuration and limits, use the
+[Configuration reference](/reference/operations/configuration/).

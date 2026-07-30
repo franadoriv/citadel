@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+#[cfg(feature = "runtime-python")]
 #[path = "support/runtime_smoke.rs"]
 mod runtime_smoke;
 

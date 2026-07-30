@@ -6,7 +6,7 @@ use citadel::config::DatabaseConfig;
 use citadel::database_explorer::{
     DatabaseExplorer, ListRowsRequest, SortDirection, SortSpec, TableRef,
 };
-use citadel::repository::PgDatabase;
+use citadel::repository::{MongoDatabase, PgDatabase};
 
 async fn explorer_contract(url: String) {
     let config = DatabaseConfig {
@@ -85,4 +85,50 @@ async fn cockroach_database_explorer_contract() {
         })
         .unwrap_or(raw);
     explorer_contract(url).await;
+}
+
+#[tokio::test]
+async fn mongodb_database_explorer_contract() {
+    let Some(url) = std::env::var("CITADEL_TEST_MONGODB_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        eprintln!("skipping MongoDB database explorer contract: set CITADEL_TEST_MONGODB_URL");
+        return;
+    };
+    let backend = MongoDatabase::connect(&DatabaseConfig {
+        url: Some(url),
+        ..DatabaseConfig::default()
+    })
+    .await
+    .expect("connect MongoDB backend");
+    let explorer = backend.database_explorer();
+    let tables = explorer
+        .list_tables()
+        .await
+        .expect("list MongoDB collections");
+    let users = TableRef::new("mongodb", "users").expect("valid MongoDB collection reference");
+    assert!(tables.iter().any(|table| table.table == users));
+    let description = explorer
+        .describe_table(&users)
+        .await
+        .expect("describe MongoDB collection");
+    assert_eq!(description.primary_key, ["_id"]);
+    assert!(description.capabilities.stable_keyset_pagination);
+    assert!(description.capabilities.indexes);
+    assert!(!description.capabilities.foreign_keys);
+    let page = explorer
+        .list_rows(&ListRowsRequest {
+            table: users,
+            filters: Vec::new(),
+            sort: SortSpec {
+                column: "_id".to_owned(),
+                direction: SortDirection::Asc,
+            },
+            cursor: None,
+            limit: Some(1),
+        })
+        .await
+        .expect("execute bounded MongoDB row page");
+    assert!(page.rows.len() <= 1);
 }

@@ -55,7 +55,9 @@ the language-specific argument and return shapes.
 - Use friends, groups, chat, leaderboards, notifications, wallets, and purchase
   verification records.
 - Operate the node through health/status endpoints, structured logs, an admin
-  dashboard/API, audit records, SQLite, PostgreSQL, or CockroachDB.
+  dashboard/API, audit records, SQLite, PostgreSQL, CockroachDB, or MongoDB.
+  Start with [Choose a database](/guides/choose-a-database/) for the practical
+  trade-offs.
 
 ### Client choices
 
