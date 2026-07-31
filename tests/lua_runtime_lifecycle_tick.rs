@@ -71,8 +71,8 @@ async fn tick_service_drives_the_game_loop_until_shutdown() {
     let gw = gateway();
     // Register directly on the registry so only the tick delivers (no join noise).
     let id = gw.next_participant_id();
-    let (tx, mut rx) = mpsc::channel(64);
-    gw.registry().register(SessionHandle {
+    let (tx, _reliable_rx) = mpsc::channel(64);
+    let unreliable_rx = gw.registry().register(SessionHandle {
         id,
         kind: TransportKind::WebSocket,
         outbound: tx,
@@ -90,18 +90,16 @@ async fn tick_service_drives_the_game_loop_until_shutdown() {
     ));
 
     // The periodic loop must deliver on_tick broadcasts.
-    let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let first = tokio::time::timeout(Duration::from_secs(2), unreliable_rx.recv())
         .await
-        .expect("a tick arrives within the timeout")
-        .expect("channel open");
+        .expect("a tick arrives within the timeout");
     assert_eq!(first.envelope.kind, 20);
     assert_eq!(first.envelope.body, b"tick".to_vec());
 
     // A second tick confirms the loop is periodic, not a one-shot.
-    let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let second = tokio::time::timeout(Duration::from_secs(2), unreliable_rx.recv())
         .await
-        .expect("a second tick arrives")
-        .expect("channel open");
+        .expect("a second tick arrives");
     assert_eq!(second.envelope.kind, 20);
 
     // Cancellation stops the loop cleanly.

@@ -3,6 +3,12 @@
 All notable changes to Citadel are documented here. Version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- Lua tick and hot-reload integration coverage now consumes unreliable script broadcasts through the transport's latest-wins mailbox, matching production delivery semantics.
+
 ## [0.9.11] - 2026-07-28
 
 ### Added
