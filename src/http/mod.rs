@@ -13,6 +13,7 @@ pub mod error;
 pub mod player;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
@@ -201,7 +202,12 @@ pub async fn run(app: App) -> AppResult<()> {
     // Start enabled realtime transports under a shared cancellation token so
     // they stop together with the HTTP server.
     let cancel = crate::lifecycle::CancellationToken::new();
-    let transports = crate::transport::start_enabled(&app, cancel.clone()).await?;
+    let mut transports = crate::transport::start_enabled(&app, cancel.clone()).await?;
+    // Deferred writes are a separately supervised service: normal repository
+    // calls remain synchronous and never pass through this worker.
+    if let Some(writer) = app.deferred_storage() {
+        transports.spawn(Arc::clone(writer));
+    }
 
     // The server is ready: print the startup banner once. Written to stdout so
     // it is visible regardless of the configured log level/format.

@@ -69,6 +69,7 @@ export default defineConfig({
 						{ label: 'Organize multi-file Lua and Python game logic', slug: 'guides/organize-game-server-logic' },
 						{ label: 'Use shared static gameplay data', slug: 'guides/static-game-data' },
 						{ label: 'Query indexed storage from game logic', slug: 'guides/storage-indexes' },
+						{ label: 'Use deferred storage writes safely', slug: 'guides/deferred-storage-writes' },
 						{ label: 'Run a two-node matchmaker', slug: 'guides/distributed-matchmaker' },
 					],
 				},

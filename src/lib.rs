@@ -12,6 +12,7 @@ pub mod chat_cluster;
 pub mod cli;
 pub mod config;
 pub mod database_explorer;
+pub mod deferred_storage;
 pub mod error;
 pub mod error_journal;
 pub mod error_reporting;

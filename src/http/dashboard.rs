@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::app::App;
 use crate::config::RuntimeConfig;
+use crate::deferred_storage::DeferredStorageMetricsSnapshot;
 use crate::observability::NodeMetricsSnapshot;
 
 /// Path for the machine-readable node status endpoint.
@@ -154,6 +155,9 @@ pub struct NodeStatus {
     pub runtime: RuntimeStatus,
     /// Runtime counters snapshot.
     pub metrics: NodeMetricsSnapshot,
+    /// Volatile deferred-storage queue metrics when that opt-in service is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_storage: Option<DeferredStorageMetricsSnapshot>,
 }
 
 impl NodeStatus {
@@ -184,6 +188,9 @@ impl NodeStatus {
             },
             runtime: RuntimeStatus::from_config(&app.config().runtime),
             metrics: app.metrics().snapshot(),
+            deferred_storage: app
+                .deferred_storage()
+                .map(|writer| writer.metrics().snapshot()),
         }
     }
 }
@@ -217,6 +224,7 @@ mod tests {
         assert_eq!(status.runtime.tier, "trusted");
         assert_eq!(status.runtime.lua_execution_mode, "sandboxed");
         assert_eq!(status.metrics.http_requests_total, 0);
+        assert!(status.deferred_storage.is_none());
     }
 
     #[test]
