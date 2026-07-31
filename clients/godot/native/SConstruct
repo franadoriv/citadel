@@ -26,8 +26,9 @@ ffi_link = os.path.join(
 env.Append(LINKFLAGS=[ffi_link])
 if os.name == "nt":
     # Rust's Windows pipe implementation imports this ntdll entry point when
-    # linked as a static archive into the GDExtension.
-    env.Append(LIBS=["ntdll"])
+    # linked as a static archive into the GDExtension. The host telemetry
+    # dependency also resolves GetAdaptersAddresses from iphlpapi.
+    env.Append(LIBS=["ntdll", "iphlpapi"])
 
 sources = Glob("src/*.cpp")
 library = env.SharedLibrary(

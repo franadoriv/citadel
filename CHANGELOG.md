@@ -5,9 +5,35 @@ All notable changes to Citadel are documented here. Version numbers follow
 
 ## Unreleased
 
+## [0.9.12] - 2026-07-31
+
+### Added
+
+- Added the durable MongoDB repository backend, including transaction-capable
+  deployment checks, operator guidance, and backup/restore coverage.
+- Added NetworkPeer replication foundations and authoring surfaces across the
+  shipped SDKs, TMX collision import/cooking, and a portable JavaScript browser
+  SDK release artifact.
+- Added configurable WebSocket liveness probes, retained error incidents with
+  optional Sentry reporting, host CPU/RAM/storage telemetry, and opt-in
+  deferred durable-storage writes.
+- Added the aggressive bot stress simulator and compact log analyzer for
+  multiplayer load testing.
+
+### Changed
+
+- Expanded WebDoc database operations into a dedicated Operations > Databases
+  navigation group for in-memory, SQLite, PostgreSQL, CockroachDB, and MongoDB.
+- Release automation now packages the JavaScript browser SDK alongside the
+  existing Windows, portable Linux, and Godot Web artifacts.
+
 ### Fixed
 
 - Lua tick and hot-reload integration coverage now consumes unreliable script broadcasts through the transport's latest-wins mailbox, matching production delivery semantics.
+- Kept Godot native collection encoding aligned with the version 3 client FFI
+  descriptor used by the bundled runtime.
+- Resolved the Rustls provider selection and WebSocket liveness implementation
+  quality gates required for release validation.
 
 ## [0.9.11] - 2026-07-28
 

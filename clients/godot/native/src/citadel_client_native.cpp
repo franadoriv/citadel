@@ -167,8 +167,6 @@ Dictionary CitadelClientNative::decode_rep(const PackedByteArray &body, const Pa
         codec.scalar_max = float(spec.get("scalar_max", 0.0));
         codec.values_per_unit = static_cast<uint32_t>(int64_t(spec.get("values_per_unit", 0)));
         codec.max_len = static_cast<uint32_t>(int64_t(spec.get("max_len", 0)));
-        codec.vector_bounds = float(spec.get("vector_bounds", 0.0));
-        codec.quat_bits = static_cast<uint32_t>(int64_t(spec.get("quat_bits", 0)));
         native_codecs.push_back(codec);
     }
     CitadelRepDecoded *decoded = nullptr;
@@ -235,7 +233,7 @@ Dictionary CitadelClientNative::encode_rep(int64_t object_id, bool is_full, int6
             case 5: { const Quaternion value = field.get("value", Quaternion()); const std::array<float, 4> raw{value.x, value.y, value.z, value.w}; status = citadel_rep_encoder_add_quat(encoder, id, static_cast<uint32_t>(int64_t(field.get("bits", 0))), raw.data()); break; }
             case 6: {
                 const Dictionary item_spec = field.get("item_codec", Dictionary());
-                CitadelRepCodec item{};
+                CitadelRepCodecV3 item{};
                 item.kind = static_cast<uint8_t>(int64_t(item_spec.get("kind", -1)));
                 item.int_min = int64_t(item_spec.get("int_min", 0)); item.int_max = int64_t(item_spec.get("int_max", 0));
                 item.scalar_min = float(item_spec.get("scalar_min", 0.0)); item.scalar_max = float(item_spec.get("scalar_max", 0.0));

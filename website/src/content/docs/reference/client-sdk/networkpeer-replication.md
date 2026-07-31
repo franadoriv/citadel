@@ -107,8 +107,12 @@ var body = CitadelNetworkPeerAuthor.Encode(objectId, isFull, resultId, baseId,
   </TabItem>
   <TabItem label="GDScript (Godot)">
 
-Godot native codec source remains available, but no Godot runtime was available
-for ABI v3 verification. Do not treat this as a verified typed-authoring binding.
+Godot's native `CitadelClient.encode_rep_delta` authoring surface uses ABI v3,
+including keyed collections whose item codec may be scalar, `Vector3`, or
+quaternion. Its `decode_rep_delta` compatibility surface intentionally remains
+scalar-only; use the C ABI v3 decoder directly before relying on typed decode in
+Godot. No Godot runtime was available for end-to-end verification, so this
+remains a partial binding rather than verified gameplay integration.
 
   </TabItem>
   <TabItem label="JavaScript">
