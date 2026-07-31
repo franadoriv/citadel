@@ -26,6 +26,8 @@ python3 scripts/check-networkpeer-cross-engine.py
 # frontend reference before the backend contract can be considered shipped.
 bash scripts/check-client-feature-completion.sh
 python3 scripts/check-godot-web-sdk.py
+# Server release archives must remain separate from engine SDK artifacts.
+python3 scripts/check-server-release-packages.py
 # Tier-A/B script-runtime host-API parity for embedded runtimes.
 bash scripts/check-runtime-parity.sh
 # Local Dockerfile, Compose sample, and container lifecycle invariants that do

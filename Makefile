@@ -184,30 +184,22 @@ unity-plugin: ## Build the C ABI cdylib and install it into the Unity SDK
 	fi
 
 # --- Windows release package ----------------------------------------------
-# Build the server + Unity plugin DLL, stage the release layout, and zip it as
-# citadel-windows-x86_64-v{version}.zip. This is the shared definition the
-# release CI reuses (windows-latest calls make.ps1 package-windows) and the
-# local verification path. Windows-first; a macOS/Linux target can be added
-# alongside without changing this one.
+# Build the server, stage its server-only release layout, and zip it as
+# citadel-windows-x86_64-v{version}.zip. Client SDKs are published by their
+# dedicated package-client-* targets. This is the shared definition the release
+# CI reuses (windows-latest calls make.ps1 package-windows) and the local
+# verification path.
 package-windows: ## Stage + zip the Windows release ($(DIST_DIR)/citadel-windows-x86_64-v{version}.zip)
 	@echo ">> Packaging Citadel v$(VERSION) for windows-x86_64"
 	cargo build --release
-	cargo build --release -p citadel-client-ffi
 	$(eval PKG_NAME := citadel-windows-x86_64-v$(VERSION))
 	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
 	@rm -rf "$(PKG_STAGE)"
 	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps"
-	@mkdir -p "$(PKG_STAGE)/clients/unity/Citadel"
-	@mkdir -p "$(PKG_STAGE)/clients/unity/Demo"
-	@mkdir -p "$(PKG_STAGE)/clients/unity/Plugins/x86_64"
 	cp target/release/citadel.exe "$(PKG_STAGE)/citadel.exe"
 	sed 's|scripts_dir = "./game"|scripts_dir = "./scripts"|' citadel.toml > "$(PKG_STAGE)/citadel.toml"
 	cp packaging/server/scripts/main.lua "$(PKG_STAGE)/scripts/main.lua"
 	cp packaging/windows/README.md "$(PKG_STAGE)/README.md"
-	cp clients/unity/Citadel/*.cs "$(PKG_STAGE)/clients/unity/Citadel/"
-	cp clients/unity/Demo/*.cs "$(PKG_STAGE)/clients/unity/Demo/"
-	cp target/release/citadel_client_ffi.dll "$(PKG_STAGE)/clients/unity/Plugins/x86_64/"
-	cp packaging/windows/unity-README.md "$(PKG_STAGE)/clients/unity/README.md"
 	@rm -f "$(DIST_DIR)/$(PKG_NAME).zip"
 	cd "$(DIST_DIR)" && zip -r "$(PKG_NAME).zip" "$(PKG_NAME)"
 	@echo ">> Packaged $(DIST_DIR)/$(PKG_NAME).zip"
@@ -230,26 +222,22 @@ package-linux: ## Stage + zip a portable Linux server ($(DIST_DIR)/citadel-linux
 	@echo ">> Packaged $(DIST_DIR)/$(PKG_NAME).zip"
 
 # --- macOS release package -------------------------------------------------
-# Build the standalone server + Unity plugin for the active native macOS
-# architecture. The release workflow runs this target once on Apple Silicon and
-# once on Intel, yielding distinct, architecture-correct archives.
+# Build the standalone server for the active native macOS architecture. Client
+# SDKs are published separately. The release workflow runs this target once on
+# Apple Silicon and once on Intel, yielding distinct, architecture-correct
+# archives.
 package-macos: ## Stage + zip the macOS release for the native arch ($(DIST_DIR)/citadel-macos-<arch>-v{version}.zip)
 	@case "$(MACOS_ARCH)" in aarch64|x86_64) ;; *) echo "!! Unsupported macOS architecture: $(MACOS_ARCH)"; exit 1 ;; esac
 	@echo ">> Packaging Citadel v$(VERSION) for macos-$(MACOS_ARCH)"
 	MACOSX_DEPLOYMENT_TARGET="$(MACOS_DEPLOYMENT_TARGET)" cargo build --release
-	MACOSX_DEPLOYMENT_TARGET="$(MACOS_DEPLOYMENT_TARGET)" cargo build --release -p citadel-client-ffi
 	$(eval PKG_NAME := citadel-macos-$(MACOS_ARCH)-v$(VERSION))
 	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
 	@rm -rf "$(PKG_STAGE)"
-	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps" "$(PKG_STAGE)/clients/unity/Citadel" "$(PKG_STAGE)/clients/unity/Demo" "$(PKG_STAGE)/clients/unity/Plugins/macOS"
+	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps"
 	cp target/release/citadel "$(PKG_STAGE)/citadel"
 	sed 's|scripts_dir = "./game"|scripts_dir = "./scripts"|' citadel.toml > "$(PKG_STAGE)/citadel.toml"
 	cp packaging/server/scripts/main.lua "$(PKG_STAGE)/scripts/main.lua"
 	cp packaging/macos/README.md "$(PKG_STAGE)/README.md"
-	cp clients/unity/Citadel/*.cs "$(PKG_STAGE)/clients/unity/Citadel/"
-	cp clients/unity/Demo/*.cs "$(PKG_STAGE)/clients/unity/Demo/"
-	cp target/release/libcitadel_client_ffi.dylib "$(PKG_STAGE)/clients/unity/Plugins/macOS/"
-	cp packaging/macos/unity-README.md "$(PKG_STAGE)/clients/unity/README.md"
 	@if [ -n "$(MACOS_SIGN_IDENTITY)" ]; then \
 		bash scripts/sign-macos-artifacts.sh "$(PKG_STAGE)" "$(MACOS_SIGN_IDENTITY)"; \
 	else \

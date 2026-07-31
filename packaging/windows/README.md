@@ -10,7 +10,7 @@ citadel/
 ├── citadel.toml       # editable config (loaded automatically)
 ├── scripts/main.lua   # Lua game logic (hot-reloads on save)
 ├── data.sqlite        # auto-created + migrated on first run
-└── clients/unity/     # Unity client plugin (C# bindings + native DLL + README)
+└── maps/              # optional cooked level geometry
 ```
 
 ## 1. Run the server
@@ -64,13 +64,12 @@ With the server running, open a browser at:
   connection/session/message gauges).
 - <http://127.0.0.1:7350/health> — liveness check.
 
-## 4. Connect a Unity client
+## 4. Connect a game client
 
-`clients/unity/` is a drop-in Unity plugin (C# bindings + the native
-`citadel_client_ffi.dll`) that connects over QUIC. See
-`clients/unity/README.md` for how to import it into a Unity project and wire up
-the sample scene. Point the client at this server's QUIC address
-(`127.0.0.1:7351` by default).
+Server archives intentionally contain no client SDKs. Download the dedicated
+Unity, Unreal, Godot, or browser SDK archive from the same Citadel release, then
+follow that SDK's import instructions. Point the client at this server's QUIC
+address (`127.0.0.1:7351` by default).
 
 ## Configuration
 

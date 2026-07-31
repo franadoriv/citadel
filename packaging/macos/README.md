@@ -11,7 +11,7 @@ citadel/
 ├── citadel.toml        # editable config, discovered automatically
 ├── scripts/main.lua    # Lua game logic, hot-reloaded on save
 ├── data.sqlite         # auto-created and migrated on first run
-└── clients/unity/      # Unity C# bindings + native macOS library
+└── maps/               # optional cooked level geometry
 ```
 
 ## 1. Run the server
@@ -50,5 +50,5 @@ Open <http://127.0.0.1:7350/dashboard> after starting the server. Edit
 and RPCs. With `runtime.hot_reload = true`, a valid edit reloads without a
 restart; a broken edit leaves the previous script serving.
 
-See `clients/unity/README.md` to import the included Unity bindings, or download
-the dedicated Unity, Unreal, or Godot package matching this macOS architecture.
+Server archives intentionally contain no client SDKs. Download the dedicated
+Unity, Unreal, or Godot package matching this macOS architecture.

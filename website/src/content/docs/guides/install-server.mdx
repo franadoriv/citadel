@@ -10,6 +10,11 @@ a supported operating system shown below from the [GitHub Releases](https://gith
 page, extract it, then run the included server. You do **not** need to clone
 the repository, install Rust, or compile anything.
 
+Server archives are deliberately server-only: they contain the server binary,
+configuration, starter game script, maps directory, and any platform service
+files, but no client SDK or engine asset. Download a dedicated client SDK archive
+from the same release when you need one.
+
 Each release also includes `SHA256SUMS.txt`. Download it beside the archive and
 verify **the archive you selected** before extracting it. The manifest lists all
 release assets, so do not run `sha256sum -c SHA256SUMS.txt` unless you downloaded

@@ -523,26 +523,22 @@ function Get-CargoVersion {
 }
 
 function Invoke-PackageWindows {
-    # Build the server + Unity plugin DLL, stage the release layout, and zip it.
-    # This is the shared definition the release CI reuses (windows-latest calls
-    # this target) and the local verification path.
+    # Build the server, stage the server-only release layout, and zip it. Client
+    # SDKs are produced by separate package-client-* targets. This is the shared
+    # definition the release CI reuses (windows-latest calls this target) and the
+    # local verification path.
     $version = Get-CargoVersion
     Write-Host ">> Packaging Citadel v$version for windows-x86_64"
 
     Invoke-Native -FilePath "cargo" -Arguments @("build", "--release")
-    Invoke-Native -FilePath "cargo" -Arguments @("build", "--release", "-p", "citadel-client-ffi")
 
     $pkgName = "citadel-windows-x86_64-v$version"
     $distDir = Join-Path $RepoRoot $DistDir
     $stage = Join-Path $distDir $pkgName
-    $unityRoot = Join-Path $stage "clients\unity"
 
     if (Test-Path -LiteralPath $stage) {
         Remove-Item -LiteralPath $stage -Recurse -Force
     }
-    New-Item -ItemType Directory -Path (Join-Path $unityRoot "Citadel") -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $unityRoot "Demo") -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $unityRoot "Plugins\x86_64") -Force | Out-Null
     $scriptsDir = Join-Path $stage "scripts"
     New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $stage "maps") -Force | Out-Null
@@ -558,16 +554,6 @@ function Invoke-PackageWindows {
     Set-Content -LiteralPath (Join-Path $stage "citadel.toml") -Value $toml -Encoding utf8 -NoNewline
     Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\server\scripts\main.lua") -Destination (Join-Path $scriptsDir "main.lua") -Force
     Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\windows\README.md") -Destination (Join-Path $stage "README.md") -Force
-
-    # Unity plugin: C# bindings + native DLL + import README.
-    Copy-Item -Path (Join-Path $RepoRoot "clients\unity\Citadel\*.cs") -Destination (Join-Path $unityRoot "Citadel") -Force
-    Copy-Item -Path (Join-Path $RepoRoot "clients\unity\Demo\*.cs") -Destination (Join-Path $unityRoot "Demo") -Force
-    $dll = Join-Path $RepoRoot "target\release\citadel_client_ffi.dll"
-    if (-not (Test-Path -LiteralPath $dll)) {
-        throw "Expected native plugin not found: $dll. Did the release build succeed?"
-    }
-    Copy-Item -LiteralPath $dll -Destination (Join-Path $unityRoot "Plugins\x86_64") -Force
-    Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\windows\unity-README.md") -Destination (Join-Path $unityRoot "README.md") -Force
 
     # Zip the staged package.
     $zipPath = Join-Path $distDir "$pkgName.zip"
