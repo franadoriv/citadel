@@ -35,6 +35,7 @@ use crate::matchmaker_cluster::{
     RemoteMatchmakerTicketSubmission, TicketCancellationHandler, TicketStatusHandler,
     TicketSubmissionHandler,
 };
+use crate::runtime::cluster::{RuntimeCacheMutation, RuntimeCacheWrite, RuntimeClusterEvent};
 use crate::session::NodeId;
 use crate::time::{Clock, SystemClock, TimestampMillis};
 
@@ -189,6 +190,9 @@ enum NodeCommand {
     DeliverChat(RemoteChatDelivery),
     AdvertiseChatPresence(ChatPresenceLease),
     WithdrawChatPresence(ChatPresenceWithdrawal),
+    DeliverRuntimeEvent(RuntimeClusterEvent),
+    ApplyRuntimeCacheMutation(RuntimeCacheMutation),
+    SubmitRuntimeCacheWrite(RuntimeCacheWrite),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +228,9 @@ enum ControlResponse {
     },
     ChatPresence {
         update: ChatLeaseUpdate,
+    },
+    RuntimePropagation {
+        accepted: bool,
     },
 }
 
@@ -270,6 +277,9 @@ struct RouterState {
     chat_delivery_handler: Mutex<Option<ChatDeliveryHandler>>,
     chat_presence_handler: Mutex<Option<ChatPresenceHandler>>,
     chat_dedupe: ChatCommandDedupe,
+    runtime_event_handler: Mutex<Option<RuntimeEventHandler>>,
+    runtime_cache_handler: Mutex<Option<RuntimeCacheMutationHandler>>,
+    runtime_cache_write_handler: Mutex<Option<RuntimeCacheWriteHandler>>,
     dedupe: Mutex<CommandDedupe>,
 }
 
@@ -290,6 +300,14 @@ pub type ChatDeliveryHandler =
 /// session or participant handle.
 pub type ChatPresenceHandler =
     Arc<dyn Fn(NodeId, ChatPresenceCommand) -> ChatLeaseUpdate + Send + Sync>;
+
+/// Receiver for one authenticated, at-least-once runtime event.
+pub type RuntimeEventHandler = Arc<dyn Fn(NodeId, RuntimeClusterEvent) -> bool + Send + Sync>;
+/// Receiver for one fenced runtime cache mutation or invalidation.
+pub type RuntimeCacheMutationHandler =
+    Arc<dyn Fn(NodeId, RuntimeCacheMutation) -> bool + Send + Sync>;
+/// Receiver for a cache write that the current global writer must fence.
+pub type RuntimeCacheWriteHandler = Arc<dyn Fn(NodeId, RuntimeCacheWrite) -> bool + Send + Sync>;
 
 /// Typed update transported to peers so every node can resolve channel
 /// destinations from the same fenced lease view.
@@ -399,6 +417,9 @@ impl TlsMatchmakerHandoffRouter {
                 chat_delivery_handler: Mutex::new(None),
                 chat_presence_handler: Mutex::new(None),
                 chat_dedupe: ChatCommandDedupe::new(MAX_DEDUPED_COMMANDS),
+                runtime_event_handler: Mutex::new(None),
+                runtime_cache_handler: Mutex::new(None),
+                runtime_cache_write_handler: Mutex::new(None),
                 dedupe: Mutex::new(CommandDedupe::default()),
             }),
         })
@@ -465,6 +486,28 @@ impl TlsMatchmakerHandoffRouter {
     /// The mTLS source identity is rechecked before the callback is invoked.
     pub fn register_chat_presence_handler(&self, handler: ChatPresenceHandler) {
         if let Ok(mut slot) = self.state.chat_presence_handler.lock() {
+            *slot = Some(handler);
+        }
+    }
+
+    /// Install the local runtime-event receiver. It must tolerate a duplicate
+    /// event ID because the bounded control-plane dedupe is not durable.
+    pub fn register_runtime_event_handler(&self, handler: RuntimeEventHandler) {
+        if let Ok(mut slot) = self.state.runtime_event_handler.lock() {
+            *slot = Some(handler);
+        }
+    }
+
+    /// Install the local fenced cache mutation receiver.
+    pub fn register_runtime_cache_handler(&self, handler: RuntimeCacheMutationHandler) {
+        if let Ok(mut slot) = self.state.runtime_cache_handler.lock() {
+            *slot = Some(handler);
+        }
+    }
+
+    /// Install the current global cache writer's submission boundary.
+    pub fn register_runtime_cache_write_handler(&self, handler: RuntimeCacheWriteHandler) {
+        if let Ok(mut slot) = self.state.runtime_cache_write_handler.lock() {
             *slot = Some(handler);
         }
     }
@@ -697,6 +740,45 @@ impl TlsMatchmakerHandoffRouter {
         }
     }
 
+    /// Deliver one typed runtime event over the authenticated control plane.
+    pub fn deliver_runtime_event(
+        &self,
+        destination: &NodeId,
+        event: RuntimeClusterEvent,
+    ) -> Result<bool, MatchmakerRouterError> {
+        match self.send(destination, NodeCommand::DeliverRuntimeEvent(event))? {
+            ControlResponse::RuntimePropagation { accepted } => Ok(accepted),
+            _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
+        }
+    }
+
+    /// Apply one fenced cache value or invalidation on a peer.
+    pub fn apply_runtime_cache_mutation(
+        &self,
+        destination: &NodeId,
+        mutation: RuntimeCacheMutation,
+    ) -> Result<bool, MatchmakerRouterError> {
+        match self.send(
+            destination,
+            NodeCommand::ApplyRuntimeCacheMutation(mutation),
+        )? {
+            ControlResponse::RuntimePropagation { accepted } => Ok(accepted),
+            _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
+        }
+    }
+
+    /// Forward one local cache mutation to the current global cache writer.
+    pub fn submit_runtime_cache_write(
+        &self,
+        destination: &NodeId,
+        write: RuntimeCacheWrite,
+    ) -> Result<bool, MatchmakerRouterError> {
+        match self.send(destination, NodeCommand::SubmitRuntimeCacheWrite(write))? {
+            ControlResponse::RuntimePropagation { accepted } => Ok(accepted),
+            _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
+        }
+    }
+
     /// Snapshot configured peer nodes for a narrow typed broadcaster.
     ///
     /// This does not expose endpoints or transport internals to the caller.
@@ -877,6 +959,66 @@ fn dispatch(
                 Some(match_id) => Ok(ControlResponse::Admitted { match_id }),
                 None => Ok(ControlResponse::Rejected),
             }
+        }
+        NodeCommand::DeliverRuntimeEvent(event) => {
+            if event.id.source_node != source
+                || event.event.payload.len() > MAX_FRAME_BYTES / 2
+                || crate::runtime::RuntimeEvent::new(
+                    event.event.namespace.clone(),
+                    event.event.event_type.clone(),
+                    event.event.payload.clone(),
+                )
+                .is_err()
+            {
+                return Ok(ControlResponse::RuntimePropagation { accepted: false });
+            }
+            let handler = state
+                .runtime_event_handler
+                .lock()
+                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
+                .clone();
+            Ok(ControlResponse::RuntimePropagation {
+                accepted: handler.is_some_and(|handler| handler(source, event)),
+            })
+        }
+        NodeCommand::ApplyRuntimeCacheMutation(mutation) => {
+            if mutation.fence.owner_node != source
+                || mutation.namespace.len() > 80
+                || mutation.key.len() > 80
+                || mutation
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_FRAME_BYTES / 2)
+            {
+                return Ok(ControlResponse::RuntimePropagation { accepted: false });
+            }
+            let handler = state
+                .runtime_cache_handler
+                .lock()
+                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
+                .clone();
+            Ok(ControlResponse::RuntimePropagation {
+                accepted: handler.is_some_and(|handler| handler(source, mutation)),
+            })
+        }
+        NodeCommand::SubmitRuntimeCacheWrite(write) => {
+            if write.namespace.len() > 80
+                || write.key.len() > 80
+                || write
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_FRAME_BYTES / 2)
+            {
+                return Ok(ControlResponse::RuntimePropagation { accepted: false });
+            }
+            let handler = state
+                .runtime_cache_write_handler
+                .lock()
+                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
+                .clone();
+            Ok(ControlResponse::RuntimePropagation {
+                accepted: handler.is_some_and(|handler| handler(source, write)),
+            })
         }
         NodeCommand::DeliverChat(delivery) => {
             if delivery.channel_id.is_empty()
@@ -1092,12 +1234,77 @@ mod tests {
     }
 
     #[test]
+    fn runtime_propagation_rejects_forged_source_fences_before_handlers() {
+        let (_, cert_a) = identity();
+        let (identity_b, _) = identity();
+        let node_a = node("node-a");
+        let node_b = node("node-b");
+        let router = TlsMatchmakerHandoffRouter::new(
+            node_b.clone(),
+            identity_b,
+            BTreeMap::from([(node_a.clone(), cert_a)]),
+            BTreeMap::new(),
+            Duration::from_secs(2),
+        )
+        .expect("router");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_event = Arc::clone(&calls);
+        router.register_runtime_event_handler(Arc::new(move |_, _| {
+            calls_for_event.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let calls_for_cache = Arc::clone(&calls);
+        router.register_runtime_cache_handler(Arc::new(move |_, _| {
+            calls_for_cache.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let event =
+            crate::runtime::RuntimeEvent::new("match", "changed", Vec::new()).expect("event");
+        assert!(matches!(
+            dispatch(
+                &router.state,
+                node_a.clone(),
+                NodeCommand::DeliverRuntimeEvent(RuntimeClusterEvent {
+                    id: crate::runtime::cluster::RuntimeClusterEventId {
+                        source_node: node_b.clone(),
+                        sequence: 1,
+                    },
+                    event,
+                }),
+            ),
+            Ok(ControlResponse::RuntimePropagation { accepted: false })
+        ));
+        assert!(matches!(
+            dispatch(
+                &router.state,
+                node_a,
+                NodeCommand::ApplyRuntimeCacheMutation(RuntimeCacheMutation {
+                    namespace: "match".to_owned(),
+                    key: "score".to_owned(),
+                    value: Some(Vec::new()),
+                    expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                    fence: crate::runtime::cluster::RuntimeCacheFence {
+                        owner_node: node_b,
+                        generation: OwnershipGeneration::new(1),
+                        sequence: 1,
+                    },
+                }),
+            ),
+            Ok(ControlResponse::RuntimePropagation { accepted: false })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn mutual_tls_transport_delivers_and_admits_over_a_real_listener() {
         let (identity_a, cert_a) = identity();
         let (identity_b, cert_b) = identity();
         let node_a = node("node-a");
         let node_b = node("node-b");
         let chat_deliveries = Arc::new(AtomicUsize::new(0));
+        let runtime_events = Arc::new(AtomicUsize::new(0));
+        let runtime_mutations = Arc::new(AtomicUsize::new(0));
+        let runtime_writes = Arc::new(AtomicUsize::new(0));
         let chat_directory = Arc::new(crate::chat_cluster::ChatPresenceDirectory::default());
         let chat_presence = Arc::new(ChatPresenceRegistry::new());
         chat_presence.join(
@@ -1129,6 +1336,27 @@ mod tests {
             )
             .expect("router b"),
         );
+        let runtime_events_for_handler = Arc::clone(&runtime_events);
+        router_b.register_runtime_event_handler(Arc::new(move |source, event| {
+            source.as_str() == "node-a" && event.id.source_node == source && {
+                runtime_events_for_handler.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }));
+        let runtime_mutations_for_handler = Arc::clone(&runtime_mutations);
+        router_b.register_runtime_cache_handler(Arc::new(move |source, mutation| {
+            source.as_str() == "node-a" && mutation.fence.owner_node == source && {
+                runtime_mutations_for_handler.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }));
+        let runtime_writes_for_handler = Arc::clone(&runtime_writes);
+        router_b.register_runtime_cache_write_handler(Arc::new(move |source, write| {
+            source.as_str() == "node-a" && write.namespace == "match" && {
+                runtime_writes_for_handler.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }));
         router_b.register_admission_handler(Arc::new(|request| {
             (request.ticket_id.as_str() == "remote-ticket")
                 .then_some(99)
@@ -1233,7 +1461,7 @@ mod tests {
         let admission = RemoteMatchmakerAdmission {
             ticket_id: handoff.ticket_id,
             user_id: "alice".to_owned(),
-            requester_node: node_a,
+            requester_node: node_a.clone(),
             join_token: handoff.join_token,
             formation_lease: handoff.formation_lease,
         };
@@ -1303,6 +1531,57 @@ mod tests {
             "the authenticated listener rejects a bounded typed command before it reaches local delivery"
         );
         assert_eq!(chat_deliveries.load(Ordering::SeqCst), 2);
+        let runtime_event =
+            crate::runtime::RuntimeEvent::new("match", "score.changed", b"payload".to_vec())
+                .expect("runtime event");
+        assert!(
+            router_a
+                .deliver_runtime_event(
+                    &node_b,
+                    RuntimeClusterEvent {
+                        id: crate::runtime::cluster::RuntimeClusterEventId {
+                            source_node: node_a.clone(),
+                            sequence: 1,
+                        },
+                        event: runtime_event,
+                    },
+                )
+                .expect("mutual TLS runtime event")
+        );
+        assert!(
+            router_a
+                .apply_runtime_cache_mutation(
+                    &node_b,
+                    RuntimeCacheMutation {
+                        namespace: "match".to_owned(),
+                        key: "score".to_owned(),
+                        value: Some(b"9".to_vec()),
+                        expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                        fence: crate::runtime::cluster::RuntimeCacheFence {
+                            owner_node: node_a.clone(),
+                            generation: OwnershipGeneration::new(1),
+                            sequence: 1,
+                        },
+                    },
+                )
+                .expect("mutual TLS runtime cache mutation")
+        );
+        assert!(
+            router_a
+                .submit_runtime_cache_write(
+                    &node_b,
+                    RuntimeCacheWrite {
+                        namespace: "match".to_owned(),
+                        key: "score".to_owned(),
+                        value: None,
+                        expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                    },
+                )
+                .expect("mutual TLS runtime cache write")
+        );
+        assert_eq!(runtime_events.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime_mutations.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime_writes.load(Ordering::SeqCst), 1);
         drop(listener);
     }
 }

@@ -375,8 +375,9 @@ The optional cluster section enables the live cross-node matchmaker. It is a
 **durable** feature: startup rejects `cluster.enabled = true` without a
 `database.url`. The active shard owner is selected by a stored generation-fenced
 lease; a non-owner forwards ticket submit/cancel/status, handoff delivery, and
-admission through a bounded mutual-TLS connection. Citadel does not proxy
-realtime sockets or expose a general inter-node message tunnel.
+admission through a bounded mutual-TLS connection. The same typed control plane
+also carries bounded runtime-event fan-out and fenced cache mutations; Citadel
+does not proxy realtime sockets or expose a general inter-node message tunnel.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -395,6 +396,20 @@ Every `[[cluster.peers]]` entry requires `node_id`, `control_addr`,
 certificate used to pin that identity after the CA validates TLS. The peer leaf
 must carry `server_name` in its DNS SAN. See the complete ordered setup in
 [Run a two-node matchmaker](/guides/distributed-matchmaker/).
+
+With `cluster.enabled`, a locally accepted runtime event is also offered to
+configured peers through a bounded asynchronous queue. Delivery is
+best-effort delivery attempt: peer outages or a full queue can lose a remote
+copy, and no retry or replay is promised. Cache writes, CAS writes, and deletes
+first commit to the caller's node-local cache, then are offered to a bounded
+queue for the current durable global cache-writer lease. The writer propagates
+last-writer-wins fenced mutations with an absolute expiry timestamp. Queue
+saturation, a peer outage, or a failover can lose that remote attempt; a
+successful local call is never a global commit. A writer failover advances the
+durable fence, so delayed mutations from an older writer are rejected. Cache
+values remain memory-only: they are neither globally linearizable nor durable,
+local CAS versions are node-local, and a peer restart does not replay cache
+contents.
 
 ### `[storage]`
 
@@ -511,6 +526,61 @@ the console's `GET /console/v1/runtime` response. The status object includes the
 configured language (when set), selected language, selection source
 (`explicit`/`autodetected`), entrypoint path, adapter, tier, and scripts
 directory.
+
+### `[runtime.capabilities.custom_http_endpoints]`
+
+Opt-in policy for script registrations made through `citadel.http.register`.
+Every registered route is served under the reserved `/ext` prefix; the script
+never receives router access or the session bearer used for authentication.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Enables endpoint registration during runtime startup and reload. Disabled scripts cannot add external routes. |
+| `max_request_bytes` | integer | `65536` | Maximum buffered request body per invocation. |
+| `max_response_bytes` | integer | `1048576` | Maximum script response body. An oversized response becomes a generic `500`. |
+| `max_requests_per_minute` | integer | `120` | Node-local fixed-window limit per endpoint, caller identity (or anonymous), and source IP. |
+
+Only `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` can be registered. A script
+chooses `auth = "public"` or `auth = "session"` for each path. Runtime source
+reloads preserve this operator-owned policy and publish a complete new registry
+only after all registrations succeed.
+
+### `[runtime.capabilities.events]`
+
+Opt-in, process-local event queue for `citadel.events.emit` and
+`citadel.events.subscribe`. Version one is best-effort: Citadel does not
+persist, retry, replicate, or replay accepted events after restart. Events are
+therefore not a substitute for storage, a job queue, or cluster messaging.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Enables the node-local event surface. `emit` returns `false` while disabled or when an event is dropped. |
+| `queue_capacity` | integer | `1024` | Fixed maximum number of pending events for this node. |
+| `max_event_bytes` | integer | `16384` | Maximum opaque binary payload accepted by `emit`. |
+| `max_events_per_minute` | integer | `600` | Node-local fixed-window rate limit per namespace. |
+
+### `[runtime.capabilities.shared_cache]`
+
+Opt-in mutable cache shared by all Lua, Python, and JavaScript runtime VMs on
+this process. Without `[cluster]` it is node-local. With `cluster.enabled`,
+nodes offer mutations to a bounded queue for a single durable global writer
+lease and receive best-effort fenced fan-out. A successful API call is a local
+cache update, not a cluster-wide commit. Values themselves stay non-durable and
+are not replayed after restart; use durable storage when a value must survive a
+restart. Script hot reloads retain the same node-owned cache.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Enables `citadel.cache`; calls fail while disabled. |
+| `max_entries` | integer | `1024` | Maximum entries across all namespaces on this node. Inserting a new key at capacity evicts the entry nearest expiry. |
+| `max_value_bytes` | integer | `65536` | Maximum opaque binary value accepted by `set` or `cas`. |
+| `max_ttl_ms` | integer | `3600000` | Maximum TTL for one value; expiration is lazy on subsequent cache access. |
+
+Namespaces and keys use 1–80 ASCII alphanumeric, `.`, `_`, or `-` characters.
+The API exposes `get`, `set`, `delete`, and versioned atomic `cas`; all four
+are unavailable in `before_realtime` and `after_realtime` hooks, which remain
+observational. Expired entries disappear lazily when that key or the cache is
+accessed. Node metrics expose capacity evictions.
 
 `maps_dir` is scanned once at startup: every well-formed `.map` (CMAP level
 geometry, produced by the map cook tool) is loaded and indexed by file stem. When

@@ -43,6 +43,9 @@ pub struct NodeMetrics {
     websocket_pings_sent_total: AtomicU64,
     websocket_pongs_received_total: AtomicU64,
     websocket_liveness_timeouts_total: AtomicU64,
+    runtime_events_queued_total: AtomicU64,
+    runtime_events_dropped_total: AtomicU64,
+    runtime_shared_cache_evictions_total: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -141,6 +144,24 @@ impl NodeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one event accepted by the local runtime event queue.
+    pub fn record_runtime_event_queued(&self) {
+        self.runtime_events_queued_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one best-effort runtime event rejected by a local bound.
+    pub fn record_runtime_event_dropped(&self) {
+        self.runtime_events_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one entry evicted from the bounded node-local runtime cache.
+    pub fn record_runtime_shared_cache_eviction(&self) {
+        self.runtime_shared_cache_evictions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a consistent-enough snapshot for reporting.
     ///
     /// Values are read independently, so a snapshot may interleave concurrent
@@ -169,6 +190,11 @@ impl NodeMetrics {
                 .load(Ordering::Relaxed),
             websocket_liveness_timeouts_total: self
                 .websocket_liveness_timeouts_total
+                .load(Ordering::Relaxed),
+            runtime_events_queued_total: self.runtime_events_queued_total.load(Ordering::Relaxed),
+            runtime_events_dropped_total: self.runtime_events_dropped_total.load(Ordering::Relaxed),
+            runtime_shared_cache_evictions_total: self
+                .runtime_shared_cache_evictions_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -208,6 +234,13 @@ pub struct NodeMetricsSnapshot {
     pub websocket_pongs_received_total: u64,
     /// WebSocket sessions closed after their Pong deadline elapsed.
     pub websocket_liveness_timeouts_total: u64,
+    /// Events accepted by the node-local runtime event bus.
+    pub runtime_events_queued_total: u64,
+    /// Events dropped by the node-local runtime event bus because a configured
+    /// capacity, payload, or rate bound rejected them.
+    pub runtime_events_dropped_total: u64,
+    /// Entries evicted because the node-local runtime cache reached its entry bound.
+    pub runtime_shared_cache_evictions_total: u64,
 }
 
 /// Build the [`EnvFilter`] for the given level directive.

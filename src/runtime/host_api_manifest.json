@@ -476,5 +476,42 @@
     "returns": "response:table",
     "status": "shipped",
     "since": "pre-1.0"
+  },
+  {
+    "name": "http.register",
+    "category": "http",
+    "params": [
+      "method:string",
+      "path:string",
+      "options:table?",
+      "handler:function"
+    ],
+    "returns": "handler:function",
+    "status": "shipped",
+    "since": "TASK-0416"
+  },
+  {
+    "name": "events.emit",
+    "category": "event",
+    "params": [
+      "namespace:string",
+      "type:string",
+      "payload:bytes"
+    ],
+    "returns": "queued:bool",
+    "status": "shipped",
+    "since": "TASK-0417"
+  },
+  {
+    "name": "events.subscribe",
+    "category": "event",
+    "params": [
+      "namespace:string",
+      "type:string",
+      "handler:function"
+    ],
+    "returns": "handler:function",
+    "status": "shipped",
+    "since": "TASK-0417"
   }
 ]

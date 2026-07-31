@@ -38,8 +38,12 @@
 //! (`docs/architecture/runtime-contract.md`) so other languages can adopt the
 //! same shape later.
 
+pub mod cache_lease;
+pub mod cluster;
+pub mod event_bus;
 pub mod host_api_spec;
 pub mod host_services;
+pub mod http_endpoint;
 #[cfg(feature = "runtime-js")]
 pub mod js;
 pub mod lua;
@@ -48,14 +52,26 @@ pub mod outbound_http;
 pub mod python;
 #[cfg(feature = "runtime-python")]
 mod python_bundle;
+pub mod shared_cache;
 pub(crate) mod static_data;
 
 use std::time::Duration;
 
+pub use event_bus::{
+    MAX_RUNTIME_EVENTS_PER_INVOCATION, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    RuntimeEventEmitOutcome, RuntimeEventError, RuntimeEventPolicy, RuntimeEventPublisher,
+    disabled_runtime_event_bus_handle, is_valid_runtime_event_name, runtime_event_bus,
+    set_runtime_event_bus,
+};
 pub use host_api_spec::{HOST_API_SURFACE, HostApiCategory, HostApiFn, HostApiStatus};
 pub use host_services::{
     DomainHost, FriendRowDto, ServiceDomainHost, StorageIndexObjectDto, StorageObjectDto,
     StorageWriteInput,
+};
+pub use http_endpoint::{
+    RUNTIME_HTTP_ENDPOINT_PREFIX, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointError,
+    RuntimeHttpEndpointPolicy, RuntimeHttpEndpointRateLimiter, RuntimeHttpMethod,
+    RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
 };
 #[cfg(feature = "runtime-js")]
 pub use js::{JS_ENTRYPOINT, JsRuntime};
@@ -69,7 +85,50 @@ pub use python::PythonRuntime;
 pub use python_bundle::{
     BundledPythonEnv, configure_bundled_python_runtime, detect_bundled_python_runtime,
 };
+pub use shared_cache::{
+    RuntimeCachePublisher, RuntimeSharedCache, RuntimeSharedCacheError, RuntimeSharedCacheHandle,
+    RuntimeSharedCachePolicy, RuntimeSharedCacheValue, disabled_runtime_shared_cache_handle,
+    runtime_shared_cache, set_runtime_shared_cache,
+};
 pub(crate) use static_data::DEFAULT_STATIC_DATA_MAX_FILE_BYTES;
+
+/// Keep event-snapshot delivery within the same aggregate fan-out envelope as
+/// one ordinary runtime invocation. Each subscriber has its own bounded sink,
+/// but a full queue must not multiply that bound by the queue capacity.
+pub(crate) fn append_runtime_event_commands(
+    commands: &mut Vec<OutboundCommand>,
+    event_commands: Vec<OutboundCommand>,
+    source_label: &str,
+) {
+    const MAX_COMMANDS: usize = 1_024;
+    const MAX_BODY_BYTES: usize = 1 << 20;
+
+    let mut body_bytes = commands
+        .iter()
+        .map(outbound_command_body_bytes)
+        .sum::<usize>();
+    for command in event_commands {
+        let command_bytes = outbound_command_body_bytes(&command);
+        if commands.len() >= MAX_COMMANDS
+            || body_bytes.saturating_add(command_bytes) > MAX_BODY_BYTES
+        {
+            tracing::warn!(
+                script = %source_label,
+                "runtime event commands exceeded the per-invocation aggregate limit; dropping remainder"
+            );
+            break;
+        }
+        body_bytes = body_bytes.saturating_add(command_bytes);
+        commands.push(command);
+    }
+}
+
+fn outbound_command_body_bytes(command: &OutboundCommand) -> usize {
+    match command {
+        OutboundCommand::Broadcast { body, .. } | OutboundCommand::Send { body, .. } => body.len(),
+        _ => 0,
+    }
+}
 
 /// Decision returned by a runtime's pre-dispatch realtime interceptor.
 ///
@@ -191,6 +250,21 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// Run the room-join admission gate.
     fn call_room_join(&self, sender: u64, user_id: Option<&str>, room_id: u64) -> bool;
+
+    /// Snapshot the endpoint declarations registered while this runtime was
+    /// initialized. The HTTP transport uses this only to route under its
+    /// reserved prefix; it never permits a runtime to replace Citadel routes.
+    fn http_endpoints(&self) -> Vec<RuntimeHttpEndpoint> {
+        Vec::new()
+    }
+
+    /// Invoke one endpoint handler selected by the transport from
+    /// [`Self::http_endpoints`]. Implementations must apply the same error
+    /// isolation and invocation deadline as other synchronous host calls.
+    fn call_http_endpoint(&self, request: RuntimeHttpRequest) -> RuntimeHttpOutcome {
+        let _ = request;
+        RuntimeHttpOutcome::NotFound
+    }
 
     /// Whether a game-loop (`on_tick`) handler is registered.
     fn has_tick_handler(&self) -> bool;

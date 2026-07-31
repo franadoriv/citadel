@@ -18,9 +18,17 @@ use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
-use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::outbound_http::{OutboundHttpPolicy, OutboundHttpRequest, TrustedHttpClient};
 use crate::runtime::static_data::StaticDataCatalog;
-use crate::runtime::{RealtimeAfterOutcome, RealtimeInterception, Runtime};
+use crate::runtime::{
+    MAX_RUNTIME_EVENTS_PER_INVOCATION, RealtimeAfterOutcome, RealtimeInterception, Runtime,
+    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
+    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
+    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle,
+    append_runtime_event_commands, disabled_runtime_event_bus_handle,
+    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
+    set_runtime_event_bus, set_runtime_shared_cache,
+};
 use crate::services::PlayerNotification;
 use crate::storage::StorageIndexName;
 
@@ -81,6 +89,16 @@ const HANDLERS_KEY: &str = "citadel.handlers";
 
 /// Registry key under which the per-method RPC handler table is stored.
 const RPC_HANDLERS_KEY: &str = "citadel.rpc_handlers";
+
+/// Registry key for runtime HTTP endpoint declarations. Each value is a table
+/// containing the validated method/path/auth data and its Lua callback.
+const HTTP_ENDPOINT_HANDLERS_KEY: &str = "citadel.http_endpoint_handlers";
+
+/// Registry key for per-namespace/type ordered runtime event subscribers.
+const EVENT_HANDLERS_KEY: &str = "citadel.event_handlers";
+
+/// Bound per-key callback fan-out for a single local event snapshot.
+const MAX_RUNTIME_EVENT_SUBSCRIBERS: usize = 64;
 
 /// Registry key for the module cache (`require`d module name -> returned value).
 ///
@@ -478,6 +496,10 @@ pub struct LuaRuntime {
     /// The capability mode used when constructing this VM. Retained so a reload
     /// cannot accidentally change the script's authority.
     execution_mode: LuaExecutionMode,
+    outbound_http_policy: OutboundHttpPolicy,
+    http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    event_bus_handle: RuntimeEventBusHandle,
+    shared_cache_handle: RuntimeSharedCacheHandle,
 }
 
 impl std::fmt::Debug for LuaRuntime {
@@ -533,6 +555,46 @@ impl LuaRuntime {
         static_data_max_file_bytes: usize,
         execution_mode: LuaExecutionMode,
     ) -> AppResult<Option<Self>> {
+        Self::load_with_static_data_and_mode_and_http_policy(
+            scripts_dir,
+            deadline_ms,
+            static_data_dir,
+            static_data_max_file_bytes,
+            execution_mode,
+            OutboundHttpPolicy::default(),
+        )
+    }
+
+    /// Load Lua with an explicit outbound HTTP policy retained across reloads.
+    pub fn load_with_static_data_and_mode_and_http_policy(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+        execution_mode: LuaExecutionMode,
+        outbound_http_policy: OutboundHttpPolicy,
+    ) -> AppResult<Option<Self>> {
+        Self::load_with_static_data_and_mode_and_capability_policies(
+            scripts_dir,
+            deadline_ms,
+            static_data_dir,
+            static_data_max_file_bytes,
+            execution_mode,
+            outbound_http_policy,
+            RuntimeHttpEndpointPolicy::default(),
+        )
+    }
+
+    /// Load Lua with the complete operator-owned runtime extension policy.
+    pub fn load_with_static_data_and_mode_and_capability_policies(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+        execution_mode: LuaExecutionMode,
+        outbound_http_policy: OutboundHttpPolicy,
+        http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    ) -> AppResult<Option<Self>> {
         let main = scripts_dir.join("main.lua");
         if !main.is_file() {
             return Ok(None);
@@ -542,6 +604,8 @@ impl LuaRuntime {
         let module_root = scripts_dir.to_path_buf();
         let source_label = main.display().to_string();
         let static_data = StaticDataCatalog::new(static_data_dir, static_data_max_file_bytes)?;
+        let event_bus_handle = disabled_runtime_event_bus_handle();
+        let shared_cache_handle = disabled_runtime_shared_cache_handle();
         let lua = build_lua(
             &source,
             &source_label,
@@ -549,6 +613,12 @@ impl LuaRuntime {
             Some(&module_root),
             static_data.clone(),
             execution_mode,
+            LuaCapabilityPolicies {
+                outbound_http: outbound_http_policy.clone(),
+                http_endpoints: http_endpoint_policy,
+                event_bus_handle: Arc::clone(&event_bus_handle),
+                shared_cache_handle: Arc::clone(&shared_cache_handle),
+            },
         )?;
         let budget = Duration::from_millis(deadline_ms.max(1));
         Ok(Some(Self {
@@ -567,6 +637,10 @@ impl LuaRuntime {
             maps: None,
             transform_hub: None,
             execution_mode,
+            outbound_http_policy,
+            http_endpoint_policy,
+            event_bus_handle,
+            shared_cache_handle,
         }))
     }
 
@@ -585,6 +659,9 @@ impl LuaRuntime {
         let source_label = label.into();
         let static_data =
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let capability_policies = LuaCapabilityPolicies::default();
+        let event_bus_handle = Arc::clone(&capability_policies.event_bus_handle);
+        let shared_cache_handle = Arc::clone(&capability_policies.shared_cache_handle);
         let lua = build_lua(
             source,
             &source_label,
@@ -592,6 +669,7 @@ impl LuaRuntime {
             None,
             static_data.clone(),
             LuaExecutionMode::Sandboxed,
+            capability_policies,
         )?;
         let budget = Duration::from_millis(deadline_ms.max(1));
         Ok(Self {
@@ -609,6 +687,10 @@ impl LuaRuntime {
             maps: None,
             transform_hub: None,
             execution_mode: LuaExecutionMode::Sandboxed,
+            outbound_http_policy: OutboundHttpPolicy::default(),
+            http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+            event_bus_handle,
+            shared_cache_handle,
         })
     }
 
@@ -626,6 +708,9 @@ impl LuaRuntime {
         let source_label = label.into();
         let static_data =
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let capability_policies = LuaCapabilityPolicies::default();
+        let event_bus_handle = Arc::clone(&capability_policies.event_bus_handle);
+        let shared_cache_handle = Arc::clone(&capability_policies.shared_cache_handle);
         let lua = build_lua(
             source,
             &source_label,
@@ -633,6 +718,7 @@ impl LuaRuntime {
             Some(module_root),
             static_data.clone(),
             LuaExecutionMode::Sandboxed,
+            capability_policies,
         )?;
         let budget = Duration::from_millis(deadline_ms.max(1));
         Ok(Self {
@@ -650,6 +736,10 @@ impl LuaRuntime {
             maps: None,
             transform_hub: None,
             execution_mode: LuaExecutionMode::Sandboxed,
+            outbound_http_policy: OutboundHttpPolicy::default(),
+            http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+            event_bus_handle,
+            shared_cache_handle,
         })
     }
 
@@ -666,6 +756,21 @@ impl LuaRuntime {
             let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
             apply_domain_host(&guard.lua, &self.domain);
         }
+        self
+    }
+
+    /// Attach the node-owned local event bus. The indirection is retained
+    /// across hot reloads, while the bus itself remains process-local and
+    /// best-effort.
+    #[must_use]
+    pub fn with_event_bus(self, bus: Arc<RuntimeEventBus>) -> Self {
+        set_runtime_event_bus(&self.event_bus_handle, bus);
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_cache(self, cache: Arc<RuntimeSharedCache>) -> Self {
+        set_runtime_shared_cache(&self.shared_cache_handle, cache);
         self
     }
 
@@ -756,6 +861,71 @@ impl LuaRuntime {
         }
     }
 
+    /// Snapshot the atomically live set of Lua endpoint declarations.
+    #[must_use]
+    pub fn http_endpoints(&self) -> Vec<RuntimeHttpEndpoint> {
+        let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+        let Ok(handlers) = guard
+            .lua
+            .named_registry_value::<Table>(HTTP_ENDPOINT_HANDLERS_KEY)
+        else {
+            return Vec::new();
+        };
+        let mut endpoints: Vec<_> = handlers
+            .pairs::<String, Table>()
+            .flatten()
+            .filter_map(|(_, entry)| {
+                let method = entry
+                    .get::<String>("method")
+                    .ok()
+                    .and_then(|value| RuntimeHttpMethod::parse(&value))?;
+                let path = entry.get::<String>("path").ok()?;
+                let auth = entry
+                    .get::<String>("auth")
+                    .ok()
+                    .and_then(|value| RuntimeHttpAuth::parse(&value))?;
+                RuntimeHttpEndpoint::new(method, path, auth).ok()
+            })
+            .collect();
+        endpoints.sort_unstable();
+        endpoints
+    }
+
+    /// Invoke an endpoint handler under the same lock, deadline, panic
+    /// isolation, and command-sink discard policy as RPC calls.
+    pub fn call_http_endpoint(&self, request: RuntimeHttpRequest) -> RuntimeHttpOutcome {
+        let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+        let lua = &guard.lua;
+        let budget = self.budget;
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_sink(lua);
+            set_deadline(lua, Some(Instant::now() + budget));
+            let result = call_http_endpoint_handler(lua, request);
+            set_deadline(lua, None);
+            result
+        }));
+        clear_sink(lua);
+        match outcome {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    error = %error,
+                    "lua runtime HTTP endpoint handler failed; isolated"
+                );
+                RuntimeHttpOutcome::Failed
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    "lua runtime HTTP endpoint handler panicked; isolated"
+                );
+                set_deadline(lua, None);
+                RuntimeHttpOutcome::Failed
+            }
+        }
+    }
+
     /// Rebuild the VM from the backing script on disk and swap it in, failure-safe.
     ///
     /// The reload is deliberately two-phase so a broken edit can never take the
@@ -819,6 +989,12 @@ impl LuaRuntime {
             self.module_root.as_deref(),
             fresh_static_data.clone(),
             self.execution_mode,
+            LuaCapabilityPolicies {
+                outbound_http: self.outbound_http_policy.clone(),
+                http_endpoints: self.http_endpoint_policy,
+                event_bus_handle: Arc::clone(&self.event_bus_handle),
+                shared_cache_handle: Arc::clone(&self.shared_cache_handle),
+            },
         ) {
             Ok(lua) => lua,
             Err(e) => {
@@ -977,7 +1153,7 @@ impl LuaRuntime {
         body: &[u8],
         outcome: RealtimeAfterOutcome,
     ) {
-        let _ = self.run_locked("after_realtime", self.budget, |lua| {
+        let _ = self.run_locked_with_event_drain("after_realtime", self.budget, false, |lua| {
             let Some(handler) = lua.named_registry_value::<Option<Function>>(AFTER_REALTIME_KEY)?
             else {
                 return Ok(false);
@@ -1228,6 +1404,19 @@ impl LuaRuntime {
     where
         F: FnOnce(&Lua) -> mlua::Result<bool>,
     {
+        self.run_locked_with_event_drain(what, budget, true, call)
+    }
+
+    fn run_locked_with_event_drain<F>(
+        &self,
+        what: &str,
+        budget: Duration,
+        drain_events: bool,
+        call: F,
+    ) -> Vec<OutboundCommand>
+    where
+        F: FnOnce(&Lua) -> mlua::Result<bool>,
+    {
         // Recover a poisoned lock rather than propagate: a prior panic must not
         // wedge the whole runtime (state is only ever mutated under this lock and
         // is left consistent below). Holding the guard for the whole invocation
@@ -1244,10 +1433,32 @@ impl LuaRuntime {
             ran
         }));
         match outcome {
-            Ok(Ok(true)) => take_commands(lua, &guard.source_label, what),
+            Ok(Ok(true)) => {
+                let mut commands = take_commands(lua, &guard.source_label, what);
+                if drain_events {
+                    set_deadline(lua, Some(Instant::now() + budget));
+                    append_runtime_event_commands(
+                        &mut commands,
+                        dispatch_pending_runtime_events(lua, &guard.source_label, budget),
+                        &guard.source_label,
+                    );
+                    set_deadline(lua, None);
+                }
+                commands
+            }
             Ok(Ok(false)) => {
                 clear_sink(lua);
-                Vec::new()
+                let mut commands = Vec::new();
+                if drain_events {
+                    set_deadline(lua, Some(Instant::now() + budget));
+                    append_runtime_event_commands(
+                        &mut commands,
+                        dispatch_pending_runtime_events(lua, &guard.source_label, budget),
+                        &guard.source_label,
+                    );
+                    set_deadline(lua, None);
+                }
+                commands
             }
             Ok(Err(e)) => {
                 tracing::error!(
@@ -1410,6 +1621,14 @@ impl Runtime for LuaRuntime {
 
     fn call_room_join(&self, sender: u64, user_id: Option<&str>, room_id: u64) -> bool {
         LuaRuntime::call_room_join(self, sender, user_id, room_id)
+    }
+
+    fn http_endpoints(&self) -> Vec<RuntimeHttpEndpoint> {
+        LuaRuntime::http_endpoints(self)
+    }
+
+    fn call_http_endpoint(&self, request: RuntimeHttpRequest) -> RuntimeHttpOutcome {
+        LuaRuntime::call_http_endpoint(self, request)
     }
 
     fn has_tick_handler(&self) -> bool {
@@ -1604,6 +1823,150 @@ fn call_room_join_handler(
     Ok(Some(allow))
 }
 
+fn call_http_endpoint_handler(
+    lua: &Lua,
+    request: RuntimeHttpRequest,
+) -> mlua::Result<RuntimeHttpOutcome> {
+    let handlers: Table = match lua.named_registry_value(HTTP_ENDPOINT_HANDLERS_KEY) {
+        Ok(handlers) => handlers,
+        Err(_) => return Ok(RuntimeHttpOutcome::NotFound),
+    };
+    let key = format!("{} {}", request.method.as_str(), request.path);
+    let Some(entry) = handlers.get::<Option<Table>>(key)? else {
+        return Ok(RuntimeHttpOutcome::NotFound);
+    };
+    let handler: Function = entry.get("handler")?;
+    let value = lua.create_table()?;
+    value.set("method", request.method.as_str())?;
+    value.set("path", request.path)?;
+    value.set("body", lua.create_string(request.body)?)?;
+    if let Some(user_id) = request.user_id {
+        value.set("user_id", user_id)?;
+    }
+    let headers = lua.create_table()?;
+    for (name, header) in request.headers {
+        headers.set(name, header)?;
+    }
+    value.set("headers", headers)?;
+    let response: Table = handler.call(value)?;
+    let status = response.get::<Option<u16>>("status")?.unwrap_or(200);
+    if !(100..=599).contains(&status) {
+        return Err(mlua::Error::RuntimeError(
+            "runtime HTTP endpoint response status is invalid".to_string(),
+        ));
+    }
+    let body = response
+        .get::<Option<mlua::String>>("body")?
+        .map(|body| body.as_bytes().to_vec())
+        .unwrap_or_default();
+    let mut response_headers = std::collections::BTreeMap::new();
+    if let Some(headers) = response.get::<Option<Table>>("headers")? {
+        for pair in headers.pairs::<mlua::String, mlua::String>() {
+            let (name, value) = pair?;
+            response_headers.insert(name.to_string_lossy(), value.to_string_lossy());
+        }
+    }
+    Ok(RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+        status,
+        headers: response_headers,
+        body,
+    }))
+}
+
+fn runtime_event_key(namespace: &str, event_type: &str) -> String {
+    format!("{namespace}\0{event_type}")
+}
+
+fn cache_value_table(
+    lua: &Lua,
+    value: crate::runtime::RuntimeSharedCacheValue,
+) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("value", lua.create_string(&value.value)?)?;
+    table.set("version", value.version)?;
+    table.set("expires_in_ms", value.expires_in_ms)?;
+    Ok(table)
+}
+
+/// Deliver the queue snapshot that existed after an outer Lua invocation. A
+/// subscriber error drops only that subscriber's queued commands and does not
+/// stop later callbacks; any event it emits remains queued for the next outer
+/// invocation, so delivery is never recursive.
+fn dispatch_pending_runtime_events(
+    lua: &Lua,
+    label: &str,
+    budget: Duration,
+) -> Vec<OutboundCommand> {
+    let Some(handle) = lua.app_data_ref::<RuntimeEventBusHandle>() else {
+        return Vec::new();
+    };
+    let event_bus = runtime_event_bus(&handle);
+    let mut events = event_bus
+        .drain_snapshot_limit(MAX_RUNTIME_EVENTS_PER_INVOCATION)
+        .into_iter()
+        .peekable();
+    let Ok(handlers) = lua.named_registry_value::<Table>(EVENT_HANDLERS_KEY) else {
+        return Vec::new();
+    };
+    let mut commands = Vec::new();
+    let delivery_deadline = Instant::now() + budget;
+    'events: while let Some(event) = events.next() {
+        let key = runtime_event_key(&event.namespace, &event.event_type);
+        let Ok(Some(callbacks)) = handlers.get::<Option<Table>>(key.as_str()) else {
+            continue;
+        };
+        let callback_count = callbacks.raw_len();
+        for (callback_index, callback) in callbacks.sequence_values::<Function>().enumerate() {
+            let Ok(callback) = callback else {
+                continue;
+            };
+            let Some(remaining) = delivery_deadline.checked_duration_since(Instant::now()) else {
+                tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+                event_bus.requeue_front(events.collect());
+                break 'events;
+            };
+            let subscribers_remaining = callback_count.saturating_sub(callback_index);
+            let subscriber_budget = remaining / subscribers_remaining.max(1) as u32;
+            if subscriber_budget.is_zero() {
+                tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+                event_bus.requeue_front(events.collect());
+                break 'events;
+            }
+            clear_sink(lua);
+            set_deadline(lua, Some(Instant::now() + subscriber_budget));
+            let result = (|| -> mlua::Result<()> {
+                let value = lua.create_table()?;
+                value.set("namespace", event.namespace.as_str())?;
+                value.set("type", event.event_type.as_str())?;
+                value.set("payload", lua.create_string(&event.payload)?)?;
+                callback.call(value)
+            })();
+            match result {
+                Ok(()) => append_runtime_event_commands(
+                    &mut commands,
+                    take_commands(lua, label, "runtime_event"),
+                    label,
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        script = %label,
+                        namespace = %event.namespace,
+                        event_type = %event.event_type,
+                        error = %error,
+                        "lua runtime event subscriber failed; isolated"
+                    );
+                    clear_sink(lua);
+                    if is_deadline_error(&error) && Instant::now() >= delivery_deadline {
+                        event_bus.requeue_front(events.collect());
+                        break 'events;
+                    }
+                }
+            }
+        }
+    }
+    commands
+}
+
 /// Whether an `mlua` error is the deadline-hook abort (a blown time budget).
 ///
 /// The deadline hook raises a `RuntimeError` with a fixed message; matching it
@@ -1619,6 +1982,8 @@ fn install_host_api(
     source_label: &str,
     static_data: StaticDataCatalog,
     execution_mode: LuaExecutionMode,
+    outbound_http_policy: OutboundHttpPolicy,
+    http_endpoint_policy: RuntimeHttpEndpointPolicy,
 ) -> mlua::Result<()> {
     let citadel = lua.create_table()?;
     let handlers = lua.create_table()?;
@@ -1640,6 +2005,133 @@ fn install_host_api(
         Ok(())
     })?;
     citadel.set("on_rpc", on_rpc)?;
+
+    // Runtime events are an explicitly local, best-effort queue. Subscribe
+    // registrations are VM-local and reload atomically with the VM; emission
+    // resolves the node-owned bus through app-data at call time.
+    let event_handlers = lua.create_table()?;
+    lua.set_named_registry_value(EVENT_HANDLERS_KEY, event_handlers)?;
+    let events = lua.create_table()?;
+    let subscribe = lua.create_function(
+        |lua, (namespace, event_type, handler): (String, String, Function)| {
+            let event = RuntimeEvent::new(namespace, event_type, Vec::new())
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            let key = runtime_event_key(&event.namespace, &event.event_type);
+            let handlers: Table = lua.named_registry_value(EVENT_HANDLERS_KEY)?;
+            let callbacks = match handlers.get::<Option<Table>>(key.as_str())? {
+                Some(callbacks) => callbacks,
+                None => {
+                    let callbacks = lua.create_table()?;
+                    handlers.set(key.as_str(), callbacks.clone())?;
+                    callbacks
+                }
+            };
+            if callbacks.raw_len() >= MAX_RUNTIME_EVENT_SUBSCRIBERS {
+                return Err(mlua::Error::RuntimeError(
+                    "runtime event subscriber limit exceeded".to_string(),
+                ));
+            }
+            callbacks.set(callbacks.raw_len() + 1, handler.clone())?;
+            Ok(handler)
+        },
+    )?;
+    events.set("subscribe", subscribe)?;
+    let emit = lua.create_function(
+        |lua, (namespace, event_type, payload): (String, String, mlua::String)| {
+            ensure_realtime_effects_allowed(lua)?;
+            let event = RuntimeEvent::new(namespace, event_type, payload.as_bytes().to_vec())
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            let Some(handle) = lua.app_data_ref::<RuntimeEventBusHandle>() else {
+                return Err(mlua::Error::RuntimeError(
+                    "runtime event bus is unavailable".to_string(),
+                ));
+            };
+            Ok(matches!(
+                runtime_event_bus(&handle).emit(event),
+                RuntimeEventEmitOutcome::Queued
+            ))
+        },
+    )?;
+    events.set("emit", emit)?;
+    citadel.set("events", events)?;
+
+    let cache = lua.create_table()?;
+    let get = lua.create_function(|lua, (namespace, key): (String, String)| {
+        ensure_realtime_effects_allowed(lua)?;
+        let Some(handle) = lua.app_data_ref::<RuntimeSharedCacheHandle>() else {
+            return Err(mlua::Error::RuntimeError(
+                "runtime shared cache is unavailable".to_string(),
+            ));
+        };
+        runtime_shared_cache(&handle)
+            .get(&namespace, &key)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?
+            .map(|value| cache_value_table(lua, value))
+            .transpose()
+    })?;
+    cache.set("get", get)?;
+    let set = lua.create_function(
+        |lua, (namespace, key, value, ttl_ms): (String, String, mlua::String, u64)| {
+            ensure_realtime_effects_allowed(lua)?;
+            let Some(handle) = lua.app_data_ref::<RuntimeSharedCacheHandle>() else {
+                return Err(mlua::Error::RuntimeError(
+                    "runtime shared cache is unavailable".to_string(),
+                ));
+            };
+            let value = runtime_shared_cache(&handle)
+                .set(
+                    &namespace,
+                    &key,
+                    value.as_bytes().to_vec(),
+                    Duration::from_millis(ttl_ms),
+                )
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            cache_value_table(lua, value)
+        },
+    )?;
+    cache.set("set", set)?;
+    let delete = lua.create_function(|lua, (namespace, key): (String, String)| {
+        ensure_realtime_effects_allowed(lua)?;
+        let Some(handle) = lua.app_data_ref::<RuntimeSharedCacheHandle>() else {
+            return Err(mlua::Error::RuntimeError(
+                "runtime shared cache is unavailable".to_string(),
+            ));
+        };
+        runtime_shared_cache(&handle)
+            .delete(&namespace, &key)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+    })?;
+    cache.set("delete", delete)?;
+    let cas = lua.create_function(
+        |lua,
+         (namespace, key, expected, value, ttl_ms): (
+            String,
+            String,
+            Option<u64>,
+            mlua::String,
+            u64,
+        )| {
+            ensure_realtime_effects_allowed(lua)?;
+            let Some(handle) = lua.app_data_ref::<RuntimeSharedCacheHandle>() else {
+                return Err(mlua::Error::RuntimeError(
+                    "runtime shared cache is unavailable".to_string(),
+                ));
+            };
+            runtime_shared_cache(&handle)
+                .compare_and_swap(
+                    &namespace,
+                    &key,
+                    expected,
+                    value.as_bytes().to_vec(),
+                    Duration::from_millis(ttl_ms),
+                )
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?
+                .map(|value| cache_value_table(lua, value))
+                .transpose()
+        },
+    )?;
+    cache.set("cas", cas)?;
+    citadel.set("cache", cache)?;
 
     // Lifecycle + tick handlers are single functions stored under fixed registry
     // keys (re-registering replaces the prior handler).
@@ -1687,8 +2179,89 @@ fn install_host_api(
     )?;
     citadel.set("log", log)?;
 
+    let http_api = lua.create_table()?;
+    if http_endpoint_policy.enabled {
+        let endpoint_handlers = lua.create_table()?;
+        lua.set_named_registry_value(HTTP_ENDPOINT_HANDLERS_KEY, endpoint_handlers)?;
+        let register = lua.create_function(
+            move |lua,
+                  (method, path, options_or_handler, supplied_handler): (
+                String,
+                String,
+                mlua::Value,
+                Option<Function>,
+            )| {
+                let (options, handler) = match options_or_handler {
+                    mlua::Value::Function(handler) if supplied_handler.is_none() => (None, handler),
+                    mlua::Value::Nil => (
+                        None,
+                        supplied_handler.ok_or_else(|| {
+                            mlua::Error::RuntimeError(
+                                "runtime HTTP endpoint handler must be a function".to_string(),
+                            )
+                        })?,
+                    ),
+                    mlua::Value::Table(options) => (
+                        Some(options),
+                        supplied_handler.ok_or_else(|| {
+                            mlua::Error::RuntimeError(
+                                "runtime HTTP endpoint handler must be a function".to_string(),
+                            )
+                        })?,
+                    ),
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(
+                            "runtime HTTP endpoint options must be a table".to_string(),
+                        ));
+                    }
+                };
+                let method = RuntimeHttpMethod::parse(&method).ok_or_else(|| {
+                    mlua::Error::RuntimeError("runtime HTTP endpoint method is invalid".to_string())
+                })?;
+                let auth = match options.as_ref() {
+                    Some(options) => match options.get::<Option<mlua::Value>>("auth")? {
+                        Some(mlua::Value::String(auth)) => {
+                            let auth = auth.to_string_lossy();
+                            RuntimeHttpAuth::parse(&auth).ok_or_else(|| {
+                                mlua::Error::RuntimeError(
+                                    "runtime HTTP endpoint auth must be 'public' or 'session'"
+                                        .to_string(),
+                                )
+                            })?
+                        }
+                        Some(_) => {
+                            return Err(mlua::Error::RuntimeError(
+                                "runtime HTTP endpoint auth must be 'public' or 'session'"
+                                    .to_string(),
+                            ));
+                        }
+                        None => RuntimeHttpAuth::Public,
+                    },
+                    None => RuntimeHttpAuth::Public,
+                };
+                let endpoint = RuntimeHttpEndpoint::new(method, path, auth)
+                    .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+                let key = format!("{} {}", endpoint.method.as_str(), endpoint.path);
+                let handlers: Table = lua.named_registry_value(HTTP_ENDPOINT_HANDLERS_KEY)?;
+                if handlers.contains_key(key.as_str())? {
+                    return Err(mlua::Error::RuntimeError(
+                        "runtime HTTP endpoint is already registered".to_string(),
+                    ));
+                }
+                let entry = lua.create_table()?;
+                entry.set("method", endpoint.method.as_str())?;
+                entry.set("path", endpoint.path)?;
+                entry.set("auth", endpoint.auth.as_str())?;
+                entry.set("handler", &handler)?;
+                handlers.set(key, entry)?;
+                Ok(handler)
+            },
+        )?;
+        http_api.set("register", register)?;
+    }
+
     if execution_mode == LuaExecutionMode::Trusted {
-        let http = TrustedHttpClient::new().map_err(|error| {
+        let http = TrustedHttpClient::new_with_policy(outbound_http_policy).map_err(|error| {
             mlua::Error::RuntimeError(format!("cannot initialize outbound HTTP client: {error}"))
         })?;
         let fetch = lua.create_function(move |lua, (url, options): (String, Option<Table>)| {
@@ -1721,8 +2294,9 @@ fn install_host_api(
             result.set("body", lua.create_string(response.body)?)?;
             Ok(result)
         })?;
-        let http_api = lua.create_table()?;
         http_api.set("fetch", fetch)?;
+    }
+    if !http_api.is_empty() {
         citadel.set("http", http_api)?;
     }
 
@@ -2727,6 +3301,25 @@ fn install_deadline_hook(lua: &Lua) -> mlua::Result<()> {
 /// error and leaves nothing behind (the VM is local until returned), which is
 /// what makes [`LuaRuntime::reload`] failure-safe. Shared by initial load and
 /// hot-reload.
+#[derive(Clone)]
+struct LuaCapabilityPolicies {
+    outbound_http: OutboundHttpPolicy,
+    http_endpoints: RuntimeHttpEndpointPolicy,
+    event_bus_handle: RuntimeEventBusHandle,
+    shared_cache_handle: RuntimeSharedCacheHandle,
+}
+
+impl Default for LuaCapabilityPolicies {
+    fn default() -> Self {
+        Self {
+            outbound_http: OutboundHttpPolicy::default(),
+            http_endpoints: RuntimeHttpEndpointPolicy::default(),
+            event_bus_handle: disabled_runtime_event_bus_handle(),
+            shared_cache_handle: disabled_runtime_shared_cache_handle(),
+        }
+    }
+}
+
 fn build_lua(
     source: &str,
     source_label: &str,
@@ -2734,6 +3327,7 @@ fn build_lua(
     module_root: Option<&Path>,
     static_data: StaticDataCatalog,
     execution_mode: LuaExecutionMode,
+    capability_policies: LuaCapabilityPolicies,
 ) -> AppResult<Lua> {
     let lua = Lua::new_with(script_stdlib(execution_mode), LuaOptions::default())
         .map_err(|e| script_error("failed to initialize Lua state", &e))?;
@@ -2742,8 +3336,17 @@ fn build_lua(
     lua.set_app_data(InvocationMode::Normal);
     lua.set_app_data(NpcIdCounter(NPC_ID_BASE));
     lua.set_app_data(NpcPatrols::default());
-    install_host_api(&lua, source_label, static_data.clone(), execution_mode)
-        .map_err(|e| script_error("failed to install host API", &e))?;
+    lua.set_app_data(Arc::clone(&capability_policies.event_bus_handle));
+    lua.set_app_data(Arc::clone(&capability_policies.shared_cache_handle));
+    install_host_api(
+        &lua,
+        source_label,
+        static_data.clone(),
+        execution_mode,
+        capability_policies.outbound_http,
+        capability_policies.http_endpoints,
+    )
+    .map_err(|e| script_error("failed to install host API", &e))?;
     if execution_mode == LuaExecutionMode::Sandboxed {
         install_require(&lua, module_root)
             .map_err(|e| script_error("failed to install require", &e))?;
@@ -2801,6 +3404,30 @@ fn has_any_handler(lua: &Lua) -> bool {
     if has_rpc {
         return true;
     }
+    let has_http_endpoint = lua
+        .named_registry_value::<Table>(HTTP_ENDPOINT_HANDLERS_KEY)
+        .map(|handlers| {
+            handlers
+                .pairs::<mlua::Value, mlua::Value>()
+                .next()
+                .is_some()
+        })
+        .unwrap_or(false);
+    if has_http_endpoint {
+        return true;
+    }
+    let has_event_subscriber = lua
+        .named_registry_value::<Table>(EVENT_HANDLERS_KEY)
+        .map(|handlers| {
+            handlers
+                .pairs::<mlua::Value, mlua::Value>()
+                .next()
+                .is_some()
+        })
+        .unwrap_or(false);
+    if has_event_subscriber {
+        return true;
+    }
     [ON_JOIN_KEY, ON_LEAVE_KEY, ON_TICK_KEY].iter().any(|key| {
         lua.named_registry_value::<Option<Function>>(key)
             .map(|h| h.is_some())
@@ -2839,6 +3466,330 @@ mod tests {
 
     fn runtime(src: &str) -> LuaRuntime {
         LuaRuntime::from_source(src, "test", DEFAULT_DEADLINE_MS).expect("runtime loads")
+    }
+
+    #[test]
+    fn trusted_lua_http_policy_is_applied_at_the_host_boundary() {
+        let static_data =
+            StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)
+                .expect("disabled static-data catalog");
+        let error = build_lua(
+            "citadel.http.fetch('https://api.example.test/')",
+            "disabled-http.lua",
+            Duration::from_millis(50),
+            None,
+            static_data,
+            LuaExecutionMode::Trusted,
+            LuaCapabilityPolicies {
+                outbound_http: OutboundHttpPolicy {
+                    enabled: false,
+                    ..OutboundHttpPolicy::default()
+                },
+                http_endpoints: RuntimeHttpEndpointPolicy::default(),
+                event_bus_handle: disabled_runtime_event_bus_handle(),
+                shared_cache_handle: disabled_runtime_shared_cache_handle(),
+            },
+        )
+        .expect_err("disabled HTTP policy must reject Lua fetch");
+        assert!(
+            error
+                .log_detail()
+                .unwrap_or_default()
+                .contains("outbound HTTP capability is disabled")
+        );
+    }
+
+    #[test]
+    fn custom_http_endpoint_registration_dispatch_and_reload_are_atomic() {
+        let dir = TempDir::new("custom-http-endpoint");
+        let source = r#"
+            citadel.http.register("POST", "/echo", { auth = "session" }, function(request)
+                return {
+                    status = 201,
+                    headers = { ["content-type"] = "text/plain" },
+                    body = request.user_id .. ":" .. request.body,
+                }
+            end)
+        "#;
+        dir.write_main(source);
+        let policy = RuntimeHttpEndpointPolicy {
+            enabled: true,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_requests_per_minute: 10,
+        };
+        let runtime = LuaRuntime::load_with_static_data_and_mode_and_capability_policies(
+            &dir.0,
+            100,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            LuaExecutionMode::Sandboxed,
+            OutboundHttpPolicy::default(),
+            policy,
+        )
+        .expect("load endpoint runtime")
+        .expect("main.lua present");
+        assert_eq!(
+            runtime.http_endpoints(),
+            vec![
+                RuntimeHttpEndpoint::new(
+                    RuntimeHttpMethod::Post,
+                    "/echo",
+                    RuntimeHttpAuth::Session,
+                )
+                .expect("valid endpoint")
+            ]
+        );
+        assert_eq!(
+            runtime.call_http_endpoint(RuntimeHttpRequest {
+                method: RuntimeHttpMethod::Post,
+                path: "/echo".to_string(),
+                headers: Default::default(),
+                body: b"hello".to_vec(),
+                user_id: Some("user-7".to_string()),
+            }),
+            RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                status: 201,
+                headers: [("content-type".to_string(), "text/plain".to_string())]
+                    .into_iter()
+                    .collect(),
+                body: b"user-7:hello".to_vec(),
+            })
+        );
+
+        dir.write_main(
+            r#"
+                local callback = citadel.http.register("GET", "/next", function(request)
+                    return { body = "next" }
+                end)
+                assert(type(callback) == "function")
+            "#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            runtime.http_endpoints(),
+            vec![
+                RuntimeHttpEndpoint::new(RuntimeHttpMethod::Get, "/next", RuntimeHttpAuth::Public)
+                    .expect("valid endpoint")
+            ],
+            "an endpoint-only runtime reloads atomically"
+        );
+        assert_eq!(
+            runtime.call_http_endpoint(RuntimeHttpRequest {
+                method: RuntimeHttpMethod::Get,
+                path: "/next".to_string(),
+                headers: Default::default(),
+                body: Vec::new(),
+                user_id: None,
+            }),
+            RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: b"next".to_vec(),
+            })
+        );
+
+        dir.write_main(
+            r#"
+                citadel.http.register("GET", "/invalid", { auth = 1 }, function() return {} end)
+            "#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Rejected);
+        assert_eq!(
+            runtime.http_endpoints().len(),
+            1,
+            "old registry remains live"
+        );
+
+        dir.write_main(
+            r#"
+                citadel.http.register("GET", "/dup", { auth = "public" }, function() return {} end)
+                citadel.http.register("GET", "/dup", { auth = "session" }, function() return {} end)
+            "#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Rejected);
+        assert_eq!(
+            runtime.http_endpoints().len(),
+            1,
+            "old registry remains live"
+        );
+    }
+
+    #[test]
+    fn runtime_events_are_local_fifo_and_non_reentrant() {
+        let bus = Arc::new(RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy {
+                enabled: true,
+                queue_capacity: 8,
+                max_event_bytes: 64,
+                max_events_per_minute: 10,
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+                citadel.events.subscribe("match", "first", function(event)
+                    citadel.broadcast(7, event.payload)
+                    assert(citadel.events.emit("match", "second", "two"))
+                end)
+                citadel.events.subscribe("match", "second", function(event)
+                    citadel.broadcast(8, event.payload)
+                end)
+                citadel.on_message(1, function()
+                    assert(citadel.events.emit("match", "first", "one"))
+                end)
+            "#,
+        )
+        .with_event_bus(bus);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"one".to_vec(),
+                unreliable: false,
+            }],
+            "the event emitted by a subscriber waits for the next outer invocation"
+        );
+        assert_eq!(
+            runtime.tick(Duration::ZERO, Duration::from_millis(100)),
+            vec![OutboundCommand::Broadcast {
+                kind: 8,
+                body: b"two".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_is_namespaced_and_supports_cas() {
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+                citadel.on_message(1, function()
+                    local first = citadel.cache.set("match.one", "score", "one", 1000)
+                    assert(citadel.cache.get("match.two", "score") == nil)
+                    local second = citadel.cache.cas("match.one", "score", first.version, "two", 1000)
+                    assert(second ~= nil)
+                    assert(citadel.cache.cas("match.one", "score", first.version, "bad", 1000) == nil)
+                    citadel.broadcast(7, citadel.cache.get("match.one", "score").value)
+                end)
+            "#,
+        )
+        .with_shared_cache(cache);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"two".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_survives_successful_hot_reload() {
+        let dir = TempDir::new("shared-cache-reload");
+        dir.write_main(
+            r#"
+                citadel.on_message(1, function()
+                    citadel.cache.set("match", "round", "persisted", 1000)
+                    citadel.broadcast(7, "v1")
+                end)
+            "#,
+        );
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = LuaRuntime::load(&dir.0, DEFAULT_DEADLINE_MS)
+            .expect("loads")
+            .expect("present")
+            .with_shared_cache(cache);
+        assert!(!runtime.dispatch(1, None, 1, b"").is_empty());
+        dir.write_main(
+            r#"
+                citadel.on_message(1, function()
+                    local entry = citadel.cache.get("match", "round")
+                    citadel.broadcast(7, entry and entry.value or "missing")
+                end)
+            "#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"persisted".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_is_unavailable_in_realtime_interceptors() {
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+                local before_blocked = false
+                local after_blocked = false
+                citadel.before_realtime(function()
+                    before_blocked = not pcall(citadel.cache.set, "match", "key", "bad", 1000)
+                    return false
+                end)
+                citadel.after_realtime(function()
+                    after_blocked = not pcall(citadel.cache.get, "match", "key")
+                end)
+                citadel.on_message(1, function()
+                    assert(citadel.cache.get("match", "key") == nil)
+                    citadel.broadcast(7, before_blocked and after_blocked and "ok" or "failed")
+                end)
+            "#,
+        )
+        .with_shared_cache(cache);
+        assert_eq!(
+            runtime.before_realtime(1, None, None, 1, b""),
+            RealtimeInterception::Drop
+        );
+        runtime.after_realtime(
+            1,
+            None,
+            None,
+            1,
+            b"",
+            RealtimeAfterOutcome {
+                dropped: true,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"ok".to_vec(),
+                unreliable: false,
+            }]
+        );
     }
 
     #[test]
@@ -3050,6 +4001,13 @@ mod tests {
             "storage.index_query",
             "storage.register_index_filter",
             "http.fetch",
+            "http.register",
+            "events.emit",
+            "events.subscribe",
+            "cache.get",
+            "cache.set",
+            "cache.delete",
+            "cache.cas",
         ]
         .into_iter()
         .collect();
@@ -4006,6 +4964,7 @@ mod tests {
             None,
             static_data,
             LuaExecutionMode::Sandboxed,
+            LuaCapabilityPolicies::default(),
         )
         .expect_err("top-level infinite loop must be aborted, not hang");
         assert_eq!(err.category(), ErrorCategory::Runtime);
@@ -4028,6 +4987,7 @@ mod tests {
             None,
             static_data,
             LuaExecutionMode::Trusted,
+            LuaCapabilityPolicies::default(),
         )
         .expect("trusted Lua mode exposes machine libraries but not unsafe native loading");
     }

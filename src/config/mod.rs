@@ -817,6 +817,10 @@ pub struct RuntimeConfig {
     pub adapter: RuntimeAdapter,
     /// Runtime trust tier. Only `trusted` is implemented today.
     pub tier: RuntimeTier,
+    /// Operator-declared capability policy for runtime extensions. Existing
+    /// outbound HTTP remains enabled by default for backwards compatibility;
+    /// every new externally-reachable or shared capability defaults off.
+    pub capabilities: RuntimeCapabilitiesConfig,
     /// Capability mode for the embedded Lua adapter. Sandboxed is the safe
     /// default; trusted machine access requires an explicit opt-in.
     pub lua_execution_mode: LuaExecutionMode,
@@ -860,6 +864,7 @@ impl Default for RuntimeConfig {
             language: None,
             adapter: RuntimeAdapter::Embedded,
             tier: RuntimeTier::Trusted,
+            capabilities: RuntimeCapabilitiesConfig::default(),
             lua_execution_mode: LuaExecutionMode::Sandboxed,
             scripts_dir: "./game".to_string(),
             maps_dir: "./maps".to_string(),
@@ -870,6 +875,122 @@ impl Default for RuntimeConfig {
             tick_deadline_ms: None,
             hot_reload: false,
             hot_reload_poll_ms: 500,
+        }
+    }
+}
+
+/// Shared, validated capability policy for runtime extension surfaces.
+///
+/// This is deliberately configuration-only foundation. The owning feature
+/// tasks consume the individual grants and limits when their host APIs ship;
+/// accepting a capability here never exposes a new runtime API by itself.
+/// Runtime script hot reload never changes this policy: operators restart the
+/// node after changing it so all runtime instances observe one configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeCapabilitiesConfig {
+    /// Bounded outbound HTTP is already shipped, so it remains enabled by
+    /// default while its egress policy is hardened separately.
+    pub outbound_http: OutboundHttpCapabilityConfig,
+    /// Script-defined public HTTP routes are opt-in.
+    pub custom_http_endpoints: CustomHttpEndpointsCapabilityConfig,
+    /// Generic runtime events are opt-in.
+    pub events: RuntimeEventsCapabilityConfig,
+    /// Mutable shared runtime state is opt-in.
+    pub shared_cache: SharedCacheCapabilityConfig,
+}
+
+/// Quotas for the existing outbound HTTP capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutboundHttpCapabilityConfig {
+    pub enabled: bool,
+    pub max_concurrent_requests: u32,
+    pub max_requests_per_minute: u32,
+    /// Exact DNS hostnames permitted for egress. An empty list permits any
+    /// public DNS hostname; IP-literal URLs are never accepted.
+    pub allowed_hosts: Vec<String>,
+    /// TCP ports permitted for egress. Restricting this prevents the runtime
+    /// from treating public HTTP hosts as arbitrary TCP service proxies.
+    pub allowed_ports: Vec<u16>,
+    /// Permit resolved private, loopback, link-local, and other non-public
+    /// addresses. This is false by default and intended only for an explicit
+    /// operator-controlled private integration.
+    pub allow_private_networks: bool,
+}
+
+impl Default for OutboundHttpCapabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent_requests: 16,
+            max_requests_per_minute: 120,
+            allowed_hosts: Vec::new(),
+            allowed_ports: vec![80, 443],
+            allow_private_networks: false,
+        }
+    }
+}
+
+/// Quotas for opt-in script-defined HTTP endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CustomHttpEndpointsCapabilityConfig {
+    pub enabled: bool,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_requests_per_minute: u32,
+}
+
+impl Default for CustomHttpEndpointsCapabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_request_bytes: 64 * 1024,
+            max_response_bytes: 1024 * 1024,
+            max_requests_per_minute: 120,
+        }
+    }
+}
+
+/// Quotas for opt-in node-local runtime events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeEventsCapabilityConfig {
+    pub enabled: bool,
+    pub queue_capacity: usize,
+    pub max_event_bytes: usize,
+    pub max_events_per_minute: u32,
+}
+
+impl Default for RuntimeEventsCapabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            queue_capacity: 1_024,
+            max_event_bytes: 16 * 1024,
+            max_events_per_minute: 600,
+        }
+    }
+}
+
+/// Quotas for the opt-in, node-local mutable runtime cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SharedCacheCapabilityConfig {
+    pub enabled: bool,
+    pub max_entries: usize,
+    pub max_value_bytes: usize,
+    pub max_ttl_ms: u64,
+}
+
+impl Default for SharedCacheCapabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: 1_024,
+            max_value_bytes: 64 * 1024,
+            max_ttl_ms: 3_600_000,
         }
     }
 }
@@ -1652,6 +1773,7 @@ impl Config {
                     "runtime.hot_reload_poll_ms must be >= 1 when hot_reload is enabled",
                 ));
             }
+            self.runtime.validate_capabilities()?;
         }
         self.storage.index_definitions()?;
         self.storage.deferred.validate()?;
@@ -1698,6 +1820,140 @@ impl DatabaseConfig {
 }
 
 impl RuntimeConfig {
+    const MAX_RUNTIME_CAPABILITY_CONCURRENCY: u64 = 1_024;
+    const MAX_RUNTIME_CAPABILITY_RATE_PER_MINUTE: u64 = 1_000_000;
+    const MAX_RUNTIME_CAPABILITY_BYTES: u64 = 16 * 1024 * 1024;
+    const MAX_RUNTIME_EVENT_QUEUE_CAPACITY: u64 = 65_536;
+    const MAX_RUNTIME_EVENT_QUEUE_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_RUNTIME_CACHE_ENTRIES: u64 = 65_536;
+    const MAX_RUNTIME_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+    const MAX_RUNTIME_CACHE_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1_000;
+
+    /// Validate all runtime-extension quota fields before a host API can use
+    /// them. Errors name only configuration keys and never reveal secrets.
+    fn validate_capability_quota(field: &str, value: u64, maximum: u64) -> AppResult<()> {
+        if value == 0 {
+            return Err(AppError::config(format!("{field} must be >= 1")));
+        }
+        if value > maximum {
+            return Err(AppError::config(format!("{field} must be <= {maximum}")));
+        }
+        Ok(())
+    }
+
+    fn validate_capability_config(capabilities: &RuntimeCapabilitiesConfig) -> AppResult<()> {
+        Self::validate_capability_quota(
+            "runtime.capabilities.outbound_http.max_concurrent_requests",
+            u64::from(capabilities.outbound_http.max_concurrent_requests),
+            Self::MAX_RUNTIME_CAPABILITY_CONCURRENCY,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.outbound_http.max_requests_per_minute",
+            u64::from(capabilities.outbound_http.max_requests_per_minute),
+            Self::MAX_RUNTIME_CAPABILITY_RATE_PER_MINUTE,
+        )?;
+        if capabilities.outbound_http.allowed_ports.is_empty() {
+            return Err(AppError::config(
+                "runtime.capabilities.outbound_http.allowed_ports must not be empty",
+            ));
+        }
+        if capabilities.outbound_http.allowed_ports.len() > 128 {
+            return Err(AppError::config(
+                "runtime.capabilities.outbound_http.allowed_ports must contain at most 128 entries",
+            ));
+        }
+        if capabilities.outbound_http.allowed_hosts.len() > 128 {
+            return Err(AppError::config(
+                "runtime.capabilities.outbound_http.allowed_hosts must contain at most 128 entries",
+            ));
+        }
+        for host in &capabilities.outbound_http.allowed_hosts {
+            if !Self::is_valid_outbound_http_hostname(host) {
+                return Err(AppError::config(format!(
+                    "runtime.capabilities.outbound_http.allowed_hosts contains invalid hostname '{host}'"
+                )));
+            }
+        }
+        Self::validate_capability_quota(
+            "runtime.capabilities.custom_http_endpoints.max_request_bytes",
+            capabilities.custom_http_endpoints.max_request_bytes as u64,
+            Self::MAX_RUNTIME_CAPABILITY_BYTES,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.custom_http_endpoints.max_response_bytes",
+            capabilities.custom_http_endpoints.max_response_bytes as u64,
+            Self::MAX_RUNTIME_CAPABILITY_BYTES,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.custom_http_endpoints.max_requests_per_minute",
+            u64::from(capabilities.custom_http_endpoints.max_requests_per_minute),
+            Self::MAX_RUNTIME_CAPABILITY_RATE_PER_MINUTE,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.events.queue_capacity",
+            capabilities.events.queue_capacity as u64,
+            Self::MAX_RUNTIME_EVENT_QUEUE_CAPACITY,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.events.max_event_bytes",
+            capabilities.events.max_event_bytes as u64,
+            Self::MAX_RUNTIME_CAPABILITY_BYTES,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.events.max_events_per_minute",
+            u64::from(capabilities.events.max_events_per_minute),
+            Self::MAX_RUNTIME_CAPABILITY_RATE_PER_MINUTE,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.shared_cache.max_entries",
+            capabilities.shared_cache.max_entries as u64,
+            Self::MAX_RUNTIME_CACHE_ENTRIES,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.shared_cache.max_value_bytes",
+            capabilities.shared_cache.max_value_bytes as u64,
+            Self::MAX_RUNTIME_CAPABILITY_BYTES,
+        )?;
+        Self::validate_capability_quota(
+            "runtime.capabilities.shared_cache.max_ttl_ms",
+            capabilities.shared_cache.max_ttl_ms,
+            Self::MAX_RUNTIME_CACHE_TTL_MS,
+        )?;
+        let event_budget = (capabilities.events.queue_capacity as u64)
+            .saturating_mul(capabilities.events.max_event_bytes as u64);
+        Self::validate_capability_quota(
+            "runtime.capabilities.events queue memory budget",
+            event_budget,
+            Self::MAX_RUNTIME_EVENT_QUEUE_BYTES,
+        )?;
+        let cache_budget = (capabilities.shared_cache.max_entries as u64)
+            .saturating_mul(capabilities.shared_cache.max_value_bytes as u64);
+        Self::validate_capability_quota(
+            "runtime.capabilities.shared_cache memory budget",
+            cache_budget,
+            Self::MAX_RUNTIME_CACHE_BYTES,
+        )
+    }
+
+    fn is_valid_outbound_http_hostname(host: &str) -> bool {
+        if host.is_empty() || host.len() > 253 || host.parse::<std::net::IpAddr>().is_ok() {
+            return false;
+        }
+        host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    }
+
+    fn validate_capabilities(&self) -> AppResult<()> {
+        Self::validate_capability_config(&self.capabilities)
+    }
+
     /// Validate runtime adapter/tier combinations implemented by this build.
     fn validate_hosting(&self) -> AppResult<()> {
         if self.adapter != RuntimeAdapter::Embedded {
@@ -2045,6 +2301,10 @@ mod tests {
         assert_eq!(rc.language, None);
         assert_eq!(rc.adapter, RuntimeAdapter::Embedded);
         assert_eq!(rc.tier, RuntimeTier::Trusted);
+        assert!(rc.capabilities.outbound_http.enabled);
+        assert!(!rc.capabilities.custom_http_endpoints.enabled);
+        assert!(!rc.capabilities.events.enabled);
+        assert!(!rc.capabilities.shared_cache.enabled);
         assert_eq!(rc.lua_execution_mode, LuaExecutionMode::Sandboxed);
         assert_eq!(rc.scripts_dir, "./game");
         assert_eq!(rc.static_data_dir, None);
@@ -2055,6 +2315,88 @@ mod tests {
         assert_eq!(rc.deadline_ms, crate::runtime::DEFAULT_DEADLINE_MS);
         // A default config (runtime enabled) still validates.
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_capability_quotas_must_be_nonzero() {
+        let mut config = Config::default();
+        config.runtime.capabilities.events.max_event_bytes = 0;
+        let err = config
+            .validate()
+            .expect_err("zero capability quota must be rejected");
+        assert_eq!(err.category(), crate::error::ErrorCategory::Config);
+        assert!(
+            err.message()
+                .contains("runtime.capabilities.events.max_event_bytes")
+        );
+    }
+
+    #[test]
+    fn runtime_capability_memory_budgets_are_bounded() {
+        let mut config = Config::default();
+        config.runtime.capabilities.shared_cache.max_entries = 2_049;
+        let err = config
+            .validate()
+            .expect_err("cache memory budget must be bounded");
+        assert_eq!(err.category(), crate::error::ErrorCategory::Config);
+        assert!(
+            err.message()
+                .contains("runtime.capabilities.shared_cache memory budget")
+        );
+    }
+
+    #[test]
+    fn runtime_outbound_http_egress_policy_rejects_unsafe_configuration() {
+        let mut config = Config::default();
+        config
+            .runtime
+            .capabilities
+            .outbound_http
+            .allowed_ports
+            .clear();
+        let err = config
+            .validate()
+            .expect_err("an empty egress port policy must be rejected");
+        assert!(err.message().contains("outbound_http.allowed_ports"));
+
+        let mut config = Config::default();
+        config.runtime.capabilities.outbound_http.allowed_hosts = vec!["127.0.0.1".to_string()];
+        let err = config
+            .validate()
+            .expect_err("IP literals must not be configured as trusted hostnames");
+        assert!(err.message().contains("outbound_http.allowed_hosts"));
+    }
+
+    #[test]
+    fn runtime_capabilities_parse_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+            [runtime.capabilities.custom_http_endpoints]
+            enabled = true
+            max_request_bytes = 4096
+            max_response_bytes = 8192
+            max_requests_per_minute = 25
+
+            [runtime.capabilities.outbound_http]
+            allowed_hosts = ["api.example.test"]
+            allowed_ports = [443]
+            "#,
+        )
+        .expect("capability configuration parses");
+        assert!(config.runtime.capabilities.custom_http_endpoints.enabled);
+        assert_eq!(
+            config
+                .runtime
+                .capabilities
+                .custom_http_endpoints
+                .max_request_bytes,
+            4096
+        );
+        assert_eq!(
+            config.runtime.capabilities.outbound_http.allowed_hosts,
+            vec!["api.example.test"]
+        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub enum HostApiCategory {
     StaticData,
     /// Outbound HTTP host call.
     Http,
+    /// Local best-effort runtime event publication and subscription.
+    Event,
     /// Read-only loaded-map query.
     Map,
     /// Server-authoritative physics control and state query.
@@ -452,5 +454,77 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "response:table",
         status: HostApiStatus::Shipped,
         since: "pre-1.0",
+    },
+    HostApiFn {
+        name: "http.register",
+        category: HostApiCategory::Http,
+        params: &[
+            "method:string",
+            "path:string",
+            "options:table?",
+            "handler:function",
+        ],
+        returns: "handler:function",
+        status: HostApiStatus::Shipped,
+        since: "TASK-0416",
+    },
+    HostApiFn {
+        name: "events.emit",
+        category: HostApiCategory::Event,
+        params: &["namespace:string", "type:string", "payload:bytes"],
+        returns: "queued:bool",
+        status: HostApiStatus::Shipped,
+        since: "TASK-0417",
+    },
+    HostApiFn {
+        name: "events.subscribe",
+        category: HostApiCategory::Event,
+        params: &["namespace:string", "type:string", "handler:function"],
+        returns: "handler:function",
+        status: HostApiStatus::Shipped,
+        since: "TASK-0417",
+    },
+    HostApiFn {
+        name: "cache.get",
+        category: HostApiCategory::Storage,
+        params: &["namespace:string", "key:string"],
+        returns: "{value:bytes,version:u64,expires_in_ms:u64}?",
+        status: HostApiStatus::Shipped,
+        since: "TASK-0418",
+    },
+    HostApiFn {
+        name: "cache.set",
+        category: HostApiCategory::Storage,
+        params: &[
+            "namespace:string",
+            "key:string",
+            "value:bytes",
+            "ttl_ms:u64",
+        ],
+        returns: "{value:bytes,version:u64,expires_in_ms:u64}",
+        status: HostApiStatus::Shipped,
+        since: "TASK-0418",
+    },
+    HostApiFn {
+        name: "cache.delete",
+        category: HostApiCategory::Storage,
+        params: &["namespace:string", "key:string"],
+        returns: "deleted:bool",
+        status: HostApiStatus::Shipped,
+        since: "TASK-0418",
+    },
+    HostApiFn {
+        name: "cache.cas",
+        category: HostApiCategory::Storage,
+        params: &[
+            "namespace:string",
+            "key:string",
+            "expected_version:u64?",
+            "value:bytes",
+            "ttl_ms:u64",
+        ],
+        returns: "{value:bytes,version:u64,expires_in_ms:u64}?",
+        status: HostApiStatus::Shipped,
+        since: "TASK-0418",
     },
 ];

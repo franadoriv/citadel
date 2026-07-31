@@ -4,13 +4,13 @@
 //! language-neutral [`Runtime`] trait. The base Citadel build does not compile
 //! this module; it is available only with `--features runtime-python`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pyo3::Py;
 use pyo3::exceptions::PyRuntimeError;
@@ -21,11 +21,17 @@ use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
-use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::outbound_http::{OutboundHttpPolicy, OutboundHttpRequest, TrustedHttpClient};
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
-    LifecycleHook, OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception,
-    ReloadOutcome, RoomSpec, RpcOutcome, Runtime, RuntimeIntrospection,
+    LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, OutboundCommand, PhysicsOptions,
+    RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
+    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
+    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
+    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
+    RuntimeSharedCacheHandle, append_runtime_event_commands, disabled_runtime_event_bus_handle,
+    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
+    set_runtime_event_bus, set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use citadel_physics::{PhysicsConfig, Shape};
@@ -53,6 +59,9 @@ const LOAD_DEADLINE_MS: u64 = 5_000;
 
 /// Maximum number of outbound commands a single handler invocation may enqueue.
 const MAX_OUTBOUND_COMMANDS: usize = 1024;
+
+/// Bound callback fan-out for one event key and one snapshot delivery.
+const MAX_RUNTIME_EVENT_SUBSCRIBERS: usize = 64;
 
 const RPC_ERR_UNKNOWN_METHOD: &str = "unknown RPC method";
 const RPC_ERR_TIMEOUT: &str = "RPC handler timed out";
@@ -101,6 +110,13 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "storage.index_query",
     "storage.register_index_filter",
     "http.fetch",
+    "http.register",
+    "events.emit",
+    "events.subscribe",
+    "cache.get",
+    "cache.set",
+    "cache.delete",
+    "cache.cas",
 ];
 
 /// The Python-side `citadel` module. Keeping this in Python avoids Rust-side
@@ -114,6 +130,9 @@ import time
 
 _message_handlers = {}
 _rpc_handlers = {}
+_http_endpoint_handlers = {}
+_event_handlers = {}
+_MAX_EVENT_SUBSCRIBERS = 64
 _storage_index_filters = {}
 _on_join = None
 _on_leave = None
@@ -249,7 +268,72 @@ class _Http:
             raise RuntimeError("outbound HTTP host not available")
         return _http_bridge.fetch(str(url), {} if opts is None else dict(opts))
 
+    def register(self, method, path, options=None, handler=None):
+        """Register one bounded endpoint under Citadel's reserved /ext prefix."""
+        if handler is None and callable(options):
+            handler, options = options, None
+
+        def decorator(fn):
+            if not callable(fn):
+                raise TypeError("runtime HTTP endpoint handler must be callable")
+            if "_http_endpoint_registry" not in globals():
+                raise RuntimeError("runtime HTTP endpoint capability is disabled by runtime policy")
+            key = _http_endpoint_registry.register(
+                str(method), str(path), {} if options is None else dict(options))
+            _http_endpoint_handlers[key] = fn
+            return fn
+
+        return decorator(handler) if handler is not None else decorator
+
 http = _Http()
+
+class _Events:
+    def subscribe(self, namespace, event_type, handler=None):
+        def decorator(fn):
+            if not callable(fn):
+                raise TypeError("runtime event subscriber must be callable")
+            if "_event_bus_bridge" not in globals():
+                raise RuntimeError("runtime event host not available")
+            key = _event_bus_bridge.subscribe(str(namespace), str(event_type))
+            callbacks = _event_handlers.setdefault(key, [])
+            if len(callbacks) >= _MAX_EVENT_SUBSCRIBERS:
+                raise RuntimeError("runtime event subscriber limit exceeded")
+            callbacks.append(fn)
+            return fn
+        return decorator(handler) if handler is not None else decorator
+
+    def emit(self, namespace, event_type, payload=b""):
+        if "_event_bus_bridge" not in globals():
+            raise RuntimeError("runtime event host not available")
+        return bool(_event_bus_bridge.emit(str(namespace), str(event_type), _bytes(payload)))
+
+events = _Events()
+
+class _Cache:
+    def _entry(self, value):
+        if value is None:
+            return None
+        body, version, expires_in_ms = value
+        return {"value": bytes(body), "version": int(version), "expires_in_ms": int(expires_in_ms)}
+
+    def get(self, namespace, key):
+        if "_shared_cache_bridge" not in globals():
+            raise RuntimeError("runtime shared cache host not available")
+        return self._entry(_shared_cache_bridge.get(str(namespace), str(key)))
+
+    def set(self, namespace, key, value, ttl_ms):
+        return self._entry(_shared_cache_bridge.set(
+            str(namespace), str(key), _bytes(value), int(ttl_ms)))
+
+    def delete(self, namespace, key):
+        return bool(_shared_cache_bridge.delete(str(namespace), str(key)))
+
+    def cas(self, namespace, key, expected_version, value, ttl_ms):
+        version = None if expected_version is None else int(expected_version)
+        return self._entry(_shared_cache_bridge.cas(
+            str(namespace), str(key), version, _bytes(value), int(ttl_ms)))
+
+cache = _Cache()
 
 def _push(command, body_len=0):
     global _total_bytes, _overflowed
@@ -420,6 +504,36 @@ def _call_room_join(ctx, room_id):
         return None
     return bool(_on_room_join(ctx, int(room_id)))
 
+def _call_http_endpoint(key, request):
+    handler = _http_endpoint_handlers.get(str(key))
+    if handler is None:
+        return None
+    response = handler(dict(request))
+    if response is None:
+        response = {}
+    if not isinstance(response, dict):
+        raise TypeError("runtime HTTP endpoint handler must return a mapping")
+    status = int(response.get("status", 200))
+    if status < 100 or status > 599:
+        raise ValueError("runtime HTTP endpoint response status is invalid")
+    headers = response.get("headers", {})
+    if not isinstance(headers, dict):
+        raise TypeError("runtime HTTP endpoint response headers must be a mapping")
+    return (status, _bytes(response.get("body", b"")),
+            json.dumps({str(name): str(value) for name, value in headers.items()},
+                       separators=(",", ":")))
+
+def _runtime_event_subscriber_count(key):
+    callbacks = _event_handlers.get(str(key), [])
+    return len(callbacks)
+
+def _call_runtime_event_subscriber(key, index, event):
+    callbacks = _event_handlers.get(str(key), [])
+    if index < 0 or index >= len(callbacks):
+        return False
+    callbacks[index](dict(event))
+    return True
+
 def _has_tick_handler():
     return _on_tick is not None
 
@@ -434,6 +548,8 @@ def _has_any_handler():
         or _on_room_join is not None
         or _on_before_realtime is not None
         or _on_after_realtime is not None
+        or bool(_http_endpoint_handlers)
+        or bool(_event_handlers)
     )
 
 def _introspect():
@@ -649,6 +765,28 @@ struct OutboundHttpBridge {
     interceptor_mode: Arc<AtomicBool>,
 }
 
+/// Narrow Python bridge for the node-local runtime event bus. Python owns
+/// callback lists; Rust owns validation, capacity, and rate limits.
+#[pyclass]
+struct RuntimeEventBusBridge {
+    event_bus_handle: RuntimeEventBusHandle,
+    interceptor_mode: Arc<AtomicBool>,
+}
+
+/// Narrow Python bridge for the process-local, non-durable shared runtime cache.
+#[pyclass]
+struct RuntimeSharedCacheBridge {
+    shared_cache_handle: RuntimeSharedCacheHandle,
+    interceptor_mode: Arc<AtomicBool>,
+}
+
+/// Registration bridge that validates script declarations while keeping the
+/// authoritative endpoint snapshot outside the Python heap.
+#[pyclass]
+struct RuntimeHttpEndpointRegistry {
+    endpoints: Arc<Mutex<BTreeSet<RuntimeHttpEndpoint>>>,
+}
+
 #[pyclass]
 struct RuntimeModeBridge {
     interceptor_mode: Arc<AtomicBool>,
@@ -716,6 +854,135 @@ impl OutboundHttpBridge {
         result.set_item("status", response.status)?;
         result.set_item("body", PyBytes::new(py, &response.body))?;
         Ok(result.unbind())
+    }
+}
+
+#[pymethods]
+impl RuntimeEventBusBridge {
+    fn subscribe(&self, namespace: &str, event_type: &str) -> PyResult<String> {
+        let event = RuntimeEvent::new(namespace, event_type, Vec::new())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Ok(runtime_event_key(&event.namespace, &event.event_type))
+    }
+
+    fn emit(&self, namespace: &str, event_type: &str, payload: &[u8]) -> PyResult<bool> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "domain, storage, outbound HTTP, and runtime events are unavailable in realtime interceptors",
+            ));
+        }
+        let event = RuntimeEvent::new(namespace, event_type, payload.to_vec())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Ok(matches!(
+            runtime_event_bus(&self.event_bus_handle).emit(event),
+            RuntimeEventEmitOutcome::Queued
+        ))
+    }
+}
+
+#[pymethods]
+impl RuntimeSharedCacheBridge {
+    fn get(&self, namespace: &str, key: &str) -> PyResult<Option<(Vec<u8>, u64, u64)>> {
+        self.ensure_realtime_effects_allowed()?;
+        runtime_shared_cache(&self.shared_cache_handle)
+            .get(namespace, key)
+            .map(|value| value.map(|entry| (entry.value, entry.version, entry.expires_in_ms)))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn set(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: u64,
+    ) -> PyResult<(Vec<u8>, u64, u64)> {
+        self.ensure_realtime_effects_allowed()?;
+        runtime_shared_cache(&self.shared_cache_handle)
+            .set(namespace, key, value, Duration::from_millis(ttl_ms))
+            .map(|entry| (entry.value, entry.version, entry.expires_in_ms))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn delete(&self, namespace: &str, key: &str) -> PyResult<bool> {
+        self.ensure_realtime_effects_allowed()?;
+        runtime_shared_cache(&self.shared_cache_handle)
+            .delete(namespace, key)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn cas(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected_version: Option<u64>,
+        value: Vec<u8>,
+        ttl_ms: u64,
+    ) -> PyResult<Option<(Vec<u8>, u64, u64)>> {
+        self.ensure_realtime_effects_allowed()?;
+        runtime_shared_cache(&self.shared_cache_handle)
+            .compare_and_swap(
+                namespace,
+                key,
+                expected_version,
+                value,
+                Duration::from_millis(ttl_ms),
+            )
+            .map(|value| value.map(|entry| (entry.value, entry.version, entry.expires_in_ms)))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+}
+
+impl RuntimeSharedCacheBridge {
+    fn ensure_realtime_effects_allowed(&self) -> PyResult<()> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "domain, storage, outbound HTTP, runtime events, and shared cache APIs are unavailable in realtime interceptors",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl RuntimeHttpEndpointRegistry {
+    fn register(&self, method: &str, path: &str, options: &Bound<'_, PyDict>) -> PyResult<String> {
+        let method = RuntimeHttpMethod::parse(method)
+            .ok_or_else(|| PyRuntimeError::new_err("runtime HTTP endpoint method is invalid"))?;
+        let auth = match options.get_item("auth")? {
+            Some(value) => {
+                let auth = value.extract::<String>().map_err(|_| {
+                    PyRuntimeError::new_err(
+                        "runtime HTTP endpoint auth must be 'public' or 'session'",
+                    )
+                })?;
+                RuntimeHttpAuth::parse(&auth).ok_or_else(|| {
+                    PyRuntimeError::new_err(
+                        "runtime HTTP endpoint auth must be 'public' or 'session'",
+                    )
+                })?
+            }
+            None => RuntimeHttpAuth::Public,
+        };
+        let endpoint = RuntimeHttpEndpoint::new(method, path, auth)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let mut endpoints = self
+            .endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Python callbacks use a method/path key as well. `auth` must not make
+        // a second registration distinct, or it could overwrite the callback
+        // selected by an earlier public/session declaration.
+        if endpoints
+            .iter()
+            .any(|existing| existing.method == endpoint.method && existing.path == endpoint.path)
+        {
+            return Err(PyRuntimeError::new_err(
+                "runtime HTTP endpoint is already registered",
+            ));
+        }
+        endpoints.insert(endpoint.clone());
+        Ok(format!("{} {}", endpoint.method.as_str(), endpoint.path))
     }
 }
 
@@ -1093,6 +1360,9 @@ struct PythonVm {
     /// Parsed static gameplay data initialized with this VM. Replaced atomically
     /// with the VM on hot reload so a bad data edit cannot partially publish.
     static_data: StaticDataCatalog,
+    /// Validated endpoint declarations built with this VM. A fresh registry is
+    /// published only after a complete successful reload.
+    http_endpoints: Arc<Mutex<BTreeSet<RuntimeHttpEndpoint>>>,
 }
 
 /// Embedded CPython runtime that implements the language-neutral runtime trait.
@@ -1106,6 +1376,12 @@ pub struct PythonRuntime {
     static_data_dir: Option<PathBuf>,
     /// Per-file static-data read bound retained across reloads.
     static_data_max_file_bytes: usize,
+    /// Outbound HTTP policy captured at load time and retained across a
+    /// source-only hot reload.
+    outbound_http_policy: OutboundHttpPolicy,
+    http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    event_bus_handle: RuntimeEventBusHandle,
+    shared_cache_handle: RuntimeSharedCacheHandle,
     /// Persisted-domain-services seam exposed to `citadel.friends_*` host calls
     ///, or `None` when no services are attached. Retained so a
     /// hot-reload re-applies it to the fresh VM.
@@ -1145,6 +1421,42 @@ impl PythonRuntime {
         static_data_dir: Option<&Path>,
         static_data_max_file_bytes: usize,
     ) -> AppResult<Option<Self>> {
+        Self::load_with_static_data_and_http_policy(
+            scripts_dir,
+            deadline_ms,
+            static_data_dir,
+            static_data_max_file_bytes,
+            OutboundHttpPolicy::default(),
+        )
+    }
+
+    /// Load `main.py` with an explicit operator-owned outbound HTTP policy.
+    pub fn load_with_static_data_and_http_policy(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+        outbound_http_policy: OutboundHttpPolicy,
+    ) -> AppResult<Option<Self>> {
+        Self::load_with_static_data_and_capability_policies(
+            scripts_dir,
+            deadline_ms,
+            static_data_dir,
+            static_data_max_file_bytes,
+            outbound_http_policy,
+            RuntimeHttpEndpointPolicy::default(),
+        )
+    }
+
+    /// Load `main.py` with all operator-owned runtime extension policies.
+    pub fn load_with_static_data_and_capability_policies(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+        outbound_http_policy: OutboundHttpPolicy,
+        http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    ) -> AppResult<Option<Self>> {
         let main = scripts_dir.join(PYTHON_ENTRYPOINT);
         if !main.is_file() {
             return Ok(None);
@@ -1153,6 +1465,8 @@ impl PythonRuntime {
         let module_root = scripts_dir.to_path_buf();
         let source_label = main.display().to_string();
         let static_data = StaticDataCatalog::new(static_data_dir, static_data_max_file_bytes)?;
+        let event_bus_handle = disabled_runtime_event_bus_handle();
+        let shared_cache_handle = disabled_runtime_shared_cache_handle();
         let vm = build_python(
             &source,
             &source_label,
@@ -1163,6 +1477,10 @@ impl PythonRuntime {
                 maps: &None,
                 transform_hub: &None,
                 static_data,
+                outbound_http_policy: outbound_http_policy.clone(),
+                http_endpoint_policy,
+                event_bus_handle: Arc::clone(&event_bus_handle),
+                shared_cache_handle: Arc::clone(&shared_cache_handle),
             },
         )?;
         Ok(Some(Self {
@@ -1172,6 +1490,10 @@ impl PythonRuntime {
             module_root: Some(module_root),
             static_data_dir: static_data_dir.map(Path::to_path_buf),
             static_data_max_file_bytes,
+            outbound_http_policy,
+            http_endpoint_policy,
+            event_bus_handle,
+            shared_cache_handle,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1187,6 +1509,8 @@ impl PythonRuntime {
         let source_label = label.into();
         let static_data =
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let event_bus_handle = disabled_runtime_event_bus_handle();
+        let shared_cache_handle = disabled_runtime_shared_cache_handle();
         let vm = build_python(
             source,
             &source_label,
@@ -1197,6 +1521,10 @@ impl PythonRuntime {
                 maps: &None,
                 transform_hub: &None,
                 static_data,
+                outbound_http_policy: OutboundHttpPolicy::default(),
+                http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+                event_bus_handle: Arc::clone(&event_bus_handle),
+                shared_cache_handle: Arc::clone(&shared_cache_handle),
             },
         )?;
         Ok(Self {
@@ -1206,6 +1534,10 @@ impl PythonRuntime {
             module_root: None,
             static_data_dir: None,
             static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            outbound_http_policy: OutboundHttpPolicy::default(),
+            http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+            event_bus_handle,
+            shared_cache_handle,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1222,6 +1554,8 @@ impl PythonRuntime {
         let source_label = label.into();
         let static_data =
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let event_bus_handle = disabled_runtime_event_bus_handle();
+        let shared_cache_handle = disabled_runtime_shared_cache_handle();
         let vm = build_python(
             source,
             &source_label,
@@ -1232,6 +1566,10 @@ impl PythonRuntime {
                 maps: &None,
                 transform_hub: &None,
                 static_data,
+                outbound_http_policy: OutboundHttpPolicy::default(),
+                http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+                event_bus_handle: Arc::clone(&event_bus_handle),
+                shared_cache_handle: Arc::clone(&shared_cache_handle),
             },
         )?;
         Ok(Self {
@@ -1241,6 +1579,10 @@ impl PythonRuntime {
             module_root: Some(module_root.to_path_buf()),
             static_data_dir: None,
             static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            outbound_http_policy: OutboundHttpPolicy::default(),
+            http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+            event_bus_handle,
+            shared_cache_handle,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1264,6 +1606,21 @@ impl PythonRuntime {
                 Arc::clone(&guard.interceptor_mode),
             );
         }
+        self
+    }
+
+    /// Attach the node-owned best-effort event bus and retain it through a
+    /// source-only Python hot reload.
+    #[must_use]
+    pub fn with_event_bus(self, bus: Arc<RuntimeEventBus>) -> Self {
+        set_runtime_event_bus(&self.event_bus_handle, bus);
+        self
+    }
+
+    /// Attach the node-local shared cache and retain it through a source-only reload.
+    #[must_use]
+    pub fn with_shared_cache(self, cache: Arc<RuntimeSharedCache>) -> Self {
+        set_runtime_shared_cache(&self.shared_cache_handle, cache);
         self
     }
 
@@ -1342,6 +1699,10 @@ impl PythonRuntime {
                 maps: &self.maps,
                 transform_hub: &self.transform_hub,
                 static_data: fresh_static_data,
+                outbound_http_policy: self.outbound_http_policy.clone(),
+                http_endpoint_policy: self.http_endpoint_policy,
+                event_bus_handle: Arc::clone(&self.event_bus_handle),
+                shared_cache_handle: Arc::clone(&self.shared_cache_handle),
             },
         ) {
             Ok(vm) => vm,
@@ -1693,6 +2054,80 @@ impl PythonRuntime {
         }
     }
 
+    /// Snapshot the endpoint declarations installed in the live Python VM.
+    #[must_use]
+    pub fn http_endpoints(&self) -> Vec<RuntimeHttpEndpoint> {
+        let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+        guard
+            .http_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Invoke one script-defined endpoint with the normal Python deadline and
+    /// panic-isolation boundary. Handler side-effect commands are discarded.
+    pub fn call_http_endpoint(&self, request: RuntimeHttpRequest) -> RuntimeHttpOutcome {
+        let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Python::attach(|py| -> PyResult<RuntimeHttpOutcome> {
+                let module = guard.citadel.bind(py);
+                clear_commands(module);
+                let key = format!("{} {}", request.method.as_str(), request.path);
+                let result = run_with_python_deadline(module, self.budget, || {
+                    let value = PyDict::new(py);
+                    value.set_item("method", request.method.as_str())?;
+                    value.set_item("path", request.path)?;
+                    value.set_item("body", PyBytes::new(py, &request.body))?;
+                    value.set_item("user_id", request.user_id)?;
+                    let headers = PyDict::new(py);
+                    for (name, header) in request.headers {
+                        headers.set_item(name, header)?;
+                    }
+                    value.set_item("headers", headers)?;
+                    let result = module.getattr("_call_http_endpoint")?.call1((key, value))?;
+                    if result.is_none() {
+                        return Ok(RuntimeHttpOutcome::NotFound);
+                    }
+                    let (status, body, headers_json): (u16, Vec<u8>, String) = result.extract()?;
+                    let headers = serde_json::from_str(&headers_json).map_err(|_| {
+                        PyRuntimeError::new_err(
+                            "runtime HTTP endpoint response headers are invalid",
+                        )
+                    })?;
+                    Ok(RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                        status,
+                        headers,
+                        body,
+                    }))
+                });
+                clear_commands(module);
+                result
+            })
+        }));
+        match outcome {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    error = %error,
+                    "python runtime HTTP endpoint handler failed; isolated"
+                );
+                RuntimeHttpOutcome::Failed
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    "python runtime HTTP endpoint handler panicked; isolated"
+                );
+                clear_vm_commands(&guard);
+                RuntimeHttpOutcome::Failed
+            }
+        }
+    }
+
     fn run_commands<F>(&self, what: &str, budget: Duration, call: F) -> Vec<OutboundCommand>
     where
         F: FnOnce(Python<'_>, &Bound<'_, PyModule>) -> PyResult<bool>,
@@ -1723,6 +2158,7 @@ impl PythonRuntime {
         F: FnOnce(Python<'_>, &Bound<'_, PyModule>) -> PyResult<bool>,
     {
         let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let event_bus_handle = Arc::clone(&self.event_bus_handle);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             guard.interceptor_mode.store(restricted, Ordering::Relaxed);
             Python::attach(|py| -> PyResult<Vec<OutboundCommand>> {
@@ -1730,10 +2166,36 @@ impl PythonRuntime {
                 clear_commands(module);
                 let ran = run_with_python_deadline(module, budget, || call(py, module));
                 match ran {
-                    Ok(true) => take_commands(module, &guard.source_label, what),
+                    Ok(true) => {
+                        let mut commands = take_commands(module, &guard.source_label, what)?;
+                        if !restricted {
+                            append_runtime_event_commands(
+                                &mut commands,
+                                dispatch_pending_runtime_events(
+                                    py,
+                                    module,
+                                    budget,
+                                    &event_bus_handle,
+                                    &guard.source_label,
+                                ),
+                                &guard.source_label,
+                            );
+                        }
+                        Ok(commands)
+                    }
                     Ok(false) => {
                         clear_commands(module);
-                        Ok(Vec::new())
+                        if restricted {
+                            Ok(Vec::new())
+                        } else {
+                            Ok(dispatch_pending_runtime_events(
+                                py,
+                                module,
+                                budget,
+                                &event_bus_handle,
+                                &guard.source_label,
+                            ))
+                        }
                     }
                     Err(e) => {
                         clear_commands(module);
@@ -1924,6 +2386,14 @@ impl Runtime for PythonRuntime {
         PythonRuntime::call_room_join(self, sender, user_id, room_id)
     }
 
+    fn http_endpoints(&self) -> Vec<RuntimeHttpEndpoint> {
+        PythonRuntime::http_endpoints(self)
+    }
+
+    fn call_http_endpoint(&self, request: RuntimeHttpRequest) -> RuntimeHttpOutcome {
+        PythonRuntime::call_http_endpoint(self, request)
+    }
+
     fn has_tick_handler(&self) -> bool {
         PythonRuntime::has_tick_handler(self)
     }
@@ -1996,13 +2466,56 @@ fn install_static_data(
 fn install_outbound_http(
     citadel: &Bound<'_, PyModule>,
     interceptor_mode: Arc<AtomicBool>,
+    policy: OutboundHttpPolicy,
 ) -> PyResult<()> {
-    let client =
-        TrustedHttpClient::new().map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let client = TrustedHttpClient::new_with_policy(policy)
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     citadel.setattr(
         "_http_bridge",
         OutboundHttpBridge {
             client,
+            interceptor_mode,
+        },
+    )
+}
+
+fn install_http_endpoint_registration(
+    citadel: &Bound<'_, PyModule>,
+    policy: RuntimeHttpEndpointPolicy,
+    endpoints: Arc<Mutex<BTreeSet<RuntimeHttpEndpoint>>>,
+) -> PyResult<()> {
+    if !policy.enabled {
+        return Ok(());
+    }
+    citadel.setattr(
+        "_http_endpoint_registry",
+        RuntimeHttpEndpointRegistry { endpoints },
+    )
+}
+
+fn install_runtime_events(
+    citadel: &Bound<'_, PyModule>,
+    event_bus_handle: RuntimeEventBusHandle,
+    interceptor_mode: Arc<AtomicBool>,
+) -> PyResult<()> {
+    citadel.setattr(
+        "_event_bus_bridge",
+        RuntimeEventBusBridge {
+            event_bus_handle,
+            interceptor_mode,
+        },
+    )
+}
+
+fn install_runtime_shared_cache(
+    citadel: &Bound<'_, PyModule>,
+    shared_cache_handle: RuntimeSharedCacheHandle,
+    interceptor_mode: Arc<AtomicBool>,
+) -> PyResult<()> {
+    citadel.setattr(
+        "_shared_cache_bridge",
+        RuntimeSharedCacheBridge {
+            shared_cache_handle,
             interceptor_mode,
         },
     )
@@ -2038,6 +2551,10 @@ struct PythonBuildOptions<'a> {
     maps: &'a Option<Arc<MapCatalog>>,
     transform_hub: &'a Option<Arc<TransformHub>>,
     static_data: StaticDataCatalog,
+    outbound_http_policy: OutboundHttpPolicy,
+    http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    event_bus_handle: RuntimeEventBusHandle,
+    shared_cache_handle: RuntimeSharedCacheHandle,
 }
 
 fn build_python(
@@ -2052,6 +2569,10 @@ fn build_python(
         maps,
         transform_hub,
         static_data,
+        outbound_http_policy,
+        http_endpoint_policy,
+        event_bus_handle,
+        shared_cache_handle,
     } = options;
     let prelude = cstring(PYTHON_HOST_PRELUDE, "python host prelude")?;
     let source = cstring(source, "python source")?;
@@ -2066,6 +2587,7 @@ fn build_python(
         "python host module name",
     )?;
     let interceptor_mode = Arc::new(AtomicBool::new(false));
+    let http_endpoints = Arc::new(Mutex::new(BTreeSet::new()));
     let _build_guard = PYTHON_BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     Python::attach(|py| -> PyResult<PythonVm> {
         let citadel = PyModule::from_code(
@@ -2078,7 +2600,26 @@ fn build_python(
         let modules: Bound<'_, PyDict> = sys.getattr("modules")?.cast_into()?;
         modules.set_item("citadel", &citadel)?;
         install_static_data(&citadel, static_data.clone())?;
-        install_outbound_http(&citadel, Arc::clone(&interceptor_mode))?;
+        install_outbound_http(
+            &citadel,
+            Arc::clone(&interceptor_mode),
+            outbound_http_policy,
+        )?;
+        install_runtime_events(
+            &citadel,
+            Arc::clone(&event_bus_handle),
+            Arc::clone(&interceptor_mode),
+        )?;
+        install_runtime_shared_cache(
+            &citadel,
+            Arc::clone(&shared_cache_handle),
+            Arc::clone(&interceptor_mode),
+        )?;
+        install_http_endpoint_registration(
+            &citadel,
+            http_endpoint_policy,
+            Arc::clone(&http_endpoints),
+        )?;
         install_realtime_interceptor_guard(&citadel, Arc::clone(&interceptor_mode))?;
         if let Some(root) = module_root {
             let root = root.to_string_lossy().to_string();
@@ -2101,6 +2642,7 @@ fn build_python(
             python_version: version,
             interceptor_mode,
             static_data,
+            http_endpoints,
         };
         Ok(vm)
     })
@@ -2177,6 +2719,109 @@ fn take_commands(
         );
     }
     parse_commands(commands_obj)
+}
+
+fn runtime_event_key(namespace: &str, event_type: &str) -> String {
+    format!("{namespace}\0{event_type}")
+}
+
+/// Deliver the event snapshot that existed after an outer Python handler. A
+/// callback error is isolated and events emitted by callbacks stay queued for
+/// the following outer invocation.
+fn dispatch_pending_runtime_events(
+    py: Python<'_>,
+    module: &Bound<'_, PyModule>,
+    budget: Duration,
+    event_bus_handle: &RuntimeEventBusHandle,
+    label: &str,
+) -> Vec<OutboundCommand> {
+    let count = match module.getattr("_runtime_event_subscriber_count") {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(script = %label, error = %error, "python runtime event bridge unavailable");
+            return Vec::new();
+        }
+    };
+    let call = match module.getattr("_call_runtime_event_subscriber") {
+        Ok(call) => call,
+        Err(error) => {
+            tracing::error!(script = %label, error = %error, "python runtime event bridge unavailable");
+            return Vec::new();
+        }
+    };
+    let event_bus = runtime_event_bus(event_bus_handle);
+    let mut commands = Vec::new();
+    let delivery_deadline = Instant::now() + budget;
+    let mut events = event_bus
+        .drain_snapshot_limit(MAX_RUNTIME_EVENTS_PER_INVOCATION)
+        .into_iter()
+        .peekable();
+    while events.peek().is_some() {
+        let Some(remaining) = delivery_deadline.checked_duration_since(Instant::now()) else {
+            tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+            event_bus.requeue_front(events.collect());
+            break;
+        };
+        let event = events.next().expect("peeked event exists");
+        let key = runtime_event_key(&event.namespace, &event.event_type);
+        let subscriber_count = match run_with_python_deadline(module, remaining, || {
+            count
+                .call1((key.as_str(),))
+                .and_then(|value| value.extract::<usize>())
+        }) {
+            Ok(count) => count.min(MAX_RUNTIME_EVENT_SUBSCRIBERS),
+            Err(error) => {
+                tracing::error!(script = %label, error = %error, "python runtime event subscriber lookup failed; isolated");
+                continue;
+            }
+        };
+        for subscriber_index in 0..subscriber_count {
+            let Some(remaining) = delivery_deadline.checked_duration_since(Instant::now()) else {
+                tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+                event_bus.requeue_front(events.collect());
+                return commands;
+            };
+            let subscribers_remaining = subscriber_count - subscriber_index;
+            let subscriber_budget = remaining / subscribers_remaining as u32;
+            if subscriber_budget.is_zero() {
+                tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+                event_bus.requeue_front(events.collect());
+                return commands;
+            }
+            clear_commands(module);
+            let result = run_with_python_deadline(module, subscriber_budget, || -> PyResult<()> {
+                let value = PyDict::new(py);
+                value.set_item("namespace", &event.namespace)?;
+                value.set_item("type", &event.event_type)?;
+                value.set_item("payload", PyBytes::new(py, &event.payload))?;
+                call.call1((key.as_str(), subscriber_index, value))?;
+                Ok(())
+            });
+            match result {
+                Ok(()) => match take_commands(module, label, "runtime_event") {
+                    Ok(event_commands) => {
+                        append_runtime_event_commands(&mut commands, event_commands, label)
+                    }
+                    Err(error) => {
+                        tracing::error!(script = %label, error = %error, "python runtime event commands could not be drained");
+                        clear_commands(module);
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(
+                        script = %label,
+                        namespace = %event.namespace,
+                        event_type = %event.event_type,
+                        subscriber_index,
+                        error = %error,
+                        "python runtime event subscriber failed; isolated"
+                    );
+                    clear_commands(module);
+                }
+            }
+        }
+    }
+    commands
 }
 
 fn parse_commands(commands: Bound<'_, PyAny>) -> PyResult<Vec<OutboundCommand>> {
@@ -2481,6 +3126,208 @@ mod tests {
     }
 
     #[test]
+    fn runtime_events_are_local_fifo_and_non_reentrant() {
+        let bus = Arc::new(RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy {
+                enabled: true,
+                queue_capacity: 8,
+                max_event_bytes: 64,
+                max_events_per_minute: 10,
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+import citadel
+
+@citadel.events.subscribe("match", "first")
+def first(event):
+    citadel.broadcast(7, event["payload"])
+    assert citadel.events.emit("match", "second", b"two")
+
+@citadel.events.subscribe("match", "second")
+def second(event):
+    citadel.broadcast(8, event["payload"])
+
+@citadel.on_message(1)
+def message(ctx, body):
+    assert citadel.events.emit("match", "first", b"one")
+"#,
+        )
+        .with_event_bus(bus);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"one".to_vec(),
+                unreliable: false,
+            }]
+        );
+        assert_eq!(
+            runtime.tick(Duration::ZERO, Duration::from_millis(100)),
+            vec![OutboundCommand::Broadcast {
+                kind: 8,
+                body: b"two".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_is_namespaced_and_supports_cas() {
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def message(ctx, body):
+    first = citadel.cache.set("match.one", "score", b"one", 1000)
+    assert citadel.cache.get("match.two", "score") is None
+    second = citadel.cache.cas("match.one", "score", first["version"], b"two", 1000)
+    assert second is not None
+    assert citadel.cache.cas("match.one", "score", first["version"], b"bad", 1000) is None
+    citadel.broadcast(7, citadel.cache.get("match.one", "score")["value"])
+"#,
+        )
+        .with_shared_cache(cache);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"two".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_is_unavailable_in_realtime_interceptors() {
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+import citadel
+
+before_blocked = False
+after_blocked = False
+
+@citadel.before_realtime
+def before(ctx, body):
+    global before_blocked
+    try:
+        citadel.cache.set("match", "key", b"bad", 1000)
+    except RuntimeError:
+        before_blocked = True
+    return False
+
+@citadel.after_realtime
+def after(ctx, body):
+    global after_blocked
+    try:
+        citadel.cache.get("match", "key")
+    except RuntimeError:
+        after_blocked = True
+
+@citadel.on_message(1)
+def message(ctx, body):
+    assert citadel.cache.get("match", "key") is None
+    citadel.broadcast(7, b"ok" if before_blocked and after_blocked else b"failed")
+"#,
+        )
+        .with_shared_cache(cache);
+        assert_eq!(
+            runtime.before_realtime(1, None, None, 1, b""),
+            RealtimeInterception::Drop
+        );
+        runtime.after_realtime(
+            1,
+            None,
+            None,
+            1,
+            b"",
+            RealtimeAfterOutcome {
+                dropped: true,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"ok".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn runtime_event_subscriber_timeout_preserves_outer_commands() {
+        let bus = Arc::new(RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy {
+                enabled: true,
+                queue_capacity: 8,
+                max_event_bytes: 64,
+                max_events_per_minute: 10,
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = PythonRuntime::from_source(
+            r#"
+import citadel
+
+@citadel.events.subscribe("match", "slow")
+def slow(event):
+    while True:
+        pass
+
+@citadel.events.subscribe("match", "slow")
+def next_subscriber(event):
+    citadel.broadcast(8, b"next")
+
+@citadel.on_message(1)
+def message(ctx, body):
+    citadel.broadcast(7, b"outer")
+    citadel.events.emit("match", "slow", b"x")
+"#,
+            "timeout.py",
+            10,
+        )
+        .expect("runtime loads")
+        .with_event_bus(bus);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![
+                OutboundCommand::Broadcast {
+                    kind: 7,
+                    body: b"outer".to_vec(),
+                    unreliable: false,
+                },
+                OutboundCommand::Broadcast {
+                    kind: 8,
+                    body: b"next".to_vec(),
+                    unreliable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn host_api_surface_matches_manifest_python() {
         let shipped: HashSet<&'static str> = HOST_API_SURFACE
             .iter()
@@ -2648,6 +3495,158 @@ def handle(ctx, body):
                 body: [42u64.to_be_bytes().as_slice(), b"abc"].concat(),
                 unreliable: true,
             }]
+        );
+    }
+
+    #[test]
+    fn file_runtime_http_policy_survives_reload() {
+        let dir = TempDir::new("python-http-policy");
+        let source = r#"
+import citadel
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    try:
+        citadel.http.fetch("https://api.example.test/")
+    except RuntimeError as error:
+        citadel.broadcast(2, str(error).encode())
+"#;
+        dir.write_main(source);
+        let runtime = PythonRuntime::load_with_static_data_and_http_policy(
+            &dir.0,
+            100,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            OutboundHttpPolicy {
+                enabled: false,
+                ..OutboundHttpPolicy::default()
+            },
+        )
+        .expect("load file runtime")
+        .expect("main.py present");
+        let assert_disabled = |runtime: &PythonRuntime| {
+            let commands = runtime.dispatch(1, None, 1, b"");
+            let OutboundCommand::Broadcast { body, .. } = commands
+                .into_iter()
+                .next()
+                .expect("expected error broadcast")
+            else {
+                panic!("expected broadcast");
+            };
+            assert_eq!(
+                body,
+                b"outbound HTTP capability is disabled by runtime policy"
+            );
+        };
+        assert_disabled(&runtime);
+        dir.write_main(source);
+        assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
+        assert_disabled(&runtime);
+    }
+
+    #[test]
+    fn custom_http_endpoint_registration_dispatch_and_reload_are_atomic() {
+        let dir = TempDir::new("custom-http-endpoint");
+        let source = r#"
+import citadel
+
+@citadel.http.register("POST", "/echo", {"auth": "session"})
+def echo(request):
+    return {
+        "status": 201,
+        "headers": {"content-type": "text/plain"},
+        "body": request["user_id"].encode() + b":" + request["body"],
+    }
+"#;
+        dir.write_main(source);
+        let policy = RuntimeHttpEndpointPolicy {
+            enabled: true,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_requests_per_minute: 10,
+        };
+        let runtime = PythonRuntime::load_with_static_data_and_capability_policies(
+            &dir.0,
+            100,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            OutboundHttpPolicy::default(),
+            policy,
+        )
+        .expect("load endpoint runtime")
+        .expect("main.py present");
+        assert_eq!(
+            runtime.http_endpoints(),
+            vec![
+                RuntimeHttpEndpoint::new(
+                    RuntimeHttpMethod::Post,
+                    "/echo",
+                    RuntimeHttpAuth::Session,
+                )
+                .expect("valid endpoint")
+            ]
+        );
+        assert_eq!(
+            runtime.call_http_endpoint(RuntimeHttpRequest {
+                method: RuntimeHttpMethod::Post,
+                path: "/echo".to_string(),
+                headers: Default::default(),
+                body: b"hello".to_vec(),
+                user_id: Some("user-7".to_string()),
+            }),
+            RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                status: 201,
+                headers: [("content-type".to_string(), "text/plain".to_string())]
+                    .into_iter()
+                    .collect(),
+                body: b"user-7:hello".to_vec(),
+            })
+        );
+        dir.write_main(
+            r#"
+import citadel
+
+@citadel.http.register("GET", "/next")
+def next_endpoint(request):
+    return {"body": b"next"}
+"#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            runtime.http_endpoints(),
+            vec![
+                RuntimeHttpEndpoint::new(RuntimeHttpMethod::Get, "/next", RuntimeHttpAuth::Public)
+                    .expect("valid endpoint")
+            ],
+            "an endpoint-only runtime reloads atomically"
+        );
+        assert_eq!(
+            runtime.call_http_endpoint(RuntimeHttpRequest {
+                method: RuntimeHttpMethod::Get,
+                path: "/next".to_string(),
+                headers: Default::default(),
+                body: Vec::new(),
+                user_id: None,
+            }),
+            RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: b"next".to_vec(),
+            })
+        );
+        dir.write_main(
+            r#"
+import citadel
+
+citadel.http.register("GET", "/dup", {"auth": "public"}, lambda request: {})
+citadel.http.register("GET", "/dup", {"auth": "session"}, lambda request: {})
+"#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Rejected);
+        assert_eq!(
+            runtime.http_endpoints().len(),
+            1,
+            "old registry remains live"
         );
     }
 

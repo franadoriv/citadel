@@ -138,7 +138,7 @@ fn body_error(rejection: JsonRejection) -> ApiError {
 }
 
 /// Extract an opaque access bearer secret without placing it in errors/logs.
-fn access_bearer(headers: &HeaderMap) -> Result<Option<SessionTokenSecret>, ApiError> {
+pub(crate) fn access_bearer(headers: &HeaderMap) -> Result<Option<SessionTokenSecret>, ApiError> {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
     };

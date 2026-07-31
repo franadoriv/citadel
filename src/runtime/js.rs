@@ -22,12 +22,17 @@ use rquickjs::{
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
-use crate::runtime::outbound_http::{OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::outbound_http::{OutboundHttpPolicy, OutboundHttpRequest, TrustedHttpClient};
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
-    DomainHost, LifecycleHook, OutboundCommand, PhysicsOptions, RealtimeAfterOutcome,
-    RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime, RuntimeIntrospection,
-    StorageWriteInput,
+    DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, OutboundCommand, PhysicsOptions,
+    RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
+    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
+    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
+    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
+    RuntimeSharedCacheHandle, StorageWriteInput, append_runtime_event_commands,
+    disabled_runtime_event_bus_handle, disabled_runtime_shared_cache_handle, runtime_event_bus,
+    runtime_shared_cache, set_runtime_event_bus, set_runtime_shared_cache,
 };
 use citadel_physics::{PhysicsConfig, Shape};
 
@@ -42,6 +47,10 @@ const MAX_OUTBOUND_COMMANDS: usize = 1024;
 
 /// Per-runtime heap cap for capped QuickJS mode.
 const JS_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bound callback fan-out for one event key even if a script replaces a
+/// prelude helper with an untrusted count.
+const MAX_RUNTIME_EVENT_SUBSCRIBERS: u32 = 64;
 
 /// Per-runtime stack cap for capped QuickJS mode.
 const JS_STACK_LIMIT_BYTES: usize = 512 * 1024;
@@ -93,6 +102,13 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "storage.index_query",
     "storage.register_index_filter",
     "http.fetch",
+    "http.register",
+    "events.emit",
+    "events.subscribe",
+    "cache.get",
+    "cache.set",
+    "cache.delete",
+    "cache.cas",
 ];
 
 const JS_HOST_PRELUDE: &str = r#"
@@ -101,6 +117,9 @@ const JS_HOST_PRELUDE: &str = r#"
 
   const messageHandlers = new Map();
   const rpcHandlers = new Map();
+  const httpEndpointHandlers = new Map();
+  const eventHandlers = new Map();
+  const MAX_EVENT_SUBSCRIBERS = 64;
   const storageIndexFilters = new Map();
   let onJoin = null;
   let onLeave = null;
@@ -148,6 +167,13 @@ const JS_HOST_PRELUDE: &str = r#"
       }
     }
     return new Uint8Array(out);
+  }
+
+  function cacheEntry(encoded) {
+    if (encoded === null) return null;
+    const entry = JSON.parse(encoded);
+    entry.value = Uint8Array.from(entry.value);
+    return entry;
   }
 
   function bytes(value) {
@@ -312,6 +338,55 @@ const JS_HOST_PRELUDE: &str = r#"
         const response = JSON.parse(globalThis.__citadel_http_fetch(String(url), JSON.stringify(opts || {})));
         return { status: response.status, body: Uint8Array.from(response.body) };
       },
+      register(method, path, options, handler) {
+        if (typeof globalThis.__citadel_http_register !== "function") {
+          throw new Error("runtime HTTP endpoint host not available");
+        }
+        if (typeof options === "function" && handler === undefined) {
+          handler = options;
+          options = {};
+        }
+        if (typeof handler !== "function") {
+          throw new Error("runtime HTTP endpoint handler must be a function");
+        }
+        const key = globalThis.__citadel_http_register(
+          String(method), String(path), JSON.stringify(options || {})
+        );
+        httpEndpointHandlers.set(key, handler);
+        return handler;
+      },
+    },
+    events: {
+      subscribe(namespace, type, handler) {
+        if (typeof globalThis.__citadel_event_subscribe !== "function") {
+          throw new Error("runtime event host not available");
+        }
+        if (typeof handler !== "function") {
+          throw new Error("runtime event subscriber must be a function");
+        }
+        const key = globalThis.__citadel_event_subscribe(String(namespace), String(type));
+        const callbacks = eventHandlers.get(key) || [];
+        if (callbacks.length >= MAX_EVENT_SUBSCRIBERS) {
+          throw new Error("runtime event subscriber limit exceeded");
+        }
+        callbacks.push(handler);
+        eventHandlers.set(key, callbacks);
+        return handler;
+      },
+      emit(namespace, type, payload) {
+        if (typeof globalThis.__citadel_event_emit !== "function") {
+          throw new Error("runtime event host not available");
+        }
+        return Boolean(globalThis.__citadel_event_emit(
+          String(namespace), String(type), JSON.stringify(Array.from(bytes(payload)))
+        ));
+      },
+    },
+    cache: {
+      get(namespace, key) { return cacheEntry(globalThis.__citadel_cache_get(String(namespace), String(key))); },
+      set(namespace, key, value, ttlMs) { return cacheEntry(globalThis.__citadel_cache_set(String(namespace), String(key), JSON.stringify(Array.from(bytes(value))), Number(ttlMs))); },
+      delete(namespace, key) { return Boolean(globalThis.__citadel_cache_delete(String(namespace), String(key))); },
+      cas(namespace, key, expectedVersion, value, ttlMs) { return cacheEntry(globalThis.__citadel_cache_cas(String(namespace), String(key), expectedVersion === null || expectedVersion === undefined ? null : Number(expectedVersion), JSON.stringify(Array.from(bytes(value))), Number(ttlMs))); },
     },
     static_data: {
       load_json(path) {
@@ -638,6 +713,26 @@ const JS_HOST_PRELUDE: &str = r#"
     return Boolean(onRoomJoin(ctx, toRoomId(roomId)));
   };
 
+  globalThis.__citadel_call_http_endpoint = function (key, request) {
+    const handler = httpEndpointHandlers.get(String(key));
+    if (!handler) return null;
+    const response = handler(request) || {};
+    return [Number(response.status === undefined ? 200 : response.status), bytes(response.body), JSON.stringify(response.headers || {})];
+  };
+
+  globalThis.__citadel_runtime_event_subscriber_count = function (key) {
+    const callbacks = eventHandlers.get(String(key));
+    return callbacks ? callbacks.length : 0;
+  };
+
+  globalThis.__citadel_call_runtime_event_subscriber = function (key, index, event) {
+    const callbacks = eventHandlers.get(String(key));
+    const callback = callbacks && callbacks[Number(index)];
+    if (typeof callback !== "function") return false;
+    callback(event);
+    return true;
+  };
+
   globalThis.__citadel_has_tick_handler = function () {
     return onTick !== null;
   };
@@ -651,7 +746,9 @@ const JS_HOST_PRELUDE: &str = r#"
       || onRoomCreate !== null
       || onRoomJoin !== null
       || beforeRealtime !== null
-      || afterRealtime !== null;
+      || afterRealtime !== null
+      || httpEndpointHandlers.size > 0
+      || eventHandlers.size > 0;
   };
 
   globalThis.__citadel_introspect = function () {
@@ -744,6 +841,8 @@ struct JsVm {
     /// Canonical local ESM source paths successfully declared by this VM. The
     /// runtime uses this only to watch dependency edits during development.
     module_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// Validated runtime endpoint declarations built with this VM.
+    http_endpoints: Arc<Mutex<BTreeSet<RuntimeHttpEndpoint>>>,
 }
 
 /// Authoritative transform hub captured by the synchronous QuickJS read bridge.
@@ -761,6 +860,14 @@ pub struct JsRuntime {
     static_data_dir: Option<PathBuf>,
     /// Per-file static-data read bound retained across reloads.
     static_data_max_file_bytes: usize,
+    /// Outbound HTTP policy captured when the runtime is loaded. A reload must
+    /// preserve it so a source-only hot reload cannot widen egress access.
+    outbound_http_policy: OutboundHttpPolicy,
+    /// External endpoint policy captured at load time and retained across
+    /// source-only hot reloads.
+    http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    event_bus_handle: RuntimeEventBusHandle,
+    shared_cache_handle: RuntimeSharedCacheHandle,
     /// Persisted-domain-services seam exposed to `citadel.friends_*` host calls
     ///, or `None` when no services are attached. Retained so a
     /// reload re-applies it to the fresh context.
@@ -802,6 +909,42 @@ impl JsRuntime {
         static_data_dir: Option<&Path>,
         static_data_max_file_bytes: usize,
     ) -> AppResult<Option<Self>> {
+        Self::load_with_static_data_and_http_policy(
+            scripts_dir,
+            deadline_ms,
+            static_data_dir,
+            static_data_max_file_bytes,
+            OutboundHttpPolicy::default(),
+        )
+    }
+
+    /// Load `main.js` with an explicit operator-owned outbound HTTP policy.
+    pub fn load_with_static_data_and_http_policy(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+        outbound_http_policy: OutboundHttpPolicy,
+    ) -> AppResult<Option<Self>> {
+        Self::load_with_static_data_and_capability_policies(
+            scripts_dir,
+            deadline_ms,
+            static_data_dir,
+            static_data_max_file_bytes,
+            outbound_http_policy,
+            RuntimeHttpEndpointPolicy::default(),
+        )
+    }
+
+    /// Load `main.js` with all operator-owned runtime extension policies.
+    pub fn load_with_static_data_and_capability_policies(
+        scripts_dir: &Path,
+        deadline_ms: u64,
+        static_data_dir: Option<&Path>,
+        static_data_max_file_bytes: usize,
+        outbound_http_policy: OutboundHttpPolicy,
+        http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    ) -> AppResult<Option<Self>> {
         let main = scripts_dir.join(JS_ENTRYPOINT);
         if !main.is_file() {
             return Ok(None);
@@ -810,12 +953,20 @@ impl JsRuntime {
         let module_root = scripts_dir.to_path_buf();
         let source_label = main.display().to_string();
         let static_data = StaticDataCatalog::new(static_data_dir, static_data_max_file_bytes)?;
+        let event_bus_handle = disabled_runtime_event_bus_handle();
+        let shared_cache_handle = disabled_runtime_shared_cache_handle();
         let vm = build_js(
             &source,
             &source_label,
             Duration::from_millis(LOAD_DEADLINE_MS),
-            Some(&module_root),
-            static_data,
+            JsBuildOptions {
+                module_root: Some(&module_root),
+                static_data,
+                outbound_http_policy: outbound_http_policy.clone(),
+                http_endpoint_policy,
+                event_bus_handle: Arc::clone(&event_bus_handle),
+                shared_cache_handle: Arc::clone(&shared_cache_handle),
+            },
         )?;
         Ok(Some(Self {
             vm: Mutex::new(vm),
@@ -824,6 +975,10 @@ impl JsRuntime {
             module_root: Some(module_root),
             static_data_dir: static_data_dir.map(Path::to_path_buf),
             static_data_max_file_bytes,
+            outbound_http_policy,
+            http_endpoint_policy,
+            event_bus_handle,
+            shared_cache_handle,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -839,12 +994,20 @@ impl JsRuntime {
         let source_label = label.into();
         let static_data =
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let event_bus_handle = disabled_runtime_event_bus_handle();
+        let shared_cache_handle = disabled_runtime_shared_cache_handle();
         let vm = build_js(
             source,
             &source_label,
             Duration::from_millis(LOAD_DEADLINE_MS),
-            None,
-            static_data,
+            JsBuildOptions {
+                module_root: None,
+                static_data,
+                outbound_http_policy: OutboundHttpPolicy::default(),
+                http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+                event_bus_handle: Arc::clone(&event_bus_handle),
+                shared_cache_handle: Arc::clone(&shared_cache_handle),
+            },
         )?;
         Ok(Self {
             vm: Mutex::new(vm),
@@ -853,6 +1016,10 @@ impl JsRuntime {
             module_root: None,
             static_data_dir: None,
             static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            outbound_http_policy: OutboundHttpPolicy::default(),
+            http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+            event_bus_handle,
+            shared_cache_handle,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -869,12 +1036,20 @@ impl JsRuntime {
         let source_label = label.into();
         let static_data =
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
+        let event_bus_handle = disabled_runtime_event_bus_handle();
+        let shared_cache_handle = disabled_runtime_shared_cache_handle();
         let vm = build_js(
             source,
             &source_label,
             Duration::from_millis(LOAD_DEADLINE_MS),
-            Some(module_root),
-            static_data,
+            JsBuildOptions {
+                module_root: Some(module_root),
+                static_data,
+                outbound_http_policy: OutboundHttpPolicy::default(),
+                http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+                event_bus_handle: Arc::clone(&event_bus_handle),
+                shared_cache_handle: Arc::clone(&shared_cache_handle),
+            },
         )?;
         Ok(Self {
             vm: Mutex::new(vm),
@@ -883,6 +1058,10 @@ impl JsRuntime {
             module_root: Some(module_root.to_path_buf()),
             static_data_dir: None,
             static_data_max_file_bytes: crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            outbound_http_policy: OutboundHttpPolicy::default(),
+            http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
+            event_bus_handle,
+            shared_cache_handle,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -902,6 +1081,20 @@ impl JsRuntime {
                 Arc::clone(&guard.interceptor_mode),
             );
         }
+        self
+    }
+
+    /// Attach the node-owned best-effort runtime event bus and retain its
+    /// handle through source-only hot reloads.
+    #[must_use]
+    pub fn with_event_bus(self, bus: Arc<RuntimeEventBus>) -> Self {
+        set_runtime_event_bus(&self.event_bus_handle, bus);
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_cache(self, cache: Arc<RuntimeSharedCache>) -> Self {
+        set_runtime_shared_cache(&self.shared_cache_handle, cache);
         self
     }
 
@@ -974,8 +1167,14 @@ impl JsRuntime {
             &source,
             &label,
             Duration::from_millis(LOAD_DEADLINE_MS),
-            self.module_root.as_deref(),
-            fresh_static_data,
+            JsBuildOptions {
+                module_root: self.module_root.as_deref(),
+                static_data: fresh_static_data,
+                outbound_http_policy: self.outbound_http_policy.clone(),
+                http_endpoint_policy: self.http_endpoint_policy,
+                event_bus_handle: Arc::clone(&self.event_bus_handle),
+                shared_cache_handle: Arc::clone(&self.shared_cache_handle),
+            },
         ) {
             Ok(vm) => vm,
             Err(e) => {
@@ -1344,6 +1543,73 @@ impl JsRuntime {
         }
     }
 
+    /// Snapshot the endpoint declarations installed in the live VM.
+    #[must_use]
+    pub fn http_endpoints(&self) -> Vec<RuntimeHttpEndpoint> {
+        let guard = self.lock_vm();
+        lock_mutex(&guard.http_endpoints).iter().cloned().collect()
+    }
+
+    /// Invoke a script-defined HTTP endpoint under the normal QuickJS deadline
+    /// and error-isolation boundary.
+    pub fn call_http_endpoint(&self, request: RuntimeHttpRequest) -> RuntimeHttpOutcome {
+        let guard = self.lock_vm();
+        let key = format!("{} {}", request.method.as_str(), request.path);
+        let result = run_with_js_deadline(&guard.runtime, self.budget, || {
+            guard
+                .context
+                .with(|ctx| -> JsHostResult<RuntimeHttpOutcome> {
+                    let globals = ctx.globals();
+                    let call: Function = caught(&ctx, globals.get("__citadel_call_http_endpoint"))?;
+                    let value = caught(&ctx, Object::new(ctx.clone()))?;
+                    caught(&ctx, value.set("method", request.method.as_str()))?;
+                    caught(&ctx, value.set("path", request.path))?;
+                    let body =
+                        caught(&ctx, TypedArray::<u8>::new_copy(ctx.clone(), &request.body))?;
+                    caught(&ctx, value.set("body", body))?;
+                    if let Some(user_id) = request.user_id {
+                        caught(&ctx, value.set("user_id", user_id))?;
+                    }
+                    let headers = caught(&ctx, Object::new(ctx.clone()))?;
+                    for (name, header) in request.headers {
+                        caught(&ctx, headers.set(name, header))?;
+                    }
+                    caught(&ctx, value.set("headers", headers))?;
+                    let response: Value = caught(&ctx, call.call((key, value)))?;
+                    if response.is_null() {
+                        return Ok(RuntimeHttpOutcome::NotFound);
+                    }
+                    let response =
+                        Array::from_value(response).map_err(|error| error.to_string())?;
+                    let status: u16 = response.get(0).map_err(|error| error.to_string())?;
+                    if !(100..=599).contains(&status) {
+                        return Err("runtime HTTP endpoint response status is invalid".to_string());
+                    }
+                    let body = bytes_from_js(response.get(1).map_err(|error| error.to_string())?)?;
+                    let headers: String = response.get(2).map_err(|error| error.to_string())?;
+                    let headers = serde_json::from_str(&headers).map_err(|_| {
+                        "runtime HTTP endpoint response headers are invalid".to_string()
+                    })?;
+                    Ok(RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                        status,
+                        headers,
+                        body,
+                    }))
+                })
+        });
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    error = %error,
+                    "javascript runtime HTTP endpoint handler failed; isolated"
+                );
+                RuntimeHttpOutcome::Failed
+            }
+        }
+    }
+
     fn lock_vm(&self) -> MutexGuard<'_, JsVm> {
         lock_mutex(&self.vm)
     }
@@ -1378,6 +1644,7 @@ impl JsRuntime {
         F: FnOnce(Ctx<'_>) -> JsHostResult<bool>,
     {
         let guard = self.lock_vm();
+        let event_bus_handle = Arc::clone(&self.event_bus_handle);
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             guard.interceptor_mode.store(restricted, Ordering::Relaxed);
             run_with_js_deadline(&guard.runtime, budget, || {
@@ -1386,10 +1653,10 @@ impl JsRuntime {
                     set_realtime_interceptor_mode(&ctx, restricted)?;
                     let ran = call(ctx.clone());
                     match ran {
-                        Ok(true) => take_commands(&ctx, &guard.source_label, what),
+                        Ok(true) => take_commands(&ctx, &guard.source_label, what).map(Some),
                         Ok(false) => {
                             clear_commands(&ctx);
-                            Ok(Vec::new())
+                            Ok(None)
                         }
                         Err(e) => {
                             clear_commands(&ctx);
@@ -1402,7 +1669,26 @@ impl JsRuntime {
         guard.interceptor_mode.store(false, Ordering::Relaxed);
         clear_vm_realtime_interceptor_mode(&guard);
         match outcome {
-            Ok(Ok(commands)) => commands,
+            Ok(Ok(maybe_commands)) => {
+                let mut commands = maybe_commands.unwrap_or_default();
+                if !restricted {
+                    let event_commands = guard.context.with(|ctx| {
+                        dispatch_pending_runtime_events(
+                            &ctx,
+                            &guard.runtime,
+                            budget,
+                            &event_bus_handle,
+                            &guard.source_label,
+                        )
+                    });
+                    append_runtime_event_commands(
+                        &mut commands,
+                        event_commands,
+                        &guard.source_label,
+                    );
+                }
+                commands
+            }
             Ok(Err(JsInvocationError::Timeout)) => {
                 tracing::error!(
                     script = %guard.source_label,
@@ -1579,6 +1865,14 @@ impl Runtime for JsRuntime {
         JsRuntime::call_room_join(self, sender, user_id, room_id)
     }
 
+    fn http_endpoints(&self) -> Vec<RuntimeHttpEndpoint> {
+        JsRuntime::http_endpoints(self)
+    }
+
+    fn call_http_endpoint(&self, request: RuntimeHttpRequest) -> RuntimeHttpOutcome {
+        JsRuntime::call_http_endpoint(self, request)
+    }
+
     fn has_tick_handler(&self) -> bool {
         JsRuntime::has_tick_handler(self)
     }
@@ -1654,8 +1948,12 @@ fn install_static_data(ctx: &Ctx<'_>, static_data: StaticDataCatalog) -> JsHostR
 
 /// Install the bounded Rust-owned HTTP bridge. The JavaScript prelude converts
 /// its JSON result into a `Uint8Array`, so scripts never see a socket or client.
-fn install_outbound_http(ctx: &Ctx<'_>, interceptor_mode: Arc<AtomicBool>) -> JsHostResult<()> {
-    let client = TrustedHttpClient::new().map_err(|error| error.to_string())?;
+fn install_outbound_http(
+    ctx: &Ctx<'_>,
+    interceptor_mode: Arc<AtomicBool>,
+    policy: OutboundHttpPolicy,
+) -> JsHostResult<()> {
+    let client = TrustedHttpClient::new_with_policy(policy).map_err(|error| error.to_string())?;
     let fetch = caught(
         ctx,
         Function::new(
@@ -1706,6 +2004,269 @@ fn install_outbound_http(ctx: &Ctx<'_>, interceptor_mode: Arc<AtomicBool>) -> Js
     )?;
     caught(ctx, ctx.globals().set("__citadel_http_fetch", fetch))?;
     Ok(())
+}
+
+/// Install endpoint registration during VM initialization. The native bridge
+/// validates declarations and owns the authoritative snapshot; JavaScript only
+/// retains callbacks under opaque method/path keys.
+fn install_http_endpoint_registration(
+    ctx: &Ctx<'_>,
+    policy: RuntimeHttpEndpointPolicy,
+    endpoints: Arc<Mutex<BTreeSet<RuntimeHttpEndpoint>>>,
+) -> JsHostResult<()> {
+    if !policy.enabled {
+        return Ok(());
+    }
+    let register = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>,
+                  method: String,
+                  path: String,
+                  options_json: String|
+                  -> rquickjs::Result<String> {
+                let Some(method) = RuntimeHttpMethod::parse(&method) else {
+                    return throw_js(&ctx, "runtime HTTP endpoint method is invalid".to_string());
+                };
+                let options: serde_json::Value = match serde_json::from_str(&options_json) {
+                    Ok(options) => options,
+                    Err(_) => {
+                        return throw_js(
+                            &ctx,
+                            "runtime HTTP endpoint options are invalid".to_string(),
+                        );
+                    }
+                };
+                let auth = match options.get("auth") {
+                    Some(serde_json::Value::String(auth)) => match RuntimeHttpAuth::parse(auth) {
+                        Some(auth) => auth,
+                        None => {
+                            return throw_js(
+                                &ctx,
+                                "runtime HTTP endpoint auth must be 'public' or 'session'"
+                                    .to_string(),
+                            );
+                        }
+                    },
+                    Some(_) => {
+                        return throw_js(
+                            &ctx,
+                            "runtime HTTP endpoint auth must be 'public' or 'session'".to_string(),
+                        );
+                    }
+                    None => RuntimeHttpAuth::Public,
+                };
+                let endpoint = match RuntimeHttpEndpoint::new(method, path, auth) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => return throw_js(&ctx, error.to_string()),
+                };
+                let mut endpoints = lock_mutex(&endpoints);
+                // Callbacks are keyed by method/path in the JS prelude, so
+                // auth is not part of the route identity. Reject a second
+                // declaration even if it requests a different auth policy;
+                // otherwise a later callback could overwrite a session route
+                // while the transport selects the earlier public declaration.
+                if endpoints.iter().any(|existing| {
+                    existing.method == endpoint.method && existing.path == endpoint.path
+                }) {
+                    return throw_js(
+                        &ctx,
+                        "runtime HTTP endpoint is already registered".to_string(),
+                    );
+                }
+                endpoints.insert(endpoint.clone());
+                Ok(format!("{} {}", endpoint.method.as_str(), endpoint.path))
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_http_register", register))?;
+    Ok(())
+}
+
+/// Install the local event-bus bridge. JavaScript retains callbacks in its VM;
+/// Rust owns validation, queue bounds, and the node-local delivery snapshot.
+fn install_runtime_events(
+    ctx: &Ctx<'_>,
+    interceptor_mode: Arc<AtomicBool>,
+    event_bus_handle: RuntimeEventBusHandle,
+) -> JsHostResult<()> {
+    let subscribe = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>,
+                  namespace: String,
+                  event_type: String|
+                  -> rquickjs::Result<String> {
+                let event = match RuntimeEvent::new(namespace, event_type, Vec::new()) {
+                    Ok(event) => event,
+                    Err(error) => return throw_js(&ctx, error.to_string()),
+                };
+                Ok(runtime_event_key(&event.namespace, &event.event_type))
+            },
+        ),
+    )?;
+    caught(
+        ctx,
+        ctx.globals().set("__citadel_event_subscribe", subscribe),
+    )?;
+    let emit_handle = Arc::clone(&event_bus_handle);
+    let emit_mode = Arc::clone(&interceptor_mode);
+    let emit = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>,
+                  namespace: String,
+                  event_type: String,
+                  payload_json: String|
+                  -> rquickjs::Result<bool> {
+                ensure_realtime_effects_allowed(&ctx, &emit_mode)?;
+                let payload: Vec<u8> = match serde_json::from_str(&payload_json) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return throw_js(&ctx, "runtime event payload is invalid".to_string());
+                    }
+                };
+                let event = match RuntimeEvent::new(namespace, event_type, payload) {
+                    Ok(event) => event,
+                    Err(error) => return throw_js(&ctx, error.to_string()),
+                };
+                Ok(matches!(
+                    runtime_event_bus(&emit_handle).emit(event),
+                    RuntimeEventEmitOutcome::Queued
+                ))
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_event_emit", emit))?;
+    Ok(())
+}
+
+fn install_runtime_shared_cache(
+    ctx: &Ctx<'_>,
+    handle: RuntimeSharedCacheHandle,
+    interceptor_mode: Arc<AtomicBool>,
+) -> JsHostResult<()> {
+    let get_handle = Arc::clone(&handle);
+    let get_mode = Arc::clone(&interceptor_mode);
+    let get = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>,
+                  namespace: String,
+                  key: String|
+                  -> rquickjs::Result<Option<String>> {
+                ensure_realtime_effects_allowed(&ctx, &get_mode)?;
+                let value = match runtime_shared_cache(&get_handle).get(&namespace, &key) {
+                    Ok(value) => value,
+                    Err(error) => return throw_js(&ctx, error.to_string()),
+                };
+                Ok(value.map(cache_value_json))
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_cache_get", get))?;
+    let set_handle = Arc::clone(&handle);
+    let set_mode = Arc::clone(&interceptor_mode);
+    let set = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>,
+                  namespace: String,
+                  key: String,
+                  payload: String,
+                  ttl_ms: u64|
+                  -> rquickjs::Result<String> {
+                ensure_realtime_effects_allowed(&ctx, &set_mode)?;
+                let value = match serde_json::from_str::<Vec<u8>>(&payload) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return throw_js(&ctx, "runtime cache payload is invalid".to_string());
+                    }
+                };
+                let value = match runtime_shared_cache(&set_handle).set(
+                    &namespace,
+                    &key,
+                    value,
+                    Duration::from_millis(ttl_ms),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return throw_js(&ctx, error.to_string()),
+                };
+                Ok(cache_value_json(value))
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_cache_set", set))?;
+    let delete_handle = Arc::clone(&handle);
+    let delete_mode = Arc::clone(&interceptor_mode);
+    let delete = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, namespace: String, key: String| -> rquickjs::Result<bool> {
+                ensure_realtime_effects_allowed(&ctx, &delete_mode)?;
+                match runtime_shared_cache(&delete_handle).delete(&namespace, &key) {
+                    Ok(deleted) => Ok(deleted),
+                    Err(error) => throw_js(&ctx, error.to_string()),
+                }
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_cache_delete", delete))?;
+    let cas_handle = Arc::clone(&handle);
+    let cas_mode = Arc::clone(&interceptor_mode);
+    let cas = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>,
+                  namespace: String,
+                  key: String,
+                  expected_version: Option<u64>,
+                  payload: String,
+                  ttl_ms: u64|
+                  -> rquickjs::Result<Option<String>> {
+                ensure_realtime_effects_allowed(&ctx, &cas_mode)?;
+                let value = match serde_json::from_str::<Vec<u8>>(&payload) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return throw_js(&ctx, "runtime cache payload is invalid".to_string());
+                    }
+                };
+                let value = match runtime_shared_cache(&cas_handle).compare_and_swap(
+                    &namespace,
+                    &key,
+                    expected_version,
+                    value,
+                    Duration::from_millis(ttl_ms),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return throw_js(&ctx, error.to_string()),
+                };
+                Ok(value.map(cache_value_json))
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_cache_cas", cas))?;
+    Ok(())
+}
+
+fn cache_value_json(value: crate::runtime::RuntimeSharedCacheValue) -> String {
+    let bytes = value
+        .value
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"value":[{bytes}],"version":{},"expires_in_ms":{}}}"#,
+        value.version, value.expires_in_ms
+    )
 }
 
 fn install_realtime_interceptor_guard(
@@ -1817,15 +2378,32 @@ fn esm_module_id(root: &Path, path: &Path) -> Result<String, String> {
     Ok(segments.join("/"))
 }
 
+struct JsBuildOptions<'a> {
+    module_root: Option<&'a Path>,
+    static_data: StaticDataCatalog,
+    outbound_http_policy: OutboundHttpPolicy,
+    http_endpoint_policy: RuntimeHttpEndpointPolicy,
+    event_bus_handle: RuntimeEventBusHandle,
+    shared_cache_handle: RuntimeSharedCacheHandle,
+}
+
 fn build_js(
     source: &str,
     source_label: &str,
     load_budget: Duration,
-    module_root: Option<&Path>,
-    static_data: StaticDataCatalog,
+    options: JsBuildOptions<'_>,
 ) -> AppResult<JsVm> {
+    let JsBuildOptions {
+        module_root,
+        static_data,
+        outbound_http_policy,
+        http_endpoint_policy,
+        event_bus_handle,
+        shared_cache_handle,
+    } = options;
     let module_root = module_root.map(canonical_esm_root).transpose()?;
     let module_paths = Arc::new(Mutex::new(BTreeSet::new()));
+    let http_endpoints = Arc::new(Mutex::new(BTreeSet::new()));
     let interceptor_mode = Arc::new(AtomicBool::new(false));
     let runtime = QuickJsRuntime::new().map_err(|e| {
         script_error(
@@ -1859,7 +2437,22 @@ fn build_js(
                 ctx.eval_with_options::<(), _>(JS_HOST_PRELUDE.as_bytes().to_vec(), prelude_opts),
             )?;
             install_static_data(&ctx, static_data.clone())?;
-            install_outbound_http(&ctx, Arc::clone(&interceptor_mode))?;
+            install_outbound_http(&ctx, Arc::clone(&interceptor_mode), outbound_http_policy)?;
+            install_http_endpoint_registration(
+                &ctx,
+                http_endpoint_policy,
+                Arc::clone(&http_endpoints),
+            )?;
+            install_runtime_events(
+                &ctx,
+                Arc::clone(&interceptor_mode),
+                Arc::clone(&event_bus_handle),
+            )?;
+            install_runtime_shared_cache(
+                &ctx,
+                Arc::clone(&shared_cache_handle),
+                Arc::clone(&interceptor_mode),
+            )?;
             if let Some(root) = &module_root {
                 let entry_name = esm_module_id(root, &root.join(JS_ENTRYPOINT))?;
                 let promise = caught(
@@ -1891,6 +2484,7 @@ fn build_js(
         interceptor_mode,
         static_data,
         module_paths,
+        http_endpoints,
     })
 }
 
@@ -2002,6 +2596,109 @@ fn clear_commands(ctx: &Ctx<'_>) {
 
 fn clear_vm_commands(vm: &JsVm) {
     vm.context.with(|ctx| clear_commands(&ctx));
+}
+
+fn runtime_event_key(namespace: &str, event_type: &str) -> String {
+    format!("{namespace}\0{event_type}")
+}
+
+/// Dispatch one non-reentrant snapshot after an outer JavaScript invocation.
+/// Individual subscriber failures are isolated and their commands discarded.
+fn dispatch_pending_runtime_events(
+    ctx: &Ctx<'_>,
+    runtime: &QuickJsRuntime,
+    budget: Duration,
+    event_bus_handle: &RuntimeEventBusHandle,
+    label: &str,
+) -> Vec<OutboundCommand> {
+    let globals = ctx.globals();
+    let count: Function = match caught(ctx, globals.get("__citadel_runtime_event_subscriber_count"))
+    {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(script = %label, error = %error, "javascript runtime event bridge unavailable");
+            return Vec::new();
+        }
+    };
+    let call: Function = match caught(ctx, globals.get("__citadel_call_runtime_event_subscriber")) {
+        Ok(call) => call,
+        Err(error) => {
+            tracing::error!(script = %label, error = %error, "javascript runtime event bridge unavailable");
+            return Vec::new();
+        }
+    };
+    let event_bus = runtime_event_bus(event_bus_handle);
+    let mut commands = Vec::new();
+    let delivery_deadline = Instant::now() + budget;
+    let mut events = event_bus
+        .drain_snapshot_limit(MAX_RUNTIME_EVENTS_PER_INVOCATION)
+        .into_iter()
+        .peekable();
+    while events.peek().is_some() {
+        let Some(remaining) = delivery_deadline.checked_duration_since(Instant::now()) else {
+            tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+            event_bus.requeue_front(events.collect());
+            break;
+        };
+        let event = events.next().expect("peeked event exists");
+        let key = runtime_event_key(&event.namespace, &event.event_type);
+        let subscriber_count: u32 = match run_with_js_deadline(runtime, remaining, || {
+            caught::<u32>(ctx, count.call((key.as_str(),)))
+        }) {
+            Ok(count) => count.min(MAX_RUNTIME_EVENT_SUBSCRIBERS),
+            Err(error) => {
+                tracing::error!(script = %label, error = %error, "javascript runtime event subscriber lookup failed; isolated");
+                continue;
+            }
+        };
+        for subscriber_index in 0..subscriber_count {
+            let Some(remaining) = delivery_deadline.checked_duration_since(Instant::now()) else {
+                tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+                event_bus.requeue_front(events.collect());
+                return commands;
+            };
+            let subscribers_remaining = subscriber_count - subscriber_index;
+            let subscriber_budget = remaining / subscribers_remaining;
+            if subscriber_budget.is_zero() {
+                tracing::warn!(script = %label, "runtime event delivery budget exhausted; pending events deferred");
+                event_bus.requeue_front(events.collect());
+                return commands;
+            }
+            clear_commands(ctx);
+            let result = run_with_js_deadline(runtime, subscriber_budget, || {
+                let value = caught(ctx, Object::new(ctx.clone()))?;
+                caught(ctx, value.set("namespace", event.namespace.as_str()))?;
+                caught(ctx, value.set("type", event.event_type.as_str()))?;
+                let payload = caught(ctx, TypedArray::<u8>::new_copy(ctx.clone(), &event.payload))?;
+                caught(ctx, value.set("payload", payload))?;
+                let _: bool = caught(ctx, call.call((key.as_str(), subscriber_index, value)))?;
+                Ok(())
+            });
+            match result {
+                Ok(()) => match take_commands(ctx, label, "runtime_event") {
+                    Ok(event_commands) => {
+                        append_runtime_event_commands(&mut commands, event_commands, label)
+                    }
+                    Err(error) => {
+                        tracing::error!(script = %label, error = %error, "javascript runtime event commands could not be drained");
+                        clear_commands(ctx);
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(
+                        script = %label,
+                        namespace = %event.namespace,
+                        event_type = %event.event_type,
+                        subscriber_index,
+                        error = %error,
+                        "javascript runtime event subscriber failed; isolated"
+                    );
+                    clear_commands(ctx);
+                }
+            }
+        }
+    }
+    commands
 }
 
 fn set_realtime_interceptor_mode(ctx: &Ctx<'_>, enabled: bool) -> JsHostResult<()> {
@@ -2921,6 +3618,309 @@ mod tests {
         JsRuntime::load(&dir.0, 100)
             .expect("load file runtime")
             .expect("main.js present")
+    }
+
+    #[test]
+    fn file_runtime_http_policy_survives_reload() {
+        let dir = TempDir::new("http-policy");
+        let source = r#"
+            citadel.on_message(1, () => {
+              try { citadel.http.fetch("https://api.example.test/"); }
+              catch (error) { citadel.broadcast(2, error.message); }
+            });
+        "#;
+        dir.write_main(source);
+        let runtime = JsRuntime::load_with_static_data_and_http_policy(
+            &dir.0,
+            100,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            OutboundHttpPolicy {
+                enabled: false,
+                ..OutboundHttpPolicy::default()
+            },
+        )
+        .expect("load file runtime")
+        .expect("main.js present");
+        let assert_disabled = |runtime: &JsRuntime| {
+            assert_eq!(
+                first_broadcast_body(runtime.dispatch(1, None, 1, b"")),
+                b"outbound HTTP capability is disabled by runtime policy"
+            );
+        };
+        assert_disabled(&runtime);
+        dir.write_main(source);
+        assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
+        assert_disabled(&runtime);
+    }
+
+    #[test]
+    fn custom_http_endpoint_registration_dispatch_and_reload_are_atomic() {
+        let dir = TempDir::new("custom-http-endpoint");
+        let source = r#"
+          citadel.http.register("POST", "/echo", { auth: "session" }, (request) => ({
+            status: 201,
+            headers: { "content-type": "text/plain" },
+            body: request.user_id,
+          }));
+        "#;
+        dir.write_main(source);
+        let policy = RuntimeHttpEndpointPolicy {
+            enabled: true,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_requests_per_minute: 10,
+        };
+        let runtime = JsRuntime::load_with_static_data_and_capability_policies(
+            &dir.0,
+            100,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            OutboundHttpPolicy::default(),
+            policy,
+        )
+        .expect("load endpoint runtime")
+        .expect("main.js present");
+        assert_eq!(
+            runtime.http_endpoints(),
+            vec![
+                RuntimeHttpEndpoint::new(
+                    RuntimeHttpMethod::Post,
+                    "/echo",
+                    RuntimeHttpAuth::Session,
+                )
+                .expect("valid endpoint")
+            ]
+        );
+        assert_eq!(
+            runtime.call_http_endpoint(RuntimeHttpRequest {
+                method: RuntimeHttpMethod::Post,
+                path: "/echo".to_string(),
+                headers: Default::default(),
+                body: b"hello".to_vec(),
+                user_id: Some("user-7".to_string()),
+            }),
+            RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                status: 201,
+                headers: [("content-type".to_string(), "text/plain".to_string())]
+                    .into_iter()
+                    .collect(),
+                body: b"user-7".to_vec(),
+            })
+        );
+        dir.write_main(
+            r#"
+              const callback = citadel.http.register("GET", "/next", () => ({ body: "next" }));
+              if (typeof callback !== "function") throw new Error("register must return handler");
+            "#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            runtime.http_endpoints(),
+            vec![
+                RuntimeHttpEndpoint::new(RuntimeHttpMethod::Get, "/next", RuntimeHttpAuth::Public)
+                    .expect("valid endpoint")
+            ],
+            "an endpoint-only runtime reloads atomically"
+        );
+        assert_eq!(
+            runtime.call_http_endpoint(RuntimeHttpRequest {
+                method: RuntimeHttpMethod::Get,
+                path: "/next".to_string(),
+                headers: Default::default(),
+                body: Vec::new(),
+                user_id: None,
+            }),
+            RuntimeHttpOutcome::Response(RuntimeHttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: b"next".to_vec(),
+            })
+        );
+        dir.write_main(
+            r#"
+              citadel.http.register("GET", "/dup", { auth: "public" }, () => ({}));
+              citadel.http.register("GET", "/dup", { auth: "session" }, () => ({}));
+            "#,
+        );
+        assert_eq!(runtime.reload(), ReloadOutcome::Rejected);
+        assert_eq!(
+            runtime.http_endpoints().len(),
+            1,
+            "old registry remains live"
+        );
+    }
+
+    #[test]
+    fn runtime_events_are_local_fifo_and_non_reentrant() {
+        let bus = Arc::new(RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy {
+                enabled: true,
+                queue_capacity: 8,
+                max_event_bytes: 64,
+                max_events_per_minute: 10,
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+              citadel.events.subscribe("match", "first", (event) => {
+                citadel.broadcast(7, event.payload);
+                if (!citadel.events.emit("match", "second", "two")) throw new Error("queue");
+              });
+              citadel.events.subscribe("match", "second", (event) => citadel.broadcast(8, event.payload));
+              citadel.on_message(1, () => {
+                if (!citadel.events.emit("match", "first", "one")) throw new Error("queue");
+              });
+            "#,
+        )
+        .with_event_bus(bus);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"one".to_vec(),
+                unreliable: false,
+            }]
+        );
+        assert_eq!(
+            runtime.tick(Duration::ZERO, Duration::from_millis(100)),
+            vec![OutboundCommand::Broadcast {
+                kind: 8,
+                body: b"two".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_is_namespaced_and_supports_cas() {
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+              citadel.on_message(1, () => {
+                const first = citadel.cache.set("match.one", "score", "one", 1000);
+                if (citadel.cache.get("match.two", "score") !== null) throw new Error("namespace leaked");
+                const second = citadel.cache.cas("match.one", "score", first.version, "two", 1000);
+                if (second === null) throw new Error("cas rejected");
+                if (citadel.cache.cas("match.one", "score", first.version, "bad", 1000) !== null) throw new Error("stale cas");
+                citadel.broadcast(7, citadel.cache.get("match.one", "score").value);
+              });
+            "#,
+        )
+        .with_shared_cache(cache);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"two".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_is_unavailable_in_realtime_interceptors() {
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+              let beforeBlocked = false;
+              let afterBlocked = false;
+              citadel.before_realtime(() => {
+                try { citadel.cache.set("match", "key", "bad", 1000); } catch (_) { beforeBlocked = true; }
+                return false;
+              });
+              citadel.after_realtime(() => {
+                try { citadel.cache.get("match", "key"); } catch (_) { afterBlocked = true; }
+              });
+              citadel.on_message(1, () => {
+                if (citadel.cache.get("match", "key") !== null) throw new Error("cache mutated");
+                citadel.broadcast(7, beforeBlocked && afterBlocked ? "ok" : "failed");
+              });
+            "#,
+        )
+        .with_shared_cache(cache);
+        assert_eq!(
+            runtime.before_realtime(1, None, None, 1, b""),
+            RealtimeInterception::Drop
+        );
+        runtime.after_realtime(
+            1,
+            None,
+            None,
+            1,
+            b"",
+            RealtimeAfterOutcome {
+                dropped: true,
+                delivered: 0,
+            },
+        );
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"ok".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn runtime_event_subscriber_timeout_preserves_outer_commands() {
+        let bus = Arc::new(RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy {
+                enabled: true,
+                queue_capacity: 8,
+                max_event_bytes: 64,
+                max_events_per_minute: 10,
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = JsRuntime::from_source(
+            r#"
+              citadel.events.subscribe("match", "slow", () => { while (true) {} });
+              citadel.events.subscribe("match", "slow", () => citadel.broadcast(8, "next"));
+              citadel.on_message(1, () => {
+                citadel.broadcast(7, "outer");
+                citadel.events.emit("match", "slow", "x");
+              });
+            "#,
+            "timeout.js",
+            10,
+        )
+        .expect("runtime loads")
+        .with_event_bus(bus);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![
+                OutboundCommand::Broadcast {
+                    kind: 7,
+                    body: b"outer".to_vec(),
+                    unreliable: false,
+                },
+                OutboundCommand::Broadcast {
+                    kind: 8,
+                    body: b"next".to_vec(),
+                    unreliable: false,
+                },
+            ]
+        );
     }
 
     fn first_broadcast_body(commands: Vec<OutboundCommand>) -> Vec<u8> {

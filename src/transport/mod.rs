@@ -37,7 +37,8 @@ use std::time::Duration;
 pub use codec::{Envelope, decode_datagram, decode_framed};
 pub use queue::{OutboundQueue, OverflowPolicy, PushOutcome};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
 use crate::app::App;
 use crate::chat_cluster::{
@@ -48,7 +49,7 @@ use crate::config::{
     Config, LuaExecutionMode, NetworkPeerConfig, RuntimeLanguage, TransformSyncConfig,
 };
 use crate::error::{AppError, AppResult, ErrorCategory};
-use crate::lifecycle::{CancellationToken, Supervisor};
+use crate::lifecycle::{AsyncService, CancellationToken, Supervisor};
 use crate::matchmaker_cluster::QueueShardId;
 use crate::matchmaker_live::{LiveMatchmakerConfig, LiveMatchmakerNode};
 use crate::matchmaker_transport::{
@@ -62,11 +63,17 @@ use crate::realtime::transform::{TransformHub, TransformHubConfig, TransformStat
 use crate::runtime::JsRuntime;
 #[cfg(feature = "runtime-python")]
 use crate::runtime::PythonRuntime;
-use crate::runtime::{LuaRuntime, Runtime};
+use crate::runtime::cache_lease::{
+    RuntimeCacheLease, RuntimeCacheLeaseResolution, StorageRuntimeCacheLeaseDirectory,
+};
+use crate::runtime::cluster::RuntimeCacheWrite;
+use crate::runtime::{
+    LuaRuntime, Runtime, RuntimeCachePublisher, RuntimeEvent, RuntimeEventPublisher,
+};
 use crate::services::ChatChannelAuthorizer;
 use crate::services::matchmaker_directory::StorageMatchmakerLeaseDirectory;
 use crate::session::NodeId;
-use crate::time::{Clock, DurationMillis};
+use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 
 /// Typed, best-effort broadcaster for the local channel-presence announcer.
 /// It deliberately discards a transient peer error: the supervised renewer
@@ -74,6 +81,221 @@ use crate::time::{Clock, DurationMillis};
 struct ControlChatPresencePublisher {
     router: Arc<TlsMatchmakerHandoffRouter>,
     peers: Vec<NodeId>,
+}
+
+/// Bounded asynchronous fan-out for runtime events. A saturated peer queue is
+/// deliberately a best-effort drop; the local event remains accepted.
+struct ControlRuntimeEventPublisher {
+    sender: mpsc::SyncSender<RuntimeEvent>,
+}
+
+impl ControlRuntimeEventPublisher {
+    fn new(router: Arc<TlsMatchmakerHandoffRouter>, peers: Vec<NodeId>, source: NodeId) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<RuntimeEvent>(256);
+        let _ = thread::Builder::new()
+            .name("citadel-runtime-event-fanout".to_owned())
+            .spawn(move || {
+                let mut sequence = 0u64;
+                while let Ok(event) = receiver.recv() {
+                    sequence = sequence.wrapping_add(1).max(1);
+                    let id = crate::runtime::cluster::RuntimeClusterEventId {
+                        source_node: source.clone(),
+                        sequence,
+                    };
+                    for peer in &peers {
+                        let _ = router.deliver_runtime_event(
+                            peer,
+                            crate::runtime::cluster::RuntimeClusterEvent {
+                                id: id.clone(),
+                                event: event.clone(),
+                            },
+                        );
+                    }
+                }
+            });
+        Self { sender }
+    }
+}
+
+impl RuntimeEventPublisher for ControlRuntimeEventPublisher {
+    fn publish(&self, event: RuntimeEvent) {
+        let _ = self.sender.try_send(event);
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeCacheLeaseState {
+    lease: RuntimeCacheLease,
+    local: bool,
+}
+
+type RuntimeCacheLeaseSlot = Arc<Mutex<Option<RuntimeCacheLeaseState>>>;
+
+fn runtime_cache_lease_incarnation() -> AppResult<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        AppError::new(
+            ErrorCategory::Internal,
+            "could not create runtime cache lease incarnation",
+        )
+        .with_detail(error.to_string())
+    })?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+struct ControlRuntimeCachePublisher {
+    sender: mpsc::SyncSender<RuntimeCacheWrite>,
+}
+impl ControlRuntimeCachePublisher {
+    fn new(
+        router: Arc<TlsMatchmakerHandoffRouter>,
+        peers: Vec<NodeId>,
+        source: NodeId,
+        lease: RuntimeCacheLeaseSlot,
+        cache: Arc<crate::runtime::RuntimeSharedCache>,
+    ) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<RuntimeCacheWrite>(256);
+        let _ = thread::Builder::new()
+            .name("citadel-runtime-cache-fanout".to_owned())
+            .spawn(move || {
+                let mut sequence = 0u64;
+                while let Ok(write) = receiver.recv() {
+                    if !cache.can_accept_cluster_write(&write) {
+                        continue;
+                    }
+                    let current = lease.lock().ok().and_then(|lease| lease.clone());
+                    let Some(current) =
+                        current.filter(|state| state.lease.is_current_at(SystemClock.now()))
+                    else {
+                        continue;
+                    };
+                    if !current.local {
+                        if current.lease.owner_node != source {
+                            let _ =
+                                router.submit_runtime_cache_write(&current.lease.owner_node, write);
+                        }
+                        continue;
+                    }
+                    if current.lease.owner_node != source {
+                        continue;
+                    }
+                    sequence = sequence.wrapping_add(1).max(1);
+                    let mutation = crate::runtime::cluster::RuntimeCacheMutation {
+                        namespace: write.namespace,
+                        key: write.key,
+                        value: write.value,
+                        expires_at: write.expires_at,
+                        fence: crate::runtime::cluster::RuntimeCacheFence {
+                            owner_node: source.clone(),
+                            generation: current.lease.generation,
+                            sequence,
+                        },
+                    };
+                    // Record the same fence locally before publishing it, so a
+                    // delayed packet from a previous owner cannot overwrite a
+                    // successful local write after a failover.
+                    let _ = cache.apply_cluster_mutation(mutation.clone());
+                    for peer in &peers {
+                        let _ = router.apply_runtime_cache_mutation(peer, mutation.clone());
+                    }
+                }
+            });
+        Self { sender }
+    }
+
+    fn submit(&self, write: RuntimeCacheWrite) -> bool {
+        self.sender.try_send(write).is_ok()
+    }
+}
+impl RuntimeCachePublisher for ControlRuntimeCachePublisher {
+    fn set(&self, namespace: String, key: String, value: Vec<u8>, expires_at: TimestampMillis) {
+        let _ = self.submit(RuntimeCacheWrite {
+            namespace,
+            key,
+            value: Some(value),
+            expires_at,
+        });
+    }
+    fn delete(&self, namespace: String, key: String, expires_at: TimestampMillis) {
+        let _ = self.submit(RuntimeCacheWrite {
+            namespace,
+            key,
+            value: None,
+            expires_at,
+        });
+    }
+}
+
+/// Renews or resolves the one durable runtime-cache writer lease. If storage
+/// is unavailable, publishers stop once their last lease expires instead of
+/// continuing to sign mutations with a stale fence.
+struct RuntimeCacheLeaseRenewalService {
+    directory: StorageRuntimeCacheLeaseDirectory,
+    node: NodeId,
+    incarnation: String,
+    ttl_ms: u64,
+    slot: RuntimeCacheLeaseSlot,
+}
+
+impl RuntimeCacheLeaseRenewalService {
+    fn new(
+        directory: StorageRuntimeCacheLeaseDirectory,
+        node: NodeId,
+        incarnation: String,
+        ttl_ms: u64,
+        slot: RuntimeCacheLeaseSlot,
+    ) -> Self {
+        Self {
+            directory,
+            node,
+            incarnation,
+            ttl_ms,
+            slot,
+        }
+    }
+
+    async fn refresh(&self) -> AppResult<()> {
+        let now = SystemClock.now();
+        let expires_at =
+            TimestampMillis::from_unix_millis(now.unix_millis().saturating_add(self.ttl_ms));
+        let resolution = self
+            .directory
+            .acquire_or_resolve(self.node.clone(), &self.incarnation, expires_at, now)
+            .await?;
+        let state = match resolution {
+            RuntimeCacheLeaseResolution::Local(lease) => {
+                RuntimeCacheLeaseState { lease, local: true }
+            }
+            RuntimeCacheLeaseResolution::Remote(lease) => RuntimeCacheLeaseState {
+                lease,
+                local: false,
+            },
+        };
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some(state);
+        }
+        Ok(())
+    }
+}
+
+impl AsyncService for RuntimeCacheLeaseRenewalService {
+    fn name(&self) -> &str {
+        "runtime-cache-lease-renewal"
+    }
+
+    async fn run(self: Box<Self>, cancel: CancellationToken) -> AppResult<()> {
+        let mut interval = tokio::time::interval(Duration::from_millis((self.ttl_ms / 2).max(1)));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = interval.tick() => {
+                    if let Err(error) = self.refresh().await {
+                        tracing::warn!(error = %error, "runtime cache lease renewal failed");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl ChatPresencePublisher for ControlChatPresencePublisher {
@@ -150,6 +372,8 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         Some(domain_host),
         Arc::clone(&maps),
         transform_hub.as_ref().map(|(hub, _, _)| Arc::clone(hub)),
+        Arc::clone(app.runtime_event_bus()),
+        Arc::clone(app.runtime_shared_cache()),
     )?;
     // Build the realtime authenticator from the node's session service and the
     // configured auth stance: the handshake validates a presented
@@ -213,6 +437,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     let mut chat_cluster_directory = None;
     let mut chat_cluster_router = None;
     let mut chat_cluster_node = None;
+    let mut runtime_cache_lease_renewal = None;
     if app.config().cluster.enabled {
         let cluster = &app.config().cluster;
         let local_node = NodeId::new(app.config().server.node_id.clone())?;
@@ -249,6 +474,90 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             endpoints,
             Duration::from_millis(cluster.command_timeout_ms),
         )?);
+        let cache_lease_directory =
+            StorageRuntimeCacheLeaseDirectory::new(app.backend().storage_repository());
+        let cache_lease_slot: RuntimeCacheLeaseSlot = Arc::new(Mutex::new(None));
+        let cache_lease_incarnation = runtime_cache_lease_incarnation()?;
+        let now = SystemClock.now();
+        let initial_cache_lease = cache_lease_directory
+            .acquire_or_resolve(
+                local_node.clone(),
+                &cache_lease_incarnation,
+                TimestampMillis::from_unix_millis(
+                    now.unix_millis().saturating_add(cluster.lease_ttl_ms),
+                ),
+                now,
+            )
+            .await?;
+        if let Ok(mut slot) = cache_lease_slot.lock() {
+            *slot = Some(match initial_cache_lease {
+                RuntimeCacheLeaseResolution::Local(lease) => {
+                    RuntimeCacheLeaseState { lease, local: true }
+                }
+                RuntimeCacheLeaseResolution::Remote(lease) => RuntimeCacheLeaseState {
+                    lease,
+                    local: false,
+                },
+            });
+        }
+        let remote_event_bus = Arc::clone(app.runtime_event_bus());
+        app.runtime_event_bus()
+            .set_publisher(Arc::new(ControlRuntimeEventPublisher::new(
+                Arc::clone(&router),
+                router.peer_nodes(),
+                local_node.clone(),
+            )));
+        let remote_cache = Arc::clone(app.runtime_shared_cache());
+        let cache_publisher = Arc::new(ControlRuntimeCachePublisher::new(
+            Arc::clone(&router),
+            router.peer_nodes(),
+            local_node.clone(),
+            Arc::clone(&cache_lease_slot),
+            Arc::clone(&remote_cache),
+        ));
+        app.runtime_shared_cache()
+            .set_publisher(cache_publisher.clone());
+        let remote_event_dedupe = Arc::new(Mutex::new(
+            crate::runtime::cluster::RuntimeClusterDedupe::new(4_096),
+        ));
+        router.register_runtime_event_handler(Arc::new(move |_source, event| {
+            let accepted = remote_event_dedupe
+                .lock()
+                .map(|mut dedupe| dedupe.accept(event.id))
+                .unwrap_or(false);
+            accepted
+                && matches!(
+                    remote_event_bus.emit_remote(event.event),
+                    crate::runtime::RuntimeEventEmitOutcome::Queued
+                )
+        }));
+        router.register_runtime_cache_handler(Arc::new(move |_source, mutation| {
+            remote_cache.apply_cluster_mutation(mutation)
+        }));
+        let cache_write_publisher = Arc::clone(&cache_publisher);
+        let cache_write_lease = Arc::clone(&cache_lease_slot);
+        let cache_for_write_validation = Arc::clone(app.runtime_shared_cache());
+        let write_owner = local_node.clone();
+        router.register_runtime_cache_write_handler(Arc::new(move |_source, write| {
+            cache_for_write_validation.can_accept_cluster_write(&write)
+                && cache_write_lease
+                    .lock()
+                    .ok()
+                    .and_then(|lease| lease.clone())
+                    .is_some_and(|state| {
+                        state.local
+                            && state.lease.owner_node == write_owner
+                            && state.lease.is_current_at(SystemClock.now())
+                    })
+                && cache_write_publisher.submit(write)
+        }));
+        runtime_cache_lease_renewal = Some(RuntimeCacheLeaseRenewalService::new(
+            cache_lease_directory,
+            local_node.clone(),
+            cache_lease_incarnation,
+            cluster.lease_ttl_ms,
+            cache_lease_slot,
+        ));
         // The directory is intentionally channel/node scoped. The control
         // router authenticates the source before it reaches this handler, and
         // the handler independently checks that an advertised node matches that
@@ -370,6 +679,9 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
                 64,
                 64,
             ));
+        }
+        if let Some(renewal) = runtime_cache_lease_renewal {
+            supervisor.spawn(renewal);
         }
     }
 
@@ -653,6 +965,16 @@ pub(crate) fn validate_runtime_for_check(config: &Config) -> AppResult<()> {
         None,
         Arc::new(crate::maps::MapCatalog::empty()),
         None,
+        Arc::new(crate::runtime::RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy::from(&config.runtime.capabilities.events),
+            Arc::new(crate::observability::NodeMetrics::new()),
+        )),
+        Arc::new(crate::runtime::RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy::from(
+                &config.runtime.capabilities.shared_cache,
+            ),
+            Arc::new(crate::observability::NodeMetrics::new()),
+        )),
     )?;
     Ok(())
 }
@@ -662,6 +984,8 @@ fn build_runtime(
     domain: Option<Arc<dyn crate::runtime::DomainHost>>,
     maps: Arc<crate::maps::MapCatalog>,
     transform_hub: Option<Arc<TransformHub>>,
+    event_bus: Arc<crate::runtime::RuntimeEventBus>,
+    shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     let rc = &config.runtime;
     if !rc.enabled {
@@ -699,44 +1023,58 @@ fn build_runtime(
         "selected embedded game runtime"
     );
     match selection.language {
-        RuntimeLanguage::Lua => match LuaRuntime::load_with_static_data_and_mode(
-            Path::new(&rc.scripts_dir),
-            rc.deadline_ms,
-            rc.static_data_dir.as_deref().map(Path::new),
-            rc.static_data_max_file_bytes,
-            rc.lua_execution_mode,
-        )? {
-            Some(runtime) => {
-                tracing::info!(
-                    scripts_dir = %rc.scripts_dir,
-                    deadline_ms = rc.deadline_ms,
-                    lua_execution_mode = rc.lua_execution_mode.as_str(),
-                    "loaded embedded Lua game runtime"
-                );
-                // Expose the persisted domain features (friends, …) to game logic
-                // when services are attached.
-                let runtime = match domain {
-                    Some(host) => runtime.with_domain_host(host),
-                    None => runtime,
+        RuntimeLanguage::Lua => {
+            match LuaRuntime::load_with_static_data_and_mode_and_capability_policies(
+                Path::new(&rc.scripts_dir),
+                rc.deadline_ms,
+                rc.static_data_dir.as_deref().map(Path::new),
+                rc.static_data_max_file_bytes,
+                rc.lua_execution_mode,
+                crate::runtime::outbound_http::OutboundHttpPolicy::from(
+                    &rc.capabilities.outbound_http,
+                ),
+                crate::runtime::RuntimeHttpEndpointPolicy::from(
+                    &rc.capabilities.custom_http_endpoints,
+                ),
+            )? {
+                Some(runtime) => {
+                    tracing::info!(
+                        scripts_dir = %rc.scripts_dir,
+                        deadline_ms = rc.deadline_ms,
+                        lua_execution_mode = rc.lua_execution_mode.as_str(),
+                        "loaded embedded Lua game runtime"
+                    );
+                    // Expose the persisted domain features (friends, …) to game logic
+                    // when services are attached.
+                    let runtime = match domain {
+                        Some(host) => runtime.with_domain_host(host),
+                        None => runtime,
+                    }
+                    .with_maps(maps)
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_shared_cache(Arc::clone(&shared_cache));
+                    let runtime = match transform_hub {
+                        Some(hub) => runtime.with_transform_hub(hub),
+                        None => runtime,
+                    };
+                    let runtime: Arc<dyn Runtime> = Arc::new(runtime);
+                    Ok(Some(runtime))
                 }
-                .with_maps(maps);
-                let runtime = match transform_hub {
-                    Some(hub) => runtime.with_transform_hub(hub),
-                    None => runtime,
-                };
-                let runtime: Arc<dyn Runtime> = Arc::new(runtime);
-                Ok(Some(runtime))
+                None => {
+                    tracing::info!(
+                        scripts_dir = %rc.scripts_dir,
+                        "selected Lua entrypoint disappeared before load; using the built-in relay fallback"
+                    );
+                    Ok(None)
+                }
             }
-            None => {
-                tracing::info!(
-                    scripts_dir = %rc.scripts_dir,
-                    "selected Lua entrypoint disappeared before load; using the built-in relay fallback"
-                );
-                Ok(None)
-            }
-        },
-        RuntimeLanguage::Python => load_python_runtime(rc, domain, maps, transform_hub),
-        RuntimeLanguage::Js => load_js_runtime(rc, domain, maps, transform_hub),
+        }
+        RuntimeLanguage::Python => {
+            load_python_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)
+        }
+        RuntimeLanguage::Js => {
+            load_js_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)
+        }
     }
 }
 
@@ -746,12 +1084,16 @@ fn load_python_runtime(
     domain: Option<Arc<dyn crate::runtime::DomainHost>>,
     maps: Arc<crate::maps::MapCatalog>,
     transform_hub: Option<Arc<TransformHub>>,
+    event_bus: Arc<crate::runtime::RuntimeEventBus>,
+    shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
-    match PythonRuntime::load_with_static_data(
+    match PythonRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
         rc.deadline_ms,
         rc.static_data_dir.as_deref().map(Path::new),
         rc.static_data_max_file_bytes,
+        crate::runtime::outbound_http::OutboundHttpPolicy::from(&rc.capabilities.outbound_http),
+        crate::runtime::RuntimeHttpEndpointPolicy::from(&rc.capabilities.custom_http_endpoints),
     )? {
         Some(runtime) => {
             tracing::info!(
@@ -763,7 +1105,9 @@ fn load_python_runtime(
                 Some(host) => runtime.with_domain_host(host),
                 None => runtime,
             }
-            .with_maps(maps);
+            .with_maps(maps)
+            .with_event_bus(event_bus)
+            .with_shared_cache(shared_cache);
             let runtime = match transform_hub {
                 Some(hub) => runtime.with_transform_hub(hub),
                 None => runtime,
@@ -787,6 +1131,8 @@ fn load_python_runtime(
     _domain: Option<Arc<dyn crate::runtime::DomainHost>>,
     _maps: Arc<crate::maps::MapCatalog>,
     _transform_hub: Option<Arc<TransformHub>>,
+    _event_bus: Arc<crate::runtime::RuntimeEventBus>,
+    _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,
@@ -803,12 +1149,16 @@ fn load_js_runtime(
     domain: Option<Arc<dyn crate::runtime::DomainHost>>,
     maps: Arc<crate::maps::MapCatalog>,
     transform_hub: Option<Arc<TransformHub>>,
+    event_bus: Arc<crate::runtime::RuntimeEventBus>,
+    shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
-    match JsRuntime::load_with_static_data(
+    match JsRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
         rc.deadline_ms,
         rc.static_data_dir.as_deref().map(Path::new),
         rc.static_data_max_file_bytes,
+        crate::runtime::outbound_http::OutboundHttpPolicy::from(&rc.capabilities.outbound_http),
+        crate::runtime::RuntimeHttpEndpointPolicy::from(&rc.capabilities.custom_http_endpoints),
     )? {
         Some(runtime) => {
             tracing::info!(
@@ -820,7 +1170,9 @@ fn load_js_runtime(
                 Some(host) => runtime.with_domain_host(host),
                 None => runtime,
             }
-            .with_maps(maps);
+            .with_maps(maps)
+            .with_event_bus(event_bus)
+            .with_shared_cache(shared_cache);
             let runtime = match transform_hub {
                 Some(hub) => runtime.with_transform_hub(hub),
                 None => runtime,
@@ -844,6 +1196,8 @@ fn load_js_runtime(
     _domain: Option<Arc<dyn crate::runtime::DomainHost>>,
     _maps: Arc<crate::maps::MapCatalog>,
     _transform_hub: Option<Arc<TransformHub>>,
+    _event_bus: Arc<crate::runtime::RuntimeEventBus>,
+    _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,

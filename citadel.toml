@@ -85,6 +85,41 @@ tick_hz = 0
 hot_reload = true
 hot_reload_poll_ms = 500
 
+# Runtime extension capabilities. Existing bounded outbound HTTP remains enabled
+# for compatibility. Script-defined external endpoints are available but
+# disabled by default. Events and the shared cache are node-local, non-durable,
+# and opt-in.
+# These are node-startup policy values: runtime script hot reload never changes
+# them, so restart Citadel after editing this section.
+[runtime.capabilities.outbound_http]
+enabled = true
+max_concurrent_requests = 16
+max_requests_per_minute = 120
+# Empty permits public DNS hosts; set exact names to further restrict egress.
+allowed_hosts = []
+# Public web ports only. Add an explicit private integration port if needed.
+allowed_ports = [80, 443]
+# Never enable this unless the listed host and private target are operator-owned.
+allow_private_networks = false
+
+[runtime.capabilities.custom_http_endpoints]
+enabled = false
+max_request_bytes = 65536
+max_response_bytes = 1048576
+max_requests_per_minute = 120
+
+[runtime.capabilities.events]
+enabled = false
+queue_capacity = 1024
+max_event_bytes = 16384
+max_events_per_minute = 600
+
+[runtime.capabilities.shared_cache]
+enabled = false
+max_entries = 1024
+max_value_bytes = 65536
+max_ttl_ms = 3600000
+
 # Realtime transports. Each is independently enabled and bound. QUIC is the
 # primary native transport, WebTransport serves browsers over HTTP/3, and
 # WebSocket is the broadest-compatibility fallback. All three are enabled here so

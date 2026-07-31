@@ -71,6 +71,122 @@ local response = citadel.http.fetch("https://inventory.example/v1/stock", {
 if response.status ~= 200 then error("inventory unavailable") end
 ```
 
+## citadel.http.register
+
+Register one externally reachable script endpoint during `main.lua` startup.
+Citadel owns the router: every declared path is served only below the reserved
+`/ext` prefix, so a runtime cannot replace `/health`, `/v1`, `/console`, or any
+other Citadel route. The capability is disabled by default and is available
+only when `[runtime.capabilities.custom_http_endpoints] enabled = true`.
+
+```lua
+citadel.http.register(method, path [, options], handler)
+```
+
+`method` must be `GET`, `POST`, `PUT`, `PATCH`, or `DELETE`. `path` is a
+canonical relative path such as `/webhooks/inventory`: it must begin with `/`,
+cannot end in `/`, and may contain only ASCII letters, digits, `.`, `_`, and
+`-` in non-empty segments. Duplicate method/path registrations and invalid
+paths reject the whole startup or hot reload, keeping the prior runtime live.
+
+`options.auth` is either `"public"` (the default) or `"session"`. A
+session endpoint requires a valid Citadel player bearer and receives
+`request.user_id`; public endpoints receive no user id. Citadel consumes the
+credential itself and never passes authorization or cookie headers to the
+script.
+
+```lua
+citadel.http.register("POST", "/webhooks/inventory", { auth = "session" }, function(request)
+  -- request.method, request.path, request.headers, request.body, request.user_id
+  return {
+    status = 201,
+    headers = { ["content-type"] = "application/json" },
+    body = "{\"accepted\":true}",
+  }
+end)
+```
+
+The handler returns a table with optional `status` (default `200`), `headers`,
+and binary-safe `body`. Request and response bodies, request headers, and
+requests per minute use the configured capability limits. Citadel rejects
+hop-by-hop response headers, enforces the normal runtime deadline, isolates a
+handler failure as HTTP `500`, records a sanitized audit outcome, and swaps the
+complete endpoint registry atomically on a successful reload. Python and
+JavaScript expose the same `citadel.http.register` contract with their native
+mapping/object and callback syntax.
+
+---
+
+## citadel.events
+
+Publish and subscribe to bounded, node-local runtime events. This v1 surface is
+best-effort only: events are never durable, retried, replicated to another
+node, or replayed after restart. Enable it with
+`[runtime.capabilities.events] enabled = true`.
+
+```lua
+citadel.events.subscribe("match.score", "updated", function(event)
+  -- event.namespace, event.type, event.payload (binary-safe Lua string)
+  citadel.broadcast(41, event.payload)
+end)
+
+local queued = citadel.events.emit("match.score", "updated", "42")
+if not queued then
+  -- coalesce or safely discard best-effort work
+end
+```
+
+`namespace` and `type` use 1–80 ASCII alphanumeric, `.`, `_`, or `-`
+characters. `emit` returns `false` when the capability is disabled or the
+payload is oversized, rate-limited, or the fixed queue is full. Accepted events
+are FIFO within this node; each namespace/type pair accepts at most 64
+subscribers. Citadel delivers a snapshot after a normal message,
+lifecycle, or tick dispatch: the snapshot holds at most 64 events and shares
+that invocation's deadline, while remaining FIFO events wait for the next such
+dispatch. Remaining subscribers of one event receive a fair share of the
+available time. An event emitted by a subscriber also waits for the next
+dispatch, avoiding recursive delivery. RPC, room-admission, and
+`/ext` endpoint calls can enqueue events but do not drain them themselves,
+because their command side effects are intentionally discarded. One subscriber
+failure is logged and does not prevent the remaining subscribers. Python and
+JavaScript expose the same API with byte payloads and native callback syntax.
+
+---
+
+## citadel.cache
+
+Use the opt-in, bounded cache for transient runtime coordination. It is
+node-local unless `[cluster]` is enabled; in a cluster, local mutations are
+offered to a single durable writer lease for best-effort fenced fan-out. A
+successful call is local, not a cluster-wide commit. Values are still
+non-durable and are never replayed after a restart. Enable it with
+`[runtime.capabilities.shared_cache]` `enabled = true`. Entries are isolated by
+namespace and survive a successful script hot reload because the cache is
+node-owned.
+
+```lua
+local current = citadel.cache.get("match.score", "player-42")
+local next = citadel.cache.cas(
+  "match.score", "player-42",
+  current and current.version or nil,
+  "43",
+  30000
+)
+if next == nil then
+  -- another callback changed the value; read and retry if appropriate
+end
+```
+
+`get(namespace, key)` returns `nil` or `{ value, version, expires_in_ms }`.
+`set(namespace, key, value, ttl_ms)` returns that entry, `delete(namespace,
+key)` returns whether an entry was removed, and `cas(namespace, key,
+expected_version, value, ttl_ms)` atomically writes only when the current
+version matches (use `nil` to create an absent key). Values are binary-safe Lua
+strings. Namespaces and keys are 1–80 ASCII alphanumeric, `.`, `_`, or `-`
+characters. Configured entry, value-size, and TTL limits are enforced; inserting
+a new key at capacity evicts the entry nearest expiry. Python and JavaScript
+expose the same operations with bytes/`Uint8Array` values and native mappings.
+
 ---
 
 ## citadel.static_data.load_json

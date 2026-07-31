@@ -63,6 +63,9 @@ pub struct App {
     chat_rate_limits: Arc<ChatRateLimitPolicy>,
     auth_rate_limits: Arc<AuthenticationRateLimitPolicy>,
     database_explorer_rate_limiter: Arc<DatabaseExplorerRateLimiter>,
+    runtime_http_endpoint_rate_limiter: Arc<crate::runtime::RuntimeHttpEndpointRateLimiter>,
+    runtime_event_bus: Arc<crate::runtime::RuntimeEventBus>,
+    runtime_shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
     notifications: Arc<NotificationService>,
     player_notifications: Arc<PlayerNotificationService>,
     leaderboards: Arc<LeaderboardService>,
@@ -116,6 +119,7 @@ impl App {
         } else {
             None
         };
+        let metrics = Arc::new(NodeMetrics::new());
         let sessions: SharedSessionService = Arc::new(InMemorySessionService::with_secure_issuer(
             backend.session_repository(),
         ));
@@ -131,6 +135,18 @@ impl App {
             config.authentication.limits.clone(),
         ));
         let database_explorer_rate_limiter = Arc::new(DatabaseExplorerRateLimiter::default());
+        let runtime_http_endpoint_rate_limiter =
+            Arc::new(crate::runtime::RuntimeHttpEndpointRateLimiter::default());
+        let runtime_event_bus = Arc::new(crate::runtime::RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy::from(&config.runtime.capabilities.events),
+            Arc::clone(&metrics),
+        ));
+        let runtime_shared_cache = Arc::new(crate::runtime::RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy::from(
+                &config.runtime.capabilities.shared_cache,
+            ),
+            Arc::clone(&metrics),
+        ));
         let chat_access = Arc::new(ChatAccessCoordinator::with_repository(
             backend.chat_repository(),
         ));
@@ -150,7 +166,7 @@ impl App {
         Self {
             config,
             started_at: Instant::now(),
-            metrics: Arc::new(NodeMetrics::new()),
+            metrics,
             host_telemetry: Arc::new(HostTelemetryService::new()),
             backend,
             auth,
@@ -164,6 +180,9 @@ impl App {
             chat_rate_limits,
             auth_rate_limits,
             database_explorer_rate_limiter,
+            runtime_http_endpoint_rate_limiter,
+            runtime_event_bus,
+            runtime_shared_cache,
             notifications,
             player_notifications,
             leaderboards,
@@ -307,6 +326,20 @@ impl App {
         &self.error_journal
     }
 
+    /// The node-local, best-effort runtime event bus. It is never durable or
+    /// replicated; runtime construction borrows this handle for all language
+    /// adapters so their scripts share one local queue.
+    #[must_use]
+    pub fn runtime_event_bus(&self) -> &Arc<crate::runtime::RuntimeEventBus> {
+        &self.runtime_event_bus
+    }
+
+    /// Node-local, non-durable cache shared by embedded runtime callbacks.
+    #[must_use]
+    pub fn runtime_shared_cache(&self) -> &Arc<crate::runtime::RuntimeSharedCache> {
+        &self.runtime_shared_cache
+    }
+
     /// Shared local fence for chat authorization and social/group revocations.
     #[must_use]
     pub fn chat_access(&self) -> &Arc<ChatAccessCoordinator> {
@@ -350,6 +383,14 @@ impl App {
     #[must_use]
     pub fn database_explorer_rate_limiter(&self) -> &Arc<DatabaseExplorerRateLimiter> {
         &self.database_explorer_rate_limiter
+    }
+
+    /// Node-local admission limiter for script-defined HTTP endpoints.
+    #[must_use]
+    pub fn runtime_http_endpoint_rate_limiter(
+        &self,
+    ) -> &Arc<crate::runtime::RuntimeHttpEndpointRateLimiter> {
+        &self.runtime_http_endpoint_rate_limiter
     }
 
     /// The console notification store (, persisted in ).

@@ -11,6 +11,7 @@ pub mod console_api;
 pub mod dashboard;
 pub mod error;
 pub mod player;
+mod runtime_endpoint;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -87,6 +88,7 @@ pub fn router(app: App) -> Router {
         .merge(auth::routes())
         .merge(player::routes())
         .merge(console_api::routes())
+        .merge(runtime_endpoint::routes())
         .with_state(app)
 }
 
