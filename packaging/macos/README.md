@@ -2,14 +2,14 @@
 
 This is a self-contained Citadel game server for the architecture named in the
 archive. Unzip it anywhere, then run one executable — on first start it creates
-its SQLite database, game folder, and migrations. No database server or install
+its SQLite database and migrations. No database server or install
 step is required.
 
 ```text
 citadel/
 ├── citadel             # the server (make executable if the unzipper cleared it)
 ├── citadel.toml        # editable config, discovered automatically
-├── game/               # Lua game logic, auto-created and hot-reloaded
+├── scripts/main.lua    # Lua game logic, hot-reloaded on save
 ├── data.sqlite         # auto-created and migrated on first run
 └── clients/unity/      # Unity C# bindings + native macOS library
 ```
@@ -24,7 +24,7 @@ chmod +x ./citadel  # harmless if the executable bit was preserved
 ```
 
 With no arguments the server discovers `citadel.toml`, creates `data.sqlite`,
-applies migrations, creates `game/`, and starts listening. Accounts and sessions
+applies migrations, loads `scripts/main.lua`, and starts listening. Accounts and sessions
 survive restarts in the local SQLite database.
 
 The default binds are loopback-only. To accept connections from another machine,
@@ -46,7 +46,7 @@ spctl --assess --type execute --verbose ./citadel
 ## 3. Open the dashboard and write game logic
 
 Open <http://127.0.0.1:7350/dashboard> after starting the server. Edit
-`game/main.lua` for server-authoritative messages, lifecycle handlers, ticks,
+`scripts/main.lua` for server-authoritative messages, lifecycle handlers, ticks,
 and RPCs. With `runtime.hot_reload = true`, a valid edit reloads without a
 restart; a broken edit leaves the previous script serving.
 

@@ -33,7 +33,7 @@ export default defineConfig({
 					label: 'Start here',
 					items: [
 						{ label: 'Introduction', slug: 'introduction' },
-						{ label: 'Quickstart', slug: 'quickstart' },
+						{ label: 'Getting started', slug: 'quickstart' },
 						{ label: 'Build Knights vs Monsters', slug: 'tutorials/knights-vs-monsters' },
 					],
 				},
@@ -65,6 +65,7 @@ export default defineConfig({
 						{ label: 'Choose a database', slug: 'guides/choose-a-database' },
 						{ label: 'Running on CockroachDB', slug: 'guides/cockroachdb' },
 						{ label: 'Run Citadel with Docker', slug: 'guides/docker' },
+						{ label: 'Run the web demo from source', slug: 'guides/web-demo-from-source' },
 						{ label: 'Use secure durable chat', slug: 'guides/secure-durable-chat' },
 						{ label: 'Organize multi-file Lua and Python game logic', slug: 'guides/organize-game-server-logic' },
 						{ label: 'Use shared static gameplay data', slug: 'guides/static-game-data' },

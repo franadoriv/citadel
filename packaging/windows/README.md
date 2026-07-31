@@ -1,14 +1,14 @@
 # Citadel — standalone Windows server
 
 This is a self-contained Citadel game server. Unzip it anywhere and run one
-executable — it bootstraps its own database, game folder, and migrations on
+executable — it bootstraps its own database and migrations on
 first start. No database server, no install step.
 
 ```
 citadel/
 ├── citadel.exe        # the server
 ├── citadel.toml       # editable config (loaded automatically)
-├── game/              # Lua game logic (auto-created on first run; hot-reloads)
+├── scripts/main.lua   # Lua game logic (hot-reloads on save)
 ├── data.sqlite        # auto-created + migrated on first run
 └── clients/unity/     # Unity client plugin (C# bindings + native DLL + README)
 ```
@@ -22,7 +22,7 @@ Double-click `citadel.exe`, or from a terminal in this folder:
 ```
 
 With no arguments the server discovers the `citadel.toml` next to it, creates
-`data.sqlite`, applies migrations, creates an empty `game/` folder, and starts
+`data.sqlite`, applies migrations, loads `scripts/main.lua`, and starts
 listening. Accounts and sessions persist to the single `data.sqlite` file and
 survive restarts.
 
@@ -32,7 +32,7 @@ from other machines, edit `citadel.toml` and change the `[http]` and
 
 ## 2. Write your game logic
 
-Edit `game/main.lua` to add server-authoritative behavior. Scripts handle
+Edit `scripts/main.lua` to add server-authoritative behavior. Scripts handle
 inbound messages, players joining/leaving, a server game loop, and RPC:
 
 ```lua
@@ -51,7 +51,7 @@ end)
 
 With `runtime.hot_reload = true` (the shipped default) the running server
 reloads the script live on save — no restart. A broken edit is rejected and the
-previous script keeps serving. Delete `game/` and the server falls back to the
+previous script keeps serving. Delete `scripts/` and the server falls back to the
 built-in relay.
 
 ## 3. Open the dashboard

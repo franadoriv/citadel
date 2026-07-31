@@ -543,6 +543,9 @@ function Invoke-PackageWindows {
     New-Item -ItemType Directory -Path (Join-Path $unityRoot "Citadel") -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $unityRoot "Demo") -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $unityRoot "Plugins\x86_64") -Force | Out-Null
+    $scriptsDir = Join-Path $stage "scripts"
+    New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $stage "maps") -Force | Out-Null
 
     # Server binary + editable config + quickstart README.
     $exe = Join-Path $RepoRoot "target\release\citadel.exe"
@@ -550,7 +553,10 @@ function Invoke-PackageWindows {
         throw "Expected server binary not found: $exe. Did the release build succeed?"
     }
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage "citadel.exe") -Force
-    Copy-Item -LiteralPath (Join-Path $RepoRoot "citadel.toml") -Destination (Join-Path $stage "citadel.toml") -Force
+    $toml = Get-Content -LiteralPath (Join-Path $RepoRoot "citadel.toml") -Raw
+    $toml = $toml.Replace('scripts_dir = "./game"', 'scripts_dir = "./scripts"')
+    Set-Content -LiteralPath (Join-Path $stage "citadel.toml") -Value $toml -Encoding utf8 -NoNewline
+    Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\server\scripts\main.lua") -Destination (Join-Path $scriptsDir "main.lua") -Force
     Copy-Item -LiteralPath (Join-Path $RepoRoot "packaging\windows\README.md") -Destination (Join-Path $stage "README.md") -Force
 
     # Unity plugin: C# bindings + native DLL + import README.

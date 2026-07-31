@@ -99,7 +99,8 @@ the central story behind rooms, RPCs, storage, replication, and the tutorial.
 
 ## Pick your next quest
 
-- Want proof in the next few minutes? Run the [Quickstart](/quickstart/).
+- Want to run a server and change a game rule in the next few minutes? Start
+  with [Getting started](/quickstart/).
 - Want to learn by building a game? Start [Knights vs Monsters](/tutorials/knights-vs-monsters/).
 - Want the server mental model first? Read [Game logic & server authority](/concepts/game-logic/).
 - Already have a project? [Install a client SDK](/guides/install-client-sdk/).

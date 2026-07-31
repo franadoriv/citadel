@@ -45,28 +45,29 @@ a weather system that reacts to moon phases. First make one knight move and one
 monster lose HP. That is a real win.
 :::
 
-## Step 1: make a clean game folder
+## Step 1: start from a server release
 
-Start from a Citadel checkout or a Citadel server package. In the folder that
-contains `citadel.toml`, create this layout:
+Download and extract a Citadel server release as described in
+[Getting started](/quickstart/). In the extracted folder, Citadel already gives
+you this layout:
 
 ```text
 your-game/
   citadel.toml
-  game/
+  scripts/
     main.lua
 ```
 
-Citadel loads `game/main.lua` as the Lua game layer. The standalone default
-configuration already points at `./game`; the smallest useful runtime section
-looks like this:
+Citadel loads `scripts/main.lua` as the Lua game layer. The standalone release
+configuration already points there and enables hot reload. Its relevant runtime
+section looks like this:
 
 ```toml
 [runtime]
 enabled = true
 language = "lua"
 tier = "trusted"       # your own server-side game code
-scripts_dir = "./game"
+scripts_dir = "./scripts"
 tick_hz = 10
 hot_reload = true       # save main.lua; Citadel reloads a valid edit
 hot_reload_poll_ms = 500
@@ -79,16 +80,16 @@ bind = "127.0.0.1:7352"
 Why WebSocket? It is the easiest first transport to inspect in a browser. You
 can move to QUIC later when your first knight has stopped walking into walls.
 
-Start the server from the repository root:
+Start the server from the extracted release folder:
 
 ```powershell
 # Windows PowerShell
-.\make server
+.\citadel.exe
 ```
 
 ```bash
-# macOS / Linux / Git Bash
-make server
+# Linux
+./citadel
 ```
 
 You should see a line that says Citadel loaded an embedded Lua runtime. Keep
@@ -119,7 +120,7 @@ monster,<monster-id>,<x>,<z>,<hp>,<max-hp>,<alive>
 
 ## Step 3: write the server rules
 
-Put this complete first version in `game/main.lua`.
+Put this complete first version in `scripts/main.lua`.
 
 ```lua
 -- Knights vs Monsters: a tiny authoritative server.

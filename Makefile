@@ -196,11 +196,13 @@ package-windows: ## Stage + zip the Windows release ($(DIST_DIR)/citadel-windows
 	$(eval PKG_NAME := citadel-windows-x86_64-v$(VERSION))
 	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
 	@rm -rf "$(PKG_STAGE)"
+	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps"
 	@mkdir -p "$(PKG_STAGE)/clients/unity/Citadel"
 	@mkdir -p "$(PKG_STAGE)/clients/unity/Demo"
 	@mkdir -p "$(PKG_STAGE)/clients/unity/Plugins/x86_64"
 	cp target/release/citadel.exe "$(PKG_STAGE)/citadel.exe"
-	cp citadel.toml "$(PKG_STAGE)/citadel.toml"
+	sed 's|scripts_dir = "./game"|scripts_dir = "./scripts"|' citadel.toml > "$(PKG_STAGE)/citadel.toml"
+	cp packaging/server/scripts/main.lua "$(PKG_STAGE)/scripts/main.lua"
 	cp packaging/windows/README.md "$(PKG_STAGE)/README.md"
 	cp clients/unity/Citadel/*.cs "$(PKG_STAGE)/clients/unity/Citadel/"
 	cp clients/unity/Demo/*.cs "$(PKG_STAGE)/clients/unity/Demo/"
@@ -239,9 +241,10 @@ package-macos: ## Stage + zip the macOS release for the native arch ($(DIST_DIR)
 	$(eval PKG_NAME := citadel-macos-$(MACOS_ARCH)-v$(VERSION))
 	$(eval PKG_STAGE := $(DIST_DIR)/$(PKG_NAME))
 	@rm -rf "$(PKG_STAGE)"
-	@mkdir -p "$(PKG_STAGE)/clients/unity/Citadel" "$(PKG_STAGE)/clients/unity/Demo" "$(PKG_STAGE)/clients/unity/Plugins/macOS"
+	@mkdir -p "$(PKG_STAGE)/scripts" "$(PKG_STAGE)/maps" "$(PKG_STAGE)/clients/unity/Citadel" "$(PKG_STAGE)/clients/unity/Demo" "$(PKG_STAGE)/clients/unity/Plugins/macOS"
 	cp target/release/citadel "$(PKG_STAGE)/citadel"
-	cp citadel.toml "$(PKG_STAGE)/citadel.toml"
+	sed 's|scripts_dir = "./game"|scripts_dir = "./scripts"|' citadel.toml > "$(PKG_STAGE)/citadel.toml"
+	cp packaging/server/scripts/main.lua "$(PKG_STAGE)/scripts/main.lua"
 	cp packaging/macos/README.md "$(PKG_STAGE)/README.md"
 	cp clients/unity/Citadel/*.cs "$(PKG_STAGE)/clients/unity/Citadel/"
 	cp clients/unity/Demo/*.cs "$(PKG_STAGE)/clients/unity/Demo/"
