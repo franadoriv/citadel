@@ -150,14 +150,17 @@ impl AsyncService for WebSocketServer {
                     match accepted {
                         Ok((stream, peer)) => {
                             let id = self.ids.next_id();
-                            let conn_cancel = cancel.clone();
-                            let metrics = self.metrics.clone();
-                            let gateway = Arc::clone(&self.gateway);
-                            let handshake_timeout = self.handshake_timeout;
-                            let heartbeat_interval = self.heartbeat_interval;
-                            let heartbeat_timeout = self.heartbeat_timeout;
+                            let context = WebSocketConnectionContext {
+                                id,
+                                cancel: cancel.clone(),
+                                metrics: self.metrics.clone(),
+                                gateway: Arc::clone(&self.gateway),
+                                handshake_timeout: self.handshake_timeout,
+                                heartbeat_interval: self.heartbeat_interval,
+                                heartbeat_timeout: self.heartbeat_timeout,
+                            };
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(id, stream, peer, conn_cancel, metrics, gateway, handshake_timeout, heartbeat_interval, heartbeat_timeout).await {
+                                if let Err(e) = handle_connection(stream, peer, context).await {
                                     tracing::debug!(conn = %id, error = %e, "WebSocket connection ended");
                                 }
                             });
@@ -191,6 +194,19 @@ impl Connection for WebSocketConnection {
     }
 }
 
+/// Per-connection services and limits captured when the accept loop spawns a
+/// WebSocket task. Grouping them keeps the connection entry point coherent as
+/// transport capabilities evolve.
+struct WebSocketConnectionContext {
+    id: ConnectionId,
+    cancel: CancellationToken,
+    metrics: TransportMetrics,
+    gateway: Arc<Gateway>,
+    handshake_timeout: Duration,
+    heartbeat_interval: Option<Duration>,
+    heartbeat_timeout: Duration,
+}
+
 /// Upgrade one TCP stream to WebSocket, run the authenticated handshake, and —
 /// only once the connection is accepted — register a session, run the
 /// gateway-fed write task, and route inbound envelopes to the gateway.
@@ -200,16 +216,19 @@ impl Connection for WebSocketConnection {
 /// the first envelope resolves. A rejection sends one `KIND_AUTH_RESULT` and
 /// closes with no participant/session state ever created.
 async fn handle_connection(
-    id: ConnectionId,
     stream: TcpStream,
     peer: SocketAddr,
-    cancel: CancellationToken,
-    metrics: TransportMetrics,
-    gateway: Arc<Gateway>,
-    handshake_timeout: Duration,
-    heartbeat_interval: Option<Duration>,
-    heartbeat_timeout: Duration,
+    context: WebSocketConnectionContext,
 ) -> AppResult<()> {
+    let WebSocketConnectionContext {
+        id,
+        cancel,
+        metrics,
+        gateway,
+        handshake_timeout,
+        heartbeat_interval,
+        heartbeat_timeout,
+    } = context;
     let _conn = WebSocketConnection {
         id,
         peer: PeerAddr::new(peer),
@@ -413,11 +432,9 @@ async fn handle_connection(
                         Message::Ping(payload) => {
                             writer.send(Message::Pong(payload)).await.map_err(send_err)?;
                         }
-                        Message::Pong(_) => {
-                            if pong_deadline.take().is_some() {
-                                metrics.pong_received();
-                                gateway.node_metrics().record_websocket_pong_received();
-                            }
+                        Message::Pong(_) if pong_deadline.take().is_some() => {
+                            metrics.pong_received();
+                            gateway.node_metrics().record_websocket_pong_received();
                         }
                         // Text and other frames are ignored in the binary-only MVP.
                         _ => {}
