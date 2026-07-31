@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use citadel::lifecycle::Supervisor;
 use citadel::observability::NodeMetrics;
-use citadel::realtime::registry::{Outbound, SessionHandle};
+use citadel::realtime::registry::{LatestOutboundReceiver, Outbound, SessionHandle};
 use citadel::realtime::{Gateway, LuaReloadService, LuaTickService};
 use citadel::runtime::{LuaRuntime, Runtime};
 use citadel::transport::TransportKind;
@@ -47,20 +47,20 @@ impl Drop for TempDir {
     }
 }
 
-fn register(gw: &Gateway) -> mpsc::Receiver<Outbound> {
+fn register(gw: &Gateway) -> (mpsc::Receiver<Outbound>, LatestOutboundReceiver) {
     let id = gw.next_participant_id();
     let (tx, rx) = mpsc::channel(256);
-    gw.registry().register(SessionHandle {
+    let unreliable = gw.registry().register(SessionHandle {
         id,
         kind: TransportKind::WebSocket,
         outbound: tx,
         identity: None,
     });
-    rx
+    (rx, unreliable)
 }
 
-/// Drain the channel until an envelope of `kind` is seen, or fail after a bound.
-async fn wait_for_kind(rx: &mut mpsc::Receiver<Outbound>, kind: u16, what: &str) {
+/// Drain the unreliable mailbox until an envelope of `kind` is seen, or fail after a bound.
+async fn wait_for_kind(rx: &mut LatestOutboundReceiver, kind: u16, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         assert!(
@@ -70,7 +70,7 @@ async fn wait_for_kind(rx: &mut mpsc::Receiver<Outbound>, kind: u16, what: &str)
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         // A timeout or a closed channel simply re-checks the deadline above; only
         // a matching envelope returns. Avoids `panic!`/`unwrap` (lint-clean).
-        if let Ok(Some(out)) = tokio::time::timeout(remaining, rx.recv()).await
+        if let Ok(out) = tokio::time::timeout(remaining, rx.recv()).await
             && out.envelope.kind == kind
         {
             return;
@@ -99,7 +99,7 @@ async fn editing_the_script_swaps_handlers_without_wedging_the_tick() {
         Some(Arc::clone(&runtime)),
     ));
 
-    let mut rx = register(&gateway);
+    let (_reliable_rx, mut rx) = register(&gateway);
 
     let period = Duration::from_millis(10);
     let mut supervisor = Supervisor::new();
@@ -168,7 +168,7 @@ async fn broken_edit_keeps_the_previous_script_serving_over_the_gateway() {
         outbound: stx,
         identity: None,
     });
-    let mut peer_rx = register(&gateway);
+    let (mut peer_rx, _unreliable_rx) = register(&gateway);
 
     let mut supervisor = Supervisor::new();
     supervisor.spawn(LuaReloadService::new(
