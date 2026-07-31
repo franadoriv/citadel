@@ -3,11 +3,16 @@ title: MongoDB operations
 description: Deploy, monitor, back up, restore, and recover Citadel's MongoDB backend safely.
 ---
 
-Citadel supports MongoDB as a durable full-parity backend **only** on a
+Citadel supports MongoDB as a durable backend **only** on a
 transaction-capable replica set or sharded cluster. A standalone `mongod` is
 not supported: Citadel verifies transaction capability at startup and refuses
 to start if logical sessions, supported wire version, and replica-set/sharded
 topology are absent. It never falls back to process-local in-memory data.
+
+Single-object storage mutations are transactional. Portable atomic multi-object
+storage batches are explicitly unsupported on MongoDB until Citadel has a
+replayable multi-key transaction retry implementation; use SQLite, PostgreSQL,
+or CockroachDB for that primitive.
 
 Citadel does not provide automatic data migration between SQLite, PostgreSQL,
 CockroachDB, and MongoDB. Choose a backend deliberately and use an approved

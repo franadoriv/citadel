@@ -27,12 +27,12 @@ use sqlx::sqlite::{SqliteConnection, SqliteRow};
 use sqlx::{Row, Sqlite};
 
 use crate::error::{AppError, AppResult};
-use crate::repository::{StorageRepository, check_precondition};
+use crate::repository::{StorageRepository, check_precondition, validate_atomic_batch};
 use crate::storage::{
-    Accessor, Collection, CollectionSummary, Cursor, Key, ListQuery, ObjectId, Owner, Page,
-    Permissions, Precondition, ReadPermission, StorageIndexDefinition, StorageIndexMembership,
-    StorageIndexQuery, StorageIndexValue, StorageObject, StorageValue, UserId, Version,
-    WritePermission, WriteRequest,
+    Accessor, AtomicBatchOperation, AtomicBatchResult, Collection, CollectionSummary, Cursor, Key,
+    ListQuery, ObjectId, Owner, Page, Permissions, Precondition, ReadPermission,
+    StorageIndexDefinition, StorageIndexMembership, StorageIndexQuery, StorageIndexValue,
+    StorageObject, StorageValue, UserId, Version, WritePermission, WriteRequest,
 };
 
 use super::{SqliteExecutor, db_err, tx_closed};
@@ -243,6 +243,32 @@ impl SqliteStorageRepository {
 
 #[async_trait]
 impl StorageRepository for SqliteStorageRepository {
+    async fn atomic_batch(
+        &self,
+        operations: Vec<AtomicBatchOperation>,
+    ) -> AppResult<Vec<AtomicBatchResult>> {
+        validate_atomic_batch(&operations)?;
+        match &self.executor {
+            SqliteExecutor::Pool(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE;").await.map_err(db_err)?;
+                match atomic_batch_conn(&mut tx, operations).await {
+                    Ok(results) => {
+                        tx.commit().await.map_err(db_err)?;
+                        Ok(results)
+                    }
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+            SqliteExecutor::Tx(cell) => {
+                let mut guard = cell.lock().await;
+                let tx = guard.as_mut().ok_or_else(tx_closed)?;
+                atomic_batch_savepoint(&mut *tx, operations).await
+            }
+        }
+    }
     async fn read(&self, accessor: &Accessor, id: &ObjectId) -> AppResult<Option<StorageObject>> {
         match &self.executor {
             SqliteExecutor::Pool(pool) => {
@@ -396,6 +422,75 @@ impl StorageRepository for SqliteStorageRepository {
             }
         }
     }
+}
+
+/// Execute one batch as a nested atomic scope inside a caller-owned unit of
+/// work. A failed later operation is rolled back before that caller can commit
+/// any preceding batch mutation.
+async fn atomic_batch_savepoint(
+    conn: &mut SqliteConnection,
+    operations: Vec<AtomicBatchOperation>,
+) -> AppResult<Vec<AtomicBatchResult>> {
+    sqlx::query("SAVEPOINT citadel_atomic_storage_batch")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    match atomic_batch_conn(conn, operations).await {
+        Ok(results) => {
+            sqlx::query("RELEASE SAVEPOINT citadel_atomic_storage_batch")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            Ok(results)
+        }
+        Err(error) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT citadel_atomic_storage_batch")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            sqlx::query("RELEASE SAVEPOINT citadel_atomic_storage_batch")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            Err(error)
+        }
+    }
+}
+
+/// SQLite's `BEGIN IMMEDIATE` serializes writers and
+/// preserves the portable identity order used by multi-node backends.
+async fn atomic_batch_conn(
+    conn: &mut SqliteConnection,
+    operations: Vec<AtomicBatchOperation>,
+) -> AppResult<Vec<AtomicBatchResult>> {
+    // SQLite has one writer, but take identities in the same canonical order
+    // used to acquire PostgreSQL/Cockroach locks. Keep request-order results as
+    // part of the portable API contract.
+    let mut ordered = operations.into_iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_by(|(_, left), (_, right)| left.id().cmp(right.id()));
+    let mut results = Vec::with_capacity(ordered.len());
+    for (request_index, operation) in ordered {
+        let result = match operation {
+            AtomicBatchOperation::Write {
+                accessor,
+                request,
+                membership,
+            } => AtomicBatchResult::Written(
+                write_indexed_conn(conn, &accessor, request, membership.as_ref()).await?,
+            ),
+            AtomicBatchOperation::Delete {
+                accessor,
+                id,
+                expected,
+            } => {
+                delete_conn(conn, &accessor, &id, &expected).await?;
+                AtomicBatchResult::Deleted
+            }
+        };
+        results.push((request_index, result));
+    }
+    results.sort_by_key(|(request_index, _)| *request_index);
+    Ok(results.into_iter().map(|(_, result)| result).collect())
 }
 
 // --- Statement bodies (executor-agnostic over a single connection) ----------

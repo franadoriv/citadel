@@ -59,9 +59,9 @@ use crate::repository::{
 };
 use crate::session::{RevocationReason, Session, SessionId, SessionTokenRef};
 use crate::storage::{
-    Accessor, Collection, CollectionSummary, Cursor, Key, ListQuery, ObjectId, Owner, Page,
-    Precondition, StorageIndexDefinition, StorageIndexMembership, StorageIndexQuery, StorageObject,
-    Version, WriteRequest,
+    Accessor, AtomicBatchOperation, AtomicBatchResult, Collection, CollectionSummary, Cursor, Key,
+    ListQuery, ObjectId, Owner, Page, Precondition, StorageIndexDefinition, StorageIndexMembership,
+    StorageIndexQuery, StorageObject, Version, WriteRequest,
 };
 use crate::time::TimestampMillis;
 
@@ -4092,6 +4092,21 @@ fn storage_after(cursor: &Cursor, collection: &Collection) -> AppResult<(i32, St
 
 #[async_trait]
 impl StorageRepository for MongoStorageRepository {
+    async fn atomic_batch(
+        &self,
+        operations: Vec<AtomicBatchOperation>,
+    ) -> AppResult<Vec<AtomicBatchResult>> {
+        // Do not inherit the trait default implicitly: Mongo storage batches
+        // are deliberately outside this primitive's supported-backend contract.
+        // Existing single-key Mongo writes remain transactionally safe, but a
+        // replayable multi-key CAS requires dedicated transaction-retry logic
+        // before it can be offered portably.
+        crate::repository::validate_atomic_batch(&operations)?;
+        Err(AppError::validation(
+            "atomic storage batches are not supported by the MongoDB backend",
+        ))
+    }
+
     async fn read(&self, accessor: &Accessor, id: &ObjectId) -> AppResult<Option<StorageObject>> {
         let found = match &self.session {
             None => self
@@ -5820,6 +5835,9 @@ fn mongo_error(_error: mongodb::error::Error) -> AppError {
 mod tests {
     use super::*;
     use crate::config::{DatabaseBackend, DatabaseConfig};
+    use crate::error::ErrorCategory;
+    use crate::repository::StorageRepository;
+    use crate::storage::{Permissions, StorageValue};
 
     #[test]
     fn foundation_manifest_covers_every_existing_domain_projection() {
@@ -5860,6 +5878,37 @@ mod tests {
             42
         );
         assert!(chat_timestamp(TimestampMillis::from_unix_millis(u64::MAX)).is_err());
+    }
+
+    #[tokio::test]
+    async fn atomic_batch_returns_the_documented_unsupported_error_without_io() {
+        // atomic_batch must reject before touching the client, so this contract
+        // remains runnable without a MongoDB service.
+        let client = Client::with_uri_str("mongodb://127.0.0.1:27017")
+            .await
+            .expect("parse local MongoDB URI without connecting");
+        let repo = MongoStorageRepository::pooled(client.clone(), client.database("citadel_test"));
+        let error = repo
+            .atomic_batch(vec![AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(
+                    ObjectId::new(
+                        Owner::System,
+                        Collection::new("atomic-batch").expect("collection"),
+                        Key::new("unsupported").expect("key"),
+                    ),
+                    StorageValue::new(serde_json::json!({"score": 1})).expect("value"),
+                    Permissions::public_read(),
+                ),
+                membership: None,
+            }])
+            .await
+            .expect_err("MongoDB atomic batches remain explicitly unsupported");
+        assert_eq!(error.category(), ErrorCategory::Validation);
+        assert_eq!(
+            error.message(),
+            "atomic storage batches are not supported by the MongoDB backend"
+        );
     }
 
     #[test]

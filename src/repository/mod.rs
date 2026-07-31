@@ -78,9 +78,9 @@ use async_trait::async_trait;
 
 use crate::error::{AppError, AppResult};
 use crate::storage::{
-    Accessor, Collection, CollectionSummary, Cursor, ListQuery, ObjectId, Page, Precondition,
-    StorageIndexDefinition, StorageIndexMembership, StorageIndexName, StorageIndexQuery,
-    StorageObject, Version, WriteRequest,
+    Accessor, AtomicBatchOperation, AtomicBatchResult, Collection, CollectionSummary, Cursor,
+    ListQuery, ObjectId, Page, Precondition, StorageIndexDefinition, StorageIndexMembership,
+    StorageIndexName, StorageIndexQuery, StorageObject, Version, WriteRequest,
 };
 
 /// Portable storage repository contract.
@@ -92,6 +92,24 @@ use crate::storage::{
 /// [`ErrorCategory::Conflict`](crate::error::ErrorCategory::Conflict).
 #[async_trait]
 pub trait StorageRepository: Send + Sync {
+    /// Atomically execute a bounded, duplicate-free set of object mutations.
+    ///
+    /// All permissions, memberships, and preconditions are checked at one
+    /// serialization point. On error no object or index membership changes are
+    /// visible. Results retain request order.
+    ///
+    /// This primitive is supported by the in-memory, SQLite, PostgreSQL, and
+    /// CockroachDB storage backends. MongoDB explicitly rejects it until its
+    /// replayable multi-key transaction retry contract is implemented.
+    async fn atomic_batch(
+        &self,
+        operations: Vec<AtomicBatchOperation>,
+    ) -> AppResult<Vec<AtomicBatchResult>> {
+        validate_atomic_batch(&operations)?;
+        Err(AppError::internal(
+            "atomic storage batches are not supported by this backend",
+        ))
+    }
     /// Read a single object.
     ///
     /// Returns `Ok(None)` both when the object does not exist and when it exists
@@ -189,6 +207,30 @@ pub trait StorageRepository: Send + Sync {
     /// # Errors
     /// Returns an error only on an internal/backend failure.
     async fn list_collections(&self) -> AppResult<Vec<CollectionSummary>>;
+}
+
+/// Reject malformed batches before any backend mutation begins.
+pub(crate) fn validate_atomic_batch(operations: &[AtomicBatchOperation]) -> AppResult<()> {
+    const MAX_ATOMIC_BATCH_OPERATIONS: usize = 64;
+    if operations.is_empty() {
+        return Err(AppError::validation(
+            "atomic storage batch must not be empty",
+        ));
+    }
+    if operations.len() > MAX_ATOMIC_BATCH_OPERATIONS {
+        return Err(AppError::validation(
+            "atomic storage batch exceeds 64 operations",
+        ));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for operation in operations {
+        if !ids.insert(operation.id().clone()) {
+            return Err(AppError::validation(
+                "atomic storage batch contains duplicate object identity",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate an optimistic-concurrency precondition against the current version.
@@ -293,6 +335,44 @@ impl InMemoryStorageRepository {
 
 #[async_trait]
 impl StorageRepository for InMemoryStorageRepository {
+    async fn atomic_batch(
+        &self,
+        operations: Vec<AtomicBatchOperation>,
+    ) -> AppResult<Vec<AtomicBatchResult>> {
+        validate_atomic_batch(&operations)?;
+        let mut state = self.guard()?;
+        // Stage the complete state. Every validation occurs against this one
+        // snapshot; only the final assignment makes it observable.
+        let mut staged = InMemoryStorageState {
+            objects: state.objects.clone(),
+            indexes: state.indexes.clone(),
+            memberships: state.memberships.clone(),
+        };
+        let mut results = Vec::with_capacity(operations.len());
+        for operation in operations {
+            match operation {
+                AtomicBatchOperation::Write {
+                    accessor,
+                    request,
+                    membership,
+                } => {
+                    let object =
+                        write_indexed_state(&mut staged, &accessor, request, membership.as_ref())?;
+                    results.push(AtomicBatchResult::Written(object));
+                }
+                AtomicBatchOperation::Delete {
+                    accessor,
+                    id,
+                    expected,
+                } => {
+                    delete_state(&mut staged, &accessor, &id, expected)?;
+                    results.push(AtomicBatchResult::Deleted);
+                }
+            }
+        }
+        *state = staged;
+        Ok(results)
+    }
     async fn read(&self, accessor: &Accessor, id: &ObjectId) -> AppResult<Option<StorageObject>> {
         let state = self.guard()?;
         match state.objects.get(id) {
@@ -316,61 +396,7 @@ impl StorageRepository for InMemoryStorageRepository {
         membership: Option<&StorageIndexMembership>,
     ) -> AppResult<StorageObject> {
         let mut state = self.guard()?;
-        match state.objects.get(&request.id) {
-            Some(existing) => {
-                if !existing.permissions.can_write(&existing.id.owner, accessor) {
-                    return Err(AppError::permission("write denied on existing object"));
-                }
-                check_precondition(&request.expected, Some(&existing.version))?;
-            }
-            None => {
-                if !accessor.can_create(&request.id.owner) {
-                    return Err(AppError::permission(
-                        "write denied: cannot create object for this owner",
-                    ));
-                }
-                check_precondition(&request.expected, None)?;
-            }
-        }
-
-        let version = Version::of(&request.value);
-        let object = StorageObject {
-            id: request.id,
-            value: request.value,
-            version,
-            permissions: request.permissions,
-        };
-        let configured_candidates = state
-            .indexes
-            .values()
-            .filter(|index| index.matches_object(&object.id))
-            .map(|index| index.name().clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let membership = membership
-            .cloned()
-            .unwrap_or_else(|| StorageIndexMembership::include_all(configured_candidates.clone()));
-        if !configured_candidates.is_empty() && membership.candidates() != &configured_candidates {
-            return Err(AppError::validation(
-                "storage index membership candidates do not match configured indexes",
-            ));
-        }
-        let candidates = if configured_candidates.is_empty() {
-            membership.candidates().clone()
-        } else {
-            configured_candidates
-        };
-        state.objects.insert(object.id.clone(), object.clone());
-        state.memberships.retain(|(index_name, object_id)| {
-            object_id != &object.id || !candidates.contains(index_name)
-        });
-        state.memberships.extend(
-            membership
-                .included()
-                .iter()
-                .cloned()
-                .map(|index_name| (index_name, object.id.clone())),
-        );
-        Ok(object)
+        write_indexed_state(&mut state, accessor, request, membership)
     }
 
     async fn delete(
@@ -380,24 +406,7 @@ impl StorageRepository for InMemoryStorageRepository {
         expected: Precondition,
     ) -> AppResult<()> {
         let mut state = self.guard()?;
-        match state.objects.get(id) {
-            None => match expected {
-                Precondition::Match(_) => Err(AppError::conflict(
-                    "delete precondition failed: object does not exist",
-                )),
-                // Idempotent delete of an absent object.
-                Precondition::Any | Precondition::MustNotExist => Ok(()),
-            },
-            Some(existing) => {
-                if !existing.permissions.can_write(&existing.id.owner, accessor) {
-                    return Err(AppError::permission("delete denied on existing object"));
-                }
-                check_precondition(&expected, Some(&existing.version))?;
-                state.objects.remove(id);
-                state.memberships.retain(|(_, object_id)| object_id != id);
-                Ok(())
-            }
-        }
+        delete_state(&mut state, accessor, id, expected)
     }
 
     async fn list(&self, accessor: &Accessor, query: &ListQuery) -> AppResult<Page<StorageObject>> {
@@ -441,7 +450,6 @@ impl StorageRepository for InMemoryStorageRepository {
         } else {
             None
         };
-
         Ok(Page {
             items: matched,
             next,
@@ -454,16 +462,15 @@ impl StorageRepository for InMemoryStorageRepository {
         state.memberships.retain(|(name, _)| name != index.name());
         let matching = state
             .objects
-            .keys()
-            .filter(|id| index.matches_object(id))
-            .cloned()
+            .values()
+            .filter(|object| index.matches_object(&object.id))
+            .map(|object| object.id.clone())
             .collect::<Vec<_>>();
-        state
-            .memberships
-            .extend(matching.into_iter().map(|id| (index.name().clone(), id)));
+        for id in matching {
+            state.memberships.insert((index.name().clone(), id));
+        }
         Ok(())
     }
-
     async fn query_index(
         &self,
         accessor: &Accessor,
@@ -509,11 +516,101 @@ impl StorageRepository for InMemoryStorageRepository {
     }
 }
 
+fn write_indexed_state(
+    state: &mut InMemoryStorageState,
+    accessor: &Accessor,
+    request: WriteRequest,
+    membership: Option<&StorageIndexMembership>,
+) -> AppResult<StorageObject> {
+    match state.objects.get(&request.id) {
+        Some(existing) => {
+            if !existing.permissions.can_write(&existing.id.owner, accessor) {
+                return Err(AppError::permission("write denied on existing object"));
+            }
+            check_precondition(&request.expected, Some(&existing.version))?;
+        }
+        None => {
+            if !accessor.can_create(&request.id.owner) {
+                return Err(AppError::permission(
+                    "write denied: cannot create object for this owner",
+                ));
+            }
+            check_precondition(&request.expected, None)?;
+        }
+    }
+    let object = StorageObject {
+        id: request.id,
+        version: Version::of(&request.value),
+        value: request.value,
+        permissions: request.permissions,
+    };
+    let candidates = state
+        .indexes
+        .values()
+        .filter(|index| index.matches_object(&object.id))
+        .map(|index| index.name().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let membership = membership
+        .cloned()
+        .unwrap_or_else(|| StorageIndexMembership::include_all(candidates.clone()));
+    if !candidates.is_empty() && membership.candidates() != &candidates {
+        return Err(AppError::validation(
+            "storage index membership candidates do not match configured indexes",
+        ));
+    }
+    let candidates = if candidates.is_empty() {
+        membership.candidates().clone()
+    } else {
+        candidates
+    };
+    state.objects.insert(object.id.clone(), object.clone());
+    state
+        .memberships
+        .retain(|(index, id)| id != &object.id || !candidates.contains(index));
+    state.memberships.extend(
+        membership
+            .included()
+            .iter()
+            .cloned()
+            .map(|index| (index, object.id.clone())),
+    );
+    Ok(object)
+}
+
+fn delete_state(
+    state: &mut InMemoryStorageState,
+    accessor: &Accessor,
+    id: &ObjectId,
+    expected: Precondition,
+) -> AppResult<()> {
+    match state.objects.get(id) {
+        None => match expected {
+            Precondition::Match(_) => Err(AppError::conflict(
+                "delete precondition failed: object does not exist",
+            )),
+            Precondition::Any | Precondition::MustNotExist => Ok(()),
+        },
+        Some(existing) => {
+            if !existing.permissions.can_write(&existing.id.owner, accessor) {
+                return Err(AppError::permission("delete denied on existing object"));
+            }
+            check_precondition(&expected, Some(&existing.version))?;
+            state.objects.remove(id);
+            state.memberships.retain(|(_, object_id)| object_id != id);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Collection, Key, Owner, Permissions, Precondition, StorageValue, UserId};
+    use crate::storage::{
+        AtomicBatchOperation, Collection, Key, Owner, Permissions, Precondition, StorageValue,
+        UserId,
+    };
     use serde_json::json;
+    use std::sync::Arc;
 
     fn user(id: &str) -> UserId {
         UserId::new(id).expect("valid user id")
@@ -616,5 +713,124 @@ mod tests {
             .await
             .expect_err("zero limit rejected");
         assert_eq!(err.category(), crate::error::ErrorCategory::Validation);
+    }
+
+    #[tokio::test]
+    async fn atomic_batch_rolls_back_every_prior_write_when_a_later_cas_fails() {
+        let repo = InMemoryStorageRepository::new();
+        let first = object_id(Owner::System, "batch", "first");
+        let second = object_id(Owner::System, "batch", "second");
+        repo.write(
+            &Accessor::Runtime,
+            WriteRequest::upsert(second.clone(), value(1), Permissions::runtime_only()),
+        )
+        .await
+        .expect("seed");
+        let error = repo
+            .atomic_batch(vec![
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(
+                        first.clone(),
+                        value(1),
+                        Permissions::runtime_only(),
+                    ),
+                    membership: None,
+                },
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(
+                        second.clone(),
+                        value(2),
+                        Permissions::runtime_only(),
+                    )
+                    .expecting(Precondition::MustNotExist),
+                    membership: None,
+                },
+            ])
+            .await
+            .expect_err("later conflict aborts batch");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Conflict);
+        assert!(
+            repo.read(&Accessor::Runtime, &first)
+                .await
+                .expect("read")
+                .is_none()
+        );
+        assert_eq!(
+            repo.read(&Accessor::Runtime, &second)
+                .await
+                .expect("read")
+                .expect("seed remains")
+                .value,
+            value(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_atomic_batches_have_one_cas_winner_without_partial_state() {
+        let repo = Arc::new(InMemoryStorageRepository::new());
+        let gate = object_id(Owner::System, "batch", "gate");
+        let left = object_id(Owner::System, "batch", "left");
+        let right = object_id(Owner::System, "batch", "right");
+        let gate_object = repo
+            .write(
+                &Accessor::Runtime,
+                WriteRequest::upsert(gate.clone(), value(0), Permissions::runtime_only()),
+            )
+            .await
+            .expect("seed");
+        let batch = |output: ObjectId| {
+            vec![
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(
+                        gate.clone(),
+                        value(1),
+                        Permissions::runtime_only(),
+                    )
+                    .expecting(Precondition::Match(gate_object.version.clone())),
+                    membership: None,
+                },
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(output, value(1), Permissions::runtime_only()),
+                    membership: None,
+                },
+            ]
+        };
+        let a = {
+            let repo = Arc::clone(&repo);
+            let batch = batch(left.clone());
+            tokio::spawn(async move { repo.atomic_batch(batch).await })
+        };
+        let b = {
+            let repo = Arc::clone(&repo);
+            let batch = batch(right.clone());
+            tokio::spawn(async move { repo.atomic_batch(batch).await })
+        };
+        let outcomes = [a.await.expect("join"), b.await.expect("join")];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome
+                    .as_ref()
+                    .is_err_and(|e| e.category() == crate::error::ErrorCategory::Conflict))
+                .count(),
+            1
+        );
+        let outputs = usize::from(
+            repo.read(&Accessor::Runtime, &left)
+                .await
+                .expect("read")
+                .is_some(),
+        ) + usize::from(
+            repo.read(&Accessor::Runtime, &right)
+                .await
+                .expect("read")
+                .is_some(),
+        );
+        assert_eq!(outputs, 1, "losing batch left no projection");
     }
 }

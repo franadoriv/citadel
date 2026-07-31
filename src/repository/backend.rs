@@ -36,8 +36,9 @@ use crate::error::AppResult;
 use crate::identity::{AccountState, AuthCredential, AuthIdentity, User, Username};
 use crate::session::{Session, SessionId, SessionTokenRef};
 use crate::storage::{
-    Accessor, ListQuery, ObjectId, Page, Precondition, StorageIndexDefinition,
-    StorageIndexMembership, StorageIndexQuery, StorageObject, UserId, WriteRequest,
+    Accessor, AtomicBatchOperation, AtomicBatchResult, ListQuery, ObjectId, Page, Precondition,
+    StorageIndexDefinition, StorageIndexMembership, StorageIndexQuery, StorageObject, UserId,
+    WriteRequest,
 };
 use crate::time::TimestampMillis;
 
@@ -887,6 +888,12 @@ struct TxStorageRepository {
 
 #[async_trait]
 impl StorageRepository for TxStorageRepository {
+    async fn atomic_batch(
+        &self,
+        operations: Vec<AtomicBatchOperation>,
+    ) -> AppResult<Vec<AtomicBatchResult>> {
+        self.inner.atomic_batch(operations).await
+    }
     async fn read(&self, accessor: &Accessor, id: &ObjectId) -> AppResult<Option<StorageObject>> {
         self.inner.read(accessor, id).await
     }

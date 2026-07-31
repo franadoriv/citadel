@@ -487,6 +487,52 @@ impl WriteRequest {
     }
 }
 
+/// One bounded operation in an atomic storage batch.
+///
+/// Membership is owned so a batch can be assembled before it crosses the
+/// repository boundary.  A batch never executes callbacks or scans storage.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AtomicBatchOperation {
+    /// Write an object and replace its validated index memberships.
+    Write {
+        /// Actor performing this operation.
+        accessor: Accessor,
+        /// Object write and optimistic precondition.
+        request: WriteRequest,
+        /// Optional trusted index-membership decision.
+        membership: Option<StorageIndexMembership>,
+    },
+    /// Delete an object and its index memberships.
+    Delete {
+        /// Actor performing this operation.
+        accessor: Accessor,
+        /// Object to remove.
+        id: ObjectId,
+        /// Optimistic precondition.
+        expected: Precondition,
+    },
+}
+
+impl AtomicBatchOperation {
+    /// Identity touched by this operation.
+    #[must_use]
+    pub fn id(&self) -> &ObjectId {
+        match self {
+            Self::Write { request, .. } => &request.id,
+            Self::Delete { id, .. } => id,
+        }
+    }
+}
+
+/// Result of an [`AtomicBatchOperation`] in request order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AtomicBatchResult {
+    /// A successfully written object.
+    Written(StorageObject),
+    /// A successful delete (including an idempotent missing delete).
+    Deleted,
+}
+
 /// Who is performing a storage operation.
 ///
 /// The runtime-authoritative path ([`Accessor::Runtime`]) bypasses permission

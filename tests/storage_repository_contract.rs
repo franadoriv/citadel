@@ -22,9 +22,10 @@
 use citadel::error::ErrorCategory;
 use citadel::repository::{InMemoryStorageRepository, StorageRepository};
 use citadel::storage::{
-    Accessor, Collection, Key, ListQuery, ObjectId, Owner, Permissions, Precondition,
-    ReadPermission, StorageIndexDefinition, StorageIndexField, StorageIndexMembership,
-    StorageIndexName, StorageIndexQuery, StorageValue, UserId, WritePermission, WriteRequest,
+    Accessor, AtomicBatchOperation, Collection, Key, ListQuery, ObjectId, Owner, Permissions,
+    Precondition, ReadPermission, StorageIndexDefinition, StorageIndexField,
+    StorageIndexMembership, StorageIndexName, StorageIndexQuery, StorageValue, UserId,
+    WritePermission, WriteRequest,
 };
 use serde_json::json;
 
@@ -556,6 +557,63 @@ async fn scenario_index_membership_exclusion_is_durable_and_atomic(repo: &dyn St
     );
 }
 
+/// A deliberately failing final operation must roll back both the preceding
+/// object and its index projection. The reversed request identities also make
+/// every SQL backend exercise its canonical lock/execution ordering while the
+/// returned result order remains a separate contract.
+async fn scenario_atomic_batch_rolls_back_objects_and_indexes(repo: &dyn StorageRepository) {
+    let index = score_index();
+    repo.install_index(&index).await.expect("install index");
+    let first = id(Owner::System, "profiles", "z-first");
+    let second = id(Owner::System, "profiles", "a-existing");
+    repo.write(
+        &Accessor::Runtime,
+        WriteRequest::upsert(second.clone(), value(1), Permissions::public_read()),
+    )
+    .await
+    .expect("seed conflict target");
+
+    let error = repo
+        .atomic_batch(vec![
+            AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(first.clone(), value(7), Permissions::public_read())
+                    .expecting(Precondition::MustNotExist),
+                membership: None,
+            },
+            AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(second.clone(), value(2), Permissions::public_read())
+                    .expecting(Precondition::MustNotExist),
+                membership: None,
+            },
+        ])
+        .await
+        .expect_err("failing final mutation aborts the complete batch");
+    assert_eq!(error.category(), ErrorCategory::Conflict);
+    assert!(
+        repo.read(&Accessor::Runtime, &first)
+            .await
+            .expect("read")
+            .is_none(),
+        "the preceding object is rolled back"
+    );
+    let filters = json!({"score": 7});
+    let query = StorageIndexQuery::from_json_filters(
+        index,
+        filters.as_object().expect("object filters"),
+        10,
+    )
+    .expect("query");
+    assert!(
+        repo.query_index(&Accessor::Runtime, &query)
+            .await
+            .expect("query")
+            .is_empty(),
+        "the preceding index membership is rolled back too"
+    );
+}
+
 type ScenarioFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
 type Scenario = (
     &'static str,
@@ -576,8 +634,8 @@ macro_rules! scenarios {
     };
 }
 
-fn all_scenarios() -> Vec<Scenario> {
-    scenarios![
+fn all_scenarios(supports_atomic_batch: bool) -> Vec<Scenario> {
+    let mut scenarios = scenarios![
         scenario_owner_can_write_and_read_own_object,
         scenario_client_cannot_create_object_for_another_owner,
         scenario_client_cannot_create_system_object,
@@ -594,14 +652,26 @@ fn all_scenarios() -> Vec<Scenario> {
         scenario_list_collections_counts_every_object,
         scenario_index_query_filters_declared_json_fields_and_permissions,
         scenario_index_membership_exclusion_is_durable_and_atomic,
-    ]
+    ];
+    // MongoDB deliberately has no portable multi-key retry contract yet. Keep
+    // its generic storage suite on the shared single-object scenarios, with a
+    // dedicated test below pinning the documented unsupported-batch boundary.
+    if supports_atomic_batch {
+        scenarios.push((
+            stringify!(scenario_atomic_batch_rolls_back_objects_and_indexes),
+            (|repo| -> ScenarioFuture<'_> {
+                Box::pin(scenario_atomic_batch_rolls_back_objects_and_indexes(repo))
+            }) as fn(&dyn StorageRepository) -> ScenarioFuture<'_>,
+        ));
+    }
+    scenarios
 }
 
 // --- In-memory runs (always) ------------------------------------------------
 
 #[tokio::test]
 async fn in_memory_backend_satisfies_the_contract() {
-    for (name, run) in all_scenarios() {
+    for (name, run) in all_scenarios(true) {
         // A fresh repository per scenario mirrors each scenario's clean-slate
         // assumptions.
         let repo = InMemoryStorageRepository::new();
@@ -642,7 +712,7 @@ mod sqlite {
             .expect("connect + migrate against an in-memory SQLite database");
         let repo = db.storage_repository();
 
-        for (name, run) in all_scenarios() {
+        for (name, run) in all_scenarios(true) {
             // Isolate scenarios: they assume a clean slate and reuse fixed ids.
             db.reset_storage_for_tests()
                 .await
@@ -650,6 +720,103 @@ mod sqlite {
             eprintln!("sqlite scenario: {name}");
             run(repo.as_ref()).await;
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_caller_owned_batch_failure_rolls_back_to_savepoint() {
+        let db = SqliteDatabase::connect(&DatabaseConfig {
+            url: Some("sqlite::memory:".to_string()),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect");
+        let outer = id(Owner::System, "savepoint", "outer");
+        let inner = id(Owner::System, "savepoint", "inner");
+        let conflict = id(Owner::System, "savepoint", "conflict");
+        db.storage_repository()
+            .write(
+                &Accessor::Runtime,
+                WriteRequest::upsert(conflict.clone(), value(1), Permissions::public_read()),
+            )
+            .await
+            .expect("seed conflict");
+        let uow = db.begin().await.expect("begin");
+        let repo = uow.storage_repository();
+        repo.write(
+            &Accessor::Runtime,
+            WriteRequest::upsert(outer.clone(), value(1), Permissions::public_read()),
+        )
+        .await
+        .expect("outer write");
+        let error = repo
+            .atomic_batch(vec![
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(
+                        inner.clone(),
+                        value(2),
+                        Permissions::public_read(),
+                    ),
+                    membership: None,
+                },
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(conflict, value(3), Permissions::public_read())
+                        .expecting(Precondition::MustNotExist),
+                    membership: None,
+                },
+            ])
+            .await
+            .expect_err("second batch write conflicts");
+        assert_eq!(error.category(), ErrorCategory::Conflict);
+        uow.commit().await.expect("commit unaffected outer work");
+        let pooled = db.storage_repository();
+        assert!(
+            pooled
+                .read(&Accessor::Runtime, &outer)
+                .await
+                .expect("read outer")
+                .is_some()
+        );
+        assert!(
+            pooled
+                .read(&Accessor::Runtime, &inner)
+                .await
+                .expect("read inner")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_overlapping_create_batches_have_one_winner() {
+        let db = SqliteDatabase::connect(&DatabaseConfig {
+            url: Some("sqlite::memory:".to_string()),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect");
+        let repo = db.storage_repository();
+        let object = id(Owner::System, "concurrent", "same-key");
+        let batch = |score| {
+            vec![AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(
+                    object.clone(),
+                    value(score),
+                    Permissions::public_read(),
+                )
+                .expecting(Precondition::MustNotExist),
+                membership: None,
+            }]
+        };
+        let (left, right) = tokio::join!(repo.atomic_batch(batch(1)), repo.atomic_batch(batch(2)));
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert!(
+            repo.read(&Accessor::Runtime, &object)
+                .await
+                .expect("read winner")
+                .is_some()
+        );
     }
 }
 
@@ -686,7 +853,7 @@ mod postgres {
             .expect("connect + migrate against the test Postgres");
         let repo = db.storage_repository();
 
-        for (name, run) in all_scenarios() {
+        for (name, run) in all_scenarios(true) {
             // Isolate scenarios: they assume a clean slate and reuse fixed ids.
             db.reset_storage_for_tests()
                 .await
@@ -694,6 +861,113 @@ mod postgres {
             eprintln!("postgres scenario: {name}");
             run(repo.as_ref()).await;
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_caller_owned_batch_failure_rolls_back_to_savepoint() {
+        let Some(url) = test_database_url() else {
+            eprintln!("skipping Postgres savepoint batch test: no test database URL");
+            return;
+        };
+        let db = PgDatabase::connect(&DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect");
+        db.reset_storage_for_tests().await.expect("reset");
+        let outer = id(Owner::System, "savepoint", "outer");
+        let inner = id(Owner::System, "savepoint", "inner");
+        let conflict = id(Owner::System, "savepoint", "conflict");
+        db.storage_repository()
+            .write(
+                &Accessor::Runtime,
+                WriteRequest::upsert(conflict.clone(), value(1), Permissions::public_read()),
+            )
+            .await
+            .expect("seed conflict");
+        let uow = db.begin().await.expect("begin");
+        let repo = uow.storage_repository();
+        repo.write(
+            &Accessor::Runtime,
+            WriteRequest::upsert(outer.clone(), value(1), Permissions::public_read()),
+        )
+        .await
+        .expect("outer write");
+        let error = repo
+            .atomic_batch(vec![
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(
+                        inner.clone(),
+                        value(2),
+                        Permissions::public_read(),
+                    ),
+                    membership: None,
+                },
+                AtomicBatchOperation::Write {
+                    accessor: Accessor::Runtime,
+                    request: WriteRequest::upsert(conflict, value(3), Permissions::public_read())
+                        .expecting(Precondition::MustNotExist),
+                    membership: None,
+                },
+            ])
+            .await
+            .expect_err("second batch write conflicts");
+        assert_eq!(error.category(), ErrorCategory::Conflict);
+        uow.commit().await.expect("commit unaffected outer work");
+        let pooled = db.storage_repository();
+        assert!(
+            pooled
+                .read(&Accessor::Runtime, &outer)
+                .await
+                .expect("read outer")
+                .is_some()
+        );
+        assert!(
+            pooled
+                .read(&Accessor::Runtime, &inner)
+                .await
+                .expect("read inner")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_overlapping_create_batches_have_one_winner() {
+        let Some(url) = test_database_url() else {
+            eprintln!("skipping Postgres concurrent batch test: no test database URL");
+            return;
+        };
+        let db = PgDatabase::connect(&DatabaseConfig {
+            url: Some(url),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect");
+        db.reset_storage_for_tests().await.expect("reset");
+        let repo = db.storage_repository();
+        let object = id(Owner::System, "concurrent", "same-key");
+        let batch = |score| {
+            vec![AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(
+                    object.clone(),
+                    value(score),
+                    Permissions::public_read(),
+                )
+                .expecting(Precondition::MustNotExist),
+                membership: None,
+            }]
+        };
+        let (left, right) = tokio::join!(repo.atomic_batch(batch(1)), repo.atomic_batch(batch(2)));
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert!(
+            repo.read(&Accessor::Runtime, &object)
+                .await
+                .expect("read winner")
+                .is_some()
+        );
     }
 }
 
@@ -739,13 +1013,41 @@ mod mongodb {
             return;
         };
         let repo = db.storage_repository();
-        for (name, run) in all_scenarios() {
+        for (name, run) in all_scenarios(false) {
             db.clear_storage_data_for_tests()
                 .await
                 .expect("clear Mongo storage projections");
             eprintln!("mongodb scenario: {name}");
             run(repo.as_ref()).await;
         }
+    }
+
+    #[tokio::test]
+    async fn mongodb_atomic_batch_returns_the_documented_unsupported_error() {
+        let Some(db) = connect().await else {
+            eprintln!(
+                "skipping MongoDB atomic-batch boundary contract: CITADEL_TEST_MONGODB_URL is unset"
+            );
+            return;
+        };
+        let repo = db.storage_repository();
+        let error = repo
+            .atomic_batch(vec![AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(
+                    id(Owner::System, "atomic-batch", "unsupported"),
+                    value(1),
+                    Permissions::public_read(),
+                ),
+                membership: None,
+            }])
+            .await
+            .expect_err("MongoDB atomic batches remain explicitly unsupported");
+        assert_eq!(error.category(), ErrorCategory::Validation);
+        assert_eq!(
+            error.message(),
+            "atomic storage batches are not supported by the MongoDB backend"
+        );
     }
 
     #[tokio::test]

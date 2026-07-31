@@ -37,8 +37,9 @@ use citadel::identity::{AccountState, AuthCredential, AuthIdentity, DeviceId, Us
 use citadel::repository::{Backend, BackendKind, PgDatabase};
 use citadel::session::{NodeId, RevocationReason, Session, SessionId, SessionTokenRef};
 use citadel::storage::{
-    Accessor, Collection, Key, ObjectId, Owner, Permissions, Precondition, StorageIndexDefinition,
-    StorageIndexField, StorageIndexName, StorageIndexQuery, StorageValue, UserId, WriteRequest,
+    Accessor, AtomicBatchOperation, Collection, Key, ObjectId, Owner, Permissions, Precondition,
+    StorageIndexDefinition, StorageIndexField, StorageIndexName, StorageIndexQuery, StorageValue,
+    UserId, WriteRequest,
 };
 use citadel::time::TimestampMillis;
 use serde_json::json;
@@ -170,6 +171,9 @@ async fn cockroach_backend_compatibility_matrix() {
 
     db.reset_storage_for_tests().await.expect("reset");
     cockroach_storage_index_migration_survives_reconnect(&db).await;
+
+    db.reset_storage_for_tests().await.expect("reset");
+    cockroach_atomic_batches_rollback_and_serialize(&db).await;
 
     db.reset_storage_for_tests().await.expect("reset");
     cockroach_identity_and_session_repositories_match_the_contract(&db).await;
@@ -330,6 +334,78 @@ async fn cockroach_storage_repository_matches_the_contract(db: &PgDatabase) {
         .await
         .expect_err("versioned delete of missing object conflicts");
     assert_eq!(missing.category(), ErrorCategory::Conflict);
+}
+
+/// CockroachDB does not have PostgreSQL advisory locks, so this exercises the
+/// shared batch path's canonical row order, serializable conflict behavior, and
+/// all-or-nothing object/index projection rollback on the real wire backend.
+async fn cockroach_atomic_batches_rollback_and_serialize(db: &PgDatabase) {
+    let repo = db.storage_repository();
+    let index = StorageIndexDefinition::new(
+        StorageIndexName::new("profiles_by_score").expect("index name"),
+        Collection::new("profiles").expect("collection"),
+        None,
+        vec![StorageIndexField::new("score").expect("field")],
+    )
+    .expect("index definition");
+    repo.install_index(&index).await.expect("install index");
+    let first = object_id(Owner::System, "profiles", "z-first");
+    let conflict = object_id(Owner::System, "profiles", "a-conflict");
+    repo.write(
+        &Accessor::Runtime,
+        WriteRequest::upsert(conflict.clone(), value(1), Permissions::public_read()),
+    )
+    .await
+    .expect("seed conflict");
+    let error = repo
+        .atomic_batch(vec![
+            AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(first.clone(), value(7), Permissions::public_read()),
+                membership: None,
+            },
+            AtomicBatchOperation::Write {
+                accessor: Accessor::Runtime,
+                request: WriteRequest::upsert(conflict, value(2), Permissions::public_read())
+                    .expecting(Precondition::MustNotExist),
+                membership: None,
+            },
+        ])
+        .await
+        .expect_err("last mutation conflicts");
+    assert_eq!(error.category(), ErrorCategory::Conflict);
+    assert!(
+        repo.read(&Accessor::Runtime, &first)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    let filters = json!({"score": 7});
+    let query =
+        StorageIndexQuery::from_json_filters(index, filters.as_object().expect("filters"), 10)
+            .expect("query");
+    assert!(
+        repo.query_index(&Accessor::Runtime, &query)
+            .await
+            .expect("query")
+            .is_empty()
+    );
+
+    let overlapping = object_id(Owner::System, "profiles", "same-key");
+    let batch = |score| {
+        vec![AtomicBatchOperation::Write {
+            accessor: Accessor::Runtime,
+            request: WriteRequest::upsert(
+                overlapping.clone(),
+                value(score),
+                Permissions::public_read(),
+            )
+            .expecting(Precondition::MustNotExist),
+            membership: None,
+        }]
+    };
+    let (left, right) = tokio::join!(repo.atomic_batch(batch(10)), repo.atomic_batch(batch(11)));
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
 }
 
 /// Identity + session repositories and the duplicate-link conflict behave

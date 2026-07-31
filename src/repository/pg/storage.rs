@@ -21,12 +21,12 @@ use sqlx::postgres::{PgConnection, PgRow};
 
 use crate::config::PgFlavor;
 use crate::error::{AppError, AppResult};
-use crate::repository::{StorageRepository, check_precondition};
+use crate::repository::{StorageRepository, check_precondition, validate_atomic_batch};
 use crate::storage::{
-    Accessor, Collection, CollectionSummary, Cursor, Key, ListQuery, ObjectId, Owner, Page,
-    Permissions, Precondition, ReadPermission, StorageIndexDefinition, StorageIndexMembership,
-    StorageIndexQuery, StorageIndexValue, StorageObject, StorageValue, UserId, Version,
-    WritePermission, WriteRequest,
+    Accessor, AtomicBatchOperation, AtomicBatchResult, Collection, CollectionSummary, Cursor, Key,
+    ListQuery, ObjectId, Owner, Page, Permissions, Precondition, ReadPermission,
+    StorageIndexDefinition, StorageIndexMembership, StorageIndexQuery, StorageIndexValue,
+    StorageObject, StorageValue, UserId, Version, WritePermission, WriteRequest,
 };
 
 use super::{PgExecutor, db_err, get, tx_closed};
@@ -256,6 +256,32 @@ impl PgStorageRepository {
 
 #[async_trait]
 impl StorageRepository for PgStorageRepository {
+    async fn atomic_batch(
+        &self,
+        operations: Vec<AtomicBatchOperation>,
+    ) -> AppResult<Vec<AtomicBatchResult>> {
+        validate_atomic_batch(&operations)?;
+        match &self.executor {
+            PgExecutor::Pool(pool) => {
+                let mut tx = pool.begin().await.map_err(db_err)?;
+                match atomic_batch_conn(&mut tx, operations, self.flavor).await {
+                    Ok(results) => {
+                        tx.commit().await.map_err(db_err)?;
+                        Ok(results)
+                    }
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+            PgExecutor::Tx(cell) => {
+                let mut guard = cell.lock().await;
+                let tx = guard.as_mut().ok_or_else(tx_closed)?;
+                atomic_batch_savepoint(&mut *tx, operations, self.flavor).await
+            }
+        }
+    }
     async fn read(&self, accessor: &Accessor, id: &ObjectId) -> AppResult<Option<StorageObject>> {
         match &self.executor {
             PgExecutor::Pool(pool) => {
@@ -404,6 +430,101 @@ impl StorageRepository for PgStorageRepository {
             }
         }
     }
+}
+
+/// Execute one batch as a nested atomic scope inside a caller-owned unit of
+/// work.  A failed later mutation must not be left in the outer transaction for
+/// its caller to commit. PostgreSQL permits `ROLLBACK TO SAVEPOINT` after a
+/// statement error, which also clears the transaction's aborted state.
+async fn atomic_batch_savepoint(
+    conn: &mut PgConnection,
+    operations: Vec<AtomicBatchOperation>,
+    flavor: PgFlavor,
+) -> AppResult<Vec<AtomicBatchResult>> {
+    sqlx::query("SAVEPOINT citadel_atomic_storage_batch")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    match atomic_batch_conn(conn, operations, flavor).await {
+        Ok(results) => {
+            sqlx::query("RELEASE SAVEPOINT citadel_atomic_storage_batch")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            Ok(results)
+        }
+        Err(error) => {
+            // Do not return the operation error until the outer UoW is restored
+            // to exactly the state it had when the batch started.
+            sqlx::query("ROLLBACK TO SAVEPOINT citadel_atomic_storage_batch")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            sqlx::query("RELEASE SAVEPOINT citadel_atomic_storage_batch")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            Err(error)
+        }
+    }
+}
+
+/// Apply a batch within one SQL transaction. Advisory locks are taken for the
+/// complete, canonically sorted identity set before any row is read, preventing
+/// opposite-order overlapping batches from deadlocking on PostgreSQL.
+async fn atomic_batch_conn(
+    conn: &mut PgConnection,
+    operations: Vec<AtomicBatchOperation>,
+    flavor: PgFlavor,
+) -> AppResult<Vec<AtomicBatchResult>> {
+    let mut ids = operations
+        .iter()
+        .map(|operation| operation.id().clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    for id in &ids {
+        lock_object(conn, id, flavor).await?;
+    }
+    // Lock all extant rows in the same canonical order too. This is required
+    // for CockroachDB (which intentionally has no PostgreSQL advisory locks)
+    // and keeps row-lock ordering identical across both wire-compatible
+    // backends. Absent-row creation races remain retryable serializable/unique
+    // conflicts and the transaction is rolled back as a whole.
+    for id in &ids {
+        let (owner_kind, owner_id) = owner_columns(&id.owner);
+        sqlx::query(SELECT_FOR_UPDATE_SQL)
+            .bind(owner_kind)
+            .bind(owner_id.as_str())
+            .bind(id.collection.as_str())
+            .bind(id.key.as_str())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    }
+    let mut results = Vec::with_capacity(operations.len());
+    for operation in operations {
+        match operation {
+            AtomicBatchOperation::Write {
+                accessor,
+                request,
+                membership,
+            } => {
+                let object =
+                    write_indexed_conn(conn, &accessor, request, membership.as_ref(), flavor)
+                        .await?;
+                results.push(AtomicBatchResult::Written(object));
+            }
+            AtomicBatchOperation::Delete {
+                accessor,
+                id,
+                expected,
+            } => {
+                delete_conn(conn, &accessor, &id, &expected, flavor).await?;
+                results.push(AtomicBatchResult::Deleted);
+            }
+        }
+    }
+    Ok(results)
 }
 
 // --- Statement bodies (executor-agnostic over a single connection) ----------
