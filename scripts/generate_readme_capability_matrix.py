@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-"""Render the root README capability matrices from their structured catalog."""
+"""Render the compact root README capability snapshot from the catalog."""
 
 from __future__ import annotations
 
 import argparse
-from html import escape
 import json
 from pathlib import Path
 
@@ -12,173 +11,41 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 CATALOG = ROOT / "docs" / "capability-matrix.json"
-START = "## Feature status\n"
-END = "\n## What we have today\n"
-STATUS = {"shipped": "✅", "partial": "🚧", "planned": "📋", "na": "—"}
-SCRIPT_COLUMNS = ("lua", "python", "javascript", "rust_game_logic")
-PLATFORM_ICONS = {"windows": "🪟", "macos": "🍎", "linux": "🐧"}
-CLIENT_PLATFORM_ROWS = {
-    "unity": "Unity SDK package",
-    "unreal": "Unreal plugin package",
-    "godot": "Godot SDK package",
-    "web": "Web / JavaScript SDK",
-    "rust": "Rust client crate and C ABI source",
-}
-
-
-def cell(value: str) -> str:
-    try:
-        return STATUS[value]
-    except KeyError as error:
-        raise ValueError(f"unknown capability status: {value}") from error
-
-
-def html_row(cells: list[str]) -> str:
-    rendered_cells = "".join(f"<td>{escape(value)}</td>" for value in cells)
-    return f"    <tr>{rendered_cells}</tr>"
-
-
-def grouped_html_table(
-    headers: list[str], sections: list[dict[str, object]], row_builder: object
-) -> list[str]:
-    lines = ["<table>", "  <thead>", "    <tr>"]
-    lines.extend(f"      <th scope=\"col\">{escape(header)}</th>" for header in headers)
-    lines.extend(["    </tr>", "  </thead>"])
-
-    for section in sections:
-        rows = section["rows"]
-        if not rows:
-            continue
-        lines.extend(["  <tbody>", f"    <tr><th colspan=\"{len(headers)}\" align=\"left\">{escape(section['title'])}</th></tr>"])
-        lines.extend(html_row(row_builder(row)) for row in rows)
-        lines.append("  </tbody>")
-
-    lines.append("</table>")
-    return lines
-
-
-def with_server_capabilities(data: dict[str, object]) -> list[dict[str, object]]:
-    sections = []
-    for section in data["server_sections"]:
-        rows = [row for row in section["rows"] if row["common"] != "na"]
-        sections.append({"title": section["title"], "rows": rows})
-    return sections
-
-
-def with_script_capabilities(data: dict[str, object]) -> list[dict[str, object]]:
-    sections = []
-    for section in data["server_sections"]:
-        rows = [
-            row
-            for row in section["rows"]
-            if any(row[column] != "na" for column in SCRIPT_COLUMNS)
-        ]
-        sections.append({"title": section["title"], "rows": rows})
-    return sections
-
-
-def client_delivery(data: dict[str, object]) -> dict[str, dict[str, str]]:
-    rows_by_capability = {row["capability"]: row for row in data["platform_rows"]}
-    try:
-        return {
-            target: rows_by_capability[capability]
-            for target, capability in CLIENT_PLATFORM_ROWS.items()
-        }
-    except KeyError as error:
-        raise ValueError(f"missing delivery row for {error.args[0]}") from error
-
-
-def client_os_cell(feature_status: str, delivery: dict[str, str]) -> str:
-    if feature_status in {"na", "planned"}:
-        return "—"
-    if feature_status not in STATUS:
-        raise ValueError(f"unknown capability status: {feature_status}")
-
-    icons = " ".join(
-        PLATFORM_ICONS[platform]
-        for platform in PLATFORM_ICONS
-        if delivery[platform] == "shipped"
-    )
-    if not icons:
-        return "—"
-    return f"{icons} 🚧" if feature_status == "partial" else icons
-
-
+START = "## Capability snapshot\n"
+END = "\n## Roadmap\n"
 def render(data: dict[str, object]) -> str:
-    delivery = client_delivery(data)
+    if not data.get("server_sections") or not data.get("client_sections"):
+        raise ValueError("capability matrix is missing server or client sections")
+
     lines = [
-        "## Feature status",
+        "## Capability snapshot",
         "",
         "<!-- Generated from docs/capability-matrix.json; do not edit this section by hand. -->",
         "",
-        "Three independent, evidence-backed views of the product surface.",
-        "Server and game-script statuses use `✅` shipped, `🚧` partial, `📋` planned, and `—` not applicable.",
+        "Citadel is deliberately honest about its current surface. The full,",
+        "machine-readable [capability matrix](docs/capability-matrix.json) is the",
+        "source of truth; this is the useful-at-a-glance version.",
         "",
-        "### Core server features",
+        "| Area | What ships today |",
+        "| --- | --- |",
+        "| **Game logic** | Lua by default, with trusted embedded Python and JavaScript builds. All share message, lifecycle, tick, RPC, room, storage, and social-service hooks. |",
+        "| **Realtime** | QUIC for native clients, WebTransport for modern browsers, and WebSocket as the broad fallback; rooms, authoritative state, transform sync, actors, maps, and server physics are available. |",
+        "| **Game services** | Accounts and sessions, storage, friends, groups, chat, leaderboards, notifications, wallet, purchases, audit records, and an operator dashboard. |",
+        "| **Data** | SQLite for the zero-setup default, plus PostgreSQL, CockroachDB, and transaction-capable MongoDB for durable deployments. |",
+        "| **Client paths** | Unity, Unreal, Godot, Rust, and browser/JavaScript SDK surfaces. Their exact engine and OS coverage is in the matrix. |",
+        "| **Operations** | Release archives, config validation, health/status endpoints, structured logs, error journal, optional Sentry-compatible telemetry, and TLS/reverse-proxy guidance. |",
         "",
     ]
-    lines.extend(
-        grouped_html_table(
-            ["Feature", "Brief description", "Status"],
-            with_server_capabilities(data),
-            lambda row: [row["capability"], row["detail"], cell(row["common"])],
-        )
-    )
-
-    lines.extend([
-        "",
-        "### Game-script layer",
-        "",
-        "Only game-script capabilities appear here; Rust denotes the planned Citadel-as-a-crate and hardened WASM game-logic paths.",
-        "",
-    ])
-    lines.extend(
-        grouped_html_table(
-            ["Feature", "Lua", "Python", "JavaScript", "Rust game logic", "Brief description"],
-            with_script_capabilities(data),
-            lambda row: [
-                row["capability"],
-                cell(row["lua"]),
-                cell(row["python"]),
-                cell(row["javascript"]),
-                cell(row["rust_game_logic"]),
-                row["detail"],
-            ],
-        )
-    )
-
-    lines.extend([
-        "",
-        "### Client SDK readiness by engine and OS",
-        "",
-        "Each engine cell lists the OSes with a released/tested delivery path: `🪟` Windows, `🍎` macOS, `🐧` Linux. `🚧` after an icon means that engine binding is partial; `—` means no usable feature path yet. Rust is retained as a non-engine client target so its shipped SDK surface is not hidden.",
-        "",
-    ])
-    lines.extend(
-        grouped_html_table(
-            ["Feature", "Unity", "Unreal", "Godot", "Web / JS", "Rust client", "Brief description"],
-            data["client_sections"],
-            lambda row: [
-                row["capability"],
-                client_os_cell(row["unity"], delivery["unity"]),
-                client_os_cell(row["unreal"], delivery["unreal"]),
-                client_os_cell(row["godot"], delivery["godot"]),
-                client_os_cell(row["web"], delivery["web"]),
-                client_os_cell(row["rust"], delivery["rust"]),
-                row["detail"],
-            ],
-        )
-    )
     return "\n".join(lines) + "\n"
 
 
 def replace_feature_section(readme: str, section: str) -> str:
     start = readme.find(START)
     if start == -1:
-        raise ValueError("README has no Feature status heading")
+        raise ValueError("README has no Capability snapshot heading")
     end = readme.find(END, start)
     if end == -1:
-        raise ValueError("README has no following What we have today heading")
+        raise ValueError("README has no following Roadmap heading")
     return readme[:start] + section + "\n" + readme[end + 1 :]
 
 
