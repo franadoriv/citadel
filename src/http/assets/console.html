@@ -911,6 +911,25 @@ pre.code {
     html += transportRow('WebTransport', t.webtransport);
     html += '</tbody></table></div></div>';
 
+    // The optional writer is absent rather than zeroed when disabled, so do
+    // not imply that a deferred queue exists on ordinary nodes.
+    var deferred = d.deferred_storage;
+    if (deferred) {
+      html += '<div class="panel"><div class="panel-head"><h2>Deferred storage</h2><div class="spacer"></div>'
+        + '<span class="tag-soft on">enabled</span></div>';
+      html += '<div class="panel-body"><table class="kv">'
+        + kv('Queued items', fmtNum(deferred.queued_items || 0))
+        + kv('Queued keys', fmtNum(deferred.queued_keys || 0))
+        + kv('Queued bytes', fmtBytes(deferred.queued_bytes || 0))
+        + kv('Oldest queued age', (deferred.queued_oldest_age_ms || 0) + ' ms')
+        + kv('Accepted / coalesced', fmtNum(deferred.accepted || 0) + ' / ' + fmtNum(deferred.coalesced || 0))
+        + kv('Committed / failed / cancelled', fmtNum(deferred.committed || 0) + ' / ' + fmtNum(deferred.failed || 0) + ' / ' + fmtNum(deferred.cancelled || 0))
+        + kv('Rejected (full / bytes)', fmtNum(deferred.rejected_full || 0) + ' / ' + fmtNum(deferred.rejected_bytes || 0))
+        + kv('Backend latency (last / total)', (deferred.backend_latency_last_ms || 0) + ' ms / ' + (deferred.backend_latency_total_ms || 0) + ' ms')
+        + kv('Shutdown abandoned (receipts / bytes)', fmtNum(deferred.shutdown_abandoned || 0) + ' / ' + fmtBytes(deferred.shutdown_abandoned_bytes || 0))
+        + '</table></div></div>';
+    }
+
     var el = qs('status-live');
     if (el) el.innerHTML = html;
   }

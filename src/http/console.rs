@@ -101,6 +101,11 @@ mod tests {
         assert!(CONSOLE_HTML.contains("fetch('/status'"));
         // Host capacity telemetry is only requested with the console bearer.
         assert!(CONSOLE_HTML.contains("/console/v1/telemetry"));
+        // Optional deferred-storage metrics returned by /status are rendered,
+        // rather than only being visible in raw JSON.
+        assert!(CONSOLE_HTML.contains("Deferred storage"));
+        assert!(CONSOLE_HTML.contains("deferred.queued_items"));
+        assert!(CONSOLE_HTML.contains("deferred.shutdown_abandoned_bytes"));
         // The rest of the SPA authenticates against the console API...
         assert!(CONSOLE_HTML.contains("/console/v1/login"));
         // ...and no placeholder affordance survives anywhere.

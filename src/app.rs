@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, RuntimeConfig};
+use crate::deferred_storage::DeferredStorageWriter;
 use crate::error::{AppError, AppResult};
 use crate::error_journal::ErrorJournal;
 use crate::error_reporting;
@@ -69,6 +70,7 @@ pub struct App {
     realtime: Arc<OnceLock<Arc<crate::realtime::Gateway>>>,
     wallet: Arc<WalletService>,
     friends: Arc<FriendsService>,
+    deferred_storage: Option<Arc<DeferredStorageWriter>>,
 }
 
 impl std::fmt::Debug for App {
@@ -99,6 +101,21 @@ impl App {
     /// the life of the node rather than rebuilt per request.
     #[must_use]
     pub fn with_backend(config: Config, backend: Arc<dyn Backend>) -> Self {
+        // Construct only when explicitly enabled. This keeps the default
+        // in-memory application usable while preventing an enabled volatile
+        // writer from being mistaken for a durable in-memory backend.
+        let deferred_storage = if config.storage.deferred.enabled {
+            Some(
+                DeferredStorageWriter::new(
+                    config.storage.deferred.clone(),
+                    backend.storage_repository(),
+                    backend.kind(),
+                )
+                .expect("validated deferred storage configuration and durable backend"),
+            )
+        } else {
+            None
+        };
         let sessions: SharedSessionService = Arc::new(InMemorySessionService::with_secure_issuer(
             backend.session_repository(),
         ));
@@ -154,6 +171,7 @@ impl App {
             realtime: Arc::new(OnceLock::new()),
             wallet,
             friends,
+            deferred_storage,
         }
     }
 
@@ -404,6 +422,13 @@ impl App {
     #[must_use]
     pub fn friends(&self) -> &Arc<FriendsService> {
         &self.friends
+    }
+
+    /// The optional volatile deferred writer. Normal storage APIs never use it;
+    /// callers must explicitly opt in and accept its queue-only receipt.
+    #[must_use]
+    pub fn deferred_storage(&self) -> Option<&Arc<DeferredStorageWriter>> {
+        self.deferred_storage.as_ref()
     }
 
     /// How long this process has been assembled (monotonic).

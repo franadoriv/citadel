@@ -1,0 +1,43 @@
+---
+title: Deferred storage writes
+summary: Use Citadel's optional volatile write buffer only for loss-tolerant state.
+---
+
+Citadel storage is **durable by default**. A normal write, indexed write, or delete returns only after its backend transaction commits. Reads and index queries immediately see that committed result.
+
+## When to use deferred writes
+
+`storage.deferred` is an opt-in runtime service for high-rate, reconstructible data such as presence hints, analytics rollups, or a cache that can be rebuilt. It accepts an unconditional write/delete into a bounded **memory-only** queue, then commits through the ordinary repository transaction later.
+
+> **MVP API status:** the queue and receipt types are currently internal runtime plumbing. Citadel does **not** yet expose a supported public SDK, Lua, HTTP, or console admission API, so applications cannot opt into deferred admission directly. The configuration and operator status surface are shipped; a supported admission API is a follow-up product API, not an undocumented interface to depend on.
+
+Do **not** use it for player progression, currency, purchases, authentication, chat, notifications, admin changes, create-only writes, or version/CAS updates. Those must continue through the normal synchronous API.
+
+## Durability and visibility
+
+An accepted deferred receipt means **queued, not saved**. It has no durable version and a read/index query may still return the old value. Await the receipt's flush result when the eventual commit outcome matters. A process crash, power loss, or forced kill loses accepted operations that had not committed; this MVP has no disk spool or durable outbox.
+
+For a graceful shutdown, Citadel stops admission and drains until `shutdown_drain_timeout_ms`, including a transaction already in flight. Receipts still queued at the deadline fail as cancelled. An in-flight receipt also fails as cancelled with **commit outcome unknown**: the caller must not treat it as saved and must reconcile or safely retry from the durable source of truth. Citadel never reports a deadline-expired operation as saved.
+
+## Configure deliberately
+
+```toml
+[storage.deferred]
+enabled = true
+collections = ["presence_hints"] # explicit, loss-tolerant allowlist
+max_items = 1024
+max_bytes = 4194304
+flush_interval_ms = 10
+flush_batch_items = 64
+shutdown_drain_timeout_ms = 5000
+```
+
+The service is disabled by default, requires a durable backend, and rejects invalid/zero bounds. Queue overflow rejects the new operation with retryable backpressure; Citadel never evicts accepted work.
+
+## Queue behavior and failures
+
+The queue is bounded by both item count and payload bytes. Unconditional operations for the same object coalesce so the final value wins; receipts for coalesced submissions resolve with that final commit. Different object keys are scheduled round-robin, while each key remains ordered. The MVP uses one transaction at a time, so shutdown and the worker cannot execute a later same-key operation beside an earlier one. The backend still performs each final write (including its precomputed index membership) or delete as its normal atomic object-plus-index transaction.
+
+A backend error fails the affected receipt. The service does not silently retry because safe retries require a separately designed idempotent durable outbox. When enabled, its bounded, label-free metrics are exposed at the supported operator surface: `GET /status` → `deferred_storage` (and therefore the dashboard status view). Monitor queue items, bytes, age, acceptance/coalescing/rejection, committed/failed/cancelled outcomes, backend latency, and shutdown abandonment **receipts and bytes**. Metrics intentionally do not label collections, keys, or users.
+
+**Recommendation:** start with one noncritical collection in staging, test a forced crash and a slow backend, alert on failures/abandonment and sustained queue age, and keep normal durable writes as the default.

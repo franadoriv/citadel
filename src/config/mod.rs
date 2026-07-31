@@ -474,6 +474,8 @@ impl Default for DatabaseConfig {
 pub struct StorageConfig {
     /// Declared physical indexes. TOML uses `[[storage.indexes]]` entries.
     pub indexes: Vec<StorageIndexConfig>,
+    /// Optional loss-tolerant runtime-only write buffer. Disabled by default.
+    pub deferred: crate::deferred_storage::DeferredStorageConfig,
 }
 
 /// One static index declaration in the `[storage]` configuration section.
@@ -1652,6 +1654,7 @@ impl Config {
             }
         }
         self.storage.index_definitions()?;
+        self.storage.deferred.validate()?;
         self.chat.limits.validate()?;
         self.authentication.limits.validate()?;
         self.database.validate()?;
