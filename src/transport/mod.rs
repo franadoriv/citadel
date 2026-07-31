@@ -72,6 +72,7 @@ use crate::runtime::{
 };
 use crate::services::ChatChannelAuthorizer;
 use crate::services::matchmaker_directory::StorageMatchmakerLeaseDirectory;
+use crate::services::party_directory::StoragePartyDirectory;
 use crate::session::NodeId;
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 
@@ -558,6 +559,16 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             cluster.lease_ttl_ms,
             cache_lease_slot,
         ));
+        // Construct and attach durable party authority before any listener is
+        // bound. The gateway retains the local registry only for standalone
+        // compatibility; cluster party RPCs use this directory and mTLS router.
+        gateway = gateway.with_storage_party_directory(
+            Arc::new(StoragePartyDirectory::new(
+                app.backend().storage_repository(),
+            )),
+            local_node.clone(),
+            Arc::clone(&router),
+        );
         // The directory is intentionally channel/node scoped. The control
         // router authenticates the source before it reaches this handler, and
         // the handler independently checks that an advertised node matches that
@@ -613,6 +624,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
 
     let gateway = Arc::new(gateway);
     gateway.register_live_matchmaker_endpoint();
+    gateway.register_party_directory_endpoint();
     let mut chat_delivery_dispatcher = None;
     if let (Some(directory), Some(router), Some(local_node)) = (
         chat_cluster_directory,

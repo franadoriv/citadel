@@ -8,11 +8,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Opaque party handle used by realtime RPC callers.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PartyId(String);
 
 impl PartyId {
@@ -35,10 +35,15 @@ impl PartyId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Mint a new opaque party handle for durable authority creation.
+    pub fn generate() -> Result<Self, PartyError> {
+        fresh_party_id()
+    }
 }
 
 /// Read-only party state exposed through RPC responses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartySnapshot {
     /// Opaque party identifier.
     pub party_id: PartyId,
@@ -48,6 +53,10 @@ pub struct PartySnapshot {
     pub members: Vec<String>,
     /// Accounts with an unaccepted invitation.
     pub invitations: Vec<String>,
+    /// Monotonically increasing authoritative revision. Local parties use zero;
+    /// durable party owners fence mutations and queue snapshots with this value.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +295,7 @@ impl PartyRegistry {
             leader_user_id: party.leader_user_id.clone(),
             members: party.members.iter().cloned().collect(),
             invitations: party.invitations.iter().cloned().collect(),
+            revision: 0,
         })
     }
 

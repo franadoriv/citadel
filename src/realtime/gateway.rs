@@ -17,6 +17,7 @@
 //! work; this is the minimal relay needed to prove multi-client interaction.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -30,10 +31,14 @@ use crate::maps::MapCatalog;
 use crate::matchmaker::{Matchmaker, MatchmakerStats, TicketId, TicketRequest, TicketState};
 use crate::matchmaker_cluster::{
     InMemoryMatchmakerCluster, InMemoryMatchmakerHandoffRouter, MatchmakerRouterError,
-    MatchmakerShardLease, RemoteMatchmakerAdmission, RemoteMatchmakerHandoff,
+    MatchmakerShardLease, PartyAdmissionFence, RemoteMatchmakerAdmission, RemoteMatchmakerHandoff,
     RemoteMatchmakerTicketOwner,
 };
 use crate::matchmaker_live::LiveMatchmakerNode;
+use crate::matchmaker_transport::{
+    PartyControlCommand, PartyControlOperation, PartyControlReply, PartyQueueAdmission,
+    TlsMatchmakerHandoffRouter,
+};
 use crate::observability::NodeMetrics;
 use crate::party::{PartyId, PartyRegistry, PartySnapshot};
 use crate::realtime::auth::{AuthOutcome, Authenticator, PresentedCredential};
@@ -48,6 +53,9 @@ use crate::realtime::rooms::{RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
     LifecycleHook, OutboundCommand, RealtimeAfterOutcome, RealtimeInterception, RpcOutcome, Runtime,
+};
+use crate::services::party_directory::{
+    PartyOwnerResolution, PartyQueueFreeze, StoragePartyDirectory,
 };
 use crate::services::{
     ChatChannelAuthorizer, ChatRateLimitPolicy, ChatService, ChatTarget, CreateGroupRequest,
@@ -74,6 +82,28 @@ const MATCHMAKER_HANDOFF_TTL_MS: u64 = 30_000;
 /// Receiver-side expiration for a chat typing indication. Typing is intentionally
 /// ephemeral: it has no durable event id and never participates in resync.
 const CHAT_TYPING_TTL_MS: u64 = 5_000;
+const PARTY_OWNER_LEASE_MS: u64 = 15_000;
+
+#[derive(Clone)]
+struct DurablePartyGateway {
+    directory: Arc<StoragePartyDirectory>,
+    node_id: NodeId,
+    router: Arc<TlsMatchmakerHandoffRouter>,
+}
+
+fn party_block_on<T: Send + 'static>(
+    future: impl Future<Output = crate::error::AppResult<T>> + Send + 'static,
+) -> crate::error::AppResult<T> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| crate::error::AppError::internal(error.to_string()))?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| crate::error::AppError::internal("party directory worker panicked"))?
+}
 
 #[derive(Clone)]
 struct JoinToken(String);
@@ -223,6 +253,12 @@ fn target_user_id_arg(payload: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "missing string field: target_user_id".to_owned())
 }
 
+fn expected_party_revision_arg(payload: &[u8]) -> Result<Option<u64>, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|_| "invalid party RPC JSON payload".to_owned())?;
+    Ok(value.get("revision").and_then(serde_json::Value::as_u64))
+}
+
 const fn matchmaker_state_name(state: TicketState) -> &'static str {
     match state {
         TicketState::Queued => "queued",
@@ -237,6 +273,7 @@ fn party_json(party: PartySnapshot) -> serde_json::Value {
         "leader_user_id": party.leader_user_id,
         "members": party.members,
         "invitations": party.invitations,
+        "revision": party.revision,
     })
 }
 
@@ -2082,6 +2119,9 @@ pub struct Gateway {
     /// Authenticated, local party membership used to resolve indivisible party
     /// tickets before they enter the matchmaker.
     parties: PartyRegistry,
+    /// Durable, fenced party authority. `None` preserves standalone/local test
+    /// compatibility while production startup attaches it before listeners bind.
+    durable_parties: Option<DurablePartyGateway>,
     cluster_matchmaker: Option<ClusterMatchmakerGateway>,
     /// Durable, live multi-node matchmaker path. When configured it owns the
     /// queue through a bounded worker rather than the local in-process index.
@@ -2107,6 +2147,7 @@ impl std::fmt::Debug for Gateway {
             .field("domain_attached", &self.domain.is_some())
             .field("matchmaker", &self.matchmaker)
             .field("parties", &"[redacted]")
+            .field("durable_parties", &self.durable_parties.is_some())
             .field("live_matchmaker", &self.live_matchmaker.is_some())
             .field("handoffs", &"[redacted]")
             .finish()
@@ -2304,6 +2345,35 @@ impl Gateway {
             .map_err(|_| ())
     }
 
+    /// Shard-owner-side validation after a party ticket crossed the
+    /// asynchronous worker/control route. A revision change causes the worker
+    /// to cancel before it publishes or forms the queued ticket.
+    pub(crate) fn live_matchmaker_revalidate_party_admission(
+        &self,
+        admission: &PartyAdmissionFence,
+    ) -> bool {
+        let Some(parties) = &self.durable_parties else {
+            return false;
+        };
+        let Ok(party_id) = PartyId::parse(&admission.party_id) else {
+            return false;
+        };
+        let directory = Arc::clone(&parties.directory);
+        let leader = admission.leader_user_id.clone();
+        matches!(
+            party_block_on(async move { directory.snapshot_for(&leader, &party_id).await }),
+            Ok(snapshot) if snapshot.revision == admission.revision
+                && snapshot.leader_user_id == admission.leader_user_id
+        )
+    }
+
+    /// Release an admission freeze after the authoritative shard rejects it.
+    /// This path is deliberately storage-backed; a remote shard must not leave
+    /// a party permanently frozen after it cancels a stale ticket.
+    pub(crate) fn live_matchmaker_release_party_admission(&self, admission: &PartyAdmissionFence) {
+        let _ = self.release_durable_party_admission(admission);
+    }
+
     /// Create a gateway with shared `metrics`, an optional script `runtime`, and
     /// an explicit `authenticator` that governs the realtime auth handshake.
     ///
@@ -2330,6 +2400,7 @@ impl Gateway {
             domain: None,
             matchmaker: Matchmaker::new(),
             parties: PartyRegistry::new(),
+            durable_parties: None,
             cluster_matchmaker: None,
             live_matchmaker: None,
             handoffs: Mutex::new(MatchmakerHandoffs::default()),
@@ -2344,6 +2415,41 @@ impl Gateway {
     pub fn with_domain_services(mut self, services: DomainRpcServices) -> Self {
         self.domain = Some(services);
         self
+    }
+
+    /// Attach the storage-backed party directory and its authenticated control
+    /// router before the gateway is shared with transport listeners.
+    #[must_use]
+    pub fn with_storage_party_directory(
+        mut self,
+        directory: Arc<StoragePartyDirectory>,
+        node_id: NodeId,
+        router: Arc<TlsMatchmakerHandoffRouter>,
+    ) -> Self {
+        self.durable_parties = Some(DurablePartyGateway {
+            directory,
+            node_id,
+            router,
+        });
+        self
+    }
+
+    /// Register the local mTLS party-owner callback after the shared gateway is
+    /// available. The command still carries the durable fence and is rejected
+    /// as stale if ownership changed between routing and application.
+    pub fn register_party_directory_endpoint(self: &Arc<Self>) {
+        let Some(parties) = &self.durable_parties else {
+            return;
+        };
+        let router = Arc::clone(&parties.router);
+        let gateway = Arc::downgrade(self);
+        router.register_party_handler(Arc::new(move |_source, command| {
+            gateway
+                .upgrade()
+                .map_or(PartyControlReply::Rejected, |gateway| {
+                    gateway.apply_remote_party_command(command)
+                })
+        }));
     }
 
     /// Attach the optional fenced cluster-presence lifecycle before sharing the
@@ -2966,6 +3072,9 @@ impl Gateway {
                 b"authentication required",
             );
         };
+        if self.durable_parties.is_some() {
+            return self.handle_durable_party_rpc(sender, request_id, method, payload, user_id);
+        }
         let result: Result<serde_json::Value, String> = match method {
             "party.create" => self
                 .parties
@@ -3070,6 +3179,584 @@ impl Gateway {
         }
     }
 
+    fn handle_durable_party_rpc(
+        &self,
+        sender: ParticipantId,
+        request_id: u64,
+        method: &str,
+        payload: &[u8],
+        user_id: String,
+    ) -> usize {
+        let Some(parties) = &self.durable_parties else {
+            unreachable!()
+        };
+        let now = SystemClock.now();
+        let result: Result<serde_json::Value, String> = if method == "party.create" {
+            let create_request_id = request_id.to_string();
+            let id = PartyId::generate().map_err(|error| error.to_string());
+            id.and_then(|id| {
+                let expires = now
+                    .checked_add(DurationMillis::from_millis(PARTY_OWNER_LEASE_MS))
+                    .map_err(|error| error.to_string())?;
+                let directory = Arc::clone(&parties.directory);
+                let node = parties.node_id.clone();
+                party_block_on(async move {
+                    directory
+                        .create_with_request(
+                            id,
+                            &user_id,
+                            Some(&create_request_id),
+                            node,
+                            expires,
+                            now,
+                        )
+                        .await
+                })
+                .map(|(snapshot, _)| party_json(snapshot))
+                .map_err(|error| error.to_string())
+            })
+        } else if method == "party.status" {
+            party_id_arg(payload).and_then(|id| {
+                let directory = Arc::clone(&parties.directory);
+                party_block_on(async move { directory.snapshot_for(&user_id, &id).await })
+                    .map(party_json)
+                    .map_err(|error| error.to_string())
+            })
+        } else {
+            self.durable_party_mutation(parties, method, payload, &user_id, request_id, now)
+                .map(|snapshot| match method {
+                    "party.leave" => {
+                        serde_json::json!({ "left": true, "revision": snapshot.revision })
+                    }
+                    "party.close" => {
+                        serde_json::json!({ "closed": true, "revision": snapshot.revision })
+                    }
+                    _ => party_json(snapshot),
+                })
+        };
+        match result {
+            Ok(body) => self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_OK,
+                body.to_string().as_bytes(),
+            ),
+            Err(error) => self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                error.as_bytes(),
+            ),
+        }
+    }
+
+    fn durable_party_mutation(
+        &self,
+        parties: &DurablePartyGateway,
+        method: &str,
+        payload: &[u8],
+        actor: &str,
+        request_id: u64,
+        now: TimestampMillis,
+    ) -> Result<PartySnapshot, String> {
+        let party_id = party_id_arg(payload)?;
+        // Ticket safety is enforced by the aggregate's durable queue freeze.
+        // Do not consult this Gateway's local matchmaker cache: the ticket
+        // shard may be remote and such a check would race an admitted ticket.
+        let operation = match method {
+            "party.invite" => PartyControlOperation::Invite {
+                target: target_user_id_arg(payload)?,
+            },
+            "party.accept" => PartyControlOperation::Accept,
+            "party.leave" => PartyControlOperation::Leave,
+            "party.promote" => PartyControlOperation::Promote {
+                target: target_user_id_arg(payload)?,
+            },
+            "party.remove" => PartyControlOperation::Remove {
+                target: target_user_id_arg(payload)?,
+            },
+            "party.close" => PartyControlOperation::Close,
+            other => return Err(format!("unknown party method: {other}")),
+        };
+        let expires = now
+            .checked_add(DurationMillis::from_millis(PARTY_OWNER_LEASE_MS))
+            .map_err(|e| e.to_string())?;
+        // Older clients do not send a revision. Preserve that RPC contract by
+        // taking a fresh durable snapshot before applying the fenced command;
+        // newer callers can supply a revision for explicit optimistic CAS.
+        let expected_revision = match expected_party_revision_arg(payload)? {
+            Some(revision) => revision,
+            None => {
+                let directory = Arc::clone(&parties.directory);
+                let snapshot_id = party_id.clone();
+                party_block_on(async move { directory.snapshot(&snapshot_id).await })
+                    .map_err(|error| error.to_string())?
+                    .revision
+            }
+        };
+        let directory = Arc::clone(&parties.directory);
+        let node = parties.node_id.clone();
+        let resolving_party_id = party_id.clone();
+        let resolution = party_block_on(async move {
+            directory
+                .acquire_or_resolve(&resolving_party_id, node, expires, now)
+                .await
+        })
+        .map_err(|error| error.to_string())?;
+        let lease = match resolution {
+            PartyOwnerResolution::Local(lease) => lease,
+            PartyOwnerResolution::Remote(lease) => {
+                let command = PartyControlCommand {
+                    party_id,
+                    lease: lease.clone(),
+                    actor: actor.to_owned(),
+                    request_id: request_id.to_string(),
+                    expected_revision,
+                    operation,
+                };
+                return match parties.router.party_command(&lease.owner_node, command) {
+                    Ok(PartyControlReply::Snapshot(snapshot, reply_lease))
+                        if reply_lease == lease =>
+                    {
+                        Ok(snapshot)
+                    }
+                    Ok(PartyControlReply::Snapshot(_, _)) => Err(
+                        "party owner reply fence mismatched; retry with a fresh snapshot"
+                            .to_owned(),
+                    ),
+                    Ok(PartyControlReply::StaleOwnerFence) => {
+                        Err("party owner fence is stale; retry with a fresh snapshot".to_owned())
+                    }
+                    Ok(PartyControlReply::QueueAdmission(_))
+                    | Ok(PartyControlReply::Rejected)
+                    | Err(_) => Err("party owner is unavailable".to_owned()),
+                };
+            }
+        };
+        let command = PartyControlCommand {
+            party_id: party_id.clone(),
+            lease,
+            actor: actor.to_owned(),
+            request_id: request_id.to_string(),
+            expected_revision,
+            operation,
+        };
+        let expected_reply_lease = command.lease.clone();
+        match self.apply_remote_party_command(command) {
+            PartyControlReply::Snapshot(snapshot, reply_lease)
+                if reply_lease == expected_reply_lease =>
+            {
+                Ok(snapshot)
+            }
+            PartyControlReply::StaleOwnerFence => {
+                Err("party owner fence is stale; retry with a fresh snapshot".to_owned())
+            }
+            PartyControlReply::Snapshot(_, _)
+            | PartyControlReply::QueueAdmission(_)
+            | PartyControlReply::Rejected => Err("party command rejected".to_owned()),
+        }
+    }
+
+    fn apply_remote_party_command(&self, command: PartyControlCommand) -> PartyControlReply {
+        let Some(parties) = &self.durable_parties else {
+            return PartyControlReply::Rejected;
+        };
+        // The transport authenticates the sending node, while this check binds
+        // the delivered command to the destination owner's local identity.
+        // Never allow a node to apply another node's lease merely because it
+        // can read the shared storage.
+        if parties.node_id != command.lease.owner_node || command.party_id != command.lease.party_id
+        {
+            return PartyControlReply::StaleOwnerFence;
+        }
+        let directory = Arc::clone(&parties.directory);
+        let lease = command.lease.clone();
+        let actor = command.actor.clone();
+        let request_id = command.request_id.clone();
+        if let PartyControlOperation::ReleaseQueueAdmission { admission } = &command.operation {
+            let freeze = PartyQueueFreeze {
+                revision: admission.revision,
+                owner_generation: admission.owner_generation,
+                admission_generation: admission.admission_generation,
+                admission_token: admission.admission_token,
+            };
+            let release_actor = actor.clone();
+            return match party_block_on(async move {
+                directory
+                    .release_queue_freeze(&lease, &release_actor, &freeze, SystemClock.now())
+                    .await
+            }) {
+                Ok(()) => PartyControlReply::Snapshot(
+                    // Release has no public state result; a fence-bound snapshot
+                    // merely acknowledges that this exact cleanup was applied.
+                    PartySnapshot {
+                        party_id: command.party_id,
+                        leader_user_id: actor,
+                        members: vec![],
+                        invitations: vec![],
+                        revision: command.expected_revision,
+                    },
+                    command.lease,
+                ),
+                Err(error) if error.to_string().contains("fence") => {
+                    PartyControlReply::StaleOwnerFence
+                }
+                Err(_) => PartyControlReply::Rejected,
+            };
+        }
+        if let PartyControlOperation::RenewQueueAdmission {
+            admission,
+            ticket_expires_at,
+        } = &command.operation
+        {
+            let freeze = PartyQueueFreeze {
+                revision: admission.revision,
+                owner_generation: admission.owner_generation,
+                admission_generation: admission.admission_generation,
+                admission_token: admission.admission_token,
+            };
+            let renewal_actor = actor.clone();
+            let ticket_expires_at = *ticket_expires_at;
+            return match party_block_on(async move {
+                directory
+                    .renew_queue_freeze(
+                        &lease,
+                        &renewal_actor,
+                        &freeze,
+                        ticket_expires_at,
+                        SystemClock.now(),
+                    )
+                    .await
+            }) {
+                Ok(()) => PartyControlReply::Snapshot(
+                    PartySnapshot {
+                        party_id: command.party_id,
+                        leader_user_id: actor,
+                        members: vec![],
+                        invitations: vec![],
+                        revision: command.expected_revision,
+                    },
+                    command.lease,
+                ),
+                Err(error) if error.to_string().contains("fence") => {
+                    PartyControlReply::StaleOwnerFence
+                }
+                Err(_) => PartyControlReply::Rejected,
+            };
+        }
+        if let PartyControlOperation::QueueAdmission { ticket_expires_at } = &command.operation {
+            let ticket_expires_at = *ticket_expires_at;
+            return match party_block_on(async move {
+                directory
+                    .queue_snapshot(
+                        &lease,
+                        &actor,
+                        command.expected_revision,
+                        ticket_expires_at,
+                        SystemClock.now(),
+                    )
+                    .await
+            }) {
+                Ok((members, freeze)) => PartyControlReply::QueueAdmission(PartyQueueAdmission {
+                    members,
+                    revision: freeze.revision,
+                    lease: command.lease,
+                    admission_generation: freeze.admission_generation,
+                    admission_token: freeze.admission_token,
+                }),
+                Err(error) if error.to_string().contains("fence") => {
+                    PartyControlReply::StaleOwnerFence
+                }
+                Err(_) => PartyControlReply::Rejected,
+            };
+        }
+        let result = party_block_on(async move {
+            match command.operation {
+                PartyControlOperation::Invite { target } => {
+                    directory
+                        .invite(
+                            &lease,
+                            &actor,
+                            &request_id,
+                            &target,
+                            command.expected_revision,
+                            SystemClock.now(),
+                        )
+                        .await
+                }
+                PartyControlOperation::Accept => {
+                    directory
+                        .accept(
+                            &lease,
+                            &actor,
+                            &request_id,
+                            command.expected_revision,
+                            SystemClock.now(),
+                        )
+                        .await
+                }
+                PartyControlOperation::Leave => {
+                    directory
+                        .leave(
+                            &lease,
+                            &actor,
+                            &request_id,
+                            command.expected_revision,
+                            SystemClock.now(),
+                        )
+                        .await
+                }
+                PartyControlOperation::Promote { target } => {
+                    directory
+                        .promote(
+                            &lease,
+                            &actor,
+                            &request_id,
+                            &target,
+                            command.expected_revision,
+                            SystemClock.now(),
+                        )
+                        .await
+                }
+                PartyControlOperation::Remove { target } => {
+                    directory
+                        .remove(
+                            &lease,
+                            &actor,
+                            &request_id,
+                            &target,
+                            command.expected_revision,
+                            SystemClock.now(),
+                        )
+                        .await
+                }
+                PartyControlOperation::Close => {
+                    directory
+                        .close(
+                            &lease,
+                            &actor,
+                            &request_id,
+                            command.expected_revision,
+                            SystemClock.now(),
+                        )
+                        .await
+                }
+                PartyControlOperation::QueueAdmission { .. }
+                | PartyControlOperation::RenewQueueAdmission { .. }
+                | PartyControlOperation::ReleaseQueueAdmission { .. } => {
+                    unreachable!("handled above")
+                }
+            }
+        });
+        match result {
+            Ok(snapshot) => PartyControlReply::Snapshot(snapshot, command.lease),
+            Err(error) if error.to_string().contains("fence") => PartyControlReply::StaleOwnerFence,
+            Err(_) => PartyControlReply::Rejected,
+        }
+    }
+
+    /// Take the member list from the durable aggregate under its current owner
+    /// fence.  Unlike `PartyRegistry::queue_members`, this path is shared by
+    /// every gateway and validates one committed revision immediately before a
+    /// ticket is admitted.
+    fn durable_party_queue_snapshot(
+        &self,
+        parties: &DurablePartyGateway,
+        party_id: PartyId,
+        actor: &str,
+        ticket_expires_at: TimestampMillis,
+        now: TimestampMillis,
+    ) -> Result<(Vec<String>, PartyAdmissionFence), String> {
+        let expires = now
+            .checked_add(DurationMillis::from_millis(PARTY_OWNER_LEASE_MS))
+            .map_err(|error| error.to_string())?;
+        let directory = Arc::clone(&parties.directory);
+        let node = parties.node_id.clone();
+        let resolving_id = party_id.clone();
+        let resolution = party_block_on(async move {
+            directory
+                .acquire_or_resolve(&resolving_id, node, expires, now)
+                .await
+        })
+        .map_err(|error| error.to_string())?;
+        let lease = match resolution {
+            PartyOwnerResolution::Local(lease) | PartyOwnerResolution::Remote(lease) => lease,
+        };
+        let snapshot_directory = Arc::clone(&parties.directory);
+        let id = party_id.clone();
+        let revision = party_block_on(async move { snapshot_directory.snapshot(&id).await })
+            .map_err(|error| error.to_string())?
+            .revision;
+        let command = PartyControlCommand {
+            party_id: party_id.clone(),
+            lease: lease.clone(),
+            actor: actor.to_owned(),
+            request_id: format!("queue-admission-{revision}"),
+            expected_revision: revision,
+            operation: PartyControlOperation::QueueAdmission { ticket_expires_at },
+        };
+        let reply = if lease.owner_node == parties.node_id {
+            self.apply_remote_party_command(command)
+        } else {
+            parties
+                .router
+                .party_command(&lease.owner_node, command)
+                .map_err(|_| "party owner is unavailable".to_owned())?
+        };
+        match reply {
+            PartyControlReply::QueueAdmission(admission)
+                if admission.lease == lease && admission.lease.owner_node == lease.owner_node =>
+            {
+                Ok((
+                    admission.members,
+                    PartyAdmissionFence {
+                        party_id: party_id.as_str().to_owned(),
+                        leader_user_id: actor.to_owned(),
+                        revision: admission.revision,
+                        owner_generation: lease.generation.get(),
+                        admission_generation: admission.admission_generation,
+                        admission_token: admission.admission_token,
+                    },
+                ))
+            }
+            PartyControlReply::StaleOwnerFence => {
+                Err("party owner fence is stale; retry with a fresh snapshot".to_owned())
+            }
+            PartyControlReply::QueueAdmission(_)
+            | PartyControlReply::Snapshot(_, _)
+            | PartyControlReply::Rejected => Err("party owner rejected queue admission".to_owned()),
+        }
+    }
+
+    /// Route cleanup through the *currently* resolved party owner.  The
+    /// admission's original owner generation/token are payload fences, while
+    /// the command lease proves which owner is allowed to serialize cleanup.
+    fn release_durable_party_admission(
+        &self,
+        admission: &PartyAdmissionFence,
+    ) -> Result<(), String> {
+        let parties = self
+            .durable_parties
+            .as_ref()
+            .ok_or_else(|| "durable party state unavailable".to_owned())?;
+        let party_id = PartyId::parse(&admission.party_id)
+            .map_err(|_| "invalid party admission".to_owned())?;
+        let now = SystemClock.now();
+        let expires = now
+            .checked_add(DurationMillis::from_millis(PARTY_OWNER_LEASE_MS))
+            .map_err(|e| e.to_string())?;
+        let directory = Arc::clone(&parties.directory);
+        let node = parties.node_id.clone();
+        let resolving = party_id.clone();
+        let resolution = party_block_on(async move {
+            directory
+                .acquire_or_resolve(&resolving, node, expires, now)
+                .await
+        })
+        .map_err(|e| e.to_string())?;
+        let lease = match resolution {
+            PartyOwnerResolution::Local(lease) | PartyOwnerResolution::Remote(lease) => lease,
+        };
+        let command = PartyControlCommand {
+            party_id,
+            lease: lease.clone(),
+            actor: admission.leader_user_id.clone(),
+            request_id: format!(
+                "queue-release-{}-{}",
+                admission.admission_generation, admission.admission_token
+            ),
+            expected_revision: admission.revision,
+            operation: PartyControlOperation::ReleaseQueueAdmission {
+                admission: admission.clone(),
+            },
+        };
+        let reply = if lease.owner_node == parties.node_id {
+            self.apply_remote_party_command(command)
+        } else {
+            parties
+                .router
+                .party_command(&lease.owner_node, command)
+                .map_err(|_| "party owner is unavailable".to_owned())?
+        };
+        match reply {
+            PartyControlReply::Snapshot(_, reply_lease) if reply_lease == lease => Ok(()),
+            PartyControlReply::StaleOwnerFence => {
+                Err("party owner fence is stale; retry".to_owned())
+            }
+            PartyControlReply::Snapshot(_, _)
+            | PartyControlReply::QueueAdmission(_)
+            | PartyControlReply::Rejected => {
+                Err("party owner rejected admission cleanup".to_owned())
+            }
+        }
+    }
+
+    /// Route exact-fenced admission renewal to the current party owner. This
+    /// is called by the authoritative matchmaker shard immediately before it
+    /// creates the live ticket, so persisted expiry and ticket expiry share
+    /// one timestamp.
+    pub(crate) fn live_matchmaker_renew_party_admission(
+        &self,
+        admission: &PartyAdmissionFence,
+        ticket_expires_at: TimestampMillis,
+    ) -> Result<(), String> {
+        let parties = self
+            .durable_parties
+            .as_ref()
+            .ok_or_else(|| "durable party state unavailable".to_owned())?;
+        let party_id = PartyId::parse(&admission.party_id)
+            .map_err(|_| "invalid party admission".to_owned())?;
+        let now = SystemClock.now();
+        let expires = now
+            .checked_add(DurationMillis::from_millis(PARTY_OWNER_LEASE_MS))
+            .map_err(|e| e.to_string())?;
+        let directory = Arc::clone(&parties.directory);
+        let node = parties.node_id.clone();
+        let resolving = party_id.clone();
+        let resolution = party_block_on(async move {
+            directory
+                .acquire_or_resolve(&resolving, node, expires, now)
+                .await
+        })
+        .map_err(|e| e.to_string())?;
+        let lease = match resolution {
+            PartyOwnerResolution::Local(lease) | PartyOwnerResolution::Remote(lease) => lease,
+        };
+        let command = PartyControlCommand {
+            party_id,
+            lease: lease.clone(),
+            actor: admission.leader_user_id.clone(),
+            request_id: format!(
+                "queue-renew-{}-{}",
+                admission.admission_generation, admission.admission_token
+            ),
+            expected_revision: admission.revision,
+            operation: PartyControlOperation::RenewQueueAdmission {
+                admission: admission.clone(),
+                ticket_expires_at,
+            },
+        };
+        let reply = if lease.owner_node == parties.node_id {
+            self.apply_remote_party_command(command)
+        } else {
+            parties
+                .router
+                .party_command(&lease.owner_node, command)
+                .map_err(|_| "party owner is unavailable".to_owned())?
+        };
+        match reply {
+            PartyControlReply::Snapshot(_, reply_lease) if reply_lease == lease => Ok(()),
+            PartyControlReply::StaleOwnerFence => {
+                Err("party owner fence is stale; retry".to_owned())
+            }
+            PartyControlReply::Snapshot(_, _)
+            | PartyControlReply::QueueAdmission(_)
+            | PartyControlReply::Rejected => {
+                Err("party owner rejected admission renewal".to_owned())
+            }
+        }
+    }
+
     fn ensure_party_mutable(&self, requester_user_id: &str, id: &PartyId) -> Result<(), String> {
         let party = self
             .parties
@@ -3121,6 +3808,31 @@ impl Gateway {
                         );
                     }
                 };
+                // Preserve the committed party revision through admission. If
+                // a mutation wins after this snapshot, the post-admission
+                // check below cancels the just-created ticket rather than
+                // leaving a ticket with stale membership.
+                let mut durable_party_admission = None;
+                let ticket_expires_at =
+                    match now.checked_add(DurationMillis::from_millis(request.ttl_ms)) {
+                        Ok(expires_at) if expires_at > now => expires_at,
+                        Ok(_) => {
+                            return self.reply_rpc(
+                                sender,
+                                request_id,
+                                protocol::RPC_STATUS_ERROR,
+                                b"ticket TTL must be positive",
+                            );
+                        }
+                        Err(error) => {
+                            return self.reply_rpc(
+                                sender,
+                                request_id,
+                                protocol::RPC_STATUS_ERROR,
+                                error.to_string().as_bytes(),
+                            );
+                        }
+                    };
                 let owners = match request.party_id.take() {
                     Some(raw_party_id) => {
                         let party_id = match PartyId::parse(raw_party_id) {
@@ -3134,17 +3846,37 @@ impl Gateway {
                                 );
                             }
                         };
-                        let members = match self.parties.queue_members(&user_id, &party_id) {
-                            Ok(members) => members,
-                            Err(error) => {
-                                return self.reply_rpc(
-                                    sender,
-                                    request_id,
-                                    protocol::RPC_STATUS_ERROR,
-                                    error.to_string().as_bytes(),
-                                );
-                            }
+                        let (members, admission) = match &self.durable_parties {
+                            Some(parties) => match self.durable_party_queue_snapshot(
+                                parties,
+                                party_id.clone(),
+                                &user_id,
+                                ticket_expires_at,
+                                now,
+                            ) {
+                                Ok((members, admission)) => (members, Some(admission)),
+                                Err(error) => {
+                                    return self.reply_rpc(
+                                        sender,
+                                        request_id,
+                                        protocol::RPC_STATUS_ERROR,
+                                        error.as_bytes(),
+                                    );
+                                }
+                            },
+                            None => match self.parties.queue_members(&user_id, &party_id) {
+                                Ok(members) => (members, None),
+                                Err(error) => {
+                                    return self.reply_rpc(
+                                        sender,
+                                        request_id,
+                                        protocol::RPC_STATUS_ERROR,
+                                        error.to_string().as_bytes(),
+                                    );
+                                }
+                            },
                         };
+                        durable_party_admission = admission;
                         let mut owners = Vec::with_capacity(members.len());
                         for member_user_id in members {
                             let participant = if member_user_id == user_id {
@@ -3181,7 +3913,20 @@ impl Gateway {
                             session_node: live.node_id().clone(),
                         })
                         .collect();
-                    if !live.submit_from_session(sender, request_id, remote_owners, request) {
+                    let party_admission = durable_party_admission.clone();
+                    if !live.submit_from_session(
+                        sender,
+                        request_id,
+                        remote_owners,
+                        request,
+                        party_admission,
+                    ) {
+                        // The durable snapshot was frozen before enqueueing.
+                        // A saturated session-worker queue has no authoritative
+                        // ticket which could later release it.
+                        if let Some(admission) = durable_party_admission {
+                            let _ = self.release_durable_party_admission(&admission);
+                        }
                         return self.reply_rpc(
                             sender,
                             request_id,
@@ -3197,6 +3942,35 @@ impl Gateway {
                     .add_party(sender, participants, request, now)
                 {
                     Ok(id) => {
+                        if let Some(admission) = durable_party_admission {
+                            let party_id = PartyId::parse(&admission.party_id)
+                                .expect("admission party id was validated");
+                            let directory = Arc::clone(
+                                &self
+                                    .durable_parties
+                                    .as_ref()
+                                    .expect("durable party state")
+                                    .directory,
+                            );
+                            let requester = user_id.clone();
+                            let current = party_block_on(async move {
+                                directory.snapshot_for(&requester, &party_id).await
+                            });
+                            if !matches!(current, Ok(ref snapshot) if snapshot.revision == admission.revision)
+                            {
+                                // A concurrent membership mutation won the
+                                // race. Cancellation is owner-bound and is the
+                                // same operation exposed by matchmaker.cancel.
+                                let _ = self.matchmaker.cancel(sender, &id, SystemClock.now());
+                                let _ = self.release_durable_party_admission(&admission);
+                                return self.reply_rpc(
+                                    sender,
+                                    request_id,
+                                    protocol::RPC_STATUS_ERROR,
+                                    b"party changed during queue admission; retry",
+                                );
+                            }
+                        }
                         self.remember_ticket_owners(id.clone(), owners);
                         let body = serde_json::json!({ "ticket_id": id.as_str() }).to_string();
                         let mut sent = self.reply_rpc(
@@ -3208,12 +3982,20 @@ impl Gateway {
                         sent += self.activate_formed_matches(now);
                         sent
                     }
-                    Err(error) => self.reply_rpc(
-                        sender,
-                        request_id,
-                        protocol::RPC_STATUS_ERROR,
-                        error.to_string().as_bytes(),
-                    ),
+                    Err(error) => {
+                        // `add_party` failed before it created a ticket, so
+                        // there is no later cancellation/formation lifecycle
+                        // to unfreeze this durable admission.
+                        if let Some(admission) = durable_party_admission {
+                            let _ = self.release_durable_party_admission(&admission);
+                        }
+                        self.reply_rpc(
+                            sender,
+                            request_id,
+                            protocol::RPC_STATUS_ERROR,
+                            error.to_string().as_bytes(),
+                        )
+                    }
                 }
             }
             "matchmaker.cancel" => {
@@ -5879,6 +6661,7 @@ mod domain_rpc_tests {
         InMemoryWalletRepository,
     };
     use crate::services::matchmaker_directory::StorageMatchmakerLeaseDirectory;
+    use crate::services::party_directory::StoragePartyDirectory;
     use crate::services::{
         ChatService, CreateLeaderboardRequest, GroupsService, LeaderboardService, Operator,
         PlayerNotificationService, SortOrder, WalletService,
@@ -7055,7 +7838,8 @@ mod domain_rpc_tests {
             )
             .expect("router b"),
         );
-        let storage = Arc::new(InMemoryStorageRepository::new());
+        let storage: Arc<dyn crate::repository::StorageRepository> =
+            Arc::new(InMemoryStorageRepository::new());
         let directory = StorageMatchmakerLeaseDirectory::new(storage);
         let now = SystemClock.now();
         let initial_lease = MatchmakerShardLease {
@@ -7332,5 +8116,299 @@ mod domain_rpc_tests {
             ),
         );
         assert_eq!(recv(&mut charlie_rx).await.1, protocol::RPC_STATUS_ERROR);
+    }
+
+    #[tokio::test]
+    async fn durable_party_two_gateways_forward_fence_restart_and_cancel_stale_ticket() {
+        let node_a = NodeId::new("party-node-a").expect("node a");
+        let node_b = NodeId::new("party-node-b").expect("node b");
+        let (identity_a, cert_a) = control_identity();
+        let (identity_b, cert_b) = control_identity();
+        let router_a = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_a.clone(),
+                identity_a,
+                BTreeMap::from([(node_b.clone(), cert_b)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router a"),
+        );
+        let router_b = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_b.clone(),
+                identity_b,
+                BTreeMap::from([(node_a.clone(), cert_a)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router b"),
+        );
+        let storage: Arc<dyn crate::repository::StorageRepository> =
+            Arc::new(InMemoryStorageRepository::new());
+        let matchmaker_directory = StorageMatchmakerLeaseDirectory::new(Arc::clone(&storage));
+        let party_directory = Arc::new(StoragePartyDirectory::new(Arc::clone(&storage)));
+        let now = SystemClock.now();
+        matchmaker_directory
+            .acquire(
+                MatchmakerShardLease {
+                    shard: QueueShardId::new(0),
+                    owner_node: node_b.clone(),
+                    generation: OwnershipGeneration::new(1),
+                    expires_at: now
+                        .checked_add(DurationMillis::from_millis(5_000))
+                        .expect("expiry"),
+                },
+                now,
+            )
+            .await
+            .expect("b owns shard");
+        let party_id = PartyId::parse("party-two-gateway").expect("party id");
+        let created_at = SystemClock.now();
+        let (_, stale_party_lease) = party_block_on({
+            let directory = Arc::clone(&party_directory);
+            let party_id = party_id.clone();
+            let node_b = node_b.clone();
+            async move {
+                directory
+                    .create(
+                        party_id,
+                        "alice",
+                        node_b,
+                        created_at
+                            .checked_add(DurationMillis::from_millis(5_000))
+                            .expect("expiry"),
+                        created_at,
+                    )
+                    .await
+            }
+        })
+        .expect("durable party created on b");
+        let live_a = LiveMatchmakerNode::new(LiveMatchmakerConfig {
+            node_id: node_a.clone(),
+            shard: QueueShardId::new(0),
+            lease_ttl: DurationMillis::from_millis(5_000),
+            handoff_ttl: DurationMillis::from_millis(5_000),
+            command_timeout: Duration::from_secs(2),
+            directory: matchmaker_directory.clone(),
+            router: Arc::clone(&router_a),
+        })
+        .expect("live a");
+        let live_b = LiveMatchmakerNode::new(LiveMatchmakerConfig {
+            node_id: node_b.clone(),
+            shard: QueueShardId::new(0),
+            lease_ttl: DurationMillis::from_millis(5_000),
+            handoff_ttl: DurationMillis::from_millis(5_000),
+            command_timeout: Duration::from_secs(2),
+            directory: matchmaker_directory,
+            router: Arc::clone(&router_b),
+        })
+        .expect("live b");
+        live_a
+            .start_listener("127.0.0.1:0".parse().expect("loopback"))
+            .expect("listener a");
+        live_b
+            .start_listener("127.0.0.1:0".parse().expect("loopback"))
+            .expect("listener b");
+        router_a.register_endpoint(
+            node_b.clone(),
+            MatchmakerControlEndpoint {
+                address: live_b.control_listener_addr().expect("b address"),
+                server_name: "localhost".to_owned(),
+            },
+        );
+        router_b.register_endpoint(
+            node_a.clone(),
+            MatchmakerControlEndpoint {
+                address: live_a.control_listener_addr().expect("a address"),
+                server_name: "localhost".to_owned(),
+            },
+        );
+        let gateway_a = Arc::new(
+            Gateway::new()
+                .with_live_matchmaker(Arc::clone(&live_a))
+                .with_storage_party_directory(
+                    Arc::clone(&party_directory),
+                    node_a.clone(),
+                    Arc::clone(&router_a),
+                ),
+        );
+        let gateway_b = Arc::new(
+            Gateway::new()
+                .with_live_matchmaker(Arc::clone(&live_b))
+                .with_storage_party_directory(
+                    Arc::clone(&party_directory),
+                    node_b.clone(),
+                    Arc::clone(&router_b),
+                ),
+        );
+        gateway_a.register_live_matchmaker_endpoint();
+        gateway_b.register_live_matchmaker_endpoint();
+        gateway_a.register_party_directory_endpoint();
+        gateway_b.register_party_directory_endpoint();
+        let (alice, mut alice_rx) = register(&gateway_a, Some("alice"));
+        let (_bob, _bob_rx) = register(&gateway_b, Some("bob"));
+
+        // Gateway A forwards to B's durable party owner over the real mTLS listener.
+        gateway_a.handle_inbound(
+            alice,
+            &rpc(
+                1,
+                "party.invite",
+                serde_json::json!({"party_id": party_id.as_str(), "target_user_id": "bob"}),
+            ),
+        );
+        assert_eq!(recv(&mut alice_rx).await.1, protocol::RPC_STATUS_OK);
+        // Retrying the same remote mutation is idempotent at B's owner.
+        gateway_a.handle_inbound(
+            alice,
+            &rpc(
+                1,
+                "party.invite",
+                serde_json::json!({"party_id": party_id.as_str(), "target_user_id": "bob"}),
+            ),
+        );
+        assert_eq!(json(&recv(&mut alice_rx).await.2)["revision"], 2);
+
+        // Queue admission is a mutation. A must not write ticket_freeze using
+        // B's lease locally: it sends the typed command to B and verifies the
+        // returned owner fence before using the committed member snapshot.
+        let admission = gateway_a
+            .durable_party_queue_snapshot(
+                gateway_a.durable_parties.as_ref().expect("durable parties"),
+                party_id.clone(),
+                "alice",
+                SystemClock
+                    .now()
+                    .checked_add(DurationMillis::from_millis(60_000))
+                    .expect("expiry"),
+                SystemClock.now(),
+            )
+            .expect("remote owner queue admission");
+        assert_eq!(admission.0, vec!["alice".to_owned()]);
+        assert_eq!(admission.1.revision, 2);
+        assert!(
+            gateway_a
+                .durable_party_queue_snapshot(
+                    gateway_a.durable_parties.as_ref().expect("durable parties"),
+                    party_id.clone(),
+                    "alice",
+                    SystemClock
+                        .now()
+                        .checked_add(DurationMillis::from_millis(60_000))
+                        .expect("expiry"),
+                    SystemClock.now(),
+                )
+                .is_err()
+        );
+
+        // Advance the directory's explicit logical clock past the lease rather
+        // than sleeping and hoping the mTLS listener was ready in time.
+        let takeover_now = created_at
+            .checked_add(DurationMillis::from_millis(5_001))
+            .expect("logical takeover time");
+        let takeover = party_block_on({
+            let directory = Arc::clone(&party_directory);
+            let party_id = party_id.clone();
+            let node_a = node_a.clone();
+            async move {
+                directory
+                    .acquire_or_resolve(
+                        &party_id,
+                        node_a,
+                        takeover_now
+                            .checked_add(DurationMillis::from_millis(5_000))
+                            .expect("expiry"),
+                        takeover_now,
+                    )
+                    .await
+            }
+        })
+        .expect("takeover");
+        assert!(
+            matches!(takeover, PartyOwnerResolution::Local(ref lease) if lease.generation > stale_party_lease.generation)
+        );
+        assert!(matches!(
+            router_a.party_command(
+                &node_b,
+                PartyControlCommand {
+                    party_id: party_id.clone(),
+                    lease: stale_party_lease,
+                    actor: "alice".to_owned(),
+                    request_id: "stale".to_owned(),
+                    expected_revision: 2,
+                    operation: PartyControlOperation::Close,
+                }
+            ),
+            Ok(PartyControlReply::StaleOwnerFence)
+        ));
+
+        // A fresh Gateway instance proves recovery is from the shared durable store, not memory.
+        let restarted_a = Arc::new(Gateway::new().with_storage_party_directory(
+            Arc::clone(&party_directory),
+            node_a,
+            Arc::clone(&router_a),
+        ));
+        restarted_a.register_party_directory_endpoint();
+        let (restarted_alice, mut restarted_alice_rx) = register(&restarted_a, Some("alice"));
+        restarted_a.handle_inbound(
+            restarted_alice,
+            &rpc(
+                3,
+                "party.status",
+                serde_json::json!({"party_id": party_id.as_str()}),
+            ),
+        );
+        let (_, status, recovered) = recv(&mut restarted_alice_rx).await;
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        assert_eq!(json(&recovered)["revision"], 2);
+        assert_eq!(
+            party_directory
+                .snapshot(&party_id)
+                .await
+                .expect("recovered snapshot")
+                .leader_user_id,
+            "alice"
+        );
+
+        // The live shard owner is B. It receives a deliberately stale snapshot from A,
+        // revalidates it after forwarding, and cancels/refuses the asynchronous ticket.
+        assert!(live_a.submit_from_session(
+            alice,
+            99,
+            vec![
+                RemoteMatchmakerTicketOwner {
+                    user_id: "alice".to_owned(),
+                    session_node: NodeId::new("party-node-a").expect("node"),
+                },
+                RemoteMatchmakerTicketOwner {
+                    user_id: "bob".to_owned(),
+                    session_node: NodeId::new("party-node-b").expect("node"),
+                },
+            ],
+            TicketRequest {
+                query: String::new(),
+                properties: BTreeMap::new(),
+                min_count: 2,
+                max_count: 2,
+                count_multiple: 1,
+                ttl_ms: 60_000,
+                party_id: None,
+            },
+            Some(PartyAdmissionFence {
+                party_id: party_id.as_str().to_owned(),
+                leader_user_id: "alice".to_owned(),
+                revision: 1,
+                owner_generation: 1,
+                admission_generation: 1,
+                admission_token: 1,
+            }),
+        ));
+        let (_, status, body) = recv(&mut alice_rx).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "matchmaker shard is unavailable"
+        );
     }
 }

@@ -136,8 +136,18 @@ former member create or join another party.
 
 **Payload:** `{"party_id":"…"}`.
 
-**Returns:** the response shape above. Only a member or an invited account can
-read a party snapshot.
+**Returns:** the response shape above, including the authoritative `revision`.
+Only a member or an invited account can read a party snapshot.
+
+## Clustered party authority
+
+On a clustered PostgreSQL or CockroachDB deployment, party RPCs can arrive at
+any gateway. Citadel routes each mutation to a durably leased party owner and
+fences it by owner generation and snapshot revision. Repeating the same client
+request id replays the original result, including after an owner restart; a
+stale owner response is rejected and the client should retry from a fresh
+`party.status` snapshot. Clustered SQLite is rejected at startup rather than
+being treated as distributed durable storage.
 
 ## Queueing the party
 
@@ -157,3 +167,8 @@ membership and invitations are frozen; cancel the ticket before changing them.
 The matchmaker counts all members toward the cohort size and never forms a subset
 of the party. Each member gets a distinct, account-bound `KIND_MATCHMAKER_MATCHED`
 token and may recover it through `matchmaker.status` after reconnecting.
+
+For clustered party authority, `matchmaker.add` admits the committed fenced
+party snapshot rather than a gateway-local membership list. If the party changes
+before admission, the request is rejected as retryable instead of queuing a
+partial or stale party.

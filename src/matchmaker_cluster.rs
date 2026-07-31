@@ -166,6 +166,19 @@ pub struct RemoteMatchmakerTicketOwner {
     pub session_node: NodeId,
 }
 
+/// Committed durable-party snapshot carried from the session gateway to the
+/// shard owner. The owner revalidates it immediately after its asynchronous
+/// queue insertion and cancels the ticket if membership changed in transit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartyAdmissionFence {
+    pub party_id: String,
+    pub leader_user_id: String,
+    pub revision: u64,
+    pub owner_generation: u64,
+    pub admission_generation: u64,
+    pub admission_token: u64,
+}
+
 /// A ticket forwarded by its session node to the current shard owner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteMatchmakerTicketSubmission {
@@ -173,6 +186,10 @@ pub struct RemoteMatchmakerTicketSubmission {
     pub owners: Vec<RemoteMatchmakerTicketOwner>,
     /// The validated client matching request.
     pub request: TicketRequest,
+    /// Present only for a party ticket. This must never be trusted without the
+    /// shard owner's post-submit durable revalidation.
+    #[serde(default)]
+    pub party_admission: Option<PartyAdmissionFence>,
 }
 
 /// A cancellation forwarded by the ticket's session node to its shard owner.

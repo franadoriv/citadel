@@ -15,9 +15,9 @@ use base64::Engine as _;
 
 use crate::matchmaker::{Matchmaker, TicketId, TicketRequest, TicketState};
 use crate::matchmaker_cluster::{
-    MatchmakerHandoffRouter, MatchmakerRouterError, QueueShardId, RemoteMatchmakerAdmission,
-    RemoteMatchmakerHandoff, RemoteMatchmakerTicketCancellation, RemoteMatchmakerTicketOwner,
-    RemoteMatchmakerTicketStatus, RemoteMatchmakerTicketSubmission,
+    MatchmakerHandoffRouter, MatchmakerRouterError, PartyAdmissionFence, QueueShardId,
+    RemoteMatchmakerAdmission, RemoteMatchmakerHandoff, RemoteMatchmakerTicketCancellation,
+    RemoteMatchmakerTicketOwner, RemoteMatchmakerTicketStatus, RemoteMatchmakerTicketSubmission,
 };
 use crate::matchmaker_transport::{RunningMatchmakerControlListener, TlsMatchmakerHandoffRouter};
 use crate::realtime::{Gateway, ParticipantId, ParticipantIdGen};
@@ -52,6 +52,11 @@ pub struct LiveMatchmakerConfig {
 struct LiveState {
     owners: HashMap<TicketId, Vec<RemoteMatchmakerTicketOwner>>,
     leaders: HashMap<TicketId, ParticipantId>,
+    /// Durable party queue freezes, keyed by the authoritative ticket. This
+    /// lets the shard release the exact frozen revision on both cancellation
+    /// and normal match formation, including when the session gateway is
+    /// remote.
+    party_admissions: HashMap<TicketId, PartyAdmissionFence>,
     locations: HashMap<TicketId, NodeId>,
     received: HashMap<(String, String), RemoteMatchmakerHandoff>,
     formed: HashMap<(String, String), RemoteMatchmakerHandoff>,
@@ -85,6 +90,7 @@ enum Job {
         request_id: u64,
         owners: Vec<RemoteMatchmakerTicketOwner>,
         request: TicketRequest,
+        party_admission: Option<PartyAdmissionFence>,
     },
     CancelSession {
         sender: ParticipantId,
@@ -138,6 +144,7 @@ impl LiveMatchmakerNode {
             state: Mutex::new(LiveState {
                 owners: HashMap::new(),
                 leaders: HashMap::new(),
+                party_admissions: HashMap::new(),
                 locations: HashMap::new(),
                 received: HashMap::new(),
                 formed: HashMap::new(),
@@ -227,6 +234,7 @@ impl LiveMatchmakerNode {
         request_id: u64,
         owners: Vec<RemoteMatchmakerTicketOwner>,
         request: TicketRequest,
+        party_admission: Option<PartyAdmissionFence>,
     ) -> bool {
         self.jobs
             .try_send(Job::SubmitSession {
@@ -234,6 +242,7 @@ impl LiveMatchmakerNode {
                 request_id,
                 owners,
                 request,
+                party_admission,
             })
             .is_ok()
     }
@@ -421,8 +430,9 @@ async fn handle_job(inner: &LiveInner, job: Job) {
             request_id,
             owners,
             request,
+            party_admission,
         } => {
-            let result = submit_from_session(inner, owners, request).await;
+            let result = submit_from_session(inner, owners, request, party_admission).await;
             if let Some(gateway) = gateway(inner) {
                 match result {
                     Ok(ticket_id) => gateway.live_matchmaker_reply(
@@ -529,16 +539,29 @@ async fn submit_from_session(
     inner: &LiveInner,
     owners: Vec<RemoteMatchmakerTicketOwner>,
     request: TicketRequest,
+    party_admission: Option<PartyAdmissionFence>,
 ) -> Result<TicketId, MatchmakerRouterError> {
     let now = SystemClock.now();
     match resolve_owner(inner, now).await? {
         MatchmakerShardLeaseResolution::Local(_) => {
-            authoritative_submit(inner, RemoteMatchmakerTicketSubmission { owners, request }).await
+            authoritative_submit(
+                inner,
+                RemoteMatchmakerTicketSubmission {
+                    owners,
+                    request,
+                    party_admission,
+                },
+            )
+            .await
         }
         MatchmakerShardLeaseResolution::Remote(owner) => {
             let ticket_id = inner.config.router.submit_ticket(
                 &owner.owner_node,
-                RemoteMatchmakerTicketSubmission { owners, request },
+                RemoteMatchmakerTicketSubmission {
+                    owners,
+                    request,
+                    party_admission,
+                },
             )?;
             if let Ok(mut state) = inner.state.lock() {
                 state.locations.insert(ticket_id.clone(), owner.owner_node);
@@ -571,17 +594,76 @@ async fn authoritative_submit(
             ));
         }
     };
+    let party_admission = submission.party_admission.clone();
+    let ticket_expires_at = now
+        .checked_add(DurationMillis::from_millis(submission.request.ttl_ms))
+        .map_err(|_| MatchmakerRouterError::Rejected(inner.config.node_id.clone()))?;
+    if ticket_expires_at <= now {
+        return Err(MatchmakerRouterError::Rejected(
+            inner.config.node_id.clone(),
+        ));
+    }
+    // The initial admission only protects the asynchronous handoff. Renew it
+    // through the current party owner before a ticket becomes live, using the
+    // exact same timestamp that add_party will persist on the ticket.
+    if let Some(admission) = party_admission.as_ref()
+        && !gateway(inner).is_some_and(|gateway| {
+            gateway
+                .live_matchmaker_renew_party_admission(admission, ticket_expires_at)
+                .is_ok()
+        })
+    {
+        if let Some(gateway) = gateway(inner) {
+            gateway.live_matchmaker_release_party_admission(admission);
+        }
+        return Err(MatchmakerRouterError::Rejected(
+            inner.config.node_id.clone(),
+        ));
+    }
     let members = (0..submission.owners.len())
         .map(|_| inner.synthetic_participants.next_id())
         .collect::<Vec<_>>();
     let leader = members[0];
-    let ticket_id = inner
+    let ticket_id = match inner
         .index
         .add_party(leader, members, submission.request, now)
-        .map_err(|_| MatchmakerRouterError::Rejected(inner.config.node_id.clone()))?;
+    {
+        Ok(ticket_id) => ticket_id,
+        Err(_) => {
+            // Renewal succeeded, but no ticket was created. Do not make the
+            // client wait for its requested TTL to retry an invalid/rejected
+            // admission; exact-fenced cleanup cannot affect a newer ticket.
+            if let Some(admission) = party_admission.as_ref()
+                && let Some(gateway) = gateway(inner)
+            {
+                gateway.live_matchmaker_release_party_admission(admission);
+            }
+            return Err(MatchmakerRouterError::Rejected(
+                inner.config.node_id.clone(),
+            ));
+        }
+    };
+    // This runs on the shard-owner worker after any forwarding delay and after
+    // queue insertion. A changed party revision must not survive as a queued
+    // ticket: cancel before publishing the ticket or forming a cohort.
+    if let Some(admission) = party_admission.as_ref()
+        && !gateway(inner)
+            .is_some_and(|gateway| gateway.live_matchmaker_revalidate_party_admission(admission))
+    {
+        let _ = inner.index.cancel(leader, &ticket_id, SystemClock.now());
+        if let Some(gateway) = gateway(inner) {
+            gateway.live_matchmaker_release_party_admission(admission);
+        }
+        return Err(MatchmakerRouterError::Rejected(
+            inner.config.node_id.clone(),
+        ));
+    }
     if let Ok(mut state) = inner.state.lock() {
         state.owners.insert(ticket_id.clone(), submission.owners);
         state.leaders.insert(ticket_id.clone(), leader);
+        if let Some(admission) = party_admission {
+            state.party_admissions.insert(ticket_id.clone(), admission);
+        }
         state
             .locations
             .insert(ticket_id.clone(), inner.config.node_id.clone());
@@ -620,12 +702,16 @@ async fn form_matches(
             .checked_add(inner.config.handoff_ttl)
             .map_err(|_| MatchmakerRouterError::Unavailable(inner.config.node_id.clone()))?;
         let mut handoffs = Vec::new();
+        let mut release_admissions = Vec::new();
         {
             let mut state = inner
                 .state
                 .lock()
                 .map_err(|_| MatchmakerRouterError::Unavailable(inner.config.node_id.clone()))?;
             for ticket_id in &formed.tickets {
+                if let Some(admission) = state.party_admissions.remove(ticket_id) {
+                    release_admissions.push(admission);
+                }
                 let owners = state
                     .owners
                     .remove(ticket_id)
@@ -648,6 +734,12 @@ async fn form_matches(
                     handoffs.push((owner.session_node, handoff));
                 }
             }
+        }
+        // The tickets are now matched rather than queued.  The durable
+        // revision/leader fence makes this harmless if a delayed cleanup
+        // races a later party admission.
+        for admission in release_admissions {
+            gateway.live_matchmaker_release_party_admission(&admission);
         }
         for (session_node, handoff) in handoffs {
             if session_node == inner.config.node_id {
@@ -695,22 +787,35 @@ async fn authoritative_cancel(
             inner.config.node_id.clone(),
         ));
     }
-    let mut state = inner
-        .state
-        .lock()
-        .map_err(|_| MatchmakerRouterError::Unavailable(inner.config.node_id.clone()))?;
-    let authorized = state
-        .owners
-        .get(&cancellation.ticket_id)
-        .and_then(|owners| owners.first())
-        .is_some_and(|leader| leader.user_id == cancellation.user_id);
-    let Some(leader) = state.leaders.get(&cancellation.ticket_id).copied() else {
-        return Ok(false);
+    let (cancelled, release) = {
+        let mut state = inner
+            .state
+            .lock()
+            .map_err(|_| MatchmakerRouterError::Unavailable(inner.config.node_id.clone()))?;
+        let authorized = state
+            .owners
+            .get(&cancellation.ticket_id)
+            .and_then(|owners| owners.first())
+            .is_some_and(|leader| leader.user_id == cancellation.user_id);
+        let Some(leader) = state.leaders.get(&cancellation.ticket_id).copied() else {
+            return Ok(false);
+        };
+        let cancelled = authorized && inner.index.cancel(leader, &cancellation.ticket_id, now);
+        if cancelled {
+            state.owners.remove(&cancellation.ticket_id);
+            state.leaders.remove(&cancellation.ticket_id);
+            (
+                cancelled,
+                state.party_admissions.remove(&cancellation.ticket_id),
+            )
+        } else {
+            (cancelled, None)
+        }
     };
-    let cancelled = authorized && inner.index.cancel(leader, &cancellation.ticket_id, now);
-    if cancelled {
-        state.owners.remove(&cancellation.ticket_id);
-        state.leaders.remove(&cancellation.ticket_id);
+    if let Some(admission) = release
+        && let Some(gateway) = gateway(inner)
+    {
+        gateway.live_matchmaker_release_party_admission(&admission);
     }
     Ok(cancelled)
 }

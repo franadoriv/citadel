@@ -313,6 +313,16 @@ impl ClusterConfig {
                 "cluster.enabled requires database.url so matchmaker fencing survives node restart",
             ));
         }
+        if matches!(database.backend()?, Some(DatabaseBackend::Sqlite)) {
+            return Err(AppError::config(
+                "cluster.enabled does not support SQLite; use PostgreSQL or CockroachDB for durable multi-node party and matchmaker fencing",
+            ));
+        }
+        if matches!(database.backend()?, Some(DatabaseBackend::MongoDb)) {
+            return Err(AppError::config(
+                "cluster.enabled does not support MongoDB because its StorageRepository lacks atomic_batch; use PostgreSQL or CockroachDB for durable multi-node party authority",
+            ));
+        }
         NodeId::new(local_node.to_owned())?;
         validate_socket_addr("cluster.control_bind", &self.control_bind)?;
         if self.lease_ttl_ms == 0 || self.handoff_ttl_ms == 0 || self.command_timeout_ms == 0 {
@@ -2422,12 +2432,18 @@ mod tests {
                 },
             },
             database: DatabaseConfig {
-                url: Some("sqlite::memory:".to_owned()),
+                url: Some("postgres://citadel@localhost/citadel".to_owned()),
                 ..DatabaseConfig::default()
             },
             ..Config::default()
         };
         assert!(config.validate().is_ok());
+        config.database.url = Some("sqlite::memory:".to_owned());
+        assert!(config.validate().is_err());
+        config.database.url = Some("mongodb://localhost/citadel".to_owned());
+        let mongo_error = config.validate().expect_err("MongoDB cluster must fail");
+        assert!(mongo_error.to_string().contains("atomic_batch"));
+        config.database.url = Some("postgres://citadel@localhost/citadel".to_owned());
         config.cluster.tls.ca_certificate_file.clear();
         assert!(config.validate().is_err());
         config.cluster.tls.ca_certificate_file = "cluster-ca.pem".to_owned();

@@ -30,12 +30,14 @@ use crate::chat_cluster::{
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::matchmaker::{TicketId, TicketState};
 use crate::matchmaker_cluster::{
-    AdmissionHandler, MatchmakerHandoffRouter, MatchmakerRouterError, RemoteMatchmakerAdmission,
-    RemoteMatchmakerHandoff, RemoteMatchmakerTicketCancellation, RemoteMatchmakerTicketStatus,
-    RemoteMatchmakerTicketSubmission, TicketCancellationHandler, TicketStatusHandler,
-    TicketSubmissionHandler,
+    AdmissionHandler, MatchmakerHandoffRouter, MatchmakerRouterError, PartyAdmissionFence,
+    RemoteMatchmakerAdmission, RemoteMatchmakerHandoff, RemoteMatchmakerTicketCancellation,
+    RemoteMatchmakerTicketStatus, RemoteMatchmakerTicketSubmission, TicketCancellationHandler,
+    TicketStatusHandler, TicketSubmissionHandler,
 };
+use crate::party::{PartyId, PartySnapshot};
 use crate::runtime::cluster::{RuntimeCacheMutation, RuntimeCacheWrite, RuntimeClusterEvent};
+use crate::services::party_directory::PartyOwnerLease;
 use crate::session::NodeId;
 use crate::time::{Clock, SystemClock, TimestampMillis};
 
@@ -193,6 +195,73 @@ enum NodeCommand {
     DeliverRuntimeEvent(RuntimeClusterEvent),
     ApplyRuntimeCacheMutation(RuntimeCacheMutation),
     SubmitRuntimeCacheWrite(RuntimeCacheWrite),
+    Party(PartyControlCommand),
+}
+
+/// One fenced party mutation forwarded only to the durable party owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyControlCommand {
+    pub party_id: PartyId,
+    pub lease: PartyOwnerLease,
+    pub actor: String,
+    pub request_id: String,
+    pub expected_revision: u64,
+    pub operation: PartyControlOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PartyControlOperation {
+    Invite {
+        target: String,
+    },
+    Accept,
+    Leave,
+    Promote {
+        target: String,
+    },
+    Remove {
+        target: String,
+    },
+    Close,
+    /// Freeze one committed membership revision before ticket admission. Like
+    /// every other party mutation, this must execute on the fenced owner.
+    QueueAdmission {
+        ticket_expires_at: TimestampMillis,
+    },
+    /// Replace a pre-ticket reservation expiry with the exact expiry of the
+    /// authoritative ticket. The original admission remains the complete
+    /// token/generation fence, so delayed shard work cannot renew a newer one.
+    RenewQueueAdmission {
+        admission: PartyAdmissionFence,
+        ticket_expires_at: TimestampMillis,
+    },
+    /// Cleanup is also a party mutation: it is always routed to the current
+    /// owner and succeeds only for the exact admission token/fence.
+    ReleaseQueueAdmission {
+        admission: PartyAdmissionFence,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyQueueAdmission {
+    pub members: Vec<String>,
+    pub revision: u64,
+    /// Echoed by the owner so the caller can reject a reply from a stale or
+    /// misrouted lease rather than admitting a ticket from an unfenced view.
+    pub lease: PartyOwnerLease,
+    pub admission_generation: u64,
+    pub admission_token: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PartyControlReply {
+    /// Every successful mutation reply is bound to the command's owner fence.
+    /// Callers must reject a delayed or misrouted reply whose lease differs.
+    Snapshot(PartySnapshot, PartyOwnerLease),
+    QueueAdmission(PartyQueueAdmission),
+    /// The caller must re-resolve the owner before retrying this command.
+    StaleOwnerFence,
+    Rejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +300,9 @@ enum ControlResponse {
     },
     RuntimePropagation {
         accepted: bool,
+    },
+    Party {
+        reply: PartyControlReply,
     },
 }
 
@@ -276,6 +348,7 @@ struct RouterState {
     status_handler: Mutex<Option<TicketStatusHandler>>,
     chat_delivery_handler: Mutex<Option<ChatDeliveryHandler>>,
     chat_presence_handler: Mutex<Option<ChatPresenceHandler>>,
+    party_handler: Mutex<Option<PartyControlHandler>>,
     chat_dedupe: ChatCommandDedupe,
     runtime_event_handler: Mutex<Option<RuntimeEventHandler>>,
     runtime_cache_handler: Mutex<Option<RuntimeCacheMutationHandler>>,
@@ -288,6 +361,9 @@ struct RouterState {
 /// block on a client socket.
 pub type HandoffHandler =
     Arc<dyn Fn(RemoteMatchmakerHandoff) -> Result<(), MatchmakerRouterError> + Send + Sync>;
+/// Callback for a fenced party command after mTLS source authentication.
+pub type PartyControlHandler =
+    Arc<dyn Fn(NodeId, PartyControlCommand) -> PartyControlReply + Send + Sync>;
 
 /// Callback invoked for one typed, durable chat event. It receives no remote
 /// socket or participant capability and must validate its local lease fence
@@ -416,6 +492,7 @@ impl TlsMatchmakerHandoffRouter {
                 status_handler: Mutex::new(None),
                 chat_delivery_handler: Mutex::new(None),
                 chat_presence_handler: Mutex::new(None),
+                party_handler: Mutex::new(None),
                 chat_dedupe: ChatCommandDedupe::new(MAX_DEDUPED_COMMANDS),
                 runtime_event_handler: Mutex::new(None),
                 runtime_cache_handler: Mutex::new(None),
@@ -508,6 +585,13 @@ impl TlsMatchmakerHandoffRouter {
     /// Install the current global cache writer's submission boundary.
     pub fn register_runtime_cache_write_handler(&self, handler: RuntimeCacheWriteHandler) {
         if let Ok(mut slot) = self.state.runtime_cache_write_handler.lock() {
+            *slot = Some(handler);
+        }
+    }
+
+    /// Install the typed fenced party owner handler.
+    pub fn register_party_handler(&self, handler: PartyControlHandler) {
+        if let Ok(mut slot) = self.state.party_handler.lock() {
             *slot = Some(handler);
         }
     }
@@ -775,6 +859,18 @@ impl TlsMatchmakerHandoffRouter {
     ) -> Result<bool, MatchmakerRouterError> {
         match self.send(destination, NodeCommand::SubmitRuntimeCacheWrite(write))? {
             ControlResponse::RuntimePropagation { accepted } => Ok(accepted),
+            _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
+        }
+    }
+
+    /// Route one party command to its currently resolved owner over mTLS.
+    pub fn party_command(
+        &self,
+        destination: &NodeId,
+        command: PartyControlCommand,
+    ) -> Result<PartyControlReply, MatchmakerRouterError> {
+        match self.send(destination, NodeCommand::Party(command))? {
+            ControlResponse::Party { reply } => Ok(reply),
             _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
         }
     }
@@ -1080,6 +1176,27 @@ fn dispatch(
                 }),
             })
         }
+        NodeCommand::Party(command) => {
+            if command.lease.owner_node != state.local_node
+                || command.party_id != command.lease.party_id
+                || command.actor.is_empty()
+                || command.request_id.is_empty()
+            {
+                return Ok(ControlResponse::Party {
+                    reply: PartyControlReply::Rejected,
+                });
+            }
+            let handler = state
+                .party_handler
+                .lock()
+                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
+                .clone();
+            Ok(ControlResponse::Party {
+                reply: handler.map_or(PartyControlReply::Rejected, |handler| {
+                    handler(source, command)
+                }),
+            })
+        }
     }
 }
 
@@ -1144,6 +1261,7 @@ mod tests {
     use crate::realtime::chat_presence::ChatPresenceRegistry;
     use crate::realtime::registry::ParticipantId;
     use crate::services::ChatTarget;
+    use crate::services::party_directory::PartyOwnerLease;
     use crate::session::OwnershipGeneration;
     use crate::time::TimestampMillis;
     use std::sync::atomic::AtomicUsize;
@@ -1362,6 +1480,13 @@ mod tests {
                 .then_some(99)
                 .ok_or(MatchmakerRouterError::Rejected(node("node-b")))
         }));
+        // A routed party command is a distinct typed mTLS frame. The receiving
+        // owner can force a re-resolution when its durable fence changed.
+        router_b.register_party_handler(Arc::new(|source, command| {
+            assert_eq!(source.as_str(), "node-a");
+            assert_eq!(command.party_id.as_str(), "party-control");
+            PartyControlReply::StaleOwnerFence
+        }));
         let chat_deliveries_for_handler = Arc::clone(&chat_deliveries);
         let chat_directory_for_handler = Arc::clone(&chat_directory);
         let chat_presence_for_handler = Arc::clone(&chat_presence);
@@ -1409,6 +1534,25 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect("router a");
+        assert!(matches!(
+            router_a.party_command(
+                &node_b,
+                PartyControlCommand {
+                    party_id: PartyId::parse("party-control").expect("party"),
+                    lease: PartyOwnerLease {
+                        party_id: PartyId::parse("party-control").expect("party"),
+                        owner_node: node_b.clone(),
+                        generation: OwnershipGeneration::new(7),
+                        expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                    },
+                    actor: "alice".to_owned(),
+                    request_id: "party-command-1".to_owned(),
+                    expected_revision: 1,
+                    operation: PartyControlOperation::Accept,
+                },
+            ),
+            Ok(PartyControlReply::StaleOwnerFence)
+        ));
         let remote_channel_lease = ChatPresenceLease {
             channel_id: "channel-advertised".to_owned(),
             node_id: node_a.clone(),

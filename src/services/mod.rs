@@ -29,6 +29,7 @@ pub mod leaderboards;
 pub mod matchmaker_directory;
 pub mod memory;
 pub mod notifications;
+pub mod party_directory;
 pub mod player_notifications;
 pub mod purchases;
 pub mod session;
