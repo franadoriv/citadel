@@ -1,6 +1,30 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import { execFileSync } from 'node:child_process';
+
+// Pagefind's published Linux ARM64 binary is a musl build linked with jemalloc.
+// It cannot start on 16 KiB-page ARM64 kernels (including Raspberry Pi 5's
+// Debian kernel). Do not make the documentation build unusable there: CI and
+// normal 4 KiB-page hosts still build the complete local-search index.
+function pagefindSupportedOnHost() {
+	if (process.platform !== 'linux' || process.arch !== 'arm64') return true;
+
+	try {
+		return execFileSync('getconf', ['PAGESIZE'], { encoding: 'utf8' }).trim() === '4096';
+	} catch {
+		// If the page size cannot be determined, retain search rather than
+		// silently changing the generated site.
+		return true;
+	}
+}
+
+const pagefindEnabled = pagefindSupportedOnHost();
+if (!pagefindEnabled) {
+	console.warn(
+		'[citadel docs] Skipping Pagefind on this 16 KiB-page ARM64 host; the published Pagefind binary cannot run here. CI builds retain search.',
+	);
+}
 
 // Local-only documentation site for developers consuming Citadel.
 // No external hosting/deploy configuration lives here by design.
@@ -11,6 +35,7 @@ export default defineConfig({
 			description:
 				'Developer documentation for Citadel: authoritative game logic, realtime multiplayer, durable game services, and client SDKs.',
 			customCss: ['./src/styles/citadel.css'],
+			pagefind: pagefindEnabled,
 			social: [
 				{
 					icon: 'github',
