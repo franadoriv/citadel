@@ -44,32 +44,80 @@ operator owns. The trusted VM has no handler deadline. `debug` and native
 C-module loading remain unavailable in both modes because they require an
 unsafe Rust VM constructor.
 
-## citadel.http.fetch
+## `citadel.http.start`, `poll`, and `cancel`
 
-Make one bounded outbound HTTP request through Citadel's Rust-owned client. It
-exists only when `runtime.lua_execution_mode = "trusted"`; sandboxed Lua has no
-`citadel.http` table.
-
-```lua
-citadel.http.fetch(url [, options]) -> { status = integer, body = string }
-```
-
-`options.method` defaults to `"GET"`; `options.headers` is a string-to-string
-table; `options.body` is a binary-safe Lua string. The response body is also a
-binary-safe Lua string. The call is synchronous from the handler's viewpoint.
-
-Citadel, not Lua, owns DNS, TLS, and the socket. Requests time out after 5
-seconds; request bodies are capped at 64 KiB and response bodies at 1 MiB.
-Redirects and environment/system proxies are disabled. Invalid methods/headers,
-timeouts, network failures, and either size limit raise a Lua error.
+This is a **trusted-server-only** capability: Lua exposes it only with
+`runtime.lua_execution_mode = "trusted"`, and it is for game code the operator
+owns—not client input or a browser. Citadel owns the Rust HTTP client, DNS, TLS,
+sockets, timeout, and cancellation; a script never receives a network handle.
+It is unavailable in either realtime interceptor: `fetch`, `start`, `poll`, and
+`cancel` fail with `interceptor_forbidden` there.
 
 ```lua
-local response = citadel.http.fetch("https://inventory.example/v1/stock", {
-  method = "GET",
-  headers = { ["authorization"] = "Bearer " .. token },
-})
-if response.status ~= 200 then error("inventory unavailable") end
+local handle = citadel.http.start(url, opts)
 ```
+
+`url` must be an `http` or `https` DNS-hostname URL. `opts` is optional and may
+contain `method` (string, default `"GET"`), `headers` (string-to-string table),
+and `body` (a Lua string). `start` validates this request and the operator
+policy before allocating an opaque runtime-local `u64` handle, then schedules
+network I/O without waiting for it. Rust policy rejections raise their stable
+code and do not produce a handle. Local Lua argument or option validation can
+instead raise a Lua-visible validation error; it is not an `error_code` contract.
+
+`poll(handle)` never waits and returns one of these tables:
+
+| `state` | Other fields | Meaning |
+| --- | --- | --- |
+| `"pending"` | — | Work is still running; poll again from a later tick. |
+| `"success"` | `status` (`u16`), `body` (binary-safe string) | HTTP response completed. |
+| `"error"` | `error_code` (string) | A stable, redacted code for a network/runtime request result. |
+| `"timeout"` | — | The five-second request deadline elapsed. |
+| `"cancelled"` | — | The request was cancelled. |
+
+`cancel(handle)` returns the same state table. It aborts a pending request and
+returns `cancelled`; it is idempotent for an already-terminal known handle
+(including a second cancel). Unknown, malformed, evicted, or reload-invalidated
+handles raise an error instead. Terminal handles remain pollable only until the
+bounded per-runtime table needs to evict one; reload and shutdown cancel and
+forget all handles.
+
+### `citadel.http.fetch` compatibility
+
+`fetch(url, opts?)` remains available in trusted Lua for backward compatibility.
+It uses the same request shape and policy, but is synchronous and returns
+`{ status = u16, body = string }`; it is not replaced by `start`. New gameplay
+paths should use `start` + `poll` to avoid blocking a tick or handler.
+
+```lua
+local pending_inventory
+
+citadel.on_tick(function(_dt)
+  if not pending_inventory then
+    pending_inventory = citadel.http.start("https://inventory.example/v1/stock", {
+      method = "GET", headers = { ["authorization"] = "Bearer " .. token },
+    })
+    return -- start never waits for the response
+  end
+
+  local result = citadel.http.poll(pending_inventory)
+  if result.state == "pending" then return end
+  pending_inventory = nil
+  if result.state == "success" and result.status == 200 then
+    print(result.body)
+  elseif result.state == "error" then
+    print("inventory request failed: " .. result.error_code)
+  elseif result.state == "timeout" or result.state == "cancelled" then
+    print("inventory request did not complete")
+  end
+end)
+```
+
+The same operator policy applies to `fetch`, `start`, `poll`, and `cancel`:
+hostname/port allowlists, public-address and DNS-rebinding checks, proxy and
+redirect denial, a 64 KiB request body cap, 1 MiB response cap, 64 headers/
+16 KiB aggregate header cap, five-second timeout, and configured concurrency
+and rate quotas. See [outbound HTTP configuration](/reference/operations/configuration/#runtimecapabilitiesoutbound_http).
 
 ## citadel.http.register
 

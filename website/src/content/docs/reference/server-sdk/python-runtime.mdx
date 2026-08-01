@@ -7,25 +7,70 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 ## HTTP host API
 
-### `citadel.http.fetch(url, opts=None)`
+### `citadel.http.start`, `poll`, and `cancel`
 
-Performs one bounded outbound request through Citadel's Rust-owned HTTP client.
-`opts` accepts `method` (default `"GET"`), `headers` (a `dict[str, str]`), and
-`body` (`bytes` or `str`). It returns `{"status": int, "body": bytes}`.
+This is a **trusted-server-only** capability for operator-owned game code, not
+client code. `start(url, opts=None)` schedules Rust-owned outbound HTTP and
+returns an opaque runtime-local `int` handle immediately; it never waits for
+network I/O. `url` must be an `http` or `https` DNS-hostname URL. `opts` may
+contain `method` (string, default `"GET"`), `headers` (a `dict[str, str]`), and
+`body` (`bytes` or `str`). Rust policy rejections raise their stable code without
+allocating a handle. Local Python argument or option validation can instead
+raise a Python-visible validation exception; it is not an `error_code` contract.
 
-The call waits synchronously for its response. Citadel retains ownership of DNS,
-TLS, and the socket: it enforces a 5-second deadline, a 64 KiB request-body
-limit, and a 1 MiB response-body limit; redirects and environment/system proxies
-are disabled. Invalid input, a size limit, timeout, or network failure raises
-`RuntimeError`.
+`poll(handle)` never blocks and returns one of these mappings:
+
+| `state` | Other keys | Meaning |
+| --- | --- | --- |
+| `"pending"` | — | Still running; poll from a later tick. |
+| `"success"` | `status` (`int`), `body` (`bytes`) | Completed HTTP response. |
+| `"error"` | `error_code` (`str`) | Stable, redacted code for a network/runtime request result. |
+| `"timeout"` | — | The five-second deadline elapsed. |
+| `"cancelled"` | — | The request was cancelled. |
+
+`cancel(handle)` returns the same mapping. It aborts a pending request and is
+idempotent for any already-terminal known handle; unknown, malformed, evicted,
+or reload-invalidated handles raise an error. Reload and shutdown cancel and
+forget all handles. `fetch`, `start`, `poll`, and `cancel` all raise
+`RuntimeError("interceptor_forbidden")` inside realtime interceptors.
+
+### `citadel.http.fetch` compatibility
+
+`fetch(url, opts=None)` remains available in the trusted runtime for backward
+compatibility. It uses the same URL, method, header, and policy rules, but is
+synchronous and returns `{"status": int, "body": bytes}`; it is not replaced by `start`. New
+gameplay paths should use `start` + `poll` to avoid blocking a tick or handler.
 
 ```python
-response = citadel.http.fetch("https://inventory.example/v1/stock", {
-    "headers": {"authorization": f"Bearer {token}"},
-})
-if response["status"] != 200:
-    raise RuntimeError("inventory unavailable")
+pending_inventory = None
+
+@citadel.on_tick
+def refresh_inventory(_dt):
+    global pending_inventory
+    if pending_inventory is None:
+        pending_inventory = citadel.http.start(
+            "https://inventory.example/v1/stock",
+            {"method": "GET", "headers": {"authorization": f"Bearer {token}"}},
+        )
+        return  # start only schedules work
+
+    result = citadel.http.poll(pending_inventory)
+    if result["state"] == "pending":
+        return
+    pending_inventory = None
+    if result["state"] == "success" and result["status"] == 200:
+        consume_inventory(result["body"])
+    elif result["state"] == "error":
+        citadel.log("warn", f"inventory failed: {result['error_code']}")
+    elif result["state"] in ("timeout", "cancelled"):
+        citadel.log("warn", "inventory request did not complete")
 ```
+
+The same operator policy applies to `fetch`, `start`, `poll`, and `cancel`:
+hostname/port allowlists, public-address and DNS-rebinding checks, proxy and
+redirect denial, a 64 KiB request body cap, 1 MiB response cap, 64 headers/
+16 KiB aggregate header cap, five-second timeout, and configured concurrency
+and rate quotas. See [outbound HTTP configuration](/reference/operations/configuration/#runtimecapabilitiesoutbound_http).
 
 ## Storage host API
 

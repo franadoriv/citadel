@@ -21,7 +21,10 @@ use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
-use crate::runtime::outbound_http::{OutboundHttpPolicy, OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::outbound_http::{
+    AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
+    TrustedHttpClient,
+};
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
     LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, OutboundCommand, PhysicsOptions,
@@ -110,6 +113,9 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "storage.index_query",
     "storage.register_index_filter",
     "http.fetch",
+    "http.start",
+    "http.poll",
+    "http.cancel",
     "http.register",
     "events.emit",
     "events.subscribe",
@@ -267,6 +273,18 @@ class _Http:
         if "_http_bridge" not in globals():
             raise RuntimeError("outbound HTTP host not available")
         return _http_bridge.fetch(str(url), {} if opts is None else dict(opts))
+
+    def start(self, url, opts=None):
+        """Schedule one bounded Rust-owned HTTP request without blocking."""
+        if "_http_bridge" not in globals():
+            raise RuntimeError("outbound HTTP host not available")
+        return _http_bridge.start(str(url), {} if opts is None else dict(opts))
+
+    def poll(self, handle):
+        return _http_bridge.poll(int(handle))
+
+    def cancel(self, handle):
+        return _http_bridge.cancel(int(handle))
 
     def register(self, method, path, options=None, handler=None):
         """Register one bounded endpoint under Citadel's reserved /ext prefix."""
@@ -761,7 +779,8 @@ struct StaticDataBridge {
 /// socket, an HTTP client, or proxy configuration.
 #[pyclass]
 struct OutboundHttpBridge {
-    client: TrustedHttpClient,
+    client: AsyncOutboundHttp,
+    fetch_client: TrustedHttpClient,
     interceptor_mode: Arc<AtomicBool>,
 }
 
@@ -821,9 +840,36 @@ impl StaticDataBridge {
 impl OutboundHttpBridge {
     fn fetch(&self, url: &str, opts: &Bound<'_, PyDict>, py: Python<'_>) -> PyResult<Py<PyDict>> {
         if self.interceptor_mode.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err(
-                "domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors",
-            ));
+            return Err(PyRuntimeError::new_err("interceptor_forbidden"));
+        }
+        let response = self
+            .fetch_client
+            .execute_blocking(OutboundHttpRequest {
+                method: opts
+                    .get_item("method")?
+                    .and_then(|value| value.extract::<String>().ok())
+                    .unwrap_or_else(|| "GET".to_string()),
+                url: url.to_string(),
+                headers: opts
+                    .get_item("headers")?
+                    .map(|value| value.extract::<BTreeMap<String, String>>())
+                    .transpose()?
+                    .unwrap_or_default(),
+                body: opts
+                    .get_item("body")?
+                    .map(|value| value.extract::<Vec<u8>>())
+                    .transpose()?
+                    .unwrap_or_default(),
+            })
+            .map_err(|error| PyRuntimeError::new_err(error.error_code().to_string()))?;
+        let result = PyDict::new(py);
+        result.set_item("status", response.status)?;
+        result.set_item("body", PyBytes::new(py, &response.body))?;
+        Ok(result.unbind())
+    }
+    fn start(&self, url: &str, opts: &Bound<'_, PyDict>) -> PyResult<u64> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("interceptor_forbidden"));
         }
         let method = opts
             .get_item("method")?
@@ -841,20 +887,56 @@ impl OutboundHttpBridge {
             Some(value) => value.extract::<BTreeMap<String, String>>()?,
             None => BTreeMap::new(),
         };
-        let response = self
-            .client
-            .execute_blocking(OutboundHttpRequest {
+        self.client
+            .start(OutboundHttpRequest {
                 method,
                 url: url.to_string(),
                 headers,
                 body,
             })
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let result = PyDict::new(py);
-        result.set_item("status", response.status)?;
-        result.set_item("body", PyBytes::new(py, &response.body))?;
-        Ok(result.unbind())
+            .map_err(|error| PyRuntimeError::new_err(error.error_code().to_string()))
     }
+
+    fn poll(&self, handle: u64, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("interceptor_forbidden"));
+        }
+        outbound_http_state_to_python(
+            py,
+            self.client
+                .poll(handle)
+                .map_err(|e| PyRuntimeError::new_err(e.error_code().to_string()))?,
+        )
+    }
+
+    fn cancel(&self, handle: u64, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        if self.interceptor_mode.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("interceptor_forbidden"));
+        }
+        outbound_http_state_to_python(
+            py,
+            self.client
+                .cancel(handle)
+                .map_err(|e| PyRuntimeError::new_err(e.error_code().to_string()))?,
+        )
+    }
+}
+
+fn outbound_http_state_to_python(
+    py: Python<'_>,
+    state: OutboundHttpRequestState,
+) -> PyResult<Py<PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("state", state.status())?;
+    match state {
+        OutboundHttpRequestState::Success(response) => {
+            result.set_item("status", response.status)?;
+            result.set_item("body", PyBytes::new(py, &response.body))?;
+        }
+        OutboundHttpRequestState::Error(error) => result.set_item("error_code", error)?,
+        _ => {}
+    }
+    Ok(result.unbind())
 }
 
 #[pymethods]
@@ -2470,10 +2552,12 @@ fn install_outbound_http(
 ) -> PyResult<()> {
     let client = TrustedHttpClient::new_with_policy(policy)
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let async_client = AsyncOutboundHttp::new(client.clone());
     citadel.setattr(
         "_http_bridge",
         OutboundHttpBridge {
-            client,
+            client: async_client,
+            fetch_client: client,
             interceptor_mode,
         },
     )
@@ -3506,10 +3590,18 @@ import citadel
 
 @citadel.on_message(1)
 def handle(ctx, body):
-    try:
-        citadel.http.fetch("https://api.example.test/")
-    except RuntimeError as error:
-        citadel.broadcast(2, str(error).encode())
+    failures = []
+    for operation in (
+        lambda: citadel.http.fetch("https://api.example.test/"),
+        lambda: citadel.http.start("https://api.example.test/"),
+        lambda: citadel.http.poll(7),
+        lambda: citadel.http.cancel(7),
+    ):
+        try:
+            operation()
+        except RuntimeError as error:
+            failures.append(str(error))
+    citadel.broadcast(2, ",".join(failures).encode())
 "#;
         dir.write_main(source);
         let runtime = PythonRuntime::load_with_static_data_and_http_policy(
@@ -3535,7 +3627,8 @@ def handle(ctx, body):
             };
             assert_eq!(
                 body,
-                b"outbound HTTP capability is disabled by runtime policy"
+                b"capability_disabled,capability_disabled,capability_disabled,capability_disabled",
+                "fetch compatibility and every async operation must enforce the same host policy"
             );
         };
         assert_disabled(&runtime);

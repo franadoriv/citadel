@@ -22,7 +22,10 @@ use rquickjs::{
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
-use crate::runtime::outbound_http::{OutboundHttpPolicy, OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::outbound_http::{
+    AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
+    TrustedHttpClient,
+};
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
     DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, OutboundCommand, PhysicsOptions,
@@ -102,6 +105,9 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "storage.index_query",
     "storage.register_index_filter",
     "http.fetch",
+    "http.start",
+    "http.poll",
+    "http.cancel",
     "http.register",
     "events.emit",
     "events.subscribe",
@@ -170,7 +176,7 @@ const JS_HOST_PRELUDE: &str = r#"
   }
 
   function cacheEntry(encoded) {
-    if (encoded === null) return null;
+    if (encoded === null || encoded === undefined) return null;
     const entry = JSON.parse(encoded);
     entry.value = Uint8Array.from(entry.value);
     return entry;
@@ -330,13 +336,32 @@ const JS_HOST_PRELUDE: &str = r#"
     http: {
       fetch(url, opts) {
         if (globalThis.__citadel_realtime_interceptor) {
-          throw new Error("domain, storage, and outbound HTTP APIs are unavailable in realtime interceptors");
+          throw new Error("interceptor_forbidden");
         }
-        if (!globalThis.__citadel_http_fetch) {
-          throw new Error("outbound HTTP host not available");
-        }
+        if (!globalThis.__citadel_http_fetch) throw new Error("outbound HTTP host not available");
         const response = JSON.parse(globalThis.__citadel_http_fetch(String(url), JSON.stringify(opts || {})));
         return { status: response.status, body: Uint8Array.from(response.body) };
+      },
+      start(url, opts) {
+        if (globalThis.__citadel_realtime_interceptor) {
+          throw new Error("interceptor_forbidden");
+        }
+        if (!globalThis.__citadel_http_start) {
+          throw new Error("outbound HTTP host not available");
+        }
+        return globalThis.__citadel_http_start(String(url), JSON.stringify(opts || {}));
+      },
+      poll(handle) {
+        if (globalThis.__citadel_realtime_interceptor) {
+          throw new Error("interceptor_forbidden");
+        }
+        return JSON.parse(globalThis.__citadel_http_poll(String(handle)));
+      },
+      cancel(handle) {
+        if (globalThis.__citadel_realtime_interceptor) {
+          throw new Error("interceptor_forbidden");
+        }
+        return JSON.parse(globalThis.__citadel_http_cancel(String(handle)));
       },
       register(method, path, options, handler) {
         if (typeof globalThis.__citadel_http_register !== "function") {
@@ -1672,15 +1697,13 @@ impl JsRuntime {
             Ok(Ok(maybe_commands)) => {
                 let mut commands = maybe_commands.unwrap_or_default();
                 if !restricted {
-                    let event_commands = guard.context.with(|ctx| {
-                        dispatch_pending_runtime_events(
-                            &ctx,
-                            &guard.runtime,
-                            budget,
-                            &event_bus_handle,
-                            &guard.source_label,
-                        )
-                    });
+                    let event_commands = dispatch_pending_runtime_events(
+                        &guard.context,
+                        &guard.runtime,
+                        budget,
+                        &event_bus_handle,
+                        &guard.source_label,
+                    );
                     append_runtime_event_commands(
                         &mut commands,
                         event_commands,
@@ -1954,12 +1977,67 @@ fn install_outbound_http(
     policy: OutboundHttpPolicy,
 ) -> JsHostResult<()> {
     let client = TrustedHttpClient::new_with_policy(policy).map_err(|error| error.to_string())?;
+    let async_http = AsyncOutboundHttp::new(client.clone());
+    let fetch_http = client;
+    let fetch_mode = Arc::clone(&interceptor_mode);
     let fetch = caught(
         ctx,
         Function::new(
             ctx.clone(),
+            move |ctx: Ctx<'_>, url: String, options: String| -> rquickjs::Result<String> {
+                if fetch_mode.load(Ordering::Relaxed) {
+                    return throw_js(&ctx, "interceptor_forbidden".to_string());
+                }
+                let opts: serde_json::Value = match serde_json::from_str(&options) {
+                    Ok(value) => value,
+                    Err(_) => return throw_js(&ctx, "invalid_request".to_string()),
+                };
+                let method = opts
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("GET")
+                    .to_string();
+                let body = opts
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec();
+                let headers = match opts
+                    .get("headers")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                {
+                    Ok(headers) => headers.unwrap_or_default(),
+                    Err(_) => return throw_js(&ctx, "invalid_request".to_string()),
+                };
+                let response = match fetch_http.execute_blocking(OutboundHttpRequest {
+                    method,
+                    url,
+                    headers,
+                    body,
+                }) {
+                    Ok(response) => response,
+                    Err(error) => return throw_js(&ctx, error.error_code().to_string()),
+                };
+                Ok(
+                    serde_json::json!({"status": response.status, "body": response.body})
+                        .to_string(),
+                )
+            },
+        ),
+    )?;
+    let start_http = async_http.clone();
+    let start_mode = Arc::clone(&interceptor_mode);
+    let start = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
             move |ctx: Ctx<'_>, url: String, opts_json: String| -> rquickjs::Result<String> {
-                ensure_realtime_effects_allowed(&ctx, &interceptor_mode)?;
+                if start_mode.load(Ordering::Relaxed) {
+                    return throw_js(&ctx, "interceptor_forbidden".to_string());
+                }
                 let opts: serde_json::Value = match serde_json::from_str(&opts_json) {
                     Ok(value) => value,
                     Err(_) => return throw_js(&ctx, "invalid HTTP options".to_string()),
@@ -1986,24 +2064,78 @@ fn install_outbound_http(
                         return throw_js(&ctx, "HTTP headers must be a string map".to_string());
                     }
                 };
-                match client.execute_blocking(OutboundHttpRequest {
+                match start_http.start(OutboundHttpRequest {
                     method,
                     url,
                     headers,
                     body,
                 }) {
-                    Ok(response) => Ok(serde_json::json!({
-                        "status": response.status,
-                        "body": response.body,
-                    })
-                    .to_string()),
-                    Err(error) => throw_js(&ctx, error.to_string()),
+                    Ok(handle) => Ok(handle.to_string()),
+                    Err(error) => throw_js(&ctx, error.error_code().to_string()),
                 }
             },
         ),
     )?;
+    let poll_http = async_http.clone();
+    let poll_mode = Arc::clone(&interceptor_mode);
+    let poll = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, handle: String| -> rquickjs::Result<String> {
+                if poll_mode.load(Ordering::Relaxed) {
+                    return throw_js(&ctx, "interceptor_forbidden".to_string());
+                }
+                let handle = match handle.parse::<u64>() {
+                    Ok(handle) => handle,
+                    Err(_) => return throw_js(&ctx, "invalid_handle".to_string()),
+                };
+                match poll_http.poll(handle) {
+                    Ok(state) => outbound_http_state_to_js(state),
+                    Err(error) => throw_js(&ctx, error.error_code().to_string()),
+                }
+            },
+        ),
+    )?;
+    let cancel_mode = Arc::clone(&interceptor_mode);
+    let cancel = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, handle: String| -> rquickjs::Result<String> {
+                if cancel_mode.load(Ordering::Relaxed) {
+                    return throw_js(&ctx, "interceptor_forbidden".to_string());
+                }
+                let handle = match handle.parse::<u64>() {
+                    Ok(handle) => handle,
+                    Err(_) => return throw_js(&ctx, "invalid_handle".to_string()),
+                };
+                match async_http.cancel(handle) {
+                    Ok(state) => outbound_http_state_to_js(state),
+                    Err(error) => throw_js(&ctx, error.error_code().to_string()),
+                }
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_http_start", start))?;
     caught(ctx, ctx.globals().set("__citadel_http_fetch", fetch))?;
+    caught(ctx, ctx.globals().set("__citadel_http_poll", poll))?;
+    caught(ctx, ctx.globals().set("__citadel_http_cancel", cancel))?;
     Ok(())
+}
+
+fn outbound_http_state_to_js(state: OutboundHttpRequestState) -> rquickjs::Result<String> {
+    let mut value = serde_json::json!({"state": state.status()});
+    match state {
+        OutboundHttpRequestState::Success(response) => {
+            value = serde_json::json!({"state":"success", "status":response.status, "body":response.body})
+        }
+        OutboundHttpRequestState::Error(error) => {
+            value = serde_json::json!({"state":"error", "error_code":error})
+        }
+        _ => {}
+    }
+    Ok(value.to_string())
 }
 
 /// Install endpoint registration during VM initialization. The native bridge
@@ -2605,28 +2737,12 @@ fn runtime_event_key(namespace: &str, event_type: &str) -> String {
 /// Dispatch one non-reentrant snapshot after an outer JavaScript invocation.
 /// Individual subscriber failures are isolated and their commands discarded.
 fn dispatch_pending_runtime_events(
-    ctx: &Ctx<'_>,
+    context: &Context,
     runtime: &QuickJsRuntime,
     budget: Duration,
     event_bus_handle: &RuntimeEventBusHandle,
     label: &str,
 ) -> Vec<OutboundCommand> {
-    let globals = ctx.globals();
-    let count: Function = match caught(ctx, globals.get("__citadel_runtime_event_subscriber_count"))
-    {
-        Ok(count) => count,
-        Err(error) => {
-            tracing::error!(script = %label, error = %error, "javascript runtime event bridge unavailable");
-            return Vec::new();
-        }
-    };
-    let call: Function = match caught(ctx, globals.get("__citadel_call_runtime_event_subscriber")) {
-        Ok(call) => call,
-        Err(error) => {
-            tracing::error!(script = %label, error = %error, "javascript runtime event bridge unavailable");
-            return Vec::new();
-        }
-    };
     let event_bus = runtime_event_bus(event_bus_handle);
     let mut commands = Vec::new();
     let delivery_deadline = Instant::now() + budget;
@@ -2643,7 +2759,14 @@ fn dispatch_pending_runtime_events(
         let event = events.next().expect("peeked event exists");
         let key = runtime_event_key(&event.namespace, &event.event_type);
         let subscriber_count: u32 = match run_with_js_deadline(runtime, remaining, || {
-            caught::<u32>(ctx, count.call((key.as_str(),)))
+            context.with(|ctx| {
+                let globals = ctx.globals();
+                let count: Function = caught(
+                    &ctx,
+                    globals.get("__citadel_runtime_event_subscriber_count"),
+                )?;
+                caught::<u32>(&ctx, count.call((key.as_str(),)))
+            })
         }) {
             Ok(count) => count.min(MAX_RUNTIME_EVENT_SUBSCRIBERS),
             Err(error) => {
@@ -2664,24 +2787,32 @@ fn dispatch_pending_runtime_events(
                 event_bus.requeue_front(events.collect());
                 return commands;
             }
-            clear_commands(ctx);
+            context.with(|ctx| clear_commands(&ctx));
             let result = run_with_js_deadline(runtime, subscriber_budget, || {
-                let value = caught(ctx, Object::new(ctx.clone()))?;
-                caught(ctx, value.set("namespace", event.namespace.as_str()))?;
-                caught(ctx, value.set("type", event.event_type.as_str()))?;
-                let payload = caught(ctx, TypedArray::<u8>::new_copy(ctx.clone(), &event.payload))?;
-                caught(ctx, value.set("payload", payload))?;
-                let _: bool = caught(ctx, call.call((key.as_str(), subscriber_index, value)))?;
-                Ok(())
+                context.with(|ctx| {
+                    let globals = ctx.globals();
+                    let call: Function =
+                        caught(&ctx, globals.get("__citadel_call_runtime_event_subscriber"))?;
+                    let value = caught(&ctx, Object::new(ctx.clone()))?;
+                    caught(&ctx, value.set("namespace", event.namespace.as_str()))?;
+                    caught(&ctx, value.set("type", event.event_type.as_str()))?;
+                    let payload = caught(
+                        &ctx,
+                        TypedArray::<u8>::new_copy(ctx.clone(), &event.payload),
+                    )?;
+                    caught(&ctx, value.set("payload", payload))?;
+                    let _: bool = caught(&ctx, call.call((key.as_str(), subscriber_index, value)))?;
+                    Ok(())
+                })
             });
             match result {
-                Ok(()) => match take_commands(ctx, label, "runtime_event") {
+                Ok(()) => match context.with(|ctx| take_commands(&ctx, label, "runtime_event")) {
                     Ok(event_commands) => {
                         append_runtime_event_commands(&mut commands, event_commands, label)
                     }
                     Err(error) => {
                         tracing::error!(script = %label, error = %error, "javascript runtime event commands could not be drained");
-                        clear_commands(ctx);
+                        context.with(|ctx| clear_commands(&ctx));
                     }
                 },
                 Err(error) => {
@@ -2693,7 +2824,7 @@ fn dispatch_pending_runtime_events(
                         error = %error,
                         "javascript runtime event subscriber failed; isolated"
                     );
-                    clear_commands(ctx);
+                    context.with(|ctx| clear_commands(&ctx));
                 }
             }
         }
@@ -3625,8 +3756,16 @@ mod tests {
         let dir = TempDir::new("http-policy");
         let source = r#"
             citadel.on_message(1, () => {
-              try { citadel.http.fetch("https://api.example.test/"); }
-              catch (error) { citadel.broadcast(2, error.message); }
+              const failures = [];
+              for (const operation of [
+                () => citadel.http.fetch("https://api.example.test/"),
+                () => citadel.http.start("https://api.example.test/"),
+                () => citadel.http.poll("7"),
+                () => citadel.http.cancel("7"),
+              ]) {
+                try { operation(); } catch (error) { failures.push(error.message); }
+              }
+              citadel.broadcast(2, failures.join(","));
             });
         "#;
         dir.write_main(source);
@@ -3645,7 +3784,8 @@ mod tests {
         let assert_disabled = |runtime: &JsRuntime| {
             assert_eq!(
                 first_broadcast_body(runtime.dispatch(1, None, 1, b"")),
-                b"outbound HTTP capability is disabled by runtime policy"
+                b"capability_disabled,capability_disabled,capability_disabled,capability_disabled",
+                "fetch compatibility and every async operation must enforce the same host policy"
             );
         };
         assert_disabled(&runtime);
@@ -3788,6 +3928,43 @@ mod tests {
             vec![OutboundCommand::Broadcast {
                 kind: 8,
                 body: b"two".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_cache_malformed_present_entry_still_throws() {
+        let cache = Arc::new(RuntimeSharedCache::new(
+            crate::runtime::RuntimeSharedCachePolicy {
+                enabled: true,
+                max_entries: 8,
+                max_value_bytes: 64,
+                max_ttl: Duration::from_secs(1),
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = runtime(
+            r#"
+              // A bridge response other than nullish remains a present entry and
+              // must retain the JSON decode failure rather than becoming a miss.
+              globalThis.__citadel_cache_get = () => "not valid JSON";
+              citadel.on_message(1, () => {
+                try {
+                  citadel.cache.get("match", "key");
+                  citadel.broadcast(7, "unexpected success");
+                } catch (_) {
+                  citadel.broadcast(7, "parse error");
+                }
+              });
+            "#,
+        )
+        .with_shared_cache(cache);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"parse error".to_vec(),
                 unreliable: false,
             }]
         );

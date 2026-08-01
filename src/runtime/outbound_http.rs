@@ -5,14 +5,17 @@
 //! redirect and proxy policy. Keeping this boundary in Rust makes the safe
 //! defaults auditable and reusable by every runtime language.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method, Url, header::HeaderName, header::HeaderValue};
+use tokio::sync::oneshot;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 
 /// Maximum request body accepted from game logic.
 pub const MAX_OUTBOUND_HTTP_REQUEST_BYTES: usize = 64 * 1024;
@@ -24,6 +27,186 @@ pub const MAX_OUTBOUND_HTTP_HEADERS: usize = 64;
 pub const MAX_OUTBOUND_HTTP_HEADER_BYTES: usize = 16 * 1024;
 /// Per-request wall-clock limit, including connection and response reads.
 pub const OUTBOUND_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum outstanding or retained terminal requests per runtime host.
+pub const MAX_OUTBOUND_HTTP_HANDLES: usize = 128;
+
+/// A non-blocking request state returned by [`AsyncOutboundHttp::poll`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundHttpRequestState {
+    Pending,
+    Success(OutboundHttpResponse),
+    Error(String),
+    Timeout,
+    Cancelled,
+}
+
+impl OutboundHttpRequestState {
+    /// Stable, language-neutral status string exposed to script bindings.
+    pub const fn status(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Success(_) => "success",
+            Self::Error(_) => "error",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+enum AsyncRequestEntry {
+    Pending {
+        receiver: oneshot::Receiver<OutboundHttpRequestState>,
+        task: JoinHandle<()>,
+    },
+    Terminal(OutboundHttpRequestState),
+}
+
+/// Per-runtime bounded handle table for Rust-owned asynchronous HTTP.
+///
+/// Start only schedules work; poll uses `try_recv` and cancel aborts the Tokio
+/// task, so no script callback or gameplay tick waits for network I/O.
+#[derive(Clone)]
+pub struct AsyncOutboundHttp {
+    client: TrustedHttpClient,
+    next_handle: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    entries: Arc<Mutex<HashMap<u64, AsyncRequestEntry>>>,
+}
+
+impl std::fmt::Debug for AsyncOutboundHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncOutboundHttp").finish_non_exhaustive()
+    }
+}
+
+impl AsyncOutboundHttp {
+    pub fn new(client: TrustedHttpClient) -> Self {
+        Self {
+            client,
+            next_handle: Arc::new(AtomicU64::new(1)),
+            generation: Arc::new(AtomicU64::new(1)),
+            entries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Schedules a request and returns an opaque, runtime-local handle.
+    pub fn start(&self, request: OutboundHttpRequest) -> Result<u64, OutboundHttpError> {
+        // Reject every deterministic policy/SSRF and shape violation before a
+        // handle is observable. DNS resolution remains in `execute`, where its
+        // result is pinned into Reqwest's per-request client before connect.
+        self.client.preflight(&request)?;
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.len() >= MAX_OUTBOUND_HTTP_HANDLES {
+            if let Some(handle) = entries.iter().find_map(|(handle, entry)| {
+                matches!(entry, AsyncRequestEntry::Terminal(_)).then_some(*handle)
+            }) {
+                entries.remove(&handle);
+            } else {
+                return Err(OutboundHttpError::HandleLimitReached);
+            }
+        }
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed).max(1);
+        let client = self.client.clone();
+        let (sender, receiver) = oneshot::channel();
+        let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+            OutboundHttpError::RequestFailed(format!("outbound runtime unavailable: {e}"))
+        })?;
+        let task = runtime.spawn(async move {
+            let result = match tokio::time::timeout(OUTBOUND_HTTP_TIMEOUT, client.execute(request))
+                .await
+            {
+                Ok(Ok(response)) => OutboundHttpRequestState::Success(response),
+                // Script-visible errors are a stable, redacted taxonomy;
+                // transport/library details stay in Rust logs only.
+                Ok(Err(error)) => OutboundHttpRequestState::Error(error.error_code().to_owned()),
+                Err(_) => OutboundHttpRequestState::Timeout,
+            };
+            let _ = sender.send(result);
+        });
+        entries.insert(handle, AsyncRequestEntry::Pending { receiver, task });
+        Ok(handle)
+    }
+
+    /// Reads a request state without waiting. Terminal entries remain readable
+    /// until evicted by the bounded table's next starts.
+    pub fn poll(&self, handle: u64) -> Result<OutboundHttpRequestState, OutboundHttpError> {
+        // Polling must not become a capability bypass: even an old opaque handle
+        // is unavailable after an operator disables outbound HTTP.
+        self.client.ensure_enabled()?;
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = entries
+            .get_mut(&handle)
+            .ok_or(OutboundHttpError::UnknownHandle)?;
+        match entry {
+            AsyncRequestEntry::Terminal(state) => Ok(state.clone()),
+            AsyncRequestEntry::Pending { receiver, .. } => match receiver.try_recv() {
+                Ok(state) => {
+                    *entry = AsyncRequestEntry::Terminal(state.clone());
+                    Ok(state)
+                }
+                Err(oneshot::error::TryRecvError::Empty) => Ok(OutboundHttpRequestState::Pending),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    let state = OutboundHttpRequestState::Cancelled;
+                    *entry = AsyncRequestEntry::Terminal(state.clone());
+                    Ok(state)
+                }
+            },
+        }
+    }
+
+    /// Cancels a pending request. It is idempotent for already-terminal handles.
+    pub fn cancel(&self, handle: u64) -> Result<OutboundHttpRequestState, OutboundHttpError> {
+        // Cancellation is part of the script-visible async capability too; do
+        // not reveal handle state while the capability is disabled.
+        self.client.ensure_enabled()?;
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = entries
+            .get_mut(&handle)
+            .ok_or(OutboundHttpError::UnknownHandle)?;
+        if let AsyncRequestEntry::Pending { task, .. } = entry {
+            task.abort();
+            *entry = AsyncRequestEntry::Terminal(OutboundHttpRequestState::Cancelled);
+        }
+        match entry {
+            AsyncRequestEntry::Terminal(state) => Ok(state.clone()),
+            AsyncRequestEntry::Pending { .. } => unreachable!(),
+        }
+    }
+
+    /// Abort and forget every request owned by this runtime host.
+    ///
+    /// Runtime reload/shutdown paths must call this only after a replacement VM
+    /// is accepted (or while shutting down). Clearing the table invalidates old
+    /// handles, while aborting each join handle prevents detached work from
+    /// publishing a result into a later VM generation.
+    pub fn cancel_all(&self) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        for entry in entries.values() {
+            if let AsyncRequestEntry::Pending { task, .. } = entry {
+                task.abort();
+            }
+        }
+        entries.clear();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Monotonic generation for lifecycle owners that need to associate a VM
+    /// generation with its handle table. It changes only after `cancel_all`.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+// The language VMs own the last references to their request table.  Explicit
+// lifecycle owners may call `cancel_all` sooner, but dropping a replaced VM or
+// a runtime during shutdown must never detach its Tokio requests.
+impl Drop for AsyncOutboundHttp {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.entries) == 1 {
+            self.cancel_all();
+        }
+    }
+}
 
 /// Runtime-owned policy applied before an outbound request reaches Reqwest.
 /// The configuration layer supplies this policy; keeping it at the Rust edge
@@ -82,7 +265,7 @@ pub struct OutboundHttpResponse {
 }
 
 /// A request was malformed, exceeded a bound, or failed at the network edge.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum OutboundHttpError {
     #[error("outbound HTTP request body exceeds {MAX_OUTBOUND_HTTP_REQUEST_BYTES} bytes")]
     RequestTooLarge,
@@ -118,8 +301,42 @@ pub enum OutboundHttpError {
     ConcurrentLimitReached,
     #[error("outbound HTTP request rate limit reached")]
     RateLimitReached,
+    #[error("outbound HTTP handle limit reached")]
+    HandleLimitReached,
+    #[error("unknown outbound HTTP request handle")]
+    UnknownHandle,
     #[error("outbound HTTP request failed: {0}")]
     RequestFailed(String),
+}
+
+impl OutboundHttpError {
+    /// Stable redacted code suitable for untrusted/script-visible responses.
+    /// Never return the `Display` form across a runtime boundary: it can carry
+    /// request URLs or dependency-specific network details.
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::RequestTooLarge => "request_too_large",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::InvalidMethod => "invalid_method",
+            Self::InvalidHeader => "invalid_header",
+            Self::HeadersTooLarge => "headers_too_large",
+            Self::AuthorityHeaderForbidden => "authority_header_forbidden",
+            Self::Disabled => "capability_disabled",
+            Self::InvalidScheme => "invalid_scheme",
+            Self::InvalidUrl => "invalid_url",
+            Self::UrlCredentialsForbidden => "url_credentials_forbidden",
+            Self::IpLiteralForbidden => "ip_literal_forbidden",
+            Self::HostForbidden => "host_forbidden",
+            Self::PortForbidden => "port_forbidden",
+            Self::PrivateAddressForbidden => "private_address_forbidden",
+            Self::ResolutionFailed => "resolution_failed",
+            Self::ConcurrentLimitReached => "concurrent_limit_reached",
+            Self::RateLimitReached => "rate_limit_reached",
+            Self::HandleLimitReached => "handle_limit_reached",
+            Self::UnknownHandle => "unknown_handle",
+            Self::RequestFailed(_) => "request_failed",
+        }
+    }
 }
 
 /// Reusable HTTP client with Citadel's non-ambient outbound policy.
@@ -154,12 +371,7 @@ impl TrustedHttpClient {
         &self,
         request: OutboundHttpRequest,
     ) -> Result<OutboundHttpResponse, OutboundHttpError> {
-        if !self.policy.enabled {
-            return Err(OutboundHttpError::Disabled);
-        }
-        if request.body.len() > MAX_OUTBOUND_HTTP_REQUEST_BYTES {
-            return Err(OutboundHttpError::RequestTooLarge);
-        }
+        self.preflight(&request)?;
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|_| OutboundHttpError::InvalidMethod)?;
         let url = self.validate_url(&request.url)?;
@@ -223,6 +435,48 @@ impl TrustedHttpClient {
             body.extend_from_slice(&chunk);
         }
         Ok(OutboundHttpResponse { status, body })
+    }
+
+    /// Fail closed for every script-visible operation when outbound HTTP is
+    /// disabled. Async `poll` and `cancel` share this guard with `start`.
+    fn ensure_enabled(&self) -> Result<(), OutboundHttpError> {
+        if self.policy.enabled {
+            Ok(())
+        } else {
+            Err(OutboundHttpError::Disabled)
+        }
+    }
+
+    /// Validate the synchronous, deterministic portion of the outbound policy.
+    /// This is deliberately shared by `execute` and async `start`, so a denied
+    /// request never consumes a handle just because it chose the async API.
+    fn preflight(&self, request: &OutboundHttpRequest) -> Result<(), OutboundHttpError> {
+        self.ensure_enabled()?;
+        if request.body.len() > MAX_OUTBOUND_HTTP_REQUEST_BYTES {
+            return Err(OutboundHttpError::RequestTooLarge);
+        }
+        Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| OutboundHttpError::InvalidMethod)?;
+        self.validate_url(&request.url)?;
+        if request.headers.len() > MAX_OUTBOUND_HTTP_HEADERS {
+            return Err(OutboundHttpError::HeadersTooLarge);
+        }
+        let mut header_bytes = 0usize;
+        for (name, value) in &request.headers {
+            header_bytes = header_bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len());
+            if header_bytes > MAX_OUTBOUND_HTTP_HEADER_BYTES {
+                return Err(OutboundHttpError::HeadersTooLarge);
+            }
+            if name.eq_ignore_ascii_case("host") || name == ":authority" {
+                return Err(OutboundHttpError::AuthorityHeaderForbidden);
+            }
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| OutboundHttpError::InvalidHeader)?;
+            HeaderValue::from_str(value).map_err(|_| OutboundHttpError::InvalidHeader)?;
+        }
+        Ok(())
     }
 
     fn validate_url(&self, raw_url: &str) -> Result<Url, OutboundHttpError> {
@@ -442,6 +696,171 @@ mod tests {
             .await
             .expect_err("disabled capability rejects before network I/O");
         assert_eq!(error, OutboundHttpError::Disabled);
+    }
+
+    #[tokio::test]
+    async fn async_handles_are_nonblocking_and_cancellable() {
+        let client = TrustedHttpClient::new().expect("client");
+        let async_client = AsyncOutboundHttp::new(client);
+        let (_sender, receiver) = oneshot::channel();
+        let task = tokio::spawn(std::future::pending());
+        let handle = 99;
+        async_client
+            .entries
+            .lock()
+            .expect("table")
+            .insert(handle, AsyncRequestEntry::Pending { receiver, task });
+        assert_eq!(
+            async_client.poll(handle).expect("known handle"),
+            OutboundHttpRequestState::Pending
+        );
+        assert_eq!(
+            async_client.cancel(handle).expect("known handle"),
+            OutboundHttpRequestState::Cancelled
+        );
+        assert_eq!(
+            async_client.poll(handle).expect("terminal handle"),
+            OutboundHttpRequestState::Cancelled
+        );
+        assert!(matches!(
+            async_client.poll(handle + 1),
+            Err(OutboundHttpError::UnknownHandle)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_poll_returns_deterministic_success_and_timeout_states() {
+        let async_client = AsyncOutboundHttp::new(TrustedHttpClient::new().expect("client"));
+        let (success_sender, success_receiver) = oneshot::channel();
+        let (timeout_sender, timeout_receiver) = oneshot::channel();
+        async_client.entries.lock().expect("table").extend([
+            (
+                1,
+                AsyncRequestEntry::Pending {
+                    receiver: success_receiver,
+                    task: tokio::spawn(std::future::pending()),
+                },
+            ),
+            (
+                2,
+                AsyncRequestEntry::Pending {
+                    receiver: timeout_receiver,
+                    task: tokio::spawn(std::future::pending()),
+                },
+            ),
+        ]);
+        success_sender
+            .send(OutboundHttpRequestState::Success(OutboundHttpResponse {
+                status: 204,
+                body: Vec::new(),
+            }))
+            .expect("receiver remains live");
+        timeout_sender
+            .send(OutboundHttpRequestState::Timeout)
+            .expect("receiver remains live");
+
+        assert_eq!(
+            async_client.poll(1).expect("success handle"),
+            OutboundHttpRequestState::Success(OutboundHttpResponse {
+                status: 204,
+                body: Vec::new(),
+            })
+        );
+        assert_eq!(
+            async_client.poll(2).expect("timeout handle"),
+            OutboundHttpRequestState::Timeout
+        );
+    }
+
+    #[test]
+    fn async_start_preserves_disabled_capability_policy() {
+        let client = TrustedHttpClient::new_with_policy(OutboundHttpPolicy {
+            enabled: false,
+            ..OutboundHttpPolicy::default()
+        })
+        .expect("client");
+        let error = AsyncOutboundHttp::new(client)
+            .start(OutboundHttpRequest {
+                method: "GET".to_string(),
+                url: "https://example.test/".to_string(),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            })
+            .expect_err("disabled before scheduling");
+        assert_eq!(error, OutboundHttpError::Disabled);
+    }
+
+    #[tokio::test]
+    async fn async_start_preflights_ssrf_before_allocating_a_handle() {
+        let async_client = AsyncOutboundHttp::new(TrustedHttpClient::new().expect("client"));
+        let error = async_client
+            .start(OutboundHttpRequest {
+                method: "GET".to_string(),
+                url: "http://127.0.0.1:1/".to_string(),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            })
+            .expect_err("IP literal must fail before async handle allocation");
+        assert_eq!(error, OutboundHttpError::IpLiteralForbidden);
+        assert!(async_client.entries.lock().expect("table").is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_cancel_all_invalidates_old_handles_and_aborts_work() {
+        let async_client = AsyncOutboundHttp::new(TrustedHttpClient::new().expect("client"));
+        let generation = async_client.generation();
+        let (_sender, receiver) = oneshot::channel();
+        let task = tokio::spawn(std::future::pending());
+        async_client
+            .entries
+            .lock()
+            .expect("table")
+            .insert(7, AsyncRequestEntry::Pending { receiver, task });
+
+        async_client.cancel_all();
+        assert_eq!(async_client.generation(), generation + 1);
+        assert!(async_client.entries.lock().expect("table").is_empty());
+        assert!(matches!(
+            async_client.poll(7),
+            Err(OutboundHttpError::UnknownHandle)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_handle_limit_refuses_new_pending_work() {
+        let async_client = AsyncOutboundHttp::new(TrustedHttpClient::new().expect("client"));
+        let mut entries = async_client.entries.lock().expect("table");
+        for handle in 0..MAX_OUTBOUND_HTTP_HANDLES as u64 {
+            let (_sender, receiver) = oneshot::channel();
+            entries.insert(
+                handle,
+                AsyncRequestEntry::Pending {
+                    receiver,
+                    task: tokio::spawn(std::future::pending()),
+                },
+            );
+        }
+        drop(entries);
+        let error = async_client
+            .start(OutboundHttpRequest {
+                method: "GET".to_string(),
+                url: "https://example.test/".to_string(),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            })
+            .expect_err("all pending slots must reject rather than exceed the cap");
+        assert_eq!(error, OutboundHttpError::HandleLimitReached);
+        async_client.cancel_all();
+    }
+
+    #[test]
+    fn async_error_codes_are_stable_and_redacted() {
+        assert_eq!(OutboundHttpError::InvalidUrl.error_code(), "invalid_url");
+        assert_eq!(
+            OutboundHttpError::RequestFailed("http://secret.invalid/token".to_string())
+                .error_code(),
+            "request_failed"
+        );
     }
 
     #[tokio::test]

@@ -18,7 +18,10 @@ use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
-use crate::runtime::outbound_http::{OutboundHttpPolicy, OutboundHttpRequest, TrustedHttpClient};
+use crate::runtime::outbound_http::{
+    AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
+    TrustedHttpClient,
+};
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
     MAX_RUNTIME_EVENTS_PER_INVOCATION, RealtimeAfterOutcome, RealtimeInterception, Runtime,
@@ -2264,8 +2267,51 @@ fn install_host_api(
         let http = TrustedHttpClient::new_with_policy(outbound_http_policy).map_err(|error| {
             mlua::Error::RuntimeError(format!("cannot initialize outbound HTTP client: {error}"))
         })?;
+        let async_http = AsyncOutboundHttp::new(http.clone());
+        let fetch_http = http;
         let fetch = lua.create_function(move |lua, (url, options): (String, Option<Table>)| {
-            ensure_realtime_effects_allowed(lua)?;
+            ensure_outbound_http_allowed(lua)?;
+            let options = options.unwrap_or(lua.create_table()?);
+            let method = options
+                .get::<Option<String>>("method")?
+                .unwrap_or_else(|| "GET".to_string());
+            let body = options
+                .get::<Option<mlua::String>>("body")?
+                .map(|value| value.as_bytes().to_vec())
+                .unwrap_or_default();
+            let headers = options
+                .get::<Option<Table>>("headers")?
+                .map(|headers| {
+                    headers
+                        .pairs::<mlua::String, mlua::String>()
+                        .map(|pair| {
+                            pair.map(|(name, value)| {
+                                (
+                                    name.to_string_lossy().to_string(),
+                                    value.to_string_lossy().to_string(),
+                                )
+                            })
+                        })
+                        .collect::<mlua::Result<_>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let response = fetch_http
+                .execute_blocking(OutboundHttpRequest {
+                    method,
+                    url,
+                    headers,
+                    body,
+                })
+                .map_err(|error| mlua::Error::RuntimeError(error.error_code().to_string()))?;
+            let result = lua.create_table()?;
+            result.set("status", response.status)?;
+            result.set("body", lua.create_string(response.body)?)?;
+            Ok(result)
+        })?;
+        let start_http = async_http.clone();
+        let start = lua.create_function(move |lua, (url, options): (String, Option<Table>)| {
+            ensure_outbound_http_allowed(lua)?;
             let options = options.unwrap_or(lua.create_table()?);
             let method = options
                 .get::<Option<String>>("method")?
@@ -2281,19 +2327,38 @@ fn install_host_api(
                     headers.insert(name.to_string_lossy(), value.to_string_lossy());
                 }
             }
-            let response = http
-                .execute_blocking(OutboundHttpRequest {
+            let handle = start_http
+                .start(OutboundHttpRequest {
                     method,
                     url,
                     headers,
                     body,
                 })
-                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
-            let result = lua.create_table()?;
-            result.set("status", response.status)?;
-            result.set("body", lua.create_string(response.body)?)?;
-            Ok(result)
+                .map_err(|error| mlua::Error::RuntimeError(error.error_code().to_string()))?;
+            Ok(handle)
         })?;
+        let poll_http = async_http.clone();
+        let poll = lua.create_function(move |lua, handle: u64| {
+            ensure_outbound_http_allowed(lua)?;
+            outbound_http_state_to_lua(
+                lua,
+                poll_http
+                    .poll(handle)
+                    .map_err(|e| mlua::Error::RuntimeError(e.error_code().to_string()))?,
+            )
+        })?;
+        let cancel = lua.create_function(move |lua, handle: u64| {
+            ensure_outbound_http_allowed(lua)?;
+            outbound_http_state_to_lua(
+                lua,
+                async_http
+                    .cancel(handle)
+                    .map_err(|e| mlua::Error::RuntimeError(e.error_code().to_string()))?,
+            )
+        })?;
+        http_api.set("start", start)?;
+        http_api.set("poll", poll)?;
+        http_api.set("cancel", cancel)?;
         http_api.set("fetch", fetch)?;
     }
     if !http_api.is_empty() {
@@ -2896,6 +2961,20 @@ fn install_host_api(
     Ok(())
 }
 
+fn outbound_http_state_to_lua(lua: &Lua, state: OutboundHttpRequestState) -> mlua::Result<Table> {
+    let result = lua.create_table()?;
+    result.set("state", state.status())?;
+    match state {
+        OutboundHttpRequestState::Success(response) => {
+            result.set("status", response.status)?;
+            result.set("body", lua.create_string(response.body)?)?;
+        }
+        OutboundHttpRequestState::Error(error) => result.set("error_code", error)?,
+        _ => {}
+    }
+    Ok(result)
+}
+
 /// Convert a static-data catalog error to a normal Lua runtime error without
 /// attaching a Rust stack trace or host-path detail.
 fn static_data_lua_error(error: crate::runtime::static_data::StaticDataError) -> mlua::Error {
@@ -2955,6 +3034,16 @@ fn domain_host(lua: &Lua) -> mlua::Result<Arc<dyn DomainHost>> {
     lua.app_data_ref::<DomainHostHandle>()
         .map(|handle| Arc::clone(&handle.0))
         .ok_or_else(|| mlua::Error::RuntimeError("friends host not available".into()))
+}
+
+fn ensure_outbound_http_allowed(lua: &Lua) -> mlua::Result<()> {
+    if lua
+        .app_data_ref::<InvocationMode>()
+        .is_some_and(|mode| *mode == InvocationMode::RealtimeInterceptor)
+    {
+        return Err(mlua::Error::RuntimeError("interceptor_forbidden".into()));
+    }
+    Ok(())
 }
 
 fn ensure_realtime_effects_allowed(lua: &Lua) -> mlua::Result<()> {
@@ -3474,7 +3563,7 @@ mod tests {
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)
                 .expect("disabled static-data catalog");
         let error = build_lua(
-            "citadel.http.fetch('https://api.example.test/')",
+            "citadel.http.start('https://api.example.test/')",
             "disabled-http.lua",
             Duration::from_millis(50),
             None,
@@ -3490,12 +3579,15 @@ mod tests {
                 shared_cache_handle: disabled_runtime_shared_cache_handle(),
             },
         )
-        .expect_err("disabled HTTP policy must reject Lua fetch");
+        .expect_err("disabled HTTP policy must reject Lua async start at the Rust host boundary");
+        let detail = error.log_detail().unwrap_or_default();
         assert!(
-            error
-                .log_detail()
-                .unwrap_or_default()
-                .contains("outbound HTTP capability is disabled")
+            detail.contains("capability_disabled"),
+            "the script-visible failure must stay a stable redacted error code: {detail}"
+        );
+        assert!(
+            !detail.contains("api.example.test"),
+            "host-policy errors must not expose request target details: {detail}"
         );
     }
 
@@ -4001,6 +4093,9 @@ mod tests {
             "storage.index_query",
             "storage.register_index_filter",
             "http.fetch",
+            "http.start",
+            "http.poll",
+            "http.cancel",
             "http.register",
             "events.emit",
             "events.subscribe",
@@ -4981,7 +5076,7 @@ mod tests {
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)
                 .expect("disabled static-data catalog");
         build_lua(
-            "assert(type(os) == 'table'); assert(type(io) == 'table'); assert(type(package) == 'table'); assert(type(coroutine) == 'table'); assert(debug == nil); assert(type(citadel.http) == 'table'); assert(type(citadel.http.fetch) == 'function')",
+            "assert(type(os) == 'table'); assert(type(io) == 'table'); assert(type(package) == 'table'); assert(type(coroutine) == 'table'); assert(debug == nil); assert(type(citadel.http) == 'table'); assert(type(citadel.http.fetch) == 'function'); assert(type(citadel.http.start) == 'function'); assert(type(citadel.http.poll) == 'function'); assert(type(citadel.http.cancel) == 'function')",
             "trusted-libraries",
             Duration::from_millis(50),
             None,

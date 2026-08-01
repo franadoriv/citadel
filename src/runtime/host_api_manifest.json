@@ -473,9 +473,40 @@
       "url:string",
       "opts:table?"
     ],
-    "returns": "response:table",
+    "returns": "{status:u16,body:bytes}",
     "status": "shipped",
     "since": "pre-1.0"
+  },
+  {
+    "name": "http.start",
+    "category": "http",
+    "params": [
+      "url:string",
+      "opts:table?"
+    ],
+    "returns": "handle:opaque (Lua/Python:u64; JavaScript:string)",
+    "status": "shipped",
+    "since": "TASK-0437"
+  },
+  {
+    "name": "http.poll",
+    "category": "http",
+    "params": [
+      "handle:opaque (Lua/Python:u64; JavaScript:string)"
+    ],
+    "returns": "state:table",
+    "status": "shipped",
+    "since": "TASK-0437"
+  },
+  {
+    "name": "http.cancel",
+    "category": "http",
+    "params": [
+      "handle:opaque (Lua/Python:u64; JavaScript:string)"
+    ],
+    "returns": "state:table",
+    "status": "shipped",
+    "since": "TASK-0437"
   },
   {
     "name": "http.register",
@@ -513,5 +544,54 @@
     "returns": "handler:function",
     "status": "shipped",
     "since": "TASK-0417"
+  },
+  {
+    "name": "cache.get",
+    "category": "storage",
+    "params": [
+      "namespace:string",
+      "key:string"
+    ],
+    "returns": "{value:bytes,version:u64,expires_in_ms:u64}?",
+    "status": "shipped",
+    "since": "TASK-0418"
+  },
+  {
+    "name": "cache.set",
+    "category": "storage",
+    "params": [
+      "namespace:string",
+      "key:string",
+      "value:bytes",
+      "ttl_ms:u64"
+    ],
+    "returns": "{value:bytes,version:u64,expires_in_ms:u64}",
+    "status": "shipped",
+    "since": "TASK-0418"
+  },
+  {
+    "name": "cache.delete",
+    "category": "storage",
+    "params": [
+      "namespace:string",
+      "key:string"
+    ],
+    "returns": "deleted:bool",
+    "status": "shipped",
+    "since": "TASK-0418"
+  },
+  {
+    "name": "cache.cas",
+    "category": "storage",
+    "params": [
+      "namespace:string",
+      "key:string",
+      "expected_version:u64?",
+      "value:bytes",
+      "ttl_ms:u64"
+    ],
+    "returns": "{value:bytes,version:u64,expires_in_ms:u64}?",
+    "status": "shipped",
+    "since": "TASK-0418"
   }
 ]

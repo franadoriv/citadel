@@ -112,6 +112,17 @@ hot_reload = false
 # Change-poll interval (ms) when hot_reload is on.
 hot_reload_poll_ms = 500
 
+# Rust-owned outbound HTTP for trusted runtime code. Empty allowed_hosts means
+# any public DNS hostname; IP-literal URLs are always rejected.
+[runtime.capabilities.outbound_http]
+enabled = true
+max_concurrent_requests = 16
+max_requests_per_minute = 120
+allowed_hosts = []
+allowed_ports = [80, 443]
+# Only enable for an operator-controlled private integration.
+allow_private_networks = false
+
 # Secure chat fixed-window policies. Every value must be positive; limits are
 # shared by nodes that use the same durable database.
 [chat.limits]
@@ -526,6 +537,41 @@ the console's `GET /console/v1/runtime` response. The status object includes the
 configured language (when set), selected language, selection source
 (`explicit`/`autodetected`), entrypoint path, adapter, tier, and scripts
 directory.
+
+### `[runtime.capabilities.outbound_http]`
+
+Operator policy for Rust-owned outbound HTTP used by trusted Lua, Python, and
+JavaScript runtime code (`citadel.http.fetch`, `start`, `poll`, and `cancel`).
+It is enabled by default for compatibility, but operators should set an exact
+`allowed_hosts` list for production integrations. This section does **not**
+grant client access, raw sockets, or access from realtime interceptors.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Disables every script-visible HTTP operation, including `poll` and `cancel`, when `false`. |
+| `max_concurrent_requests` | integer | `16` | Per-runtime maximum in-flight outbound requests; must be `1..=1024`. |
+| `max_requests_per_minute` | integer | `120` | Per-runtime rolling 60-second request-acquisition limit; a request is counted when it acquires execution capacity, not when `start` returns. Must be `1..=1000000`. |
+| `allowed_hosts` | array of hostname strings | `[]` | Exact DNS hostnames allowed for egress. An empty list permits any **public** DNS hostname; it does not allow IP-literal URLs. At most 128 hostnames. |
+| `allowed_ports` | array of integers | `[80, 443]` | Permitted TCP ports; the array must be non-empty and has at most 128 entries. |
+| `allow_private_networks` | bool | `false` | Permits resolved private, loopback, link-local, and other non-public addresses only for an explicit operator-controlled private integration. |
+
+Citadel accepts only `http`/`https` URLs with DNS hostnames and rejects URL
+credentials, forbidden `Host`/`:authority` overrides, ports outside the list,
+and hostnames outside `allowed_hosts`. It resolves and pins the approved address
+for the request, preventing DNS-rebinding from changing the connection target.
+The Rust client denies ambient proxies and redirects. Independent fixed bounds
+also apply: 64 KiB request body, 1 MiB response body, 64 headers / 16 KiB
+aggregate header bytes, five-second wall-clock deadline, and 128 retained or
+outstanding async handles per runtime. Network/runtime results returned by
+`poll` use stable, redacted `error_code` values. Local language argument or
+option validation can instead raise a language-visible validation message.
+
+Restart the node after changing this policy. Validate the exact
+`citadel.toml` before deployment:
+
+```bash
+citadel check --config /etc/citadel/citadel.toml
+```
 
 ### `[runtime.capabilities.custom_http_endpoints]`
 

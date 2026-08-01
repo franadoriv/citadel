@@ -7,23 +7,72 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 ## HTTP host API
 
-### `citadel.http.fetch(url, opts = {})`
+### `citadel.http.start`, `poll`, and `cancel`
 
-Performs one bounded outbound request through Citadel's Rust-owned HTTP client.
-`opts` accepts `method` (default `"GET"`), `headers` (a string map), and `body`
-(a UTF-8 string). It returns `{ status: number, body: Uint8Array }`.
+This is a **trusted-server-only** capability for operator-owned game code, not
+client code. `start(url, opts?)` schedules Rust-owned outbound HTTP and returns
+an opaque runtime-local **string** handle immediately. Keep it as a string—do
+not coerce it to a JavaScript number, so the underlying `u64` never loses
+precision. `url` must be an `http` or `https` DNS-hostname URL. `opts` may
+contain `method` (string, default `"GET"`), `headers` (a string-to-string
+object), and `body` (string). Rust policy rejections throw their stable code
+without allocating a handle. Local JavaScript argument or option validation can
+instead throw a JavaScript-visible validation message; it is not an `error_code`
+contract.
 
-The call waits synchronously for its response. Citadel retains ownership of DNS,
-TLS, and the socket: it enforces a 5-second deadline, a 64 KiB request-body
-limit, and a 1 MiB response-body limit; redirects and environment/system proxies
-are disabled. Invalid input, a size limit, timeout, or network failure throws.
+`poll(handle)` never blocks and returns one of these objects:
+
+| `state` | Other keys | Meaning |
+| --- | --- | --- |
+| `"pending"` | — | Still running; poll from a later tick. |
+| `"success"` | `status` (`number`), `body` (`Uint8Array`) | Completed HTTP response. |
+| `"error"` | `error_code` (`string`) | Stable, redacted code for a network/runtime request result. |
+| `"timeout"` | — | The five-second deadline elapsed. |
+| `"cancelled"` | — | The request was cancelled. |
+
+`cancel(handle)` returns the same object. It aborts a pending request and is
+idempotent for any already-terminal known handle; unknown, malformed, evicted,
+or reload-invalidated handles throw an error. Reload and shutdown cancel and
+forget all handles. `fetch`, `start`, `poll`, and `cancel` all throw
+`Error("interceptor_forbidden")` inside realtime interceptors.
+
+### `citadel.http.fetch` compatibility
+
+`fetch(url, opts?)` remains available in the trusted runtime for backward
+compatibility. It accepts the same options and policy, but is synchronous and
+returns `{ status, body: Uint8Array }`; it is not replaced by `start`. New
+gameplay paths should use `start` + `poll` to avoid blocking a tick or handler.
 
 ```js
-const response = citadel.http.fetch("https://inventory.example/v1/stock", {
-  headers: { authorization: `Bearer ${token}` },
+let pendingInventory = null;
+
+citadel.on_tick((_dt) => {
+  if (pendingInventory === null) {
+    pendingInventory = citadel.http.start("https://inventory.example/v1/stock", {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    return; // start only schedules work
+  }
+
+  const result = citadel.http.poll(pendingInventory);
+  if (result.state === "pending") return;
+  pendingInventory = null;
+  if (result.state === "success" && result.status === 200) {
+    consumeInventory(result.body);
+  } else if (result.state === "error") {
+    citadel.log("warn", `inventory failed: ${result.error_code}`);
+  } else if (result.state === "timeout" || result.state === "cancelled") {
+    citadel.log("warn", "inventory request did not complete");
+  }
 });
-if (response.status !== 200) throw new Error("inventory unavailable");
 ```
+
+The same operator policy applies to `fetch`, `start`, `poll`, and `cancel`:
+hostname/port allowlists, public-address and DNS-rebinding checks, proxy and
+redirect denial, a 64 KiB request body cap, 1 MiB response cap, 64 headers/
+16 KiB aggregate header cap, five-second timeout, and configured concurrency
+and rate quotas. See [outbound HTTP configuration](/reference/operations/configuration/#runtimecapabilitiesoutbound_http).
 
 ## Storage host API
 
