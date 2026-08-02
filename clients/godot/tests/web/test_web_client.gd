@@ -9,6 +9,16 @@ const TransformSync = preload("res://addons/citadel/transform_sync.gd")
 var failures: Array[String] = []
 
 func _init() -> void:
+	# A failed preload leaves a non-instantiable GDScript object and Godot can
+	# still exit 0 after printing parser errors. Make fresh-package load failures
+	# a deterministic test failure instead of a false-green release validation.
+	for sdk_script in [Protocol, Client, Rooms, WebClient, TransformSync]:
+		_expect(sdk_script.can_instantiate(), "packaged SDK script must load: %s" % sdk_script.resource_path)
+	if not failures.is_empty():
+		for failure in failures:
+			push_error(failure)
+		quit(1)
+		return
 	_test_framing()
 	_test_auth_decode()
 	_test_transform_v2_wrapper()

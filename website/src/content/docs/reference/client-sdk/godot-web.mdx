@@ -121,7 +121,9 @@ application in Chromium. The application itself opens two browser clients,
 guest-authenticates both, sends a reliable position, receives Citadel's peer
 relay through `poll`, and closes both sockets before setting the success marker.
 The job additionally verifies `.html`, `.js`, `.pck`, and `.wasm` payloads,
-asset references, and WebAssembly magic bytes. A deployed browser run remains
+asset references, and WebAssembly magic bytes. Before export, it loads a freshly
+copied package in Godot headless mode; a missing or non-instantiable SDK script
+is a test failure. A deployed browser run remains
 the verification step for your own origin, TLS certificate, MIME configuration,
 and content-security policy.
 

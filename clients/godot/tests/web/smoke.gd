@@ -134,7 +134,7 @@ func _authenticate_guest(client: CitadelWebClient, label: String) -> bool:
 
 
 func _endpoint_from_browser() -> String:
-	var value := JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('%s') || ''" % E2E_QUERY_PARAMETER, true)
+	var value: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('%s') || ''" % E2E_QUERY_PARAMETER, true)
 	return value if value is String else ""
 
 
@@ -146,7 +146,7 @@ func _set_status(message: String) -> void:
 func _publish_browser_result(result: String) -> void:
 	# The browser E2E runner reads this DOM marker after loading the actual Godot
 	# WebAssembly app. Keep `result` internal/static; it is interpolated into JS.
-	var marker := result.to_lower()
+	var marker: String = result.to_lower()
 	JavaScriptBridge.eval("document.documentElement.setAttribute('data-citadel-e2e', '%s'); document.title = 'CITADEL_WEB_E2E_%s';" % [marker, marker.to_upper()], true)
 
 

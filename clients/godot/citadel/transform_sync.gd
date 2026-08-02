@@ -8,6 +8,10 @@
 class_name CitadelTransformSync
 extends Node3D
 
+# Explicit preload keeps this drop-in addon usable in a fresh headless project,
+# before Godot has populated its global class cache for copied addon scripts.
+const Protocol = preload("protocol.gd")
+
 @export var object_id: int = 0
 @export var local_owner: bool = false
 @export var ownership_epoch: int = 0
@@ -34,24 +38,24 @@ func bind_client(client: Variant) -> void:
 ## CitadelClient wrapper; its native GDExtension must expose transform_view_*.
 func handle_envelope(client: Variant, kind: int, payload: PackedByteArray) -> void:
 	bind_client(client)
-	if kind == CitadelProtocol.KIND_TSYNC_HELLO:
+	if kind == Protocol.KIND_TSYNC_HELLO:
 		_hello = payload.duplicate()
 		_reset_managed_state()
 		free_runtime()
 		_view = client.transform_view_new(payload)
 		# V2 is an explicit opt-in. A peer that never confirms this manifest stays
 		# on the existing v1 path rather than receiving guessed v2 frames.
-		client.send(CitadelProtocol.KIND_TSYNC_V2_HELLO, PackedByteArray([2, 1]), true)
+		client.send(Protocol.KIND_TSYNC_V2_HELLO, PackedByteArray([2, 1]), true)
 		return
-	if kind == CitadelProtocol.KIND_TSYNC_V2_HELLO:
+	if kind == Protocol.KIND_TSYNC_V2_HELLO:
 		# The server echoes only the exact accepted manifest.
 		_v2_negotiated = payload == PackedByteArray([2, 1])
 		return
 	if _view == null:
 		return
 	var snapshot := payload
-	if kind == CitadelProtocol.KIND_TSYNC_V2_SNAPSHOT:
-		var decoded := CitadelProtocol.decode_tsync_v2_snapshot(payload)
+	if kind == Protocol.KIND_TSYNC_V2_SNAPSHOT:
+		var decoded := Protocol.decode_tsync_v2_snapshot(payload)
 		if not _v2_negotiated or decoded.is_empty():
 			return
 		var epoch: int = decoded.epoch
@@ -60,11 +64,11 @@ func handle_envelope(client: Variant, kind: int, payload: PackedByteArray) -> vo
 		_clock_epoch = epoch
 		_last_observed_tick = int(decoded.tick)
 		snapshot = decoded.snapshot
-	elif kind != CitadelProtocol.KIND_TSYNC_SNAPSHOT:
+	elif kind != Protocol.KIND_TSYNC_SNAPSHOT:
 		return # v1 fallback remains byte-for-byte the existing path.
 	if not client.transform_view_apply_datagram(_view, snapshot):
 		return
-	client.send(CitadelProtocol.KIND_TSYNC_ACK, client.transform_view_ack(_view), false)
+	client.send(Protocol.KIND_TSYNC_ACK, client.transform_view_ack(_view), false)
 
 
 ## Fence a reconnect/new match before its first v2 snapshot. Rebuild the native
@@ -80,7 +84,7 @@ func reset_v2_epoch(epoch: int) -> bool:
 	_clock_epoch = epoch
 	# A reset is a fresh runtime lifetime. Re-negotiate instead of assuming an
 	# earlier acceptance remains valid across reconnect/match boundaries.
-	_client.send(CitadelProtocol.KIND_TSYNC_V2_HELLO, PackedByteArray([2, 1]), true)
+	_client.send(Protocol.KIND_TSYNC_V2_HELLO, PackedByteArray([2, 1]), true)
 	return true
 
 
@@ -98,7 +102,7 @@ func _process(_delta: float) -> void:
 		return
 	if _client == null:
 		return
-	var sample := _client.transform_view_authoritative(_view, object_id) if local_owner else _client.transform_view_sample_now(_view, object_id)
+	var sample: Dictionary = _client.transform_view_authoritative(_view, object_id) if local_owner else _client.transform_view_sample_now(_view, object_id)
 	if sample.is_empty():
 		return
 	if local_owner:
@@ -140,12 +144,12 @@ func submit_input(velocity_metres_per_second: Vector3, dt: float) -> void:
 	_next_input_seq += 1
 	_pending_inputs.append({"sequence": seq, "velocity": velocity_metres_per_second, "dt": dt})
 	global_position += velocity_metres_per_second * dt
-	var body := _client.transform_encode_input(seq, seq, dt, object_id, ownership_epoch,
+	var body: PackedByteArray = _client.transform_encode_input(seq, seq, dt, object_id, ownership_epoch,
 		velocity_metres_per_second * 100.0)
 	if not body.is_empty():
 		if _v2_negotiated and _clock_epoch != 0:
-			var v2_body := CitadelProtocol.encode_tsync_v2_input(_clock_epoch, _last_observed_tick, body)
+			var v2_body := Protocol.encode_tsync_v2_input(_clock_epoch, _last_observed_tick, body)
 			if not v2_body.is_empty():
-				_client.send(CitadelProtocol.KIND_TSYNC_V2_INPUT, v2_body, false)
+				_client.send(Protocol.KIND_TSYNC_V2_INPUT, v2_body, false)
 				return
-		_client.send(CitadelProtocol.KIND_TSYNC_INPUT, body, false)
+		_client.send(Protocol.KIND_TSYNC_INPUT, body, false)
