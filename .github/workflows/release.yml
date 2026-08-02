@@ -27,6 +27,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Release validation must see full reachable tag/head history.
+          fetch-depth: 0
+
+      - name: Reject tracked or historical runtime ingress media
+        run: python3 scripts/check-runtime-ingress-media.py
 
       - name: Read and validate the release version
         id: version

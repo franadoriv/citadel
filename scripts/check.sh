@@ -3,6 +3,9 @@ set -euo pipefail
 
 source "$(dirname "$0")/python-runtime-env.sh"
 
+# Runtime ingress is user/tool hand-off data, never release source.
+python3 scripts/check-runtime-ingress-media.py
+
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 # `cargo test` also runs the contract-manifest stale-guard

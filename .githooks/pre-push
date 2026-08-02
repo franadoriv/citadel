@@ -1,0 +1,25 @@
+#!/bin/sh
+# Install with: git config core.hooksPath .githooks
+# Fail closed: runtime ingress media and secrets are both release blockers.
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if ! python3 scripts/check-runtime-ingress-media.py; then
+    echo >&2 "Push blocked: runtime ingress media guard failed."
+    exit 1
+fi
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo >&2 "Push blocked: gitleaks is not installed or not available on PATH."
+    exit 1
+fi
+
+echo "Running Gitleaks before push..." >&2
+if ! gitleaks git --redact --log-opts='--all' .; then
+    echo >&2 "Push blocked: Gitleaks found a potential secret or could not complete the scan."
+    exit 1
+fi
+
+echo "Ingress-media and Gitleaks guards passed; continuing push." >&2

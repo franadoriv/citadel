@@ -8,6 +8,17 @@ on:
       - master
 
 jobs:
+  runtime-ingress-media:
+    name: Block tracked runtime ingress media
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The guard inspects all reachable heads/tags, not merely HEAD.
+          fetch-depth: 0
+      - name: Reject tracked or historical runtime ingress media
+        run: python3 scripts/check-runtime-ingress-media.py
+
   rust:
     # macOS validation is intentionally deferred until the Apple release
     # credentials are available. Keep the native packaging targets local-only

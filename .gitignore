@@ -25,6 +25,10 @@ website/node_modules/
 .env.*
 !.env.example
 
+# Runtime ingress supplied by local agents/tools. This directory is never
+# source material and must not enter commits or public release history.
+/media/inbound/
+
 # Local dev server config files (e.g. transport demos). Not committed.
 /demo.toml
 /web-demo.toml
