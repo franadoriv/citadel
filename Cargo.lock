@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "citadel"
-version = "0.9.12"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "argon2",

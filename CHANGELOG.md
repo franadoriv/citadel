@@ -5,6 +5,26 @@ All notable changes to Citadel are documented here. Version numbers follow
 
 ## Unreleased
 
+## [0.9.14] - 2026-08-03
+
+### Added
+
+- Added durable clustered party authority, atomic multi-object storage batches,
+  and async outbound HTTP APIs for server runtimes.
+- Expanded the runtime extensibility surface for current game-server workflows.
+
+### Fixed
+
+- Kept server release archives free of client SDK contents.
+- Repaired Godot Web SDK package validation so fresh copied packages are loaded
+  and exercised by the headless release harness.
+
+### Release validation
+
+- Manual native Unreal Engine 5.8/PIE validation was unavailable and explicitly
+  waived by the release owner for v0.9.14. This waiver is not a passing Unreal
+  validation result.
+
 ## [0.9.12] - 2026-07-31
 
 ### Added
