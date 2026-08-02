@@ -143,6 +143,10 @@ export default defineConfig({
 									label: 'NetworkPeer schema evolution',
 									slug: 'reference/server-sdk/networkpeer-schema-evolution',
 								},
+								{
+									label: 'Authoritative gameplay clock',
+									slug: 'reference/server-sdk/gameplay-clock',
+								},
 							],
 						},
 						{

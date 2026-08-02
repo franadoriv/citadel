@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::App;
 use crate::error::{AppError, ErrorCategory};
 use crate::identity::{DisplayName, User, UserId, Username};
-use crate::services::{RefreshSessionRequest, RevokeSessionRequest, ValidateSessionRequest};
+use crate::services::{RefreshSessionRequest, SessionRevocationCommand, ValidateSessionRequest};
 use crate::session::{RevocationReason, SessionId, SessionTokenSecret, SessionValidation};
 use crate::time::{Clock, SystemClock, TimestampMillis};
 
@@ -286,14 +286,7 @@ async fn refresh_handler(
     let Some(user) = user else {
         // A state change racing refresh cannot leave a newly minted usable
         // session behind. The client receives the same uniform auth failure.
-        let _ = app
-            .session_service()
-            .revoke_session(RevokeSessionRequest {
-                session_id: refreshed.session.id,
-                revoked_at: now(),
-                reason: RevocationReason::Security,
-            })
-            .await;
+        let _ = revoke_for_refresh_security(&app, refreshed.session.id).await;
         return Err(AppError::auth("authentication failed").into());
     };
     Ok(Json(AuthResponse {
@@ -362,14 +355,45 @@ async fn logout_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn revocation_command(
+    source: &'static str,
+    session_id: SessionId,
+    revoked_at: TimestampMillis,
+) -> SessionRevocationCommand {
+    // The session id and time make retries safe: duplicate commands fence an
+    // already-closing connection, while a later revocation remains harmless.
+    SessionRevocationCommand {
+        revocation_id: format!(
+            "{source}:{}:{}",
+            session_id.as_str(),
+            revoked_at.unix_millis()
+        ),
+        session_id,
+        expected_generation: None,
+    }
+}
+
+async fn revoke_for_refresh_security(app: &App, session_id: SessionId) -> Result<(), ApiError> {
+    let revoked_at = now();
+    app.session_revocation_coordinator()
+        .revoke_local(
+            revocation_command("refresh-security", session_id, revoked_at),
+            revoked_at,
+            RevocationReason::Security,
+        )
+        .await?;
+    Ok(())
+}
+
 async fn revoke_for_logout(app: &App, session_id: SessionId) -> Result<(), ApiError> {
+    let revoked_at = now();
     match app
-        .session_service()
-        .revoke_session(RevokeSessionRequest {
-            session_id,
-            revoked_at: now(),
-            reason: RevocationReason::Logout,
-        })
+        .session_revocation_coordinator()
+        .revoke_local(
+            revocation_command("logout", session_id, revoked_at),
+            revoked_at,
+            RevocationReason::Logout,
+        )
         .await
     {
         Ok(_) => Ok(()),
@@ -384,5 +408,110 @@ async fn revoke_for_logout(app: &App, session_id: SessionId) -> Result<(), ApiEr
             Ok(())
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::config::Config;
+    use crate::realtime::{Gateway, Outbound, ParticipantIdentity, SessionHandle};
+    use crate::services::CreateSessionRequest;
+    use crate::session::NodeId;
+    use crate::time::DurationMillis;
+    use crate::transport::{Envelope, TransportKind};
+
+    #[tokio::test]
+    async fn refresh_race_security_revocation_fences_the_exact_live_session() {
+        let app = App::new(Config::default());
+        let gateway = Arc::new(Gateway::new());
+        app.attach_realtime_gateway(Arc::clone(&gateway));
+        let user_id = UserId::new("refresh-race-user").expect("user");
+        let issued_at = now();
+        let primary = app
+            .session_service()
+            .create_session(CreateSessionRequest {
+                user_id: user_id.clone(),
+                owner_node: NodeId::new(app.node_id().to_owned()).expect("node"),
+                now: issued_at,
+                session_ttl: DurationMillis::from_millis(60_000),
+                refresh_ttl: Some(DurationMillis::from_millis(60_000)),
+            })
+            .await
+            .expect("primary session");
+        let sibling = app
+            .session_service()
+            .create_session(CreateSessionRequest {
+                user_id: user_id.clone(),
+                owner_node: NodeId::new(app.node_id().to_owned()).expect("node"),
+                now: issued_at,
+                session_ttl: DurationMillis::from_millis(60_000),
+                refresh_ttl: Some(DurationMillis::from_millis(60_000)),
+            })
+            .await
+            .expect("sibling session");
+        let target = gateway.next_participant_id();
+        let (target_tx, mut target_rx) = tokio::sync::mpsc::channel(4);
+        gateway.register_session(SessionHandle {
+            id: target,
+            kind: TransportKind::WebSocket,
+            outbound: target_tx,
+            identity: Some(ParticipantIdentity {
+                user_id: user_id.clone(),
+                session_id: primary.session.id.clone(),
+                expires_at: primary.session.expires_at,
+            }),
+        });
+        let sibling_id = gateway.next_participant_id();
+        let (sibling_tx, mut sibling_rx) = tokio::sync::mpsc::channel(4);
+        gateway.register_session(SessionHandle {
+            id: sibling_id,
+            kind: TransportKind::WebSocket,
+            outbound: sibling_tx,
+            identity: Some(ParticipantIdentity {
+                user_id,
+                session_id: sibling.session.id,
+                expires_at: sibling.session.expires_at,
+            }),
+        });
+        assert!(gateway.registry().send_to(
+            target,
+            &Outbound::reliable(Envelope::new(700, b"queued".to_vec()))
+        ));
+
+        revoke_for_refresh_security(&app, primary.session.id)
+            .await
+            .expect("security revoke");
+        assert!(
+            !target_rx
+                .try_recv()
+                .expect("queued outbound")
+                .is_deliverable(),
+            "the close fence invalidates a queued reliable envelope"
+        );
+        assert_eq!(
+            gateway.handle_inbound(target, &Envelope::new(701, b"late".to_vec())),
+            0
+        );
+        assert!(!gateway.registry().send_to(
+            target,
+            &Outbound::reliable(Envelope::new(702, b"late".to_vec()))
+        ));
+        assert!(gateway.registry().send_to(
+            sibling_id,
+            &Outbound::reliable(Envelope::new(703, b"sibling".to_vec()))
+        ));
+        assert_eq!(
+            sibling_rx
+                .recv()
+                .await
+                .expect("sibling outbound")
+                .envelope
+                .body
+                .as_ref(),
+            b"sibling"
+        );
     }
 }

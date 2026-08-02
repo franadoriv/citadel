@@ -222,6 +222,9 @@ export const KIND_TSYNC_INPUT: number;
 export const KIND_TSYNC_ACK: number;
 export const KIND_TSYNC_ROLE: number;
 export const KIND_TSYNC_REWIND: number;
+export const KIND_TSYNC_V2_HELLO: number;
+export const KIND_TSYNC_V2_SNAPSHOT: number;
+export const KIND_TSYNC_V2_INPUT: number;
 export const KIND_REP_DELTA: number;
 export const KIND_REP_ACK: number;
 export const KIND_REP_SCHEMA: number;
@@ -253,6 +256,7 @@ export const NOTIFICATION_KIND_MIN: number;
 export const NOTIFICATION_KIND_MAX: number;
 export const CHAT_KIND_MIN: number;
 export const CHAT_KIND_MAX: number;
+export const TSYNC_V2_CLOCK_BYTES: number;
 
 export const AUTH_STATUS_AUTHENTICATED: number;
 export const AUTH_STATUS_GUEST: number;
@@ -294,3 +298,13 @@ export function encodeRoomCreate(name: string): Uint8Array;
 export function encodeRoomId(roomId: bigint | number): Uint8Array;
 export function decodeRoomJoined(body: Uint8Array): RoomInfo | null;
 export function decodeRoomId(body: Uint8Array): bigint | null;
+export function decodeTsyncV2Snapshot(body: Uint8Array): {
+  epoch: bigint; tick: bigint; tickHz: number; snapshotBody: Uint8Array;
+} | null;
+export class TsyncV2EpochFence {
+  readonly epoch: bigint | null;
+  apply<T>(body: Uint8Array, decodeV1Snapshot: (body: Uint8Array) => T | null): {
+    clock: { epoch: bigint; tick: bigint; tickHz: number }; snapshot: T;
+  } | null;
+  reset(epoch: bigint | number): boolean;
+}

@@ -46,8 +46,8 @@ use crate::realtime::chat_presence::{ChatPresenceRegistry, ChatSubscription};
 use crate::realtime::netpeer::layout::RepLayout;
 use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot};
 use crate::realtime::registry::{
-    LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen, SessionHandle,
-    SessionRegistry,
+    CloseDisposition, LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen,
+    SessionHandle, SessionRegistry,
 };
 use crate::realtime::rooms::{RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
@@ -75,7 +75,8 @@ pub use citadel_wire::protocol::{
     KIND_PEER_POSITION, KIND_POSITION, KIND_REP_ACK, KIND_REP_DELTA, KIND_ROOM_CREATE,
     KIND_ROOM_JOIN, KIND_ROOM_JOINED, KIND_ROOM_LEAVE, KIND_ROOM_MAP_READY, KIND_RPC_REQUEST,
     KIND_RPC_RESPONSE, KIND_TSYNC_ACK, KIND_TSYNC_HELLO, KIND_TSYNC_INPUT, KIND_TSYNC_REWIND,
-    KIND_TSYNC_ROLE, KIND_TSYNC_SNAPSHOT, ROOM_KIND_MAX, ROOM_KIND_MIN, RPC_STATUS_OK,
+    KIND_TSYNC_ROLE, KIND_TSYNC_SNAPSHOT, KIND_TSYNC_V2_HELLO, KIND_TSYNC_V2_INPUT, ROOM_KIND_MAX,
+    ROOM_KIND_MIN, RPC_STATUS_OK,
 };
 
 const MATCHMAKER_HANDOFF_TTL_MS: u64 = 30_000;
@@ -2719,9 +2720,26 @@ impl Gateway {
     /// runs *after* the registry insert, so a concurrent tick may briefly observe
     /// the new participant before `on_join` fires — acceptable for the MVP.
     pub fn register_session(&self, handle: SessionHandle) -> LatestOutboundReceiver {
+        self.register_session_with_initial(handle, None)
+    }
+
+    /// Register a session with an optional protocol envelope that must lead its
+    /// reliable queue. The registry assigns the close fence before publishing
+    /// the session, so handshake acknowledgements cannot bypass revocation.
+    pub fn register_session_with_initial(
+        &self,
+        handle: SessionHandle,
+        initial: Option<Outbound>,
+    ) -> LatestOutboundReceiver {
         let id = handle.id;
         let authenticated = handle.is_authenticated();
-        let unreliable = self.registry.register(handle);
+        let unreliable = self.registry.register_with_initial(handle, initial);
+        // A durable revocation that completed after token validation but before
+        // publication leaves a registry tombstone. Do not run lifecycle work or
+        // alter gauges for that rejected registration.
+        if !self.registry.accepts_work(id) {
+            return unreliable;
+        }
         // Every registered participant moves the participant gauge; only an
         // account-bound participant moves the authenticated-session gauge.
         self.metrics.participant_opened();
@@ -2743,6 +2761,14 @@ impl Gateway {
         unreliable
     }
 
+    /// Whether a just-registered participant survived the durable-revocation
+    /// publication barrier. Transports use this to tear down an accepted auth
+    /// handshake that lost the registration race without emitting an ack.
+    #[must_use]
+    pub fn accepts_work(&self, id: ParticipantId) -> bool {
+        self.registry.accepts_work(id)
+    }
+
     fn send_rep_bootstrap(&self, id: ParticipantId) {
         let Some(rep) = &self.rep else {
             return;
@@ -2751,10 +2777,7 @@ impl Gateway {
             let bytes = out.body.len() as u64;
             if self.registry.send_to(
                 ParticipantId::from_raw(out.participant),
-                &Outbound {
-                    delivery: Delivery::Reliable,
-                    envelope: Envelope::new(out.kind, out.body),
-                },
+                &Outbound::reliable(Envelope::new(out.kind, out.body)),
             ) {
                 self.metrics.record_message_out(bytes);
             }
@@ -2767,6 +2790,9 @@ impl Gateway {
     /// registry removal so its emitted commands still reach the remaining peers
     /// (the leaver is excluded), then the session is removed and the gauge drops.
     pub fn unregister_session(&self, id: ParticipantId) {
+        if !self.registry.claim_cleanup(id) {
+            return;
+        }
         // Run the leave hook while the participant (and its identity) is still
         // registered, so `ctx.user_id` is available to the handler.
         self.dispatch_lifecycle(LifecycleHook::Leave, id);
@@ -2838,6 +2864,29 @@ impl Gateway {
         }
     }
 
+    /// Fence and clean up every local connection for one exact session.
+    /// A routed caller supplies `expected_generation`, so an old owner cannot
+    /// close a replacement connection after reconnect or migration.
+    pub async fn disconnect_session(
+        &self,
+        session_id: &crate::session::SessionId,
+        command_id: &str,
+        expected_generation: Option<u64>,
+    ) -> usize {
+        let closed = self
+            .registry
+            .close_session(session_id, command_id, expected_generation)
+            .await;
+        let mut cleaned = 0;
+        for (connection, disposition) in closed {
+            if disposition == CloseDisposition::Closing {
+                self.unregister_session(connection.participant_id());
+                cleaned += 1;
+            }
+        }
+        cleaned
+    }
+
     /// Dispatch a lifecycle hook to the script runtime and apply its commands.
     ///
     /// A no-op when no runtime is attached. Emitted commands are applied with the
@@ -2883,6 +2932,13 @@ impl Gateway {
     /// each relayed copy counts as one outbound message so the `messages_*`
     /// gauges track real relay traffic.
     pub fn handle_inbound(&self, sender: ParticipantId, env: &Envelope) -> usize {
+        // The controller is the first application boundary after transport
+        // framing. Once close linearizes, no late buffered frame may reach
+        // runtime/domain handling or update inbound metrics.
+        if !self.registry.accepts_work(sender) {
+            tracing::debug!(%sender, kind = env.kind, "gateway dropped inbound after connection close");
+            return 0;
+        }
         self.metrics.record_message_in(env.body.len() as u64);
         // `KIND_AUTH`/`KIND_AUTH_RESULT` are handshake-only: a connection
         // authenticates exactly once, before registration. A
@@ -2930,6 +2986,8 @@ impl Gateway {
         } else if env.kind == KIND_TSYNC_HELLO
             || env.kind == KIND_TSYNC_ACK
             || env.kind == KIND_TSYNC_INPUT
+            || env.kind == KIND_TSYNC_V2_HELLO
+            || env.kind == KIND_TSYNC_V2_INPUT
         {
             self.handle_transform_control(sender, env)
         } else if env.kind == KIND_NA_PRESENCE || env.kind == KIND_NA_STATE {
@@ -3041,10 +3099,7 @@ impl Gateway {
         );
         let out_bytes = response.body.len() as u64;
         // Request/response is reliable; the reply goes to the caller only.
-        let outbound = Outbound {
-            delivery: Delivery::Reliable,
-            envelope: response,
-        };
+        let outbound = Outbound::reliable(response);
         if self.registry.send_to(sender, &outbound) {
             self.metrics.record_message_out(out_bytes);
             1
@@ -4439,10 +4494,10 @@ impl Gateway {
         domain: DomainRpcServices,
         request: &protocol::RpcRequest<'_>,
     ) -> usize {
-        let Some(outbound) = self.registry.outbound_of(sender) else {
+        if !self.registry.accepts_work(sender) {
             tracing::debug!(%sender, "domain RPC caller disconnected before dispatch");
             return 0;
-        };
+        }
         let user_id = self.registry.user_id_of(sender);
         let room_id = self.rooms.room_of(sender);
         let request_id = request.request_id;
@@ -4466,7 +4521,7 @@ impl Gateway {
                 protocol::encode_rpc_response(request_id, status, &body),
             );
             let out_bytes = response.body.len() as u64;
-            if outbound.send(Outbound::reliable(response)).await.is_ok() {
+            if registry.send_to(sender, &Outbound::reliable(response)) {
                 metrics.record_message_out(out_bytes);
             } else {
                 tracing::debug!(%sender, "domain RPC caller disconnected before its response");
@@ -4496,10 +4551,7 @@ impl Gateway {
                     participant = sender.get(),
                     "transform-sync: participant opted in (HELLO received)"
                 );
-                let outbound = Outbound {
-                    delivery: Delivery::Reliable,
-                    envelope: Envelope::new(reply.kind, reply.body),
-                };
+                let outbound = Outbound::reliable(Envelope::new(reply.kind, reply.body));
                 let out_bytes = outbound.envelope.body.len() as u64;
                 let mut sent = if self.registry.send_to(sender, &outbound) {
                     self.metrics.record_message_out(out_bytes);
@@ -4511,10 +4563,8 @@ impl Gateway {
                 // object and tell it (reliably) so its client flips that object to
                 // owner-predicted. A no-op when `player_slots == 0`.
                 if let Some((object_id, role)) = hub.assign_player_slot(sender.get()) {
-                    let role_out = Outbound {
-                        delivery: Delivery::Reliable,
-                        envelope: Envelope::new(KIND_TSYNC_ROLE, role.encode()),
-                    };
+                    let role_out =
+                        Outbound::reliable(Envelope::new(KIND_TSYNC_ROLE, role.encode()));
                     let role_bytes = role_out.envelope.body.len() as u64;
                     if self.registry.send_to(sender, &role_out) {
                         self.metrics.record_message_out(role_bytes);
@@ -4528,6 +4578,19 @@ impl Gateway {
                 }
                 sent
             }
+            KIND_TSYNC_V2_HELLO => {
+                let Some(reply) = hub.handle_v2_hello(sender.get(), &env.body) else {
+                    return 0;
+                };
+                let outbound = Outbound::reliable(Envelope::new(reply.kind, reply.body));
+                let bytes = outbound.envelope.body.len() as u64;
+                if self.registry.send_to(sender, &outbound) {
+                    self.metrics.record_message_out(bytes);
+                    1
+                } else {
+                    0
+                }
+            }
             KIND_TSYNC_ACK => {
                 hub.handle_ack(sender.get(), &env.body);
                 0
@@ -4538,13 +4601,22 @@ impl Gateway {
                 // shooter only (design §5.2). The client never resolves hits.
                 let mut sent = 0;
                 for reply in hub.handle_input(sender.get(), &env.body) {
-                    let outbound = Outbound {
-                        delivery: Delivery::Reliable,
-                        envelope: Envelope::new(reply.kind, reply.body),
-                    };
+                    let outbound = Outbound::reliable(Envelope::new(reply.kind, reply.body));
                     let out_bytes = outbound.envelope.body.len() as u64;
                     if self.registry.send_to(sender, &outbound) {
                         self.metrics.record_message_out(out_bytes);
+                        sent += 1;
+                    }
+                }
+                sent
+            }
+            KIND_TSYNC_V2_INPUT => {
+                let mut sent = 0;
+                for reply in hub.handle_v2_input(sender.get(), &env.body) {
+                    let outbound = Outbound::reliable(Envelope::new(reply.kind, reply.body));
+                    let bytes = outbound.envelope.body.len() as u64;
+                    if self.registry.send_to(sender, &outbound) {
+                        self.metrics.record_message_out(bytes);
                         sent += 1;
                     }
                 }
@@ -4665,10 +4737,7 @@ impl Gateway {
     /// Send one reliable envelope to a single participant, recording the outbound
     /// metric. Returns whether it was delivered (the target was live).
     fn send_reliable(&self, target: ParticipantId, kind: u16, body: Vec<u8>) -> bool {
-        let outbound = Outbound {
-            delivery: Delivery::Reliable,
-            envelope: Envelope::new(kind, body),
-        };
+        let outbound = Outbound::reliable(Envelope::new(kind, body));
         let out_bytes = outbound.envelope.body.len() as u64;
         if self.registry.send_to(target, &outbound) {
             self.metrics.record_message_out(out_bytes);
@@ -4908,14 +4977,14 @@ impl Gateway {
         let now_ms = SystemClock.now().unix_millis();
         let mut delivered = 0;
         for out in rep.handle_delta(sender.get(), &env.body, now_ms) {
-            let outbound = Outbound {
-                delivery: if out.reliable {
+            let outbound = Outbound::new(
+                if out.reliable {
                     Delivery::Reliable
                 } else {
                     Delivery::Unreliable
                 },
-                envelope: Envelope::new(out.kind, out.body),
-            };
+                Envelope::new(out.kind, out.body),
+            );
             let out_bytes = outbound.envelope.body.len() as u64;
             if self
                 .registry
@@ -4961,14 +5030,14 @@ impl Gateway {
         };
         let mut delivered = 0;
         for out in hub.snapshot_tick() {
-            let outbound = Outbound {
-                delivery: if out.unreliable {
+            let outbound = Outbound::new(
+                if out.unreliable {
                     Delivery::Unreliable
                 } else {
                     Delivery::Reliable
                 },
-                envelope: Envelope::new(out.kind, out.body),
-            };
+                Envelope::new(out.kind, out.body),
+            );
             let out_bytes = outbound.envelope.body.len() as u64;
             if self
                 .registry
@@ -4988,10 +5057,7 @@ impl Gateway {
                 let body = protocol::tag_with_sender(sender.get(), &env.body);
                 let relayed = Envelope::new(KIND_PEER_POSITION, body);
                 // Positions are hot-path state: relay best-effort/unreliable.
-                let outbound = Outbound {
-                    delivery: Delivery::Unreliable,
-                    envelope: relayed,
-                };
+                let outbound = Outbound::unreliable(relayed);
                 let out_bytes = outbound.envelope.body.len() as u64;
                 let delivered = match self.rooms.room_of(sender) {
                     Some(room_id) => self.registry.broadcast_members(
@@ -5046,10 +5112,8 @@ impl Gateway {
                     body,
                     unreliable,
                 } => {
-                    let outbound = Outbound {
-                        delivery: delivery_for(unreliable),
-                        envelope: Envelope::new(kind, body),
-                    };
+                    let outbound =
+                        Outbound::new(delivery_for(unreliable), Envelope::new(kind, body));
                     let out_bytes = outbound.envelope.body.len() as u64;
                     let delivered = match room_id {
                         Some(room_id) => self.registry.broadcast_members(
@@ -5073,10 +5137,8 @@ impl Gateway {
                     body,
                     unreliable,
                 } => {
-                    let outbound = Outbound {
-                        delivery: delivery_for(unreliable),
-                        envelope: Envelope::new(kind, body),
-                    };
+                    let outbound =
+                        Outbound::new(delivery_for(unreliable), Envelope::new(kind, body));
                     let out_bytes = outbound.envelope.body.len() as u64;
                     if self
                         .registry
@@ -5182,10 +5244,7 @@ impl Gateway {
                 velocity: [0.0; 3],
             },
         };
-        let outbound = Outbound {
-            delivery: Delivery::Reliable,
-            envelope: Envelope::new(KIND_NA_SPAWN, spawn.encode()),
-        };
+        let outbound = Outbound::reliable(Envelope::new(KIND_NA_SPAWN, spawn.encode()));
         self.registry.broadcast_all(&outbound)
     }
 
@@ -5199,10 +5258,7 @@ impl Gateway {
             hub.despawn(object_id);
         }
         let body = citadel_wire::na::NaDespawn { object_id }.encode();
-        let outbound = Outbound {
-            delivery: Delivery::Reliable,
-            envelope: Envelope::new(KIND_NA_DESPAWN, body),
-        };
+        let outbound = Outbound::reliable(Envelope::new(KIND_NA_DESPAWN, body));
         self.registry.broadcast_all(&outbound)
     }
 }
@@ -5359,6 +5415,23 @@ mod transform_tests {
         assert_eq!(out.delivery, Delivery::Reliable);
         let hello = tsync::Hello::decode(&out.envelope.body).expect("decodes");
         assert_eq!(hello, TransformHubConfig::default().hello);
+    }
+
+    #[tokio::test]
+    async fn inbound_after_close_is_rejected_before_application_handling() {
+        let (gw, hub) = gateway_with_hub();
+        let (participant, mut outbound) = register(&gw);
+        assert!(gw.registry().claim_cleanup(participant));
+
+        assert_eq!(
+            gw.handle_inbound(participant, &Envelope::new(KIND_TSYNC_HELLO, Vec::new())),
+            0
+        );
+        assert_eq!(hub.client_count(), 0, "closed input must not reach the hub");
+        assert!(
+            outbound.try_recv().is_err(),
+            "closed input produces no reply"
+        );
     }
 
     #[tokio::test]

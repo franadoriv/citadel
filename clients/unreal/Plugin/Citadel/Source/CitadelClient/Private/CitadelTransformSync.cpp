@@ -12,7 +12,47 @@
 #include "Engine/GameInstance.h"
 #include "GameFramework/Actor.h"
 
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#endif
+
 // ------------------------- FCitadelRemoteWorldView --------------------------
+
+void FCitadelRemoteWorldView::ResetState()
+{
+    Ring.Reset(); Samples.Reset(); OwnerAcks.Reset();
+    LastAppliedId = 0; AckLatest = 0; AckHistory = 0; ClockEpoch = 0; LastObservedClockTick = 0;
+    SimRateHz = 60.0f; SendRateHz = 20.0f;
+    BufferMultiplier = BufferCeil;
+}
+
+void FCitadelRemoteWorldView::SetCodec(const CitadelTransform::FCodecParams& InParams)
+{
+    Params = InParams; bHaveCodec = true;
+    // A reliable HELLO begins a fresh connection/match lifetime, so no old
+    // v1/v2 delta baseline or epoch may cross it.
+    ResetState();
+}
+
+bool FCitadelRemoteWorldView::ResetV2Epoch(uint64 Epoch)
+{
+    if (Epoch == 0) { return false; }
+    ResetState();
+    ClockEpoch = Epoch;
+    return true;
+}
+
+bool FCitadelRemoteWorldView::ApplyV2Datagram(const uint8* Body, int32 Len)
+{
+    // epoch:u64 | tick:u64 | tick_hz:u16 | byte-for-byte v1 snapshot
+    CitadelTransform::FClockMetadata Clock;
+    if (!bHaveCodec || !CitadelTransform::FClockMetadata::Decode(Body, static_cast<size_t>(Len), Clock)
+        || (ClockEpoch != 0 && ClockEpoch != Clock.Epoch)) { return false; }
+    if (!ApplyDatagram(Body + 18, Len - 18)) { return false; }
+    ClockEpoch = Clock.Epoch;
+    LastObservedClockTick = Clock.Tick;
+    return true;
+}
 
 bool FCitadelRemoteWorldView::ApplyDatagram(const uint8* Body, int32 Len)
 {
@@ -142,6 +182,62 @@ bool FCitadelRemoteWorldView::GetOwnerAck(uint32 ObjectId, uint32& OutSeq) const
     OutSeq = *Seq;
     return true;
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FCitadelTransformV2WrapperParityTest,
+    "Citadel.TransformSync.V2WrapperParity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCitadelTransformV2WrapperParityTest::RunTest(const FString& Parameters)
+{
+    // A complete v1 snapshot with no object updates: tick=1, id=1, base=0,
+    // send_rate=60, removed=0, updates=0. It exercises the real view's v1
+    // decoder while keeping the vector independent of any actor/world setup.
+    const uint8 V1Snapshot[] = {
+        0,0,0,1, 0,0,0,1, 0,0,0,0, 60, 0,0, 0,0
+    };
+    const uint8 V2Epoch7[] = {
+        0,0,0,0,0,0,0,7, 0,0,0,0,0,0,0,99, 0,60,
+        0,0,0,1, 0,0,0,1, 0,0,0,0, 60, 0,0, 0,0
+    };
+    const uint8 V2Epoch8[] = {
+        0,0,0,0,0,0,0,8, 0,0,0,0,0,0,0,100, 0,60,
+        0,0,0,1, 0,0,0,1, 0,0,0,0, 60, 0,0, 0,0
+    };
+    FCitadelRemoteWorldView View;
+    View.SetCodec(CitadelTransform::FCodecParams());
+    TestTrue(TEXT("v2 wrapper applies a valid embedded v1 snapshot"), View.ApplyV2Datagram(V2Epoch7, UE_ARRAY_COUNT(V2Epoch7)));
+    uint8 Ack[8] = {};
+    View.AckBytes(Ack);
+    TestEqual(TEXT("v2 apply advances the managed acknowledgement"), Ack[3], uint8(1));
+    TestFalse(TEXT("mixed epoch is rejected before touching the v1 view"), View.ApplyV2Datagram(V2Epoch8, UE_ARRAY_COUNT(V2Epoch8)));
+    TestTrue(TEXT("explicit reset admits a fresh nonzero epoch"), View.ResetV2Epoch(8));
+    View.AckBytes(Ack);
+    TestEqual(TEXT("reset clears managed acknowledgement state"), Ack[3], uint8(0));
+    TestTrue(TEXT("reset epoch applies its v2 snapshot"), View.ApplyV2Datagram(V2Epoch8, UE_ARRAY_COUNT(V2Epoch8)));
+    View.SetCodec(CitadelTransform::FCodecParams());
+    TestTrue(TEXT("v1 fallback remains the real view apply path"), View.ApplyDatagram(V1Snapshot, UE_ARRAY_COUNT(V1Snapshot)));
+
+    const std::vector<uint8_t> V1Input = { 0xaa, 0xbb };
+    std::vector<uint8_t> V2Input;
+    TestTrue(TEXT("v2 input wrapper encodes accepted epoch/tick diagnostics"),
+        CitadelTransform::FInputV2Metadata::Encode(8, 100, V1Input, V2Input));
+    const std::vector<uint8_t> ExpectedV2Input = {
+        0,0,0,0,0,0,0,8, 0,0,0,0,0,0,0,100, 0, 0xaa,0xbb };
+    TestTrue(TEXT("v2 input wrapper is big-endian epoch/tick, zero flags, unchanged v1 bundle"),
+        V2Input == ExpectedV2Input);
+    TestFalse(TEXT("v2 input wrapper rejects zero epoch"),
+        CitadelTransform::FInputV2Metadata::Encode(0, 100, V1Input, V2Input));
+    const uint8 AcceptedManifest[] = { 2, 1 };
+    const uint8 UnknownManifest[] = { 2, 2 };
+    TestTrue(TEXT("only exact HELLO echo accepts v2"),
+        CitadelTransform::FV2Manifest::IsClock(AcceptedManifest, UE_ARRAY_COUNT(AcceptedManifest)));
+    TestFalse(TEXT("unknown HELLO capability does not select v2"),
+        CitadelTransform::FV2Manifest::IsClock(UnknownManifest, UE_ARRAY_COUNT(UnknownManifest)));
+    return true;
+}
+#endif
 
 // -------------------------- FCitadelPredictionRing --------------------------
 
@@ -461,6 +557,19 @@ void UCitadelTransformSync::SendInputBundle(uint32 NewSeq, const FVector& MoveVe
     std::vector<uint8_t> Body = CitadelTransform::EncodeInputBundle(AckedId, AckedId, Bundle);
 
     TArray<uint8> Payload;
+    if (Sub->IsV2InputNegotiated())
+    {
+        std::vector<uint8_t> V2Body;
+        if (CitadelTransform::FInputV2Metadata::Encode(
+                Sub->View().V2Epoch(), Sub->View().LastObservedV2Tick(), Body, V2Body))
+        {
+            Payload.Append(V2Body.data(), static_cast<int32>(V2Body.size()));
+            Sub->SendFrame(CitadelWire::KIND_TSYNC_V2_INPUT, Payload, /*bReliable=*/false);
+            return;
+        }
+    }
+    // No exact HELLO echo, no accepted nonzero epoch, or an invalid wrapper:
+    // retain the unchanged v1 input path instead of guessing a v2 layout.
     Payload.Append(Body.data(), static_cast<int32>(Body.size()));
     Sub->SendFrame(CitadelWire::KIND_TSYNC_INPUT, Payload, /*bReliable=*/false);
 }
@@ -523,7 +632,10 @@ void UCitadelTransformSyncSubsystem::OptIn()
     {
         // Empty HELLO body: the server dictates the negotiation and replies.
         Client->Send(CitadelWire::KIND_TSYNC_HELLO, TArray<uint8>(), /*bReliable=*/true);
+        // Dedicated v2 negotiation is opt-in; a server that does not reply keeps
+        // the existing v1 snapshot path untouched.
         bOptedIn = true;
+        SendV2Hello();
     }
 }
 
@@ -547,11 +659,29 @@ void UCitadelTransformSyncSubsystem::PumpInbound()
             if (Params.DecodeHello(Payload.GetData(), Payload.Num()))
             {
                 WorldView.SetCodec(Params);
+                // A reliable HELLO begins a new baseline lifetime. Acceptance
+                // must be echoed again; never carry v2 permission across it.
+                bV2Negotiated = false;
+                SendV2Hello();
             }
+        }
+        else if (Kind == CitadelWire::KIND_TSYNC_V2_HELLO)
+        {
+            // Only the exact accepted manifest selects v2. Any other echo is
+            // not a downgrade signal and leaves the v1 path active.
+            bV2Negotiated = bOptedIn && WorldView.HasCodec()
+                && CitadelTransform::FV2Manifest::IsClock(Payload.GetData(), Payload.Num());
         }
         else if (Kind == CitadelWire::KIND_TSYNC_SNAPSHOT)
         {
             if (WorldView.ApplyDatagram(Payload.GetData(), Payload.Num()))
+            {
+                bAppliedAny = true;
+            }
+        }
+        else if (Kind == CitadelWire::KIND_TSYNC_V2_SNAPSHOT)
+        {
+            if (bV2Negotiated && WorldView.ApplyV2Datagram(Payload.GetData(), Payload.Num()))
             {
                 bAppliedAny = true;
             }
@@ -605,6 +735,17 @@ void UCitadelTransformSyncSubsystem::PumpInbound()
         // Other kinds are ignored here; a production subsystem routes them to game.
     }
     if (bAppliedAny) { SendAck(); }
+}
+
+void UCitadelTransformSyncSubsystem::SendV2Hello()
+{
+    if (UCitadelClientSubsystem* Client = GetGameInstance()->GetSubsystem<UCitadelClientSubsystem>())
+    {
+        TArray<uint8> V2Manifest;
+        V2Manifest.Add(2); // TSYNC_V2_VERSION
+        V2Manifest.Add(1); // TSYNC_V2_CLOCK_CAPABILITY
+        Client->Send(CitadelWire::KIND_TSYNC_V2_HELLO, V2Manifest, /*bReliable=*/true);
+    }
 }
 
 UCitadelTransformSync* UCitadelTransformSyncSubsystem::FindComponent(uint32 ObjectId)

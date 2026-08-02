@@ -33,6 +33,7 @@ pub mod party_directory;
 pub mod player_notifications;
 pub mod purchases;
 pub mod session;
+pub mod session_revocation;
 pub mod token;
 pub mod wallet;
 
@@ -84,6 +85,9 @@ pub use memory::{
 pub use session::{
     CreateSessionRequest, CreatedSession, RefreshSessionRequest, RevokeSessionRequest,
     SessionDirectory, SessionService, ValidateSessionRequest,
+};
+pub use session_revocation::{
+    RevocationDispatch, SessionRevocationCommand, SessionRevocationCoordinator,
 };
 pub use token::{CountingTokenIssuer, IssuedTokenSet, RandomTokenIssuer, TokenIssuer};
 

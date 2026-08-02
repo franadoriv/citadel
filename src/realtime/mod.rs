@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod chat_presence;
 pub mod gateway;
+pub mod identity;
 pub mod netpeer;
 pub mod registry;
 pub mod reload;
@@ -26,6 +27,7 @@ pub use gateway::{
     DomainRpcServices, Gateway, Handshake, KIND_AUTH, KIND_AUTH_RESULT, KIND_PEER_POSITION,
     KIND_POSITION, shared,
 };
+pub use identity::{IdentityLifecycle, Presence, PresenceState, ResumeResult, ResumeSecret};
 pub use registry::{
     LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen, ParticipantIdentity,
     SessionHandle, SessionRegistry,
@@ -33,7 +35,7 @@ pub use registry::{
 pub use reload::LuaReloadService;
 pub use rooms::{JoinError, RoomId, RoomLabel, RoomRegistry, RoomSnapshot};
 pub use tick::{
-    ChatDeliveryDispatchService, ChatPresenceRenewalService, LuaTickService, MatchmakerTickService,
-    TransformTickService,
+    ChatDeliveryDispatchService, ChatPresenceRenewalService, GameplayClock, GameplayClockSnapshot,
+    LuaTickService, MatchmakerTickService, TransformTickService,
 };
 pub use transform::{TransformHub, TransformHubConfig};

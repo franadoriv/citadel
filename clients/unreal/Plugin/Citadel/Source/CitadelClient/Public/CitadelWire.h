@@ -72,6 +72,10 @@ namespace CitadelWire
     // rode a KIND_TSYNC_INPUT bundle (reliable;  P2). The client never
     // resolves hits itself.
     constexpr uint16 KIND_TSYNC_REWIND = 12;
+    // Dedicated negotiated v2 clock metadata kinds; v1 bodies stay unchanged.
+    constexpr uint16 KIND_TSYNC_V2_HELLO = 29;
+    constexpr uint16 KIND_TSYNC_V2_SNAPSHOT = 30;
+    constexpr uint16 KIND_TSYNC_V2_INPUT = 31;
 
     // --- NetworkPeer replication kinds (; bodies in citadel_wire::netpeer) ---
     // Client<->server: property DeltaBunch (reliable by default). Bit-packed:

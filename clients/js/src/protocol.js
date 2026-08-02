@@ -35,6 +35,12 @@ export const KIND_TSYNC_INPUT = 9;
 export const KIND_TSYNC_ACK = 10;
 export const KIND_TSYNC_ROLE = 11;
 export const KIND_TSYNC_REWIND = 12;
+/** Negotiated v2 transform manifest (reliable, C↔S). */
+export const KIND_TSYNC_V2_HELLO = 29;
+/** Epoch-bearing v2 transform snapshot (unreliable, S→C). */
+export const KIND_TSYNC_V2_SNAPSHOT = 30;
+/** Epoch-fenced v2 transform input (unreliable, C→S). */
+export const KIND_TSYNC_V2_INPUT = 31;
 export const KIND_REP_DELTA = 13;
 export const KIND_REP_ACK = 14;
 export const KIND_REP_SCHEMA = 15;
@@ -70,6 +76,52 @@ export const NOTIFICATION_KIND_MIN = 27;
 export const NOTIFICATION_KIND_MAX = 27;
 export const CHAT_KIND_MIN = 28;
 export const CHAT_KIND_MAX = 28;
+
+/** Bytes of the v2 gameplay-clock prefix on a transform snapshot. */
+export const TSYNC_V2_CLOCK_BYTES = 18;
+
+/**
+ * Decode the v2 transform wrapper without interpreting the embedded v1
+ * snapshot. The returned `snapshotBody` is byte-for-byte the existing v1
+ * `KIND_TSYNC_SNAPSHOT` body, so callers retain their v1 decoder/fallback.
+ * `null` rejects a truncated or invalid (zero epoch/rate) wrapper.
+ */
+export function decodeTsyncV2Snapshot(body) {
+  if (body.length < TSYNC_V2_CLOCK_BYTES) return null;
+  const view = new DataView(body.buffer, body.byteOffset, body.length);
+  const epoch = view.getBigUint64(0, false);
+  const tick = view.getBigUint64(8, false);
+  const tickHz = view.getUint16(16, false);
+  if (epoch === 0n || tickHz === 0) return null;
+  return { epoch, tick, tickHz, snapshotBody: body.slice(TSYNC_V2_CLOCK_BYTES) };
+}
+
+/**
+ * Connection-local v2 epoch fence. It deliberately stores only an epoch and
+ * has no input-derived labels or diagnostics. A reconnect must call `reset`
+ * before admitting a different epoch; v1 handling is intentionally separate.
+ */
+export class TsyncV2EpochFence {
+  #epoch = null;
+
+  get epoch() { return this.#epoch; }
+
+  apply(body, decodeV1Snapshot) {
+    const decoded = decodeTsyncV2Snapshot(body);
+    if (decoded === null || (this.#epoch !== null && this.#epoch !== decoded.epoch)) return null;
+    const snapshot = decodeV1Snapshot(decoded.snapshotBody);
+    if (snapshot === null) return null;
+    this.#epoch = decoded.epoch;
+    return { clock: { epoch: decoded.epoch, tick: decoded.tick, tickHz: decoded.tickHz }, snapshot };
+  }
+
+  reset(epoch) {
+    epoch = BigInt(epoch);
+    if (epoch === 0n) return false;
+    this.#epoch = epoch;
+    return true;
+  }
+}
 
 // --- Auth --------------------------------------------------------------------
 

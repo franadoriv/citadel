@@ -46,6 +46,12 @@ namespace Citadel
         public const ushort KindTsyncRole = 11;
         /// <summary>Authoritative rewind result (reliable, S→C).</summary>
         public const ushort KindTsyncRewind = 12;
+        /// <summary>Negotiated v2 transform manifest (reliable, C↔S).</summary>
+        public const ushort KindTsyncV2Hello = 29;
+        /// <summary>Epoch-bearing v2 transform snapshot (unreliable, S→C).</summary>
+        public const ushort KindTsyncV2Snapshot = 30;
+        /// <summary>Epoch-fenced v2 transform input (unreliable, C→S).</summary>
+        public const ushort KindTsyncV2Input = 31;
 
         /// <summary>Client-&gt;server: create or join a named room.</summary>
         public const ushort KindRoomCreate = 21;

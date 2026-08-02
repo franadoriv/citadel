@@ -91,6 +91,170 @@ pub enum TsyncError {
     /// The underlying bit reader/writer failed.
     #[error("transform-sync bit error: {0}")]
     Bit(String),
+    /// A v2 manifest named a version or capability this implementation does not
+    /// support. Versioned transform frames are never guessed or downgraded.
+    #[error("unsupported transform-sync v2 manifest")]
+    UnsupportedVersion,
+}
+
+/// The only epoch-bearing transform-sync protocol version currently defined.
+pub const TSYNC_V2_VERSION: u8 = 2;
+/// Required capability bit for the v2 gameplay-clock metadata layout.
+pub const TSYNC_V2_CLOCK_CAPABILITY: u8 = 0b0000_0001;
+/// All currently-known v2 capability bits.
+pub const TSYNC_V2_KNOWN_CAPABILITIES: u8 = TSYNC_V2_CLOCK_CAPABILITY;
+const V2_MANIFEST_BYTES: usize = 2;
+
+/// Explicit v2 capability/version manifest exchanged on the dedicated v2 HELLO
+/// kind. Both fields must be exactly supported; mixed or unknown manifests are
+/// rejected instead of silently selecting a layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V2Manifest {
+    pub version: u8,
+    pub capabilities: u8,
+}
+
+impl V2Manifest {
+    #[must_use]
+    pub const fn clock() -> Self {
+        Self {
+            version: TSYNC_V2_VERSION,
+            capabilities: TSYNC_V2_CLOCK_CAPABILITY,
+        }
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; V2_MANIFEST_BYTES] {
+        [self.version, self.capabilities]
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, TsyncError> {
+        if body.len() != V2_MANIFEST_BYTES {
+            return Err(TsyncError::CountMismatch("v2 manifest length"));
+        }
+        let manifest = Self {
+            version: body[0],
+            capabilities: body[1],
+        };
+        if manifest.version != TSYNC_V2_VERSION
+            || manifest.capabilities != TSYNC_V2_CLOCK_CAPABILITY
+            || manifest.capabilities & !TSYNC_V2_KNOWN_CAPABILITIES != 0
+        {
+            return Err(TsyncError::UnsupportedVersion);
+        }
+        Ok(manifest)
+    }
+}
+
+/// Authoritative gameplay-clock metadata on a v2 snapshot. Epoch zero is
+/// reserved, tick is the completed authoritative step count, and rate is the
+/// configured effective simulation rate. It contains no wall-clock or RTT data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameplayClockMetadata {
+    pub epoch: u64,
+    pub tick: u64,
+    pub tick_hz: u16,
+}
+
+impl GameplayClockMetadata {
+    const BYTES: usize = 18;
+    pub fn encode(self, out: &mut Vec<u8>) -> Result<(), TsyncError> {
+        if self.epoch == 0 || self.tick_hz == 0 {
+            return Err(TsyncError::OutOfRange("gameplay clock metadata"));
+        }
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.tick.to_be_bytes());
+        out.extend_from_slice(&self.tick_hz.to_be_bytes());
+        Ok(())
+    }
+    pub fn decode(body: &[u8]) -> Result<(Self, &[u8]), TsyncError> {
+        if body.len() < Self::BYTES {
+            return Err(TsyncError::TooShort {
+                needed: Self::BYTES,
+                got: body.len(),
+            });
+        }
+        let epoch = u64::from_be_bytes(body[..8].try_into().expect("exact"));
+        let tick = u64::from_be_bytes(body[8..16].try_into().expect("exact"));
+        let tick_hz = u16::from_be_bytes(body[16..18].try_into().expect("exact"));
+        let metadata = Self {
+            epoch,
+            tick,
+            tick_hz,
+        };
+        if epoch == 0 || tick_hz == 0 {
+            return Err(TsyncError::OutOfRange("gameplay clock metadata"));
+        }
+        Ok((metadata, &body[Self::BYTES..]))
+    }
+}
+
+/// V2 snapshot wrapper. The embedded v1 snapshot bytes are byte-for-byte
+/// identical to `Snapshot::encode`; only the dedicated v2 kind selects this
+/// wrapper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotV2 {
+    pub clock: GameplayClockMetadata,
+    pub snapshot: Snapshot,
+}
+impl SnapshotV2 {
+    pub fn encode(&self, codec: &TransformCodec) -> Result<Vec<u8>, TsyncError> {
+        let mut out = Vec::with_capacity(GameplayClockMetadata::BYTES);
+        self.clock.encode(&mut out)?;
+        out.extend_from_slice(&self.snapshot.encode(codec)?);
+        Ok(out)
+    }
+    pub fn decode(body: &[u8], codec: &TransformCodec) -> Result<Self, TsyncError> {
+        let (clock, snapshot) = GameplayClockMetadata::decode(body)?;
+        Ok(Self {
+            clock,
+            snapshot: Snapshot::decode(snapshot, codec)?,
+        })
+    }
+}
+
+/// Bounded, untrusted diagnostic hints carried by v2 input. The server may log
+/// these only; they do not select a sim tick, authorize input, schedule work, or
+/// influence rewind/latency policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputDiagnosticHint {
+    pub last_observed_tick: u64,
+    pub flags: u8,
+}
+const INPUT_V2_PREFIX_BYTES: usize = 17;
+impl InputDiagnosticHint {
+    pub fn encode_v2(self, epoch: u64, bundle: &InputBundle) -> Result<Vec<u8>, TsyncError> {
+        if epoch == 0 || self.flags != 0 {
+            return Err(TsyncError::OutOfRange("v2 input hint"));
+        }
+        let mut out = Vec::with_capacity(INPUT_V2_PREFIX_BYTES);
+        out.extend_from_slice(&epoch.to_be_bytes());
+        out.extend_from_slice(&self.last_observed_tick.to_be_bytes());
+        out.push(self.flags);
+        out.extend_from_slice(&bundle.encode());
+        Ok(out)
+    }
+    pub fn decode_v2(body: &[u8]) -> Result<(u64, Self, InputBundle), TsyncError> {
+        if body.len() < INPUT_V2_PREFIX_BYTES {
+            return Err(TsyncError::TooShort {
+                needed: INPUT_V2_PREFIX_BYTES,
+                got: body.len(),
+            });
+        }
+        let epoch = u64::from_be_bytes(body[..8].try_into().expect("exact"));
+        let hint = Self {
+            last_observed_tick: u64::from_be_bytes(body[8..16].try_into().expect("exact")),
+            flags: body[16],
+        };
+        if epoch == 0 || hint.flags != 0 {
+            return Err(TsyncError::OutOfRange("v2 input hint"));
+        }
+        Ok((
+            epoch,
+            hint,
+            InputBundle::decode(&body[INPUT_V2_PREFIX_BYTES..])?,
+        ))
+    }
 }
 
 impl From<CodecError> for TsyncError {
@@ -1152,5 +1316,77 @@ mod tests {
         let mut bytes = snap.encode(&codec).unwrap();
         bytes.truncate(bytes.len() - 2);
         assert!(Snapshot::decode(&bytes, &codec).is_err());
+    }
+
+    #[test]
+    fn v2_manifest_is_exact_and_never_guesses_a_layout() {
+        assert_eq!(
+            V2Manifest::decode(&V2Manifest::clock().encode()).unwrap(),
+            V2Manifest::clock()
+        );
+        assert!(matches!(
+            V2Manifest::decode(&[1, TSYNC_V2_CLOCK_CAPABILITY]),
+            Err(TsyncError::UnsupportedVersion)
+        ));
+        assert!(matches!(
+            V2Manifest::decode(&[TSYNC_V2_VERSION, 0]),
+            Err(TsyncError::UnsupportedVersion)
+        ));
+        assert!(V2Manifest::decode(&[TSYNC_V2_VERSION, TSYNC_V2_CLOCK_CAPABILITY, 0]).is_err());
+    }
+
+    #[test]
+    fn v2_wrapper_preserves_the_embedded_v1_snapshot_bytes() {
+        let codec = codec();
+        let snapshot = Snapshot {
+            server_tick: 7,
+            snapshot_id: 9,
+            base_snapshot_id: 0,
+            send_rate_hz: 20,
+            removed: vec![],
+            updates: vec![],
+        };
+        let v1 = snapshot.encode(&codec).unwrap();
+        let v2 = SnapshotV2 {
+            clock: GameplayClockMetadata {
+                epoch: 4,
+                tick: u64::MAX,
+                tick_hz: 60,
+            },
+            snapshot: snapshot.clone(),
+        }
+        .encode(&codec)
+        .unwrap();
+        assert_eq!(&v2[GameplayClockMetadata::BYTES..], v1.as_slice());
+        assert_eq!(SnapshotV2::decode(&v2, &codec).unwrap().snapshot, snapshot);
+        assert!(SnapshotV2::decode(&v2[..17], &codec).is_err());
+    }
+
+    #[test]
+    fn v2_input_hint_is_bounded_and_rejects_invalid_flags_or_epoch() {
+        let bundle = InputBundle {
+            acked_snapshot_id: 0,
+            last_seen_snapshot_id: 0,
+            frames: vec![],
+        };
+        let body = InputDiagnosticHint {
+            last_observed_tick: 99,
+            flags: 0,
+        }
+        .encode_v2(5, &bundle)
+        .unwrap();
+        let (epoch, hint, decoded) = InputDiagnosticHint::decode_v2(&body).unwrap();
+        assert_eq!(
+            (epoch, hint.last_observed_tick, decoded),
+            (5, 99, bundle.clone())
+        );
+        assert!(
+            InputDiagnosticHint::default()
+                .encode_v2(0, &bundle)
+                .is_err()
+        );
+        let mut invalid = body;
+        invalid[16] = 1;
+        assert!(InputDiagnosticHint::decode_v2(&invalid).is_err());
     }
 }

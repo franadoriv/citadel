@@ -56,12 +56,19 @@ struct FCitadelRemoteObject
 class FCitadelRemoteWorldView
 {
 public:
-    void SetCodec(const CitadelTransform::FCodecParams& InParams) { Params = InParams; bHaveCodec = true; }
+    void SetCodec(const CitadelTransform::FCodecParams& InParams);
     bool HasCodec() const { return bHaveCodec; }
     const CitadelTransform::FCodecParams& GetCodec() const { return Params; }
 
     /** Decode + apply a snapshot datagram body. Returns true if applied. */
     bool ApplyDatagram(const uint8* Body, int32 Len);
+    /** Decode/apply a v2 wrapper, rejecting a stale/mixed gameplay-clock epoch. */
+    bool ApplyV2Datagram(const uint8* Body, int32 Len);
+    /** Clear all baselines/samples before admitting a new reconnect epoch. */
+    bool ResetV2Epoch(uint64 Epoch);
+    /** The accepted v2 epoch/tick for owner input diagnostics (zero = none). */
+    uint64 V2Epoch() const { return ClockEpoch; }
+    uint64 LastObservedV2Tick() const { return LastObservedClockTick; }
 
     /** The ack to send back (fills an 8-byte KIND_TSYNC_ACK body). */
     void AckBytes(uint8 Out[8]) const;
@@ -102,6 +109,8 @@ private:
 
     CitadelTransform::FCodecParams Params;
     bool bHaveCodec = false;
+    uint64 ClockEpoch = 0;
+    uint64 LastObservedClockTick = 0;
 
     // snapshotId -> (objectId -> reconstructed object).
     TMap<uint32, TMap<uint32, FCitadelRemoteObject>> Ring;
@@ -123,6 +132,8 @@ private:
     float BufferFloor = 1.5f;
     float BufferCeil = 2.5f;
     bool bAdaptive = true;
+
+    void ResetState();
 
     void Ack(uint32 Id);
     void PushSample(uint32 ObjectId, uint32 Tick, const FCitadelRemoteObject& Obj);
@@ -268,7 +279,7 @@ public:
     /**
      * The only owner write path (design §2.3, §5.1): predict `MoveVelocity`
      * (cm/s) locally over `Dt`, buffer + bundle the input redundantly, and send
-     * KIND_TSYNC_INPUT. The component never writes transform to the server
+     * KIND_TSYNC_INPUT (or negotiated KIND_TSYNC_V2_INPUT). The component never writes transform to the server
      * directly. No-op unless this client owns the object (OwnerPredicted).
      */
     UFUNCTION(BlueprintCallable, Category = "Citadel|Predict")
@@ -364,6 +375,8 @@ public:
 
     /** Send a raw transform-sync frame on the active connection (used by inputs). */
     void SendFrame(uint16 Kind, const TArray<uint8>& Body, bool bReliable);
+    /** True only after the server echoes the exact v2 manifest for this HELLO lifetime. */
+    bool IsV2InputNegotiated() const { return bV2Negotiated && WorldView.V2Epoch() != 0; }
 
     /** Register/unregister a component so it is updated each frame. */
     void RegisterComponent(UCitadelTransformSync* Component);
@@ -386,10 +399,12 @@ private:
     UPROPERTY()
     TArray<TWeakObjectPtr<UCitadelTransformSync>> Components;
     bool bOptedIn = false;
+    bool bV2Negotiated = false;
     /** The local player's participant id (0 = unknown; see SetLocalParticipantId). */
     uint64 LocalParticipantId = 0;
 
     void PumpInbound();
+    void SendV2Hello();
     void SendAck();
     /** Route a decoded KIND_TSYNC_ROLE frame to the matching component. */
     void RouteRoleFrame(const uint8* Body, int32 Len);

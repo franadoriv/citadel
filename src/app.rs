@@ -26,6 +26,7 @@ use crate::services::{
     LeaderboardService, NotificationService, PlayerNotificationService, PurchaseService,
     SharedSessionService, WalletService,
 };
+use crate::time::{Clock, SystemClock};
 
 /// Crate version, surfaced for `--version` and health responses.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -62,6 +63,7 @@ pub struct App {
     chat: Arc<ChatService>,
     chat_rate_limits: Arc<ChatRateLimitPolicy>,
     auth_rate_limits: Arc<AuthenticationRateLimitPolicy>,
+    auth_clock: Arc<dyn Clock + Send + Sync>,
     database_explorer_rate_limiter: Arc<DatabaseExplorerRateLimiter>,
     runtime_http_endpoint_rate_limiter: Arc<crate::runtime::RuntimeHttpEndpointRateLimiter>,
     runtime_event_bus: Arc<crate::runtime::RuntimeEventBus>,
@@ -179,6 +181,7 @@ impl App {
             chat,
             chat_rate_limits,
             auth_rate_limits,
+            auth_clock: Arc::new(SystemClock),
             database_explorer_rate_limiter,
             runtime_http_endpoint_rate_limiter,
             runtime_event_bus,
@@ -379,6 +382,22 @@ impl App {
         &self.auth_rate_limits
     }
 
+    /// Replace the clock used by HTTP authentication admission.
+    ///
+    /// Production composition retains [`SystemClock`]; isolated HTTP tests can
+    /// supply a controllable clock without changing fixed-window semantics.
+    #[must_use]
+    pub fn with_auth_clock(mut self, clock: Arc<dyn Clock + Send + Sync>) -> Self {
+        self.auth_clock = clock;
+        self
+    }
+
+    /// The clock used when admitting public authentication attempts.
+    #[must_use]
+    pub fn auth_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.auth_clock
+    }
+
     /// Per-operator admission bound for console database exploration.
     #[must_use]
     pub fn database_explorer_rate_limiter(&self) -> &Arc<DatabaseExplorerRateLimiter> {
@@ -446,6 +465,18 @@ impl App {
     #[must_use]
     pub fn realtime_gateway(&self) -> Option<Arc<crate::realtime::Gateway>> {
         self.realtime.get().cloned()
+    }
+
+    /// Compose durable session revocation with exact local live-session
+    /// fencing. The gateway is optional only for HTTP-only nodes, where no
+    /// connection can be live; callers always use this coordinator rather than
+    /// bypassing the close boundary.
+    #[must_use]
+    pub fn session_revocation_coordinator(&self) -> crate::services::SessionRevocationCoordinator {
+        crate::services::SessionRevocationCoordinator::new(
+            Arc::clone(&self.sessions),
+            self.realtime_gateway(),
+        )
     }
 
     /// The per-user virtual-currency wallet store (, persisted in

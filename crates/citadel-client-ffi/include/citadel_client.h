@@ -743,6 +743,29 @@ CitadelStatus citadel_transform_view_apply_datagram(CitadelTransformView *view,
                                                     bool *out_applied);
 
 /**
+ * Decode and apply one negotiated `KIND_TSYNC_V2_SNAPSHOT` body. The v2
+ * clock epoch is fenced by the view: stale or mixed epochs return
+ * `out_applied = false` and never contaminate v1/v2 baseline state.
+ *
+ * # Safety
+ * Same pointer requirements as [`citadel_transform_view_apply_datagram`].
+ */
+CitadelStatus citadel_transform_view_apply_v2_datagram(CitadelTransformView *view,
+                                                       const uint8_t *body,
+                                                       uintptr_t body_len,
+                                                       bool *out_applied);
+
+/**
+ * Fence this transform view for a negotiated reconnect/reset epoch. This
+ * clears all snapshot baselines, samples and acknowledgements so no stale
+ * state can cross a match lifetime.
+ *
+ * # Safety
+ * `view` must be live and `epoch` must be nonzero.
+ */
+CitadelStatus citadel_transform_view_reset_v2_epoch(CitadelTransformView *view, uint64_t epoch);
+
+/**
  * Return the runtime's current adaptive-buffer sample for an object.
  *
  * # Safety

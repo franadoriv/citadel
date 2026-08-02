@@ -7,11 +7,11 @@
 //! purely over abstract outbound sinks and never depends on a concrete
 //! transport.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard, Notify, mpsc};
 
 use citadel_wire::protocol::KIND_PEER_POSITION;
 
@@ -89,25 +89,66 @@ pub struct Outbound {
     pub delivery: Delivery,
     /// The envelope to send.
     pub envelope: Envelope,
+    /// The connection-local close fence assigned by the registry at enqueue.
+    /// Directly constructed outbound messages are unfenced until routed.
+    fence: Option<Arc<AtomicBool>>,
+    /// Serializes a final delivery decision with session revocation. This is
+    /// per connection, never a registry-wide lock, so a slow peer cannot stall
+    /// unrelated sessions.
+    delivery_gate: Option<Arc<AsyncMutex<()>>>,
 }
 
 impl Outbound {
+    /// Construct an envelope with an explicit transport delivery class.
+    #[must_use]
+    pub fn new(delivery: Delivery, envelope: Envelope) -> Self {
+        Self {
+            delivery,
+            envelope,
+            fence: None,
+            delivery_gate: None,
+        }
+    }
+
     /// A reliable outbound envelope.
     #[must_use]
     pub fn reliable(envelope: Envelope) -> Self {
-        Self {
-            delivery: Delivery::Reliable,
-            envelope,
-        }
+        Self::new(Delivery::Reliable, envelope)
     }
 
     /// An unreliable outbound envelope.
     #[must_use]
     pub fn unreliable(envelope: Envelope) -> Self {
-        Self {
-            delivery: Delivery::Unreliable,
-            envelope,
-        }
+        Self::new(Delivery::Unreliable, envelope)
+    }
+
+    fn fenced(mut self, fence: Arc<AtomicBool>, delivery_gate: Arc<AsyncMutex<()>>) -> Self {
+        self.fence = Some(fence);
+        self.delivery_gate = Some(delivery_gate);
+        self
+    }
+
+    /// Acquire the connection-local delivery lease. The returned lease must be
+    /// kept through the actual transport I/O. Revocation acquires this same
+    /// gate before lowering the fence: therefore either I/O completes before
+    /// revocation linearizes, or the writer observes the lowered fence and does
+    /// not begin I/O. Never hold registry/session locks while awaiting it.
+    pub async fn acquire_delivery(&self) -> Option<MutexGuard<'_, ()>> {
+        let gate = self.delivery_gate.as_ref()?;
+        let permit = gate.lock().await;
+        self.is_deliverable().then_some(permit)
+    }
+
+    /// Whether this envelope may still cross the transport boundary.
+    ///
+    /// Writers must check this immediately before writing: a close can race an
+    /// already dequeued reliable envelope, while latest-wins mailboxes are
+    /// cleared eagerly at close.
+    #[must_use]
+    pub fn is_deliverable(&self) -> bool {
+        self.fence
+            .as_ref()
+            .is_none_or(|fence| fence.load(Ordering::Acquire))
     }
 }
 
@@ -199,6 +240,14 @@ impl LatestOutboundSender {
         drop(pending);
         self.inner.notify.notify_one();
         true
+    }
+
+    /// Drop all pending latest-wins state during connection close.
+    fn clear(&self) {
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.values.clear();
+            pending.order.clear();
+        }
     }
 }
 
@@ -295,6 +344,147 @@ pub struct SessionHandle {
     pub identity: Option<ParticipantIdentity>,
 }
 
+/// Stable public class for a server-initiated close.  Internal revocation
+/// causes deliberately do not cross this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicCloseClass {
+    /// The authenticated session is no longer usable.
+    SessionEnded,
+    /// A trusted runtime removed the connection.
+    Removed,
+    /// A trusted runtime applied policy.
+    Policy,
+}
+
+/// An opaque, generation-fenced reference to one local connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionRef {
+    id: ParticipantId,
+    generation: u64,
+}
+
+impl ConnectionRef {
+    #[must_use]
+    pub(crate) const fn participant_id(self) -> ParticipantId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseDisposition {
+    Closing,
+    Duplicate,
+    Stale,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    Active,
+    Closing,
+    Closed,
+}
+
+/// Per-connection linearization point for application work and teardown.
+///
+/// `close` wins over all later sends.  Cleanup is claimed separately so a
+/// transport teardown racing a revocation runs gateway cleanup exactly once.
+#[derive(Debug)]
+struct RealtimeConnectionController {
+    state: Mutex<ConnectionControl>,
+    accepting: Arc<AtomicBool>,
+    delivery_gate: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Debug)]
+struct ConnectionControl {
+    state: ConnectionState,
+    cleanup_claimed: bool,
+    close_ids: Vec<String>,
+}
+
+impl RealtimeConnectionController {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ConnectionControl {
+                state: ConnectionState::Active,
+                cleanup_claimed: false,
+                close_ids: Vec::new(),
+            }),
+            accepting: Arc::new(AtomicBool::new(true)),
+            delivery_gate: Arc::new(AsyncMutex::new(())),
+        }
+    }
+    fn accepts_work(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+    fn send(&self, f: impl FnOnce() -> bool) -> bool {
+        let Ok(control) = self.state.lock() else {
+            return false;
+        };
+        matches!(control.state, ConnectionState::Active) && f()
+    }
+    async fn close(&self, command_id: &str) -> CloseDisposition {
+        // Lock ordering invariant: delivery gate -> control state. Writers
+        // acquire only the gate; registry operations acquire only control
+        // state, so there is no cycle and no global I/O serialization.
+        let _delivery = self.delivery_gate.lock().await;
+        let Ok(mut control) = self.state.lock() else {
+            return CloseDisposition::Unknown;
+        };
+        if control.close_ids.iter().any(|id| id == command_id) {
+            return CloseDisposition::Duplicate;
+        }
+        if matches!(control.state, ConnectionState::Closed) {
+            return CloseDisposition::Unknown;
+        }
+        control.close_ids.push(command_id.to_owned());
+        control.state = ConnectionState::Closing;
+        // This release is the application/transport cutoff. A writer that
+        // dequeued an envelope before close observes it before socket I/O.
+        self.accepting.store(false, Ordering::Release);
+        CloseDisposition::Closing
+    }
+    fn claim_cleanup(&self) -> bool {
+        let Ok(mut control) = self.state.lock() else {
+            return false;
+        };
+        if control.cleanup_claimed {
+            return false;
+        }
+        control.cleanup_claimed = true;
+        control.state = ConnectionState::Closing;
+        self.accepting.store(false, Ordering::Release);
+        true
+    }
+    fn finish_cleanup(&self) {
+        if let Ok(mut control) = self.state.lock() {
+            control.state = ConnectionState::Closed;
+        }
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    fn fence(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.accepting)
+    }
+
+    fn delivery_gate(&self) -> Arc<AsyncMutex<()>> {
+        Arc::clone(&self.delivery_gate)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredSession {
+    handle: SessionHandle,
+    controller: Arc<RealtimeConnectionController>,
+    generation: u64,
+}
+
 impl SessionHandle {
     /// Whether this participant is bound to an authenticated account.
     #[must_use]
@@ -309,8 +499,14 @@ impl SessionHandle {
 /// session/presence directories. Fan-out delivers to abstract outbound sinks.
 #[derive(Debug, Clone, Default)]
 pub struct SessionRegistry {
-    sessions: Arc<Mutex<HashMap<ParticipantId, SessionHandle>>>,
+    sessions: Arc<Mutex<HashMap<ParticipantId, RegisteredSession>>>,
     unreliable: Arc<Mutex<HashMap<ParticipantId, LatestOutboundSender>>>,
+    /// Durable revocation has linearized for these exact sessions. Keeping the
+    /// tombstone under the session-map lock closes the publication race: a
+    /// registration either publishes before the tombstone and is fenced by the
+    /// same close, or observes it and never publishes/delivers an auth result.
+    revoked_sessions: Arc<Mutex<HashSet<SessionId>>>,
+    next_generation: Arc<AtomicU64>,
 }
 
 impl SessionRegistry {
@@ -322,12 +518,52 @@ impl SessionRegistry {
 
     /// Register a session handle.
     pub fn register(&self, handle: SessionHandle) -> LatestOutboundReceiver {
+        self.register_with_initial(handle, None)
+    }
+
+    /// Register a session and atomically seed its reliable queue.
+    ///
+    /// The optional initial envelope is fenced by the same controller that owns
+    /// the new session *before* the session becomes visible to a concurrent
+    /// close. This is for protocol replies, such as an accepted auth result,
+    /// which must be first in the reliable queue without bypassing the close
+    /// fence through a raw transport sender.
+    pub fn register_with_initial(
+        &self,
+        handle: SessionHandle,
+        initial: Option<Outbound>,
+    ) -> LatestOutboundReceiver {
         let (sender, receiver) = latest_outbound_channel();
         if let Ok(mut map) = self.unreliable.lock() {
             map.insert(handle.id, sender);
         }
         if let Ok(mut map) = self.sessions.lock() {
-            map.insert(handle.id, handle);
+            let controller = Arc::new(RealtimeConnectionController::new());
+            let revoked = handle.identity.as_ref().is_some_and(|identity| {
+                self.revoked_sessions
+                    .lock()
+                    .is_ok_and(|revoked| revoked.contains(&identity.session_id))
+            });
+            if revoked {
+                return receiver;
+            }
+            if let Some(initial) = initial {
+                // The channel is new and therefore cannot be full. Keep the
+                // result best-effort so a closed writer still follows normal
+                // transport teardown instead of failing registration.
+                let _ = handle
+                    .outbound
+                    .try_send(initial.fenced(controller.fence(), controller.delivery_gate()));
+            }
+            let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+            map.insert(
+                handle.id,
+                RegisteredSession {
+                    handle,
+                    controller,
+                    generation,
+                },
+            );
         }
         receiver
     }
@@ -339,7 +575,10 @@ impl SessionRegistry {
     /// when it was incremented) versus a guest participant.
     pub fn unregister(&self, id: ParticipantId) -> Option<SessionHandle> {
         let removed = match self.sessions.lock() {
-            Ok(mut map) => map.remove(&id),
+            Ok(mut map) => map.remove(&id).map(|entry| {
+                entry.controller.finish_cleanup();
+                entry.handle
+            }),
             Err(_) => None,
         };
         if let Ok(mut map) = self.unreliable.lock() {
@@ -348,16 +587,110 @@ impl SessionRegistry {
         removed
     }
 
-    /// Clone the outbound sink for a participant, if registered.
-    ///
-    /// Lets an async task deliver a correlated reply to a caller after the
-    /// synchronous `handle_inbound` has already returned (built-in domain RPC;
-    /// ). The clone keeps the session alive only as a channel endpoint,
-    /// not as a registry lock, so the spawned task never contends the registry.
+    /// Atomically claim the once-only gateway cleanup for a connection.
+    pub fn claim_cleanup(&self, id: ParticipantId) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&id).map(|entry| entry.controller.claim_cleanup()))
+            .unwrap_or(false)
+    }
+
+    /// Close all local connections for this exact authenticated session.
+    /// A stale generation is harmless and cannot close a replacement connection.
+    pub async fn close_session(
+        &self,
+        session_id: &SessionId,
+        command_id: &str,
+        expected_generation: Option<u64>,
+    ) -> Vec<(ConnectionRef, CloseDisposition)> {
+        let entries: Vec<_> = {
+            let Ok(map) = self.sessions.lock() else {
+                return Vec::new();
+            };
+            let revocation_targets_live_generation = expected_generation.is_none_or(|generation| {
+                map.values().any(|entry| {
+                    entry.handle.identity.as_ref().is_some_and(|identity| {
+                        &identity.session_id == session_id && entry.generation == generation
+                    })
+                })
+            });
+            if revocation_targets_live_generation
+                && let Ok(mut revoked) = self.revoked_sessions.lock()
+            {
+                revoked.insert(session_id.clone());
+            }
+            map.values()
+                .filter(|entry| {
+                    entry
+                        .handle
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| &identity.session_id == session_id)
+                })
+                .map(|entry| {
+                    let reference = ConnectionRef {
+                        id: entry.handle.id,
+                        generation: entry.generation,
+                    };
+                    (reference, Arc::clone(&entry.controller), entry.generation)
+                })
+                .collect()
+        };
+        let mut closed = Vec::with_capacity(entries.len());
+        for (reference, controller, generation) in entries {
+            let result = if expected_generation.is_some_and(|value| value != generation) {
+                CloseDisposition::Stale
+            } else {
+                controller.close(command_id).await
+            };
+            closed.push((reference, result));
+        }
+        // Registration takes the unreliable then session locks. Clear mailbox
+        // state only after releasing the session lock to preserve that order.
+        if let Ok(unreliable) = self.unreliable.lock() {
+            for (connection, disposition) in &closed {
+                if *disposition == CloseDisposition::Closing
+                    && let Some(sender) = unreliable.get(&connection.id)
+                {
+                    sender.clear();
+                }
+            }
+        }
+        closed
+    }
+
+    /// Current local references for an exact session; never substitutes user id.
     #[must_use]
-    pub fn outbound_of(&self, id: ParticipantId) -> Option<mpsc::Sender<Outbound>> {
-        let map = self.sessions.lock().ok()?;
-        map.get(&id).map(|handle| handle.outbound.clone())
+    pub fn connections_for_session(&self, session_id: &SessionId) -> Vec<ConnectionRef> {
+        self.sessions
+            .lock()
+            .map(|map| {
+                map.values()
+                    .filter(|entry| {
+                        entry
+                            .handle
+                            .identity
+                            .as_ref()
+                            .is_some_and(|identity| &identity.session_id == session_id)
+                    })
+                    .map(|entry| ConnectionRef {
+                        id: entry.handle.id,
+                        generation: entry.generation,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether an exact participant may begin more application work.
+    #[must_use]
+    pub fn accepts_work(&self, id: ParticipantId) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&id).map(|entry| entry.controller.accepts_work()))
+            .unwrap_or(false)
     }
 
     /// The authenticated account id bound to a participant, if any.
@@ -368,7 +701,7 @@ impl SessionRegistry {
     #[must_use]
     pub fn user_id_of(&self, id: ParticipantId) -> Option<String> {
         let map = self.sessions.lock().ok()?;
-        let handle = map.get(&id)?;
+        let handle = &map.get(&id)?.handle;
         handle
             .identity
             .as_ref()
@@ -383,13 +716,14 @@ impl SessionRegistry {
     pub fn participant_for_user(&self, user_id: &str) -> Option<ParticipantId> {
         let map = self.sessions.lock().ok()?;
         map.values()
-            .filter(|handle| {
-                handle
+            .filter(|entry| {
+                entry
+                    .handle
                     .identity
                     .as_ref()
                     .is_some_and(|identity| identity.user_id.as_str() == user_id)
             })
-            .map(|handle| handle.id)
+            .map(|entry| entry.handle.id)
             .min()
     }
 
@@ -404,13 +738,14 @@ impl SessionRegistry {
             return Vec::new();
         };
         map.values()
-            .filter(|handle| {
-                handle
+            .filter(|entry| {
+                entry
+                    .handle
                     .identity
                     .as_ref()
                     .is_some_and(|identity| identity.user_id.as_str() == user_id)
             })
-            .map(|handle| handle.id)
+            .map(|entry| entry.handle.id)
             .collect()
     }
 
@@ -435,8 +770,8 @@ impl SessionRegistry {
         let recipients: Vec<ParticipantId> = match self.sessions.lock() {
             Ok(map) => map
                 .values()
-                .filter(|h| h.id != sender)
-                .map(|h| h.id)
+                .filter(|entry| entry.handle.id != sender)
+                .map(|entry| entry.handle.id)
                 .collect(),
             Err(_) => return 0,
         };
@@ -457,7 +792,7 @@ impl SessionRegistry {
     /// [`broadcast_except`]: SessionRegistry::broadcast_except
     pub fn broadcast_all(&self, outbound: &Outbound) -> usize {
         let recipients: Vec<ParticipantId> = match self.sessions.lock() {
-            Ok(map) => map.values().map(|handle| handle.id).collect(),
+            Ok(map) => map.values().map(|entry| entry.handle.id).collect(),
             Err(_) => return 0,
         };
         let mut delivered = 0;
@@ -507,20 +842,38 @@ impl SessionRegistry {
     ///
     /// [`broadcast_except`]: SessionRegistry::broadcast_except
     pub fn send_to(&self, id: ParticipantId, outbound: &Outbound) -> bool {
-        if outbound.delivery == Delivery::Unreliable {
-            let sender = self
-                .unreliable
-                .lock()
-                .ok()
-                .and_then(|map| map.get(&id).cloned());
-            return sender.is_some_and(|sender| sender.replace(outbound.clone()));
-        }
-        let handle = match self.sessions.lock() {
+        let entry = match self.sessions.lock() {
             Ok(map) => map.get(&id).cloned(),
             Err(_) => None,
         };
-        match handle {
-            Some(handle) => handle.outbound.try_send(outbound.clone()).is_ok(),
+        match entry {
+            Some(entry) if outbound.delivery == Delivery::Unreliable => {
+                let sender = self
+                    .unreliable
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&id).cloned());
+                entry.controller.send(|| {
+                    sender.is_some_and(|sender| {
+                        sender.replace(
+                            outbound
+                                .clone()
+                                .fenced(entry.controller.fence(), entry.controller.delivery_gate()),
+                        )
+                    })
+                })
+            }
+            Some(entry) => entry.controller.send(|| {
+                entry
+                    .handle
+                    .outbound
+                    .try_send(
+                        outbound
+                            .clone()
+                            .fenced(entry.controller.fence(), entry.controller.delivery_gate()),
+                    )
+                    .is_ok()
+            }),
             None => false,
         }
     }
@@ -714,5 +1067,345 @@ mod tests {
     #[test]
     fn participant_id_from_raw_round_trips() {
         assert_eq!(ParticipantId::from_raw(7).get(), 7);
+    }
+
+    fn authenticated_handle(
+        id: u64,
+        user: &str,
+        session: &str,
+    ) -> (SessionHandle, mpsc::Receiver<Outbound>) {
+        let (mut handle, receiver) = handle(id, TransportKind::WebSocket);
+        handle.identity = Some(ParticipantIdentity {
+            user_id: UserId::new(user).expect("user"),
+            session_id: SessionId::new(session).expect("session"),
+            expires_at: TimestampMillis::from_unix_millis(10_000),
+        });
+        (handle, receiver)
+    }
+
+    #[tokio::test]
+    async fn exact_session_close_does_not_conflate_same_user_devices() {
+        let registry = SessionRegistry::new();
+        let (first, _first_rx) = authenticated_handle(1, "same-user", "session-a");
+        let (second, mut second_rx) = authenticated_handle(2, "same-user", "session-b");
+        registry.register(first);
+        registry.register(second);
+
+        let session_a = SessionId::new("session-a").expect("session");
+        let closed = registry.close_session(&session_a, "revoke-1", None).await;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].1, CloseDisposition::Closing);
+        assert!(!registry.send_to(
+            ParticipantId(1),
+            &Outbound::reliable(Envelope::new(1, b"blocked".to_vec()))
+        ));
+        assert!(registry.send_to(
+            ParticipantId(2),
+            &Outbound::reliable(Envelope::new(1, b"allowed".to_vec()))
+        ));
+        assert_eq!(
+            second_rx
+                .try_recv()
+                .expect("other device remains active")
+                .envelope
+                .body,
+            &b"allowed"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_close_and_stale_generation_are_harmless() {
+        let registry = SessionRegistry::new();
+        let (handle, _receiver) = authenticated_handle(1, "u", "session-a");
+        registry.register(handle);
+        let session = SessionId::new("session-a").expect("session");
+        let generation = registry.connections_for_session(&session)[0].generation();
+        assert_eq!(
+            registry
+                .close_session(&session, "revoke-1", Some(generation))
+                .await[0]
+                .1,
+            CloseDisposition::Closing
+        );
+        assert_eq!(
+            registry
+                .close_session(&session, "revoke-1", Some(generation))
+                .await[0]
+                .1,
+            CloseDisposition::Duplicate
+        );
+        assert_eq!(
+            registry
+                .close_session(&session, "revoke-2", Some(generation + 1))
+                .await[0]
+                .1,
+            CloseDisposition::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn close_fences_every_outbound_class_and_invalidates_queued_delivery() {
+        let registry = SessionRegistry::new();
+        let (handle, mut reliable) = authenticated_handle(1, "u", "session-a");
+        let latest = registry.register(handle);
+        let id = ParticipantId(1);
+
+        // Queue both classes before close. Reliable entries may already have
+        // reached the transport receiver, so they carry the close fence; latest
+        // entries are physically discarded from their mailbox.
+        assert!(registry.send_to(id, &Outbound::reliable(Envelope::new(1, &b"queued"[..]))));
+        assert!(registry.send_to(id, &Outbound::unreliable(Envelope::new(2, &b"latest"[..]))));
+        let session = SessionId::new("session-a").expect("session");
+        assert_eq!(
+            registry.close_session(&session, "revoke-1", None).await[0].1,
+            CloseDisposition::Closing
+        );
+
+        assert!(!registry.accepts_work(id));
+        assert!(!registry.send_to(id, &Outbound::reliable(Envelope::new(3, &b"reliable"[..]))));
+        assert!(!registry.send_to(
+            id,
+            &Outbound::unreliable(Envelope::new(4, &b"unreliable"[..]))
+        ));
+        // `send_to` is also the registry-owned path used by delayed raw/domain
+        // async replies, so it receives the same controller fence.
+        assert!(!registry.send_to(id, &Outbound::reliable(Envelope::new(5, &b"async"[..]))));
+
+        assert!(
+            !reliable
+                .recv()
+                .await
+                .expect("queued reliable")
+                .is_deliverable(),
+            "transport must discard a reliable envelope dequeued before close"
+        );
+        assert!(matches!(
+            latest.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_auth_result_is_fenced_for_every_transport_without_closing_siblings() {
+        for kind in [
+            TransportKind::WebSocket,
+            TransportKind::Quic,
+            TransportKind::WebTransport,
+        ] {
+            let registry = SessionRegistry::new();
+            let (revoked, mut revoked_rx) = authenticated_handle(1, "same-user", "session-a");
+            let (sibling, mut sibling_rx) = authenticated_handle(2, "same-user", "session-b");
+            let auth_result = Outbound::reliable(Envelope::new(
+                citadel_wire::protocol::KIND_AUTH_RESULT,
+                b"accepted".to_vec(),
+            ));
+
+            // This models the transport registration boundary: the auth reply
+            // is already in the writer queue, but is controlled by the same
+            // fence that a concurrent revocation closes.
+            registry.register_with_initial(SessionHandle { kind, ..revoked }, Some(auth_result));
+            registry.register(SessionHandle { kind, ..sibling });
+
+            let session_a = SessionId::new("session-a").expect("session");
+            assert_eq!(
+                registry
+                    .close_session(&session_a, "revoke-race", None)
+                    .await[0]
+                    .1,
+                CloseDisposition::Closing,
+                "{kind:?} must linearize close after initial auth enqueue"
+            );
+            let queued_auth = revoked_rx.recv().await.expect("queued auth result");
+            assert_eq!(
+                queued_auth.envelope.kind,
+                citadel_wire::protocol::KIND_AUTH_RESULT
+            );
+            assert!(
+                !queued_auth.is_deliverable(),
+                "{kind:?} writer must reject the auth result after revocation"
+            );
+
+            assert!(registry.send_to(
+                ParticipantId(2),
+                &Outbound::reliable(Envelope::new(1, b"sibling-active".to_vec()))
+            ));
+            assert_eq!(
+                sibling_rx
+                    .recv()
+                    .await
+                    .expect("sibling delivery")
+                    .envelope
+                    .body,
+                &b"sibling-active"[..]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_lease_and_revocation_have_no_check_then_io_gap_for_every_transport() {
+        for kind in [
+            TransportKind::WebSocket,
+            TransportKind::Quic,
+            TransportKind::WebTransport,
+        ] {
+            let registry = SessionRegistry::new();
+            let (handle, mut rx) = authenticated_handle(1, "same-user", "session-a");
+            registry.register_with_initial(
+                SessionHandle { kind, ..handle },
+                Some(Outbound::reliable(Envelope::new(
+                    citadel_wire::protocol::KIND_AUTH_RESULT,
+                    b"accepted".to_vec(),
+                ))),
+            );
+            let outbound = rx.recv().await.expect("initial auth result");
+            // Model a writer that has dequeued the reply and is poised at the
+            // transport I/O boundary. Revocation cannot complete until this
+            // lease (and therefore the modeled I/O) completes.
+            let lease = outbound.acquire_delivery().await.expect("delivery lease");
+            let session = SessionId::new("session-a").expect("session");
+            let close_registry = registry.clone();
+            let close = tokio::spawn(async move {
+                close_registry
+                    .close_session(&session, "revoke-race", None)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !close.is_finished(),
+                "{kind:?} close must wait for in-flight transport I/O rather than race a pre-check"
+            );
+            drop(lease); // modeled I/O completion is the delivery linearization point
+            assert_eq!(
+                close.await.expect("close task")[0].1,
+                CloseDisposition::Closing
+            );
+            assert!(
+                outbound.acquire_delivery().await.is_none(),
+                "{kind:?} no second/late auth-result write is admitted after revocation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_before_publication_blocks_auth_result_but_not_sibling_or_new_generation() {
+        let registry = SessionRegistry::new();
+        let revoked = SessionId::new("session-a").expect("session");
+        // There is deliberately no registration yet: this is the adversarial
+        // durable-revoke-before-publication interleaving.
+        assert!(
+            registry
+                .close_session(&revoked, "revoke-before-register", None)
+                .await
+                .is_empty()
+        );
+
+        for kind in [
+            TransportKind::WebSocket,
+            TransportKind::Quic,
+            TransportKind::WebTransport,
+        ] {
+            let (late, mut late_rx) = authenticated_handle(1, "same-user", "session-a");
+            registry.register_with_initial(
+                SessionHandle { kind, ..late },
+                Some(Outbound::reliable(Envelope::new(
+                    citadel_wire::protocol::KIND_AUTH_RESULT,
+                    b"must-not-deliver".to_vec(),
+                ))),
+            );
+            assert!(!registry.accepts_work(ParticipantId(1)));
+            assert!(
+                late_rx.try_recv().is_err(),
+                "{kind:?} must not enqueue an auth result after pre-publication revocation"
+            );
+        }
+
+        let (sibling, mut sibling_rx) = authenticated_handle(2, "same-user", "session-b");
+        registry.register(sibling);
+        assert!(registry.send_to(
+            ParticipantId(2),
+            &Outbound::reliable(Envelope::new(1, b"sibling-stays-live".to_vec()))
+        ));
+        assert_eq!(
+            sibling_rx.recv().await.expect("sibling").envelope.body,
+            &b"sibling-stays-live"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_does_not_fence_replacement_initial_auth_result() {
+        let registry = SessionRegistry::new();
+        let (first, _first_rx) = authenticated_handle(1, "u", "session-a");
+        registry.register(first);
+        let session = SessionId::new("session-a").expect("session");
+        let stale_generation = registry.connections_for_session(&session)[0].generation();
+
+        let (replacement, mut replacement_rx) = authenticated_handle(1, "u", "session-a");
+        registry.register_with_initial(
+            replacement,
+            Some(Outbound::reliable(Envelope::new(
+                citadel_wire::protocol::KIND_AUTH_RESULT,
+                b"replacement".to_vec(),
+            ))),
+        );
+        assert_eq!(
+            registry
+                .close_session(&session, "stale-route", Some(stale_generation))
+                .await[0]
+                .1,
+            CloseDisposition::Stale
+        );
+        assert!(
+            replacement_rx
+                .recv()
+                .await
+                .expect("replacement auth result")
+                .is_deliverable(),
+            "a stale close must not suppress the replacement generation's auth result"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_close_reconnected_participant() {
+        let registry = SessionRegistry::new();
+        let (first, _first_rx) = authenticated_handle(1, "u", "session-a");
+        registry.register(first);
+        let session = SessionId::new("session-a").expect("session");
+        let stale_generation = registry.connections_for_session(&session)[0].generation();
+
+        // Transport ids can be reused after reconnect; only the newest
+        // generation is eligible for a routed close command.
+        let (replacement, mut replacement_rx) = authenticated_handle(1, "u", "session-a");
+        registry.register(replacement);
+        assert_eq!(
+            registry
+                .close_session(&session, "old-route", Some(stale_generation))
+                .await[0]
+                .1,
+            CloseDisposition::Stale
+        );
+        assert!(registry.send_to(
+            ParticipantId(1),
+            &Outbound::reliable(Envelope::new(1, &b"replacement-active"[..]))
+        ));
+        assert_eq!(
+            replacement_rx
+                .try_recv()
+                .expect("replacement delivery")
+                .envelope
+                .body,
+            &b"replacement-active"[..]
+        );
+    }
+
+    #[test]
+    fn cleanup_is_claimed_once_when_close_races_transport_teardown() {
+        let registry = SessionRegistry::new();
+        let (handle, _receiver) = authenticated_handle(1, "u", "session-a");
+        registry.register(handle);
+        let id = ParticipantId(1);
+        assert!(registry.claim_cleanup(id));
+        assert!(!registry.claim_cleanup(id));
+        assert!(registry.unregister(id).is_some());
+        assert!(registry.unregister(id).is_none());
     }
 }

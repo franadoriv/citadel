@@ -95,8 +95,7 @@ pub unsafe extern "C" fn citadel_transform_view_apply_datagram(
     out_applied: *mut bool,
 ) -> CitadelStatus {
     guard(|| {
-        // SAFETY: the caller contract requires `view` to be a live handle for
-        // the duration of this call; as_ref only borrows it without ownership.
+        // SAFETY: caller guarantees `view` is live for this call; this borrows it only.
         let Some(view) = (unsafe { view.as_ref() }) else {
             return CitadelStatus::InvalidArgument;
         };
@@ -106,16 +105,80 @@ pub unsafe extern "C" fn citadel_transform_view_apply_datagram(
         let body = if body_len == 0 {
             &[]
         } else {
-            // SAFETY: caller guarantees the readable body range for this call.
+            // SAFETY: caller guarantees this readable range for the duration of the call.
             unsafe { std::slice::from_raw_parts(body, body_len) }
         };
         let Ok(mut runtime) = view.view.lock() else {
             return CitadelStatus::Internal;
         };
         let applied = runtime.apply_datagram(body);
-        // SAFETY: out_applied was checked non-null and caller-writable.
+        // SAFETY: the non-null output pointer was validated above and is caller-writable.
         unsafe { *out_applied = applied };
         CitadelStatus::Ok
+    })
+}
+
+/// Decode and apply one negotiated `KIND_TSYNC_V2_SNAPSHOT` body. The v2
+/// clock epoch is fenced by the view: stale or mixed epochs return
+/// `out_applied = false` and never contaminate v1/v2 baseline state.
+///
+/// # Safety
+/// Same pointer requirements as [`citadel_transform_view_apply_datagram`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn citadel_transform_view_apply_v2_datagram(
+    view: *mut CitadelTransformView,
+    body: *const u8,
+    body_len: usize,
+    out_applied: *mut bool,
+) -> CitadelStatus {
+    guard(|| {
+        // SAFETY: caller guarantees `view` is live for this call; this borrows it only.
+        let Some(view) = (unsafe { view.as_ref() }) else {
+            return CitadelStatus::InvalidArgument;
+        };
+        if out_applied.is_null() || (body.is_null() && body_len != 0) {
+            return CitadelStatus::InvalidArgument;
+        }
+        let body = if body_len == 0 {
+            &[]
+        } else {
+            // SAFETY: caller guarantees this readable range for the duration of the call.
+            unsafe { std::slice::from_raw_parts(body, body_len) }
+        };
+        let Ok(mut runtime) = view.view.lock() else {
+            return CitadelStatus::Internal;
+        };
+        let applied = runtime.apply_v2_datagram(body);
+        // SAFETY: the non-null output pointer was validated above and is caller-writable.
+        unsafe { *out_applied = applied };
+        CitadelStatus::Ok
+    })
+}
+
+/// Fence this transform view for a negotiated reconnect/reset epoch. This
+/// clears all snapshot baselines, samples and acknowledgements so no stale
+/// state can cross a match lifetime.
+///
+/// # Safety
+/// `view` must be live and `epoch` must be nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn citadel_transform_view_reset_v2_epoch(
+    view: *mut CitadelTransformView,
+    epoch: u64,
+) -> CitadelStatus {
+    guard(|| {
+        // SAFETY: caller guarantees `view` is live for this call; this borrows it only.
+        let Some(view) = (unsafe { view.as_ref() }) else {
+            return CitadelStatus::InvalidArgument;
+        };
+        let Ok(mut runtime) = view.view.lock() else {
+            return CitadelStatus::Internal;
+        };
+        if runtime.reset_v2_epoch(epoch) {
+            CitadelStatus::Ok
+        } else {
+            CitadelStatus::InvalidArgument
+        }
     })
 }
 
@@ -131,8 +194,7 @@ pub unsafe extern "C" fn citadel_transform_view_sample_now(
     out_found: *mut bool,
 ) -> CitadelStatus {
     guard(|| {
-        // SAFETY: the caller contract requires `view` to be a live handle for
-        // the duration of this call; as_ref only borrows it without ownership.
+        // SAFETY: caller guarantees `view` is live for this call; this borrows it only.
         let Some(view) = (unsafe { view.as_ref() }) else {
             return CitadelStatus::InvalidArgument;
         };
@@ -169,8 +231,7 @@ pub unsafe extern "C" fn citadel_transform_view_authoritative_state(
     out_found: *mut bool,
 ) -> CitadelStatus {
     guard(|| {
-        // SAFETY: the caller contract requires `view` to be a live handle for
-        // the duration of this call; as_ref only borrows it without ownership.
+        // SAFETY: caller guarantees `view` is live for this call; this borrows it only.
         let Some(view) = (unsafe { view.as_ref() }) else {
             return CitadelStatus::InvalidArgument;
         };
@@ -201,8 +262,7 @@ pub unsafe extern "C" fn citadel_transform_view_ack(
     out_ack: *mut u8,
 ) -> CitadelStatus {
     guard(|| {
-        // SAFETY: the caller contract requires `view` to be a live handle for
-        // the duration of this call; as_ref only borrows it without ownership.
+        // SAFETY: caller guarantees `view` is live for this call; this borrows it only.
         let Some(view) = (unsafe { view.as_ref() }) else {
             return CitadelStatus::InvalidArgument;
         };
@@ -295,6 +355,7 @@ pub unsafe extern "C" fn citadel_transform_view_free(view: *mut CitadelTransform
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citadel_wire::tsync::{GameplayClockMetadata, Snapshot, SnapshotV2};
 
     #[test]
     fn state_layout_is_c_compatible() {
@@ -331,5 +392,96 @@ mod tests {
         assert_eq!(decoded.frames[0].input_seq, 9);
         assert_eq!(decoded.frames[0].object_id, 42);
         assert_eq!(decoded.frames[0].move_velocity, [100.0, 0.0, -25.0]);
+    }
+
+    #[test]
+    fn v2_ffi_entrypoints_reject_invalid_handles_without_mutating_state() {
+        let mut applied = true;
+        // SAFETY: null is deliberately supplied to verify the documented invalid-handle path.
+        let status = unsafe {
+            citadel_transform_view_apply_v2_datagram(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut applied,
+            )
+        };
+        assert_eq!(status, CitadelStatus::InvalidArgument);
+        assert!(applied, "invalid calls do not write the caller output");
+        // SAFETY: null is deliberately supplied to verify the documented invalid-handle path.
+        let status = unsafe { citadel_transform_view_reset_v2_epoch(std::ptr::null_mut(), 9) };
+        assert_eq!(status, CitadelStatus::InvalidArgument);
+    }
+
+    #[test]
+    fn v2_ffi_applies_fences_stale_epochs_and_resets() {
+        let hello = Hello::default();
+        let codec = TransformCodec::from_hello(&hello).expect("default codec");
+        let hello_body = hello.encode();
+        let mut view = std::ptr::null_mut();
+        // SAFETY: hello_body and view are live writable/readable local buffers.
+        let status =
+            unsafe { citadel_transform_view_new(hello_body.as_ptr(), hello_body.len(), &mut view) };
+        assert_eq!(status, CitadelStatus::Ok);
+        let wire = |epoch, id| {
+            SnapshotV2 {
+                clock: GameplayClockMetadata {
+                    epoch,
+                    tick: u64::from(id),
+                    tick_hz: 60,
+                },
+                snapshot: Snapshot {
+                    server_tick: id,
+                    snapshot_id: id,
+                    base_snapshot_id: 0,
+                    send_rate_hz: 20,
+                    removed: vec![],
+                    updates: vec![],
+                },
+            }
+            .encode(&codec)
+            .expect("v2 snapshot")
+        };
+        let first = wire(7, 1);
+        let mut applied = false;
+        // SAFETY: view is a live FFI handle and all body/output pointers reference locals.
+        let status = unsafe {
+            citadel_transform_view_apply_v2_datagram(
+                view,
+                first.as_ptr(),
+                first.len(),
+                &mut applied,
+            )
+        };
+        assert_eq!(status, CitadelStatus::Ok);
+        assert!(applied);
+        let stale = wire(6, 2);
+        applied = true;
+        // SAFETY: view is live and the body/output pointers reference local storage.
+        let status = unsafe {
+            citadel_transform_view_apply_v2_datagram(
+                view,
+                stale.as_ptr(),
+                stale.len(),
+                &mut applied,
+            )
+        };
+        assert_eq!(status, CitadelStatus::Ok);
+        assert!(!applied, "a stale epoch is rejected through the C ABI");
+        // SAFETY: view is live and epoch eight is a nonzero reconnect epoch.
+        let status = unsafe { citadel_transform_view_reset_v2_epoch(view, 8) };
+        assert_eq!(status, CitadelStatus::Ok);
+        let next = wire(8, 1);
+        // SAFETY: view is live and all body/output pointers reference locals.
+        let status = unsafe {
+            citadel_transform_view_apply_v2_datagram(view, next.as_ptr(), next.len(), &mut applied)
+        };
+        assert_eq!(status, CitadelStatus::Ok);
+        assert!(
+            applied,
+            "reset permits a fresh snapshot-id sequence for the new epoch"
+        );
+        // SAFETY: view is the one live allocation returned above.
+        unsafe { citadel_transform_view_free(view) };
     }
 }

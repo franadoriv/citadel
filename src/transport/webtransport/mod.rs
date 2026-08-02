@@ -234,21 +234,27 @@ async fn handle_session(
     let identity = handshake.outcome.identity();
     let authenticated = identity.is_some();
     let (tx, rx) = mpsc::channel::<Outbound>(OUTBOUND_CAPACITY);
-    // Acknowledge only when the client actually sent a KIND_AUTH frame (a legacy
-    // implicit guest never asked for auth).
-    if !handshake.replay_first {
-        let ack = Outbound::reliable(Envelope::new(
+    // The registry owns and fences the pre-registration auth acknowledgement.
+    let initial = (!handshake.replay_first).then(|| {
+        Outbound::reliable(Envelope::new(
             KIND_AUTH_RESULT,
             handshake.outcome.result_body(),
-        ));
-        let _ = tx.try_send(ack);
-    }
-    let unreliable = gateway.register_session(SessionHandle {
-        id: session_id,
-        kind: TransportKind::WebTransport,
-        outbound: tx,
-        identity,
+        ))
     });
+    let unreliable = gateway.register_session_with_initial(
+        SessionHandle {
+            id: session_id,
+            kind: TransportKind::WebTransport,
+            outbound: tx,
+            identity,
+        },
+        initial,
+    );
+    if !gateway.accepts_work(session_id) {
+        metrics.connection_closed();
+        gateway.connection_closed();
+        return Ok(());
+    }
     tracing::debug!(%session_id, authenticated, "WebTransport session authenticated; registered");
 
     if handshake.replay_first {
@@ -450,6 +456,9 @@ async fn outbound_writer(
 }
 
 async fn write_outbound(session: &Session, out: Outbound, metrics: &TransportMetrics) {
+    let Some(_delivery) = out.acquire_delivery().await else {
+        return;
+    };
     match out.delivery {
         Delivery::Unreliable => {
             if session

@@ -347,6 +347,9 @@ impl SessionService for InMemorySessionService {
             .get_session(&request.session_id)
             .await?
             .ok_or_else(|| AppError::not_found("session not found"))?;
+        if session.state().is_terminal() {
+            return Ok(session);
+        }
         session.revoke_at(request.revoked_at, request.reason)?;
         let stored = self.repo.update_session(session).await?;
         // The token secrets stay indexed so validation of a revoked token reports

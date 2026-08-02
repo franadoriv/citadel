@@ -21,6 +21,8 @@ import {
   encodeRoomId,
   decodeRoomJoined,
   decodeRoomId,
+  decodeTsyncV2Snapshot,
+  TsyncV2EpochFence,
 } from "../src/protocol.js";
 
 test("protocol bindings target ABI v3", () => {
@@ -108,4 +110,26 @@ test("room codecs use big-endian ids and u16 UTF-8 strings", () => {
   joined.set(mode, 12 + map.length);
   assert.deepEqual(decodeRoomJoined(joined), { roomId: 42n, map: "arena", mode: "duel" });
   assert.equal(decodeRoomJoined(joined.slice(0, -1)), null);
+});
+
+test("v2 transform wrapper decodes, fences stale epochs, and resets", () => {
+  const body = new Uint8Array(18 + 2);
+  const view = new DataView(body.buffer);
+  view.setBigUint64(0, 7n, false);
+  view.setBigUint64(8, 99n, false);
+  view.setUint16(16, 60, false);
+  body.set([0xaa, 0xbb], 18);
+  assert.deepEqual(decodeTsyncV2Snapshot(body), {
+    epoch: 7n, tick: 99n, tickHz: 60, snapshotBody: new Uint8Array([0xaa, 0xbb]),
+  });
+  const fence = new TsyncV2EpochFence();
+  assert.deepEqual(fence.apply(body, (snapshot) => snapshot), {
+    clock: { epoch: 7n, tick: 99n, tickHz: 60 }, snapshot: new Uint8Array([0xaa, 0xbb]),
+  });
+  view.setBigUint64(0, 6n, false);
+  assert.equal(fence.apply(body, (snapshot) => snapshot), null, "old epoch is rejected");
+  assert.equal(fence.reset(8n), true);
+  view.setBigUint64(0, 8n, false);
+  assert.notEqual(fence.apply(body, (snapshot) => snapshot), null, "reset admits new epoch");
+  assert.equal(decodeTsyncV2Snapshot(new Uint8Array(17)), null);
 });

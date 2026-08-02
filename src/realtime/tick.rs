@@ -25,6 +25,7 @@
 //!   never double-counted.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::MissedTickBehavior;
@@ -36,6 +37,127 @@ use crate::{
     chat_cluster::ChatDeliveryDispatcher,
     time::{Clock, SystemClock},
 };
+
+/// A read-only, server-owned view of authoritative gameplay time.
+///
+/// This is simulation time, not wall-clock time: it advances only after a
+/// completed authoritative simulation step. `epoch` identifies one hub/match
+/// lifetime, so a recreated hub never makes a reused tick number look current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameplayClockSnapshot {
+    /// Opaque, nonzero identifier for this clock lifetime.
+    pub epoch: u64,
+    /// Completed authoritative simulation steps in this epoch.
+    pub tick: u64,
+    /// Effective configured simulation rate for this epoch.
+    pub tick_hz: u16,
+    /// Saturating simulation elapsed time in microseconds.
+    pub elapsed_us: u64,
+}
+
+/// Server-owned deterministic gameplay clock.
+///
+/// The clock deliberately has no wall-clock source. Scheduler delays and skipped
+/// interval fires cannot mint catch-up steps or make gameplay time jump.
+#[derive(Debug)]
+pub struct GameplayClock {
+    snapshot: GameplayClockSnapshot,
+    /// Remainder for exact rational conversion of ticks to microseconds.
+    elapsed_remainder: u32,
+}
+
+/// Process-local issuer for automatically assigned gameplay-clock epochs.
+///
+/// `0` is a terminal exhausted sentinel, never an epoch.  The final usable
+/// epoch (`u64::MAX`) is issued once and atomically changes the issuer to that
+/// sentinel.  We deliberately do not wrap: a restarted or recreated hub must
+/// fail closed rather than make an old epoch appear current again.
+#[derive(Debug)]
+struct GameplayClockEpochIssuer {
+    next: AtomicU64,
+}
+
+impl GameplayClockEpochIssuer {
+    const fn new(first_epoch: u64) -> Self {
+        Self {
+            next: AtomicU64::new(first_epoch),
+        }
+    }
+
+    fn issue(&self) -> Option<u64> {
+        let mut current = self.next.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return None;
+            }
+            let next = current.checked_add(1).unwrap_or(0);
+            match self.next.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(current),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+static GAMEPLAY_CLOCK_EPOCH_ISSUER: GameplayClockEpochIssuer = GameplayClockEpochIssuer::new(1);
+
+impl GameplayClock {
+    /// Create a new clock with a freshly issued opaque epoch, failing closed if
+    /// the process-local epoch space has been exhausted.
+    pub fn try_new(tick_hz: u16) -> Option<Self> {
+        Self::try_new_from_issuer(&GAMEPLAY_CLOCK_EPOCH_ISSUER, tick_hz)
+    }
+
+    fn try_new_from_issuer(issuer: &GameplayClockEpochIssuer, tick_hz: u16) -> Option<Self> {
+        issuer.issue().map(|epoch| Self::with_epoch(epoch, tick_hz))
+    }
+
+    /// Create a new clock with a freshly issued opaque epoch.
+    ///
+    /// Prefer [`Self::try_new`] at service boundaries so exhaustion is handled
+    /// explicitly. This compatibility constructor deliberately panics rather
+    /// than reusing an epoch if that terminal condition is ignored.
+    #[must_use]
+    pub fn new(tick_hz: u16) -> Self {
+        Self::try_new(tick_hz).expect("gameplay clock epoch space exhausted")
+    }
+
+    /// Create a clock with an explicit nonzero epoch. This is primarily useful
+    /// for deterministic ownership/recreation tests.
+    #[must_use]
+    pub fn with_epoch(epoch: u64, tick_hz: u16) -> Self {
+        Self {
+            snapshot: GameplayClockSnapshot {
+                epoch: epoch.max(1),
+                tick: 0,
+                tick_hz: tick_hz.max(1),
+                elapsed_us: 0,
+            },
+            elapsed_remainder: 0,
+        }
+    }
+
+    /// Return the current read-only snapshot.
+    #[must_use]
+    pub const fn snapshot(&self) -> GameplayClockSnapshot {
+        self.snapshot
+    }
+
+    /// Record exactly one completed simulation step.
+    pub fn complete_step(&mut self) {
+        self.snapshot.tick = self.snapshot.tick.saturating_add(1);
+        let micros_per_second = 1_000_000_u32;
+        let numerator = self.elapsed_remainder.saturating_add(micros_per_second);
+        let increment = u64::from(numerator / u32::from(self.snapshot.tick_hz));
+        self.elapsed_remainder = numerator % u32::from(self.snapshot.tick_hz);
+        self.snapshot.elapsed_us = self.snapshot.elapsed_us.saturating_add(increment);
+    }
+}
 
 /// A periodic task that drives the script's `citadel.on_tick` game loop.
 pub struct LuaTickService {
@@ -295,6 +417,69 @@ mod tests {
     use crate::repository::{ChatDeliveryOutboxRecord, InMemoryChatRepository};
     use crate::session::NodeId;
     use crate::time::TimestampMillis;
+
+    #[test]
+    fn gameplay_clock_is_monotonic_exact_and_does_not_read_wall_time() {
+        let mut clock = GameplayClock::with_epoch(7, 60);
+        assert_eq!(
+            clock.snapshot(),
+            GameplayClockSnapshot {
+                epoch: 7,
+                tick: 0,
+                tick_hz: 60,
+                elapsed_us: 0,
+            }
+        );
+
+        for _ in 0..60 {
+            clock.complete_step();
+        }
+        assert_eq!(clock.snapshot().tick, 60);
+        assert_eq!(clock.snapshot().elapsed_us, 1_000_000);
+
+        // A delayed scheduler fire represents one completed simulation step,
+        // never an unbounded wall-clock or catch-up jump.
+        clock.complete_step();
+        assert_eq!(clock.snapshot().tick, 61);
+        assert_eq!(clock.snapshot().elapsed_us, 1_016_666);
+    }
+
+    #[test]
+    fn gameplay_clock_normalizes_configuration_and_saturates() {
+        let mut clock = GameplayClock::with_epoch(0, 0);
+        assert_eq!(clock.snapshot().epoch, 1);
+        assert_eq!(clock.snapshot().tick_hz, 1);
+
+        clock.snapshot.tick = u64::MAX;
+        clock.snapshot.elapsed_us = u64::MAX;
+        clock.complete_step();
+        assert_eq!(clock.snapshot().tick, u64::MAX);
+        assert_eq!(clock.snapshot().elapsed_us, u64::MAX);
+    }
+
+    #[test]
+    fn gameplay_clock_epoch_issuer_exhausts_without_wrapping_or_reuse() {
+        // Construct a boundary-state issuer directly: no impractical allocation
+        // loop is needed to prove that the final epoch is emitted just once.
+        let issuer = GameplayClockEpochIssuer::new(u64::MAX);
+
+        let final_clock = GameplayClock::try_new_from_issuer(&issuer, 30)
+            .expect("the final nonzero epoch is still issuable");
+        assert_eq!(final_clock.snapshot().epoch, u64::MAX);
+        assert_eq!(issuer.next.load(Ordering::Relaxed), 0);
+
+        assert!(GameplayClock::try_new_from_issuer(&issuer, 30).is_none());
+        assert!(issuer.issue().is_none());
+    }
+
+    #[test]
+    fn gameplay_clock_recreation_uses_a_distinct_epoch() {
+        let first = GameplayClock::new(30).snapshot();
+        let second = GameplayClock::new(30).snapshot();
+        assert_ne!(first.epoch, second.epoch);
+        assert_eq!(second.tick, 0);
+        assert_eq!(second.elapsed_us, 0);
+    }
 
     #[tokio::test]
     async fn matchmaker_tick_runs_without_a_script_tick_and_stops_cleanly() {

@@ -86,6 +86,9 @@ pub struct RemoteWorldView {
     /// Per-owned-object highest contiguous input seq the server has acked
     /// (design §5.1) — the reconciliation input for the prediction layer.
     owner_acks: HashMap<ObjectId, u32>,
+    /// Epoch accepted by this view's v2 connection. A different epoch is never
+    /// merged into existing baselines; callers must reset on reconnect.
+    clock_epoch: Option<u64>,
 }
 
 impl RemoteWorldView {
@@ -108,6 +111,7 @@ impl RemoteWorldView {
             discarded_missing_base: 0,
             discarded_stale: 0,
             owner_acks: HashMap::new(),
+            clock_epoch: None,
         }
     }
 
@@ -118,6 +122,47 @@ impl RemoteWorldView {
             Ok(snap) => self.apply(&snap),
             Err(_) => false,
         }
+    }
+
+    /// Decode and apply a dedicated v2 snapshot. A different epoch is stale for
+    /// this view and is rejected rather than mixing match lifetimes. Reconnects
+    /// create a new view (or call [`reset_v2_epoch`]).
+    pub fn apply_v2_datagram(&mut self, body: &[u8]) -> bool {
+        let Ok(v2) = tsync::SnapshotV2::decode(body, &self.codec) else {
+            return false;
+        };
+        if self
+            .clock_epoch
+            .is_some_and(|epoch| epoch != v2.clock.epoch)
+        {
+            self.discarded_stale += 1;
+            return false;
+        }
+        let applied = self.apply(&v2.snapshot);
+        if applied {
+            self.clock_epoch = Some(v2.clock.epoch);
+        }
+        applied
+    }
+
+    /// Explicitly fence a reconnect/reset to a newly negotiated nonzero epoch.
+    /// Existing baselines and samples cannot be used across the reset.
+    pub fn reset_v2_epoch(&mut self, epoch: u64) -> bool {
+        if epoch == 0 {
+            return false;
+        }
+        self.clock_epoch = Some(epoch);
+        self.ring.clear();
+        self.samples.clear();
+        self.owner_acks.clear();
+        self.last_applied_id = 0;
+        self.ack = AckField::new();
+        true
+    }
+
+    #[must_use]
+    pub fn clock_epoch(&self) -> Option<u64> {
+        self.clock_epoch
     }
 
     /// Apply an already-decoded snapshot. Same discard rules as
@@ -518,7 +563,9 @@ fn normalize4(q: [f32; 4]) -> [f32; 4] {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use citadel_wire::tsync::{Hello, ObjectUpdate, TransformFields};
+    use citadel_wire::tsync::{
+        GameplayClockMetadata, Hello, ObjectUpdate, SnapshotV2, TransformFields,
+    };
 
     fn codec() -> TransformCodec {
         TransformCodec::from_hello(&Hello::default()).unwrap()
@@ -749,5 +796,39 @@ mod tests {
             far.position[0]
         );
         assert!(far.position[0] >= 100.0);
+    }
+
+    #[test]
+    fn v2_epoch_rejects_stale_frames_and_reset_fences_reconnect_state() {
+        let codec = codec();
+        let mut view = RemoteWorldView::new(codec, 60, 20);
+        let wire = |epoch, id| {
+            SnapshotV2 {
+                clock: GameplayClockMetadata {
+                    epoch,
+                    tick: u64::from(id),
+                    tick_hz: 60,
+                },
+                snapshot: full_snapshot(id),
+            }
+            .encode(&codec)
+            .unwrap()
+        };
+
+        assert!(view.apply_v2_datagram(&wire(7, 1)));
+        assert_eq!(view.clock_epoch(), Some(7));
+        assert!(
+            !view.apply_v2_datagram(&wire(6, 2)),
+            "old match epoch is stale"
+        );
+        assert_eq!(view.discarded_stale(), 1);
+        assert!(view.reset_v2_epoch(8));
+        assert_eq!(view.clock_epoch(), Some(8));
+        assert!(view.object_ids().is_empty(), "reset clears prior baselines");
+        assert!(
+            view.apply_v2_datagram(&wire(8, 1)),
+            "new epoch can restart ids"
+        );
+        assert!(!view.reset_v2_epoch(0), "zero never becomes an epoch");
     }
 }

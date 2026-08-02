@@ -200,6 +200,15 @@ namespace Citadel
             [MarshalAs(UnmanagedType.I1)] out bool applied);
 
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_transform_view_apply_v2_datagram(
+            IntPtr view, [In] byte[] body, UIntPtr bodyLen,
+            [MarshalAs(UnmanagedType.I1)] out bool applied);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        public static extern CitadelStatus citadel_transform_view_reset_v2_epoch(
+            IntPtr view, ulong epoch);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
         public static extern CitadelStatus citadel_transform_view_sample_now(
             IntPtr view, uint objectId, out TransformState state,
             [MarshalAs(UnmanagedType.I1)] out bool found);

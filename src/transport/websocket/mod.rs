@@ -303,32 +303,35 @@ async fn handle_connection(
     let identity = handshake.outcome.identity();
     let authenticated = identity.is_some();
     let (tx, mut rx) = mpsc::channel::<Outbound>(OUTBOUND_CAPACITY);
-    let unreliable = gateway.register_session(SessionHandle {
-        id: session_id,
-        kind: TransportKind::WebSocket,
-        outbound: tx,
-        identity,
+    // Seed the accepted auth result through the registry-owned fence before
+    // publishing this session. A revocation racing the writer can therefore
+    // invalidate it just like every later outbound envelope.
+    let initial = (!handshake.replay_first).then(|| {
+        Outbound::reliable(Envelope::new(
+            KIND_AUTH_RESULT,
+            handshake.outcome.result_body(),
+        ))
     });
+    let unreliable = gateway.register_session_with_initial(
+        SessionHandle {
+            id: session_id,
+            kind: TransportKind::WebSocket,
+            outbound: tx,
+            identity,
+        },
+        initial,
+    );
+    if !gateway.accepts_work(session_id) {
+        metrics.connection_closed();
+        gateway.connection_closed();
+        return Ok(());
+    }
     tracing::debug!(
         conn = %id, %session_id, authenticated,
         "WebSocket connection authenticated; session registered"
     );
 
     let result: AppResult<()> = async {
-        // Acknowledge the handshake ONLY when the client actually sent a
-        // KIND_AUTH frame. A pre-handshake (legacy) client that was accepted as
-        // an implicit guest never asked for auth and would not understand a
-        // KIND_AUTH_RESULT, so it receives only relay traffic (replay_first).
-        if !handshake.replay_first {
-            let ack =
-                Envelope::new(KIND_AUTH_RESULT, handshake.outcome.result_body()).encode_framed();
-            writer
-                .send(Message::Binary(ack.to_vec()))
-                .await
-                .map_err(send_err)?;
-            metrics.envelope_sent();
-        }
-
         // Replay the first frame for a pre-handshake (legacy) client, then any
         // frames batched behind it, so nothing sent before registration is lost.
         if handshake.replay_first {
@@ -385,6 +388,7 @@ async fn handle_connection(
                 // Outbound: relay messages from the gateway to this peer.
                 out = rx.recv() => {
                     let Some(out) = out else { break };
+                    let Some(_delivery) = out.acquire_delivery().await else { continue };
                     let frame = out.envelope.encode_framed();
                     writer
                         .send(Message::Binary(frame.to_vec()))
@@ -397,6 +401,7 @@ async fn handle_connection(
                 // retains the newest state for every visible peer without a
                 // stale FIFO replay.
                 out = unreliable.recv() => {
+                    let Some(_delivery) = out.acquire_delivery().await else { continue };
                     let frame = out.envelope.encode_framed();
                     writer
                         .send(Message::Binary(frame.to_vec()))

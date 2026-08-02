@@ -34,6 +34,10 @@ const KIND_TSYNC_INPUT := 9
 const KIND_TSYNC_ACK := 10
 const KIND_TSYNC_ROLE := 11
 const KIND_TSYNC_REWIND := 12
+const KIND_TSYNC_V2_HELLO := 29
+const KIND_TSYNC_V2_SNAPSHOT := 30
+const KIND_TSYNC_V2_INPUT := 31
+const TSYNC_V2_CLOCK_BYTES := 18
 
 ## Client->server: create/join a named room; server chooses the map.
 const KIND_ROOM_CREATE := 21
@@ -233,6 +237,42 @@ static func decode_room_joined(body: PackedByteArray) -> Dictionary:
 ## Decode the exact eight-byte room-id body used by leave notifications.
 static func decode_room_id(body: PackedByteArray) -> Variant:
 	return _read_be_u64(body, 0) if body.size() == 8 else null
+
+
+## Decode the v2 transform wrapper while preserving the embedded v1 snapshot
+## bytes for the shared native runtime. Returns {} for malformed/zero epoch or
+## rate; no hint/input values are retained here.
+static func decode_tsync_v2_snapshot(body: PackedByteArray) -> Dictionary:
+	if body.size() < TSYNC_V2_CLOCK_BYTES:
+		return {}
+	var epoch := _read_be_u64(body, 0)
+	var tick := _read_be_u64(body, 8)
+	var tick_hz := _read_be_u16(body, 16)
+	if epoch == 0 or tick_hz == 0:
+		return {}
+	return {
+		"epoch": epoch,
+		"tick": tick,
+		"tick_hz": tick_hz,
+		"snapshot": body.slice(TSYNC_V2_CLOCK_BYTES),
+	}
+
+
+## Encode the epoch-bearing v2 input wrapper around the unchanged v1 bundle.
+## `epoch` and `last_observed_tick` are diagnostics only; the authority never
+## uses either value to authorize or schedule simulation work.
+static func encode_tsync_v2_input(epoch: int, last_observed_tick: int,
+		v1_input_bundle: PackedByteArray) -> PackedByteArray:
+	if epoch == 0 or last_observed_tick < 0 or v1_input_bundle.is_empty():
+		return PackedByteArray()
+	var body := PackedByteArray()
+	body.resize(17 + v1_input_bundle.size())
+	_write_be_u64(body, 0, epoch)
+	_write_be_u64(body, 8, last_observed_tick)
+	body[16] = 0 # flags; only zero is currently valid.
+	for index in v1_input_bundle.size():
+		body[17 + index] = v1_input_bundle[index]
+	return body
 
 ## Encode one stream frame for the WebSocket transport: a big-endian u32 body
 ## length, followed by the big-endian u16 kind and opaque payload. WebSocket

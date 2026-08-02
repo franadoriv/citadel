@@ -83,17 +83,26 @@ namespace Citadel
                 {
                     _view = IntPtr.Zero;
                 }
+                else if (Client != null)
+                {
+                    // Dedicated negotiation means a v1 server ignores/rejects
+                    // this without changing its v1 snapshot layout.
+                    Client.Send(CitadelProtocol.KindTsyncV2Hello, new byte[] { 2, 1 }, reliable: true);
+                }
                 return;
             }
 
-            if (kind != CitadelProtocol.KindTsyncSnapshot || _view == IntPtr.Zero)
+            if ((kind != CitadelProtocol.KindTsyncSnapshot && kind != CitadelProtocol.KindTsyncV2Snapshot) || _view == IntPtr.Zero)
             {
                 return;
             }
 
             byte[] snapshot = Slice(body, length);
-            if (CitadelNative.citadel_transform_view_apply_datagram(
-                    _view, snapshot, (UIntPtr)snapshot.Length, out bool applied) != CitadelStatus.Ok || !applied)
+            bool applied;
+            CitadelStatus status = kind == CitadelProtocol.KindTsyncV2Snapshot
+                ? CitadelNative.citadel_transform_view_apply_v2_datagram(_view, snapshot, (UIntPtr)snapshot.Length, out applied)
+                : CitadelNative.citadel_transform_view_apply_datagram(_view, snapshot, (UIntPtr)snapshot.Length, out applied);
+            if (status != CitadelStatus.Ok || !applied)
             {
                 return;
             }

@@ -134,8 +134,9 @@ pub trait SessionService: ServiceLifecycle + Send + Sync {
     /// Revoke a session.
     ///
     /// # Errors
-    /// Returns a not-found error for an unknown session and a conflict error if
-    /// the session is already terminal.
+    /// Returns a not-found error for an unknown session. Replaying a revoke of
+    /// an already-terminal session is successful and returns that terminal
+    /// session, making durable revocation safe to retry at the control boundary.
     async fn revoke_session(&self, request: RevokeSessionRequest) -> AppResult<Session>;
 }
 

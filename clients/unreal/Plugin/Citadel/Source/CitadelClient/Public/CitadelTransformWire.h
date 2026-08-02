@@ -28,6 +28,65 @@
 
 namespace CitadelTransform
 {
+    /** Exact v2 capability manifest; unknown values never select a guessed layout. */
+    struct FV2Manifest
+    {
+        static bool IsClock(const uint8_t* Body, size_t Len)
+        {
+            return Body && Len == 2 && Body[0] == 2 && Body[1] == 1;
+        }
+    };
+
+    /** Fixed v2 gameplay-clock wrapper preceding byte-for-byte v1 snapshot bytes. */
+    struct FClockMetadata
+    {
+        uint64_t Epoch = 0;
+        uint64_t Tick = 0;
+        uint16_t TickHz = 0;
+
+        static bool Decode(const uint8_t* Body, size_t Len, FClockMetadata& Out)
+        {
+            if (!Body || Len < 18) { return false; }
+            const auto U64 = [](const uint8_t* B) {
+                uint64_t V = 0;
+                for (int I = 0; I < 8; ++I) { V = (V << 8) | uint64_t(B[I]); }
+                return V;
+            };
+            Out.Epoch = U64(Body);
+            Out.Tick = U64(Body + 8);
+            Out.TickHz = (uint16_t(Body[16]) << 8) | uint16_t(Body[17]);
+            return Out.Epoch != 0 && Out.TickHz != 0;
+        }
+    };
+
+    /**
+     * The v2 owner-input prefix. It is diagnostic-only: the authority does not
+     * use either value to select simulation work or authorize the input.
+     * Layout: epoch:u64 BE | last_observed_tick:u64 BE | flags:u8(0) | v1 bundle.
+     */
+    struct FInputV2Metadata
+    {
+        static bool Encode(uint64_t Epoch, uint64_t LastObservedTick,
+                           const std::vector<uint8_t>& V1Bundle,
+                           std::vector<uint8_t>& Out)
+        {
+            if (Epoch == 0 || V1Bundle.empty()) { return false; }
+            const auto PutU64 = [&Out](uint64_t Value) {
+                for (int Shift = 56; Shift >= 0; Shift -= 8)
+                {
+                    Out.push_back(static_cast<uint8_t>(Value >> Shift));
+                }
+            };
+            Out.clear();
+            Out.reserve(17 + V1Bundle.size());
+            PutU64(Epoch);
+            PutU64(LastObservedTick);
+            Out.push_back(0); // only zero flags are currently valid.
+            Out.insert(Out.end(), V1Bundle.begin(), V1Bundle.end());
+            return true;
+        }
+    };
+
     // ---- MSB-first bit reader (mirror of citadel_wire::bits::BitReader) ----
     class FBitReader
     {

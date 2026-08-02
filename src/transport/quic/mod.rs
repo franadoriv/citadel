@@ -285,23 +285,29 @@ async fn handle_connection(
     let identity = handshake.outcome.identity();
     let authenticated = identity.is_some();
     let (tx, rx) = mpsc::channel::<Outbound>(OUTBOUND_CAPACITY);
-    // Acknowledge the handshake through the same outbound channel the write task
-    // drains, so it is delivered reliably ahead of any relay traffic. Sent ONLY
-    // when the client actually sent a KIND_AUTH frame: a legacy client accepted
-    // as an implicit guest (replay_first) never asked for auth.
-    if !handshake.replay_first {
-        let ack = Outbound::reliable(Envelope::new(
+    // The registry fences this protocol reply before publishing the session,
+    // retaining reliable-first ordering without a raw, unfenced sender path.
+    let initial = (!handshake.replay_first).then(|| {
+        Outbound::reliable(Envelope::new(
             KIND_AUTH_RESULT,
             handshake.outcome.result_body(),
-        ));
-        let _ = tx.try_send(ack);
-    }
-    let unreliable = gateway.register_session(SessionHandle {
-        id: session_id,
-        kind: TransportKind::Quic,
-        outbound: tx,
-        identity,
+        ))
     });
+    let unreliable = gateway.register_session_with_initial(
+        SessionHandle {
+            id: session_id,
+            kind: TransportKind::Quic,
+            outbound: tx,
+            identity,
+        },
+        initial,
+    );
+    if !gateway.accepts_work(session_id) {
+        connection.close(0u32.into(), b"session revoked");
+        metrics.connection_closed();
+        gateway.connection_closed();
+        return Ok(());
+    }
     tracing::debug!(
         conn = %id, %session_id, authenticated,
         "QUIC connection authenticated; session registered"
@@ -520,6 +526,9 @@ async fn outbound_writer(
 }
 
 async fn write_outbound(connection: &QuinnConnection, out: Outbound, metrics: &TransportMetrics) {
+    let Some(_delivery) = out.acquire_delivery().await else {
+        return;
+    };
     match out.delivery {
         Delivery::Unreliable => {
             if connection

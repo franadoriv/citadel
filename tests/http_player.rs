@@ -8,6 +8,11 @@ use std::time::Duration;
 use citadel::App;
 use citadel::config::Config;
 use citadel::http;
+use citadel::realtime::{Gateway, Outbound, ParticipantIdentity, SessionHandle};
+use citadel::services::{CreateSessionRequest, ValidateSessionRequest};
+use citadel::session::{NodeId, SessionTokenSecret, SessionValidation};
+use citadel::time::{Clock, DurationMillis, SystemClock};
+use citadel::transport::{Envelope, TransportKind};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -225,6 +230,104 @@ async fn run_player_lifecycle_scenario(app: App, device_prefix: &str) {
 #[tokio::test]
 async fn player_account_lookup_refresh_and_logout_are_private_and_safe_in_memory() {
     run_player_lifecycle_scenario(App::new(Config::default()), "player-lifecycle").await;
+}
+
+#[tokio::test]
+async fn logout_revokes_and_fences_only_the_exact_live_session() {
+    let app = App::new(Config::default());
+    let gateway = Arc::new(Gateway::new());
+    app.attach_realtime_gateway(Arc::clone(&gateway));
+    let (addr, shutdown, server) = spawn(app.clone()).await;
+    let auth = authenticate(addr, "live-revocation-device", "live-revocation-user").await;
+    let access = auth["token"].as_str().expect("access");
+    let validation = app
+        .session_service()
+        .validate_session(ValidateSessionRequest {
+            access_token: SessionTokenSecret::new(access).expect("token"),
+            now: SystemClock.now(),
+        })
+        .await
+        .expect("validate");
+    assert!(validation.is_valid(), "fresh session is valid");
+    let SessionValidation::Valid(validated) = validation else {
+        return;
+    };
+    let (target_tx, mut target_rx) = tokio::sync::mpsc::channel(4);
+    let target = gateway.next_participant_id();
+    gateway.register_session(SessionHandle {
+        id: target,
+        kind: TransportKind::WebSocket,
+        outbound: target_tx,
+        identity: Some(ParticipantIdentity {
+            user_id: validated.user_id.clone(),
+            session_id: validated.session_id.clone(),
+            expires_at: validated.expires_at,
+        }),
+    });
+    assert!(gateway.registry().send_to(
+        target,
+        &Outbound::reliable(Envelope::new(700, b"queued".to_vec()))
+    ));
+
+    // A second session for the same account must remain live.
+    let sibling = app
+        .session_service()
+        .create_session(CreateSessionRequest {
+            user_id: validated.user_id.clone(),
+            owner_node: NodeId::new(app.node_id().to_owned()).expect("node"),
+            now: SystemClock.now(),
+            session_ttl: DurationMillis::from_millis(60_000),
+            refresh_ttl: Some(DurationMillis::from_millis(60_000)),
+        })
+        .await
+        .expect("sibling session");
+    let (sibling_tx, mut sibling_rx) = tokio::sync::mpsc::channel(4);
+    let sibling_id = gateway.next_participant_id();
+    gateway.register_session(SessionHandle {
+        id: sibling_id,
+        kind: TransportKind::WebSocket,
+        outbound: sibling_tx,
+        identity: Some(ParticipantIdentity {
+            user_id: validated.user_id,
+            session_id: sibling.session.id,
+            expires_at: sibling.session.expires_at,
+        }),
+    });
+
+    let logout = request(addr, "POST", http::SESSION_LOGOUT_PATH, Some(access), None).await;
+    assert_eq!(logout.status, 204);
+    let queued = target_rx
+        .try_recv()
+        .expect("queued envelope remains observable");
+    assert!(
+        !queued.is_deliverable(),
+        "close fence discards queued delivery"
+    );
+    assert_eq!(
+        gateway.handle_inbound(target, &Envelope::new(701, b"late".to_vec())),
+        0
+    );
+    assert!(!gateway.registry().send_to(
+        target,
+        &Outbound::reliable(Envelope::new(702, b"late".to_vec()))
+    ));
+    assert!(gateway.registry().send_to(
+        sibling_id,
+        &Outbound::reliable(Envelope::new(703, b"sibling".to_vec()))
+    ));
+    assert_eq!(
+        sibling_rx
+            .recv()
+            .await
+            .expect("sibling outbound")
+            .envelope
+            .body
+            .as_ref(),
+        b"sibling"
+    );
+
+    shutdown.send(()).expect("shutdown");
+    server.await.expect("server task");
 }
 
 #[tokio::test]

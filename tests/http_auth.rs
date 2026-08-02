@@ -16,12 +16,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use citadel::App;
 use citadel::config::Config;
 use citadel::http;
 use citadel::repository::Backend;
+use citadel::time::{Clock, TimestampMillis};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -32,6 +34,25 @@ struct Response {
     status: u16,
     body: Option<Value>,
     retry_after: Option<String>,
+}
+
+#[derive(Debug)]
+struct TestClock(AtomicU64);
+
+impl TestClock {
+    fn new(now_ms: u64) -> Self {
+        Self(AtomicU64::new(now_ms))
+    }
+
+    fn set(&self, now_ms: u64) {
+        self.0.store(now_ms, Ordering::SeqCst);
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> TimestampMillis {
+        TimestampMillis::from_unix_millis(self.0.load(Ordering::SeqCst))
+    }
 }
 
 async fn read_http_response(stream: &mut TcpStream) -> String {
@@ -109,9 +130,54 @@ async fn authentication_rate_limit_is_uniform_and_returns_retry_after() {
     let mut config = Config::default();
     config.authentication.limits.source.limit = 2;
     config.authentication.limits.source.window_ms = 2_000;
-    let (addr, tx, server) = spawn_server(App::new(config)).await;
+    let clock = Arc::new(TestClock::new(1_000));
+    let (addr, tx, server) = spawn_server(App::new(config).with_auth_clock(clock)).await;
 
+    let mut statuses = Vec::new();
     for id in ["limited-device-one", "limited-device-two"] {
+        let accepted = post_json(
+            addr,
+            http::DEVICE_AUTH_PATH,
+            &format!(r#"{{"id":"{id}","create":true,"username":"{id}"}}"#),
+        )
+        .await;
+        statuses.push(accepted.status);
+    }
+
+    let rejected = post_json(
+        addr,
+        http::DEVICE_AUTH_PATH,
+        r#"{"id":"limited-device-three","create":true,"username":"limited-three"}"#,
+    )
+    .await;
+    statuses.push(rejected.status);
+    assert_eq!(statuses, [201, 201, 429]);
+    // A registration is subject to both its short source window and the
+    // hour-long registration window; `Retry-After` conservatively covers the
+    // complete multi-key plan without revealing which key was exhausted.
+    assert_eq!(rejected.retry_after.as_deref(), Some("3600"));
+    assert_eq!(
+        rejected
+            .body
+            .as_ref()
+            .and_then(|body| body["code"].as_str()),
+        Some("rate_limited")
+    );
+
+    let _ = tx.send(());
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn authentication_rate_limit_resets_at_controlled_fixed_window_boundary() {
+    let mut config = Config::default();
+    config.authentication.limits.source.limit = 2;
+    config.authentication.limits.source.window_ms = 2_000;
+    let clock = Arc::new(TestClock::new(1_999));
+    let (addr, tx, server) =
+        spawn_server(App::new(config).with_auth_clock(Arc::clone(&clock) as Arc<_>)).await;
+
+    for id in ["boundary-device-one", "boundary-device-two"] {
         let accepted = post_json(
             addr,
             http::DEVICE_AUTH_PATH,
@@ -124,21 +190,19 @@ async fn authentication_rate_limit_is_uniform_and_returns_retry_after() {
     let rejected = post_json(
         addr,
         http::DEVICE_AUTH_PATH,
-        r#"{"id":"limited-device-three","create":true,"username":"limited-three"}"#,
+        r#"{"id":"boundary-device-three","create":true,"username":"boundary-three"}"#,
     )
     .await;
     assert_eq!(rejected.status, 429);
-    // A registration is subject to both its short source window and the
-    // hour-long registration window; `Retry-After` conservatively covers the
-    // complete multi-key plan without revealing which key was exhausted.
-    assert_eq!(rejected.retry_after.as_deref(), Some("3600"));
-    assert_eq!(
-        rejected
-            .body
-            .as_ref()
-            .and_then(|body| body["code"].as_str()),
-        Some("rate_limited")
-    );
+
+    clock.set(2_000);
+    let accepted = post_json(
+        addr,
+        http::DEVICE_AUTH_PATH,
+        r#"{"id":"boundary-device-four","create":true,"username":"boundary-four"}"#,
+    )
+    .await;
+    assert_eq!(accepted.status, 201);
 
     let _ = tx.send(());
     let _ = server.await;

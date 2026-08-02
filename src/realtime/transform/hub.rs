@@ -17,6 +17,7 @@ use citadel_physics::{GroundHit, RaycastHit, StaticTriBvh};
 use citadel_wire::na::{NaSpawn, NaSpawnBatch, NaTransform};
 use citadel_wire::tsync::{self, Hello, InputBundle, RewindResult, TransformCodec};
 
+use crate::realtime::tick::{GameplayClock, GameplayClockSnapshot};
 use crate::runtime::PhysicsOptions;
 
 use super::ObjectId;
@@ -86,6 +87,8 @@ struct ClientEntry {
     congestion: CongestionController,
     /// Server-measured latency used to compute rewind time (design §5.2).
     lag: LagProfile,
+    /// Set only after a valid dedicated v2 manifest. v1 remains the default.
+    v2_clock: bool,
 }
 
 /// The owner-movement authority selected by trusted server configuration for a
@@ -109,6 +112,7 @@ struct NaEntry {
 
 struct HubInner {
     world: TransformWorld,
+    gameplay_clock: GameplayClock,
     latest: Arc<Frame>,
     /// Per-loaded-map collision broadphases. Building is command/map-change work,
     /// never simulation-tick work.
@@ -120,6 +124,23 @@ struct HubInner {
     /// Participant -> its networked-actor presence (relay mode). Populated when a
     /// client announces `KIND_NA_PRESENCE`; empty otherwise.
     na_presence: HashMap<u64, NaEntry>,
+    /// Aggregate-only v2 input-hint diagnostics. These intentionally carry no
+    /// participant, epoch, tick, or hint values, so telemetry cannot become an
+    /// input-derived label/cardinality sink.
+    input_hint_metrics: InputHintMetrics,
+}
+
+/// Bounded aggregate diagnostics for untrusted v2 input hints.
+///
+/// A syntactically valid, epoch-fenced hint is both `accepted` at the wire
+/// boundary and `ignored` by authority: its values never influence simulation,
+/// scheduling, authorization, latency, or rewind. `rejected` covers malformed,
+/// unnegotiated, and stale-epoch input without exposing a reason to clients.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputHintMetrics {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub ignored: u64,
 }
 
 /// The frames a [`TransformHub::register_presence`] produces for the gateway to
@@ -192,6 +213,7 @@ impl TransformHub {
     /// [`Hello`]. Fails only if the world bounds are degenerate.
     pub fn new(config: TransformHubConfig) -> Result<Self, tsync::TsyncError> {
         let codec = TransformCodec::from_hello(&config.hello)?;
+        let gameplay_tick_hz = u16::from(config.hello.sim_rate_hz.max(1));
         let mut world = TransformWorld::new(config.cell_size);
         world.set_bounds(config.hello.position_bounds);
         // ~1 s of rewind history at the negotiated sim rate.
@@ -202,11 +224,15 @@ impl TransformHub {
             config,
             inner: Mutex::new(HubInner {
                 world,
+                gameplay_clock: GameplayClock::try_new(gameplay_tick_hz).ok_or(
+                    tsync::TsyncError::OutOfRange("gameplay clock epoch exhausted"),
+                )?,
                 latest,
                 physics_bvhs: HashMap::new(),
                 clients: HashMap::new(),
                 assigned_slots: HashMap::new(),
                 na_presence: HashMap::new(),
+                input_hint_metrics: InputHintMetrics::default(),
             }),
         })
     }
@@ -362,6 +388,7 @@ impl TransformHub {
                     interp_delay_ticks: 0.0,
                     rtt_ms: 0.0,
                 },
+                v2_clock: false,
             });
         }
     }
@@ -678,6 +705,22 @@ impl TransformHub {
         }
     }
 
+    /// Negotiate the dedicated epoch-bearing v2 layout. Invalid or unknown
+    /// manifests do not register/downgrade a client, and a v1 client is never
+    /// switched by a v1 HELLO.
+    pub fn handle_v2_hello(&self, participant: u64, body: &[u8]) -> Option<HubOutbound> {
+        let manifest = tsync::V2Manifest::decode(body).ok()?;
+        self.register_client(participant);
+        let mut g = self.inner.lock().ok()?;
+        g.clients.get_mut(&participant)?.v2_clock = true;
+        Some(HubOutbound {
+            participant,
+            kind: citadel_wire::protocol::KIND_TSYNC_V2_HELLO,
+            body: manifest.encode().to_vec(),
+            unreliable: false,
+        })
+    }
+
     /// Handle a client `ACK` body, advancing that client's confirmed baseline.
     pub fn handle_ack(&self, participant: u64, body: &[u8]) {
         let Ok(ack) = tsync::Ack::decode(body) else {
@@ -793,6 +836,46 @@ impl TransformHub {
         out
     }
 
+    /// Handle an epoch-fenced v2 input. Hints are decoded only to bound and
+    /// validate the wire; they are deliberately not passed into simulation,
+    /// scheduling, authorization, latency, or rewind calculations.
+    #[must_use]
+    pub fn handle_v2_input(&self, participant: u64, body: &[u8]) -> Vec<HubOutbound> {
+        let Ok((epoch, _hint, bundle)) = tsync::InputDiagnosticHint::decode_v2(body) else {
+            if let Ok(mut g) = self.inner.lock() {
+                g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
+            }
+            return Vec::new();
+        };
+        let Ok(mut g) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let valid = g.clients.get(&participant).is_some_and(|c| c.v2_clock)
+            && g.gameplay_clock.snapshot().epoch == epoch;
+        if valid {
+            g.input_hint_metrics.accepted = g.input_hint_metrics.accepted.saturating_add(1);
+            // Deliberately count the authority decision separately from decode:
+            // no hint field is retained or passed into gameplay.
+            g.input_hint_metrics.ignored = g.input_hint_metrics.ignored.saturating_add(1);
+        } else {
+            g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
+        }
+        drop(g);
+        if !valid {
+            return Vec::new();
+        }
+        self.handle_input(participant, &bundle.encode())
+    }
+
+    /// Return aggregate-only v2 input-hint diagnostics for tests/observability.
+    #[must_use]
+    pub fn input_hint_metrics(&self) -> InputHintMetrics {
+        self.inner
+            .lock()
+            .map(|g| g.input_hint_metrics)
+            .unwrap_or_default()
+    }
+
     /// Advance the world one sim tick and latch the frame (design §7.5). The
     /// snapshot tick reads only the latched frame.
     pub fn sim_tick(&self) {
@@ -800,7 +883,19 @@ impl TransformHub {
             let dt = self.config.sim_dt;
             g.world.advance(dt);
             g.latest = g.world.latch();
+            g.gameplay_clock.complete_step();
         }
+    }
+
+    /// Read the authoritative gameplay clock for this hub. It is independent of
+    /// snapshot cadence and advances only when [`Self::sim_tick`] completes.
+    ///
+    /// Returns `None` if the hub mutex has been poisoned. A poisoned hub has no
+    /// trustworthy clock state, so callers must treat it as unavailable rather
+    /// than accepting a fabricated or potentially stale epoch.
+    #[must_use]
+    pub fn gameplay_clock(&self) -> Option<GameplayClockSnapshot> {
+        self.inner.lock().ok().map(|g| g.gameplay_clock.snapshot())
     }
 
     /// Build one delta snapshot per client from the latched frame. Returns the
@@ -813,6 +908,7 @@ impl TransformHub {
             return out;
         };
         let frame = Arc::clone(&g.latest);
+        let gameplay_clock = g.gameplay_clock.snapshot();
         let hard_cap = self.config.budget;
         for (&participant, client) in g.clients.iter_mut() {
             // The adaptive controller owns the per-client budget + coarse send
@@ -831,10 +927,26 @@ impl TransformHub {
             else {
                 continue;
             };
-            match snapshot.encode(&self.codec) {
-                Ok(body) => out.push(HubOutbound {
+            let encoded = if client.v2_clock {
+                tsync::SnapshotV2 {
+                    clock: tsync::GameplayClockMetadata {
+                        epoch: gameplay_clock.epoch,
+                        tick: gameplay_clock.tick,
+                        tick_hz: gameplay_clock.tick_hz,
+                    },
+                    snapshot,
+                }
+                .encode(&self.codec)
+                .map(|body| (citadel_wire::protocol::KIND_TSYNC_V2_SNAPSHOT, body))
+            } else {
+                snapshot
+                    .encode(&self.codec)
+                    .map(|body| (citadel_wire::protocol::KIND_TSYNC_SNAPSHOT, body))
+            };
+            match encoded {
+                Ok((kind, body)) => out.push(HubOutbound {
                     participant,
-                    kind: citadel_wire::protocol::KIND_TSYNC_SNAPSHOT,
+                    kind,
                     body,
                     unreliable: true,
                 }),
@@ -870,6 +982,31 @@ mod tests {
     }
 
     #[test]
+    fn v2_input_hint_metrics_are_aggregate_and_authority_ignored() {
+        let hub = hub();
+        let manifest = tsync::V2Manifest::clock().encode();
+        assert!(hub.handle_v2_hello(11, &manifest).is_some());
+        let epoch = hub.gameplay_clock().expect("clock").epoch;
+        let bundle = InputBundle {
+            acked_snapshot_id: 0,
+            last_seen_snapshot_id: 0,
+            frames: Vec::new(),
+        };
+        let valid = tsync::InputDiagnosticHint {
+            last_observed_tick: 123_456,
+            flags: 0,
+        }
+        .encode_v2(epoch, &bundle)
+        .expect("valid diagnostic hint");
+        assert!(hub.handle_v2_input(11, &valid).is_empty());
+        assert!(hub.handle_v2_input(11, &[0]).is_empty());
+        let metrics = hub.input_hint_metrics();
+        assert_eq!(metrics.accepted, 1);
+        assert_eq!(metrics.ignored, 1, "hint values never reach authority");
+        assert_eq!(metrics.rejected, 1);
+    }
+
+    #[test]
     fn hello_registers_and_replies() {
         let hub = hub();
         let reply = hub.handle_hello(1);
@@ -879,6 +1016,50 @@ mod tests {
         // The reply decodes to the server's negotiation.
         let hello = Hello::decode(&reply.body).expect("hello decodes");
         assert_eq!(hello, TransformHubConfig::default().hello);
+    }
+
+    #[test]
+    fn gameplay_clock_tracks_completed_steps_at_the_effective_sim_rate() {
+        let config = TransformHubConfig {
+            sim_dt: 1.0 / 30.0,
+            hello: Hello {
+                sim_rate_hz: 30,
+                ..Hello::default()
+            },
+            ..TransformHubConfig::default()
+        };
+        let hub = TransformHub::new(config).expect("hub");
+        let initial = hub.gameplay_clock().expect("clock is available");
+        assert_eq!(initial.tick_hz, 30);
+        assert_eq!(initial.tick, 0);
+
+        hub.sim_tick();
+        hub.sim_tick();
+        let clock = hub.gameplay_clock().expect("clock is available");
+        assert_eq!(clock.epoch, initial.epoch);
+        assert_eq!(clock.tick, 2);
+        assert_eq!(clock.elapsed_us, 66_666);
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn gameplay_clock_is_unavailable_after_mutex_poisoning() {
+        let hub = hub();
+        let initial = hub.gameplay_clock().expect("clock is available");
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _guard = hub.inner.lock().expect("lock is initially healthy");
+                    panic!("deliberately poison hub state");
+                });
+            });
+        }));
+
+        assert_eq!(hub.gameplay_clock(), None);
+        // `initial` is intentionally not returned: a caller cannot obtain stale
+        // state through the hub API once its clock is unavailable.
+        assert_ne!(initial.epoch, 0);
     }
 
     #[test]

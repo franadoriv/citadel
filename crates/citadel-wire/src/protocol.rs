@@ -168,6 +168,17 @@ pub const KIND_NOTIFICATION: u16 = 27;
 /// receiver-side `expires_at` timestamp instead of an event id.
 pub const KIND_CHAT_EVENT: u16 = 28;
 
+/// Transform-sync v2 negotiation manifest (reliable, C↔S).  This is a
+/// separate kind rather than an appended v1 `HELLO`, so a v1 decoder can never
+/// accidentally interpret epoch-bearing metadata.
+pub const KIND_TSYNC_V2_HELLO: u16 = 29;
+/// Transform-sync v2 snapshot (unreliable, S→C), carrying gameplay-clock
+/// epoch/tick/rate metadata followed by the unchanged v1 snapshot body.
+pub const KIND_TSYNC_V2_SNAPSHOT: u16 = 30;
+/// Transform-sync v2 owner input (unreliable, C→S), carrying an opaque epoch
+/// fence and bounded diagnostics followed by the unchanged v1 input body.
+pub const KIND_TSYNC_V2_INPUT: u16 = 31;
+
 // Compile-time guarantees that the reserved ranges are disjoint and sit above the
 // legacy kinds (1..=6). A future edit that overlaps them fails to build rather
 // than silently colliding on the wire.

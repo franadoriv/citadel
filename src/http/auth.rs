@@ -370,7 +370,7 @@ async fn admit_email_auth(
 async fn admit(app: &App, plan: &[crate::repository::ChatRateLimit]) -> Result<(), ApiError> {
     match app
         .chat()
-        .consume_rate_limits(plan, SystemClock.now())
+        .consume_rate_limits(plan, app.auth_clock().now())
         .await
     {
         Ok(()) => Ok(()),
