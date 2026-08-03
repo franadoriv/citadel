@@ -112,6 +112,10 @@ pub struct AuthLimitsConfig {
     pub source: AuthRateLimitRule,
     pub email: AuthRateLimitRule,
     pub registration_source: AuthRateLimitRule,
+    /// Admission window for `POST /console/v1/login`. Deliberately much tighter
+    /// than the player rules: the operator credential is static, unhashed, and
+    /// grants full read/write over every console section.
+    pub console_login: AuthRateLimitRule,
 }
 
 impl Default for AuthLimitsConfig {
@@ -120,6 +124,7 @@ impl Default for AuthLimitsConfig {
             source: AuthRateLimitRule::new(30, 60_000),
             email: AuthRateLimitRule::new(10, 900_000),
             registration_source: AuthRateLimitRule::new(10, 3_600_000),
+            console_login: AuthRateLimitRule::new(5, 300_000),
         }
     }
 }
@@ -130,6 +135,7 @@ impl AuthLimitsConfig {
             ("auth.limits.source", self.source),
             ("auth.limits.email", self.email),
             ("auth.limits.registration_source", self.registration_source),
+            ("auth.limits.console_login", self.console_login),
         ] {
             if rule.limit == 0 || rule.limit > 1_000_000 {
                 return Err(AppError::config(format!(
@@ -1373,6 +1379,31 @@ impl Default for HttpConfig {
     }
 }
 
+impl HttpConfig {
+    /// Whether [`Self::bind`] can only be reached from this host.
+    ///
+    /// Parsed as a socket address first so IPv6 forms (`[::1]:7350`) and the
+    /// unspecified addresses (`0.0.0.0`, `[::]`) are classified correctly.
+    /// Anything that does not parse is treated as exposed: a hostname may
+    /// resolve anywhere, and guessing in the permissive direction would defeat
+    /// the guard it feeds.
+    #[must_use]
+    pub fn binds_loopback_only(&self) -> bool {
+        use std::net::SocketAddr;
+
+        let bind = self.bind.trim();
+        if let Ok(addr) = bind.parse::<SocketAddr>() {
+            return addr.ip().is_loopback();
+        }
+        // Accept the common `localhost:PORT` spelling, which is not a valid
+        // `SocketAddr` but is unambiguously loopback.
+        matches!(
+            bind.rsplit_once(':'),
+            Some((host, _)) if host.eq_ignore_ascii_case("localhost")
+        )
+    }
+}
+
 /// Admin console authentication settings.
 ///
 /// Static operator credentials, Nakama-style: `username` + `password` grant the
@@ -1791,6 +1822,27 @@ impl Config {
         self.authentication.limits.validate()?;
         self.database.validate()?;
         self.console.validate()?;
+        self.validate_console_exposure()?;
+        Ok(())
+    }
+
+    /// Refuse to start an internet-reachable node that still carries the
+    /// built-in console credentials.
+    ///
+    /// The console grants full read/write over accounts, wallets, chat, groups,
+    /// and the database explorer, so shipping the documented default password on
+    /// a public bind is a takeover waiting to happen. Loopback binds stay
+    /// permitted: the zero-setup local demo is the reason the default exists.
+    fn validate_console_exposure(&self) -> AppResult<()> {
+        if self.console.uses_default_credentials() && !self.http.binds_loopback_only() {
+            return Err(AppError::config(format!(
+                "console.password is still the built-in default while http.bind is \
+                 '{}', which is reachable beyond this host. Set console.username and \
+                 console.password (or CITADEL_CONSOLE_USERNAME and \
+                 CITADEL_CONSOLE_PASSWORD) before binding a non-loopback address.",
+                self.http.bind
+            )));
+        }
         Ok(())
     }
 }
@@ -2946,5 +2998,78 @@ fields = ["region"]
         .expect("parse");
         let error = partial.validate().expect_err("partial TLS config rejected");
         assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+    }
+
+    #[test]
+    fn loopback_binds_are_classified_correctly() {
+        let loopback = [
+            "127.0.0.1:7350",
+            "127.1.2.3:7350",
+            "[::1]:7350",
+            "localhost:7350",
+            "LOCALHOST:7350",
+        ];
+        for bind in loopback {
+            let http = HttpConfig {
+                bind: bind.to_string(),
+            };
+            assert!(http.binds_loopback_only(), "{bind} is loopback");
+        }
+
+        let exposed = [
+            "0.0.0.0:7350",
+            "[::]:7350",
+            "192.168.0.10:7350",
+            "203.0.113.7:7350",
+            // A hostname may resolve anywhere, so it must not be trusted.
+            "citadel.example.com:7350",
+        ];
+        for bind in exposed {
+            let http = HttpConfig {
+                bind: bind.to_string(),
+            };
+            assert!(!http.binds_loopback_only(), "{bind} is not loopback");
+        }
+    }
+
+    #[test]
+    fn default_console_credentials_are_rejected_on_a_public_bind() {
+        let mut config = Config::default();
+        assert!(
+            config.console.uses_default_credentials(),
+            "fixture relies on the built-in defaults"
+        );
+
+        // Loopback keeps the zero-setup local demo working.
+        config.http.bind = "127.0.0.1:7350".to_string();
+        config.validate().expect("loopback default console allowed");
+
+        // Exposing the node with the documented password must fail closed.
+        config.http.bind = "0.0.0.0:7350".to_string();
+        let error = config
+            .validate()
+            .expect_err("public bind with default console credentials rejected");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+        let rendered = format!("{error}");
+        // A substring check against the credential itself is meaningless here:
+        // the built-in password is literally "password", which also appears in
+        // the `console.password` key name the message must cite. Assert instead
+        // that the message is actionable — it names the offending bind and the
+        // settings to change — and note that the guard never interpolates the
+        // credential value.
+        assert!(
+            rendered.contains("0.0.0.0:7350"),
+            "names the offending bind"
+        );
+        assert!(
+            rendered.contains("CITADEL_CONSOLE_PASSWORD"),
+            "points at the remediation"
+        );
+
+        // Setting a real credential clears the guard.
+        config.console.password = "an-operator-chosen-secret".to_string();
+        config
+            .validate()
+            .expect("public bind with custom console credentials allowed");
     }
 }

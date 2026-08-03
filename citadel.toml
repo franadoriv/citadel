@@ -19,7 +19,22 @@ public_addr = "127.0.0.1:7350"
 [http]
 # HTTP surface: health (/health), status (/status), and the admin console
 # (/dashboard). Bind to 0.0.0.0:7350 to accept connections from other machines.
+# Binding a non-loopback address requires real console credentials below: the
+# server refuses to start while the built-in operator password is still in use.
 bind = "127.0.0.1:7350"
+
+# [console]
+# Credentials for the operator console at /dashboard and its /console/v1/* API.
+# The built-in default (admin/password) exists so the local demo runs with zero
+# setup, and is accepted ONLY on a loopback [http] bind. Uncomment and set real
+# values before exposing this node, or supply CITADEL_CONSOLE_USERNAME and
+# CITADEL_CONSOLE_PASSWORD from your secret store instead of committing them.
+# The console has no separate transport: it is served over plain HTTP, so put it
+# behind a TLS-terminating reverse proxy or keep it on loopback.
+# username = "operator"
+# password = "choose-a-long-random-value"
+# viewer_password = "optional-read-only-value"
+# token_expiry_sec = 3600
 
 [logging]
 # Log verbosity directive (e.g. "info", "debug", "citadel=trace") and output

@@ -40,7 +40,7 @@ pub mod storage;
 pub mod telemetry;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::routing::{delete, get, post};
@@ -48,7 +48,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
-use crate::error::AppError;
+use crate::error::{AppError, ErrorCategory};
 use crate::services::{AuditEntry, ConsoleIdentity, verify_login};
 use crate::time::{Clock, SystemClock};
 
@@ -342,6 +342,7 @@ pub(super) fn routes() -> Router<App> {
 /// `POST /console/v1/login`: exchange operator credentials for a bearer token.
 async fn login_handler(
     State(app): State<App>,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     app.metrics().record_http_request();
@@ -353,6 +354,9 @@ async fn login_handler(
                 .into());
         }
     };
+    // Consume the admission counters before verifying the credential, so a
+    // password-guessing campaign is bounded regardless of the outcome.
+    admit_console_login(&app, &peer_source(peer), &request.username).await?;
     let now = SystemClock.now();
     let Some(role) = verify_login(&app.config().console, &request.username, &request.password)
     else {
@@ -371,7 +375,7 @@ async fn login_handler(
     let token = app.console_tokens().issue(ConsoleIdentity {
         username: request.username.clone(),
         role,
-    });
+    })?;
     app.audit_log().record(AuditEntry::new(
         now,
         request.username,
@@ -385,6 +389,43 @@ async fn login_handler(
         role: role.as_str(),
         expires_in_sec: app.console_tokens().ttl().as_secs(),
     }))
+}
+
+/// Return the address observed on Citadel's direct TCP connection. Deliberately
+/// ignore `X-Forwarded-For`, for the same reason as the player auth surface:
+/// unless a deployment configures and authenticates a trusted reverse proxy,
+/// that header is client-controlled spoofing input.
+fn peer_source(peer: Option<ConnectInfo<std::net::SocketAddr>>) -> String {
+    peer.map_or_else(
+        || "unavailable-peer".to_string(),
+        |peer| peer.0.ip().to_string(),
+    )
+}
+
+/// Consume the console login admission counters before credential verification.
+///
+/// The counter repository's fixed-window operation is atomic; a rejected plan
+/// consumes no individual key. A `Permission` result can only come from this
+/// dedicated limiter call and is rendered as one uniform 429, so it never leaks
+/// whether the presented username exists.
+async fn admit_console_login(app: &App, source: &str, username: &str) -> Result<(), ApiError> {
+    let plan = app.auth_rate_limits().console_login(source, username);
+    match app
+        .chat()
+        .consume_rate_limits(&plan, app.auth_clock().now())
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.category() == ErrorCategory::Permission => {
+            let retry_after = plan
+                .iter()
+                .map(|rule| rule.window_ms.div_ceil(1_000))
+                .max()
+                .unwrap_or(1);
+            Err(ApiError::rate_limited(retry_after))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// `GET /console/v1/me`: the authenticated operator identity.
