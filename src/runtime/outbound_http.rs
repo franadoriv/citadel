@@ -827,10 +827,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_a_runtime_handle_table_aborts_pending_work() {
-        struct DropSignal(Option<oneshot::Sender<()>>);
+    async fn dropping_the_last_runtime_handle_table_owner_aborts_pending_work() {
+        struct AbortWitness(Option<oneshot::Sender<()>>);
 
-        impl Drop for DropSignal {
+        impl Drop for AbortWitness {
             fn drop(&mut self) {
                 if let Some(sender) = self.0.take() {
                     let _ = sender.send(());
@@ -839,29 +839,36 @@ mod tests {
         }
 
         let async_client = AsyncOutboundHttp::new(TrustedHttpClient::new().expect("client"));
-        let (started, started_rx) = oneshot::channel::<()>();
-        let (dropped, dropped_rx) = oneshot::channel::<()>();
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (aborted_sender, aborted_receiver) = oneshot::channel();
+        let (_result_sender, result_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let _signal = DropSignal(Some(dropped));
-            let _ = started.send(());
+            let _witness = AbortWitness(Some(aborted_sender));
+            let _ = started_sender.send(());
             std::future::pending::<()>().await;
         });
+        started_receiver.await.expect("pending task started");
         async_client.entries.lock().expect("table").insert(
             7,
             AsyncRequestEntry::Pending {
-                receiver: oneshot::channel().1,
+                receiver: result_receiver,
                 task,
             },
         );
-        started_rx.await.expect("pending task started");
 
+        // Language VMs retain clones in host closures: only replacement of the
+        // final owner may abort the pending request.
+        let retained_owner = async_client.clone();
         drop(async_client);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), dropped_rx)
-                .await
-                .expect("dropping the runtime must abort its HTTP task")
-                .is_ok()
+        assert_eq!(
+            retained_owner.poll(7).expect("retained handle"),
+            OutboundHttpRequestState::Pending
         );
+        drop(retained_owner);
+        tokio::time::timeout(Duration::from_secs(1), aborted_receiver)
+            .await
+            .expect("last owner drop aborts the task")
+            .expect("task abort drops its witness");
     }
 
     #[tokio::test]
