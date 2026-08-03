@@ -3197,6 +3197,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
     use std::collections::HashSet;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::time::Instant;
 
     use super::*;
@@ -3481,6 +3484,46 @@ def message(ctx, body):
     }
 
     #[test]
+    fn realtime_interceptors_reject_all_async_http_operations() {
+        let rt = runtime(
+            r#"
+import citadel
+
+errors = []
+
+@citadel.before_realtime
+def before(ctx, body):
+    for operation in (
+        lambda: citadel.http.start("https://api.example.test/"),
+        lambda: citadel.http.poll(1),
+        lambda: citadel.http.cancel(1),
+    ):
+        try:
+            operation()
+        except RuntimeError as error:
+            errors.append(str(error))
+    return True
+
+@citadel.on_message(8)
+def message(ctx, body):
+    citadel.broadcast(9, ",".join(errors).encode())
+"#,
+        );
+        assert_eq!(
+            rt.before_realtime(7, None, None, 1, b"input"),
+            RealtimeInterception::Continue
+        );
+        assert_eq!(
+            rt.dispatch(7, None, 8, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"interceptor_forbidden,interceptor_forbidden,interceptor_forbidden".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn invalid_before_realtime_result_fails_closed() {
         let rt = runtime(
             r#"
@@ -3635,6 +3678,87 @@ def handle(ctx, body):
         dir.write_main(source);
         assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
         assert_disabled(&runtime);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_http_handles_return_bytes_without_blocking_python() {
+        let listener = TcpListener::bind(("localhost", 0)).expect("bind test HTTP server");
+        let port = listener.local_addr().expect("test server address").port();
+        let (served, served_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test HTTP request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read test HTTP request");
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\0\xffA")
+                .expect("write test HTTP response");
+            served.send(()).expect("notify response written");
+        });
+        let dir = TempDir::new("python-async-http-bytes");
+        dir.write_main(&format!(
+            r#"
+import citadel
+
+handle = None
+
+@citadel.on_message(1)
+def start(ctx, body):
+    global handle
+    handle = citadel.http.start("http://localhost:{port}/", {{
+        "method": "POST", "headers": {{"x-test": "yes"}}, "body": b"request"
+    }})
+    citadel.broadcast(9, type(handle).__name__.encode())
+
+@citadel.on_message(2)
+def poll(ctx, body):
+    result = citadel.http.poll(handle)
+    if result["state"] == "success":
+        citadel.broadcast(9, f"success:{{result['status']}}:{{result['body'].hex()}}".encode())
+    else:
+        citadel.broadcast(9, result["state"].encode())
+"#
+        ));
+        let runtime = PythonRuntime::load_with_static_data_and_http_policy(
+            &dir.0,
+            100,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            OutboundHttpPolicy {
+                allowed_hosts: vec!["localhost".to_owned()],
+                allowed_ports: vec![port],
+                allow_private_networks: true,
+                ..OutboundHttpPolicy::default()
+            },
+        )
+        .expect("load file runtime")
+        .expect("main.py present");
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"int".to_vec(),
+                unreliable: false,
+            }]
+        );
+        served_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("async request reaches test server");
+        let response = (0..100)
+            .map(|_| {
+                let commands = runtime.dispatch(1, None, 2, b"");
+                let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+                    panic!("expected HTTP state broadcast");
+                };
+                if body.starts_with(b"success:") {
+                    Some(body.clone())
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                }
+            })
+            .find_map(std::convert::identity)
+            .expect("completed async response");
+        assert_eq!(response, b"success:201:00ff41");
     }
 
     #[test]

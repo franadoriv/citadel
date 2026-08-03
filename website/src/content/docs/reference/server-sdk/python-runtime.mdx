@@ -11,12 +11,13 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 This is a **trusted-server-only** capability for operator-owned game code, not
 client code. `start(url, opts=None)` schedules Rust-owned outbound HTTP and
-returns an opaque runtime-local `int` handle immediately; it never waits for
-network I/O. `url` must be an `http` or `https` DNS-hostname URL. `opts` may
-contain `method` (string, default `"GET"`), `headers` (a `dict[str, str]`), and
-`body` (`bytes` or `str`). Rust policy rejections raise their stable code without
-allocating a handle. Local Python argument or option validation can instead
-raise a Python-visible validation exception; it is not an `error_code` contract.
+returns an opaque runtime-local `int` handle immediately; it does not create an
+`asyncio` task or coroutine and never waits for network I/O. `url` must be an
+`http` or `https` DNS-hostname URL. `opts` may contain `method` (string, default
+`"GET"`), `headers` (a `dict[str, str]`), and `body` (`bytes` or `str`). Rust
+policy rejections raise their stable code without allocating a handle. Local
+Python argument or option validation can instead raise a Python-visible
+validation exception; it is not an `error_code` contract.
 
 `poll(handle)` never blocks and returns one of these mappings:
 
@@ -30,9 +31,12 @@ raise a Python-visible validation exception; it is not an `error_code` contract.
 
 `cancel(handle)` returns the same mapping. It aborts a pending request and is
 idempotent for any already-terminal known handle; unknown, malformed, evicted,
-or reload-invalidated handles raise an error. Reload and shutdown cancel and
-forget all handles. `fetch`, `start`, `poll`, and `cancel` all raise
-`RuntimeError("interceptor_forbidden")` inside realtime interceptors.
+or reload-invalidated handles raise an error. Terminal handles remain pollable
+only until the bounded per-runtime handle table evicts one; reload and shutdown
+cancel and forget all handles. On `success`, `body` is the exact response
+`bytes` (including `b"\\x00"` and non-UTF-8 data), never decoded text. `fetch`,
+`start`, `poll`, and `cancel` all raise `RuntimeError("interceptor_forbidden")`
+inside realtime interceptors.
 
 ### `citadel.http.fetch` compatibility
 

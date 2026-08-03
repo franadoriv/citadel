@@ -11,14 +11,14 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 This is a **trusted-server-only** capability for operator-owned game code, not
 client code. `start(url, opts?)` schedules Rust-owned outbound HTTP and returns
-an opaque runtime-local **string** handle immediately. Keep it as a string—do
-not coerce it to a JavaScript number, so the underlying `u64` never loses
-precision. `url` must be an `http` or `https` DNS-hostname URL. `opts` may
-contain `method` (string, default `"GET"`), `headers` (a string-to-string
-object), and `body` (string). Rust policy rejections throw their stable code
-without allocating a handle. Local JavaScript argument or option validation can
-instead throw a JavaScript-visible validation message; it is not an `error_code`
-contract.
+an opaque runtime-local **string** handle immediately; it does not return a
+`Promise` and never waits for network I/O. Keep it as a string—do not coerce it
+to a JavaScript number, so the underlying `u64` never loses precision. `url`
+must be an `http` or `https` DNS-hostname URL. `opts` may contain `method`
+(string, default `"GET"`), `headers` (a string-to-string object), and `body`
+(string). Rust policy rejections throw their stable code without allocating a
+handle. Local JavaScript argument or option validation can instead throw a
+JavaScript-visible validation message; it is not an `error_code` contract.
 
 `poll(handle)` never blocks and returns one of these objects:
 
@@ -32,8 +32,11 @@ contract.
 
 `cancel(handle)` returns the same object. It aborts a pending request and is
 idempotent for any already-terminal known handle; unknown, malformed, evicted,
-or reload-invalidated handles throw an error. Reload and shutdown cancel and
-forget all handles. `fetch`, `start`, `poll`, and `cancel` all throw
+or reload-invalidated handles throw an error. Terminal handles remain pollable
+only until the bounded per-runtime handle table evicts one; reload and shutdown
+cancel and forget all handles. On `success`, `body` is a `Uint8Array` containing
+the exact response bytes (including `0x00` and non-UTF-8 bytes), not a JSON
+array or decoded text. `fetch`, `start`, `poll`, and `cancel` all throw
 `Error("interceptor_forbidden")` inside realtime interceptors.
 
 ### `citadel.http.fetch` compatibility
