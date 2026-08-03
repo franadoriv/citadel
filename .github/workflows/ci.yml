@@ -4,8 +4,10 @@ on:
   pull_request:
   push:
     branches:
-      - main
-      - master
+      # The integration branch and the release branch. `main`/`master` do not
+      # exist in this repository, so listing them silently disabled push CI.
+      - develop
+      - release
 
 jobs:
   runtime-ingress-media:
@@ -32,6 +34,11 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # scripts/python-runtime-env.sh serializes tests by default because
+      # embedded CPython initialization races on Windows. This job is Linux, so
+      # take the opt-back-in the script documents rather than running the whole
+      # suite single-threaded.
+      RUST_TEST_THREADS: "4"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,20 +51,19 @@ jobs:
           cache-targets: false
       - name: Report disk space before Rust compilation
         run: df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Report disk space before Rust tests
-        run: df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-      - run: cargo test --all-targets --all-features
+      - name: Run the canonical verification gate
+        # Deliberately the same entry point developers run locally, rather than
+        # a hand-copied subset. The previous inline steps had drifted: they
+        # omitted `--workspace` from clippy and test (skipping every crates/*
+        # target, including the contract-manifest ABI stale-guard) and ran only
+        # 5 of the 11 validators this script chains.
+        run: bash scripts/check.sh
       - name: Run MongoDB replica-set compatibility suite
         # The harness creates an authenticated disposable rs0 and runs every
         # Mongo-enabled contract, HTTP flow, race/cancellation regression, and
         # backup/restore integrity check. A standalone service cannot exercise
         # multi-document transactions, so do not replace this with one.
         run: bash scripts/test-mongodb.sh
-      - run: bash scripts/check-docs.sh
-      - run: bash scripts/check-sdk-parity.sh
-      - run: python3 scripts/check-godot-web-sdk.py
 
   godot-web-sdk:
     # A browser export cannot be built on a developer workstation. Validate the
