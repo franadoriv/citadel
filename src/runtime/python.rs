@@ -3733,6 +3733,25 @@ def handle(ctx, body):
                     .extract::<Vec<u8>>()?,
                 vec![0, 255]
             );
+            let error = outbound_http_state_to_python(
+                py,
+                OutboundHttpRequestState::Error("request_failed".to_string()),
+            )?;
+            let error = error.bind(py);
+            assert_eq!(
+                error
+                    .get_item("state")?
+                    .expect("error state")
+                    .extract::<String>()?,
+                "error"
+            );
+            assert_eq!(
+                error
+                    .get_item("error_code")?
+                    .expect("error code")
+                    .extract::<String>()?,
+                "request_failed"
+            );
             Ok(())
         })
         .expect("all async HTTP states map to the documented Python contract");

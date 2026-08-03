@@ -82,6 +82,17 @@ handles raise an error instead. Terminal handles remain pollable only until the
 bounded per-runtime table needs to evict one; reload and shutdown cancel and
 forget all handles.
 
+The `error_code` contract is stable and deliberately redacted: never parse a
+human-readable error message. The codes are `request_too_large`,
+`response_too_large`, `invalid_method`, `invalid_header`, `headers_too_large`,
+`authority_header_forbidden`, `capability_disabled`, `invalid_scheme`,
+`invalid_url`, `url_credentials_forbidden`, `ip_literal_forbidden`,
+`host_forbidden`, `port_forbidden`, `private_address_forbidden`,
+`resolution_failed`, `concurrent_limit_reached`, `rate_limit_reached`,
+`handle_limit_reached`, `unknown_handle`, and `request_failed`. Policy and
+handle failures raise their code directly; a completed request with `state =
+"error"` returns its code in `error_code`.
+
 ### `citadel.http.fetch` compatibility
 
 `fetch(url, opts?)` remains available in trusted Lua for backward compatibility.

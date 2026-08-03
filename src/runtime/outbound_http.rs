@@ -899,13 +899,54 @@ mod tests {
     }
 
     #[test]
-    fn async_error_codes_are_stable_and_redacted() {
-        assert_eq!(OutboundHttpError::InvalidUrl.error_code(), "invalid_url");
-        assert_eq!(
-            OutboundHttpError::RequestFailed("http://secret.invalid/token".to_string())
-                .error_code(),
-            "request_failed"
-        );
+    fn async_error_code_taxonomy_is_stable_and_redacted() {
+        let cases = [
+            (OutboundHttpError::RequestTooLarge, "request_too_large"),
+            (OutboundHttpError::ResponseTooLarge, "response_too_large"),
+            (OutboundHttpError::InvalidMethod, "invalid_method"),
+            (OutboundHttpError::InvalidHeader, "invalid_header"),
+            (OutboundHttpError::HeadersTooLarge, "headers_too_large"),
+            (
+                OutboundHttpError::AuthorityHeaderForbidden,
+                "authority_header_forbidden",
+            ),
+            (OutboundHttpError::Disabled, "capability_disabled"),
+            (OutboundHttpError::InvalidScheme, "invalid_scheme"),
+            (OutboundHttpError::InvalidUrl, "invalid_url"),
+            (
+                OutboundHttpError::UrlCredentialsForbidden,
+                "url_credentials_forbidden",
+            ),
+            (
+                OutboundHttpError::IpLiteralForbidden,
+                "ip_literal_forbidden",
+            ),
+            (OutboundHttpError::HostForbidden, "host_forbidden"),
+            (OutboundHttpError::PortForbidden, "port_forbidden"),
+            (
+                OutboundHttpError::PrivateAddressForbidden,
+                "private_address_forbidden",
+            ),
+            (OutboundHttpError::ResolutionFailed, "resolution_failed"),
+            (
+                OutboundHttpError::ConcurrentLimitReached,
+                "concurrent_limit_reached",
+            ),
+            (OutboundHttpError::RateLimitReached, "rate_limit_reached"),
+            (
+                OutboundHttpError::HandleLimitReached,
+                "handle_limit_reached",
+            ),
+            (OutboundHttpError::UnknownHandle, "unknown_handle"),
+            (
+                OutboundHttpError::RequestFailed("http://secret.invalid/token".to_string()),
+                "request_failed",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.error_code(), expected);
+        }
     }
 
     #[tokio::test]

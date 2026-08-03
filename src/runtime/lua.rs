@@ -3641,6 +3641,16 @@ mod tests {
                 .as_bytes(),
             &[0, 255]
         );
+        let error = outbound_http_state_to_lua(
+            &lua,
+            OutboundHttpRequestState::Error("request_failed".to_string()),
+        )
+        .expect("error maps");
+        assert_eq!(error.get::<String>("state").expect("error state"), "error");
+        assert_eq!(
+            error.get::<String>("error_code").expect("error code"),
+            "request_failed"
+        );
     }
 
     #[test]

@@ -3876,6 +3876,15 @@ mod tests {
         .expect("success JSON");
         assert_eq!(success["status"], 201);
         assert_eq!(success["body"], serde_json::json!([0, 255]));
+        let error: serde_json::Value = serde_json::from_str(
+            &outbound_http_state_to_js(OutboundHttpRequestState::Error(
+                "request_failed".to_string(),
+            ))
+            .expect("error maps"),
+        )
+        .expect("error JSON");
+        assert_eq!(error["state"], "error");
+        assert_eq!(error["error_code"], "request_failed");
     }
 
     #[test]
