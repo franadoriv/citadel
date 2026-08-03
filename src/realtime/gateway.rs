@@ -240,9 +240,36 @@ struct DurablePartyGateway {
     router: Arc<TlsMatchmakerHandoffRouter>,
 }
 
+/// Drive a durable party-directory future to completion from the synchronous
+/// inbound RPC path.
+///
+/// The frame dispatch in [`Gateway::handle_inbound`] is synchronous while the
+/// party directory is async, so the two have to be bridged. When the server's
+/// multi-threaded runtime is available this reuses it via `block_in_place`,
+/// exactly as [`ServiceDomainHost::block`](crate::runtime::host_services) does
+/// for host calls: the worker hands its queued tasks to a sibling thread rather
+/// than stalling the scheduler.
+///
+/// Building a fresh runtime per call — the previous behaviour — cost an OS
+/// thread spawn plus reactor and timer setup on every party RPC, and discarded
+/// the connection pool and timer state immediately afterwards.
+///
+/// The dedicated-thread path survives as a fallback for callers with no runtime
+/// or a current-thread one (unit tests constructing a gateway directly). It is
+/// never taken on the server.
 fn party_block_on<T: Send + 'static>(
     future: impl Future<Output = crate::error::AppResult<T>> + Send + 'static,
 ) -> crate::error::AppResult<T> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    if let Ok(handle) = Handle::try_current()
+        && handle.runtime_flavor() == RuntimeFlavor::MultiThread
+    {
+        // `block_in_place` is a no-op off a worker thread, so this is also
+        // correct when the tick loop calls in from the blocking pool.
+        return tokio::task::block_in_place(|| handle.block_on(future));
+    }
+
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6705,6 +6732,52 @@ mod tests {
     use crate::transport::TransportKind;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    /// The bridge must reuse the server runtime from a worker thread.
+    ///
+    /// Every other test in this module runs on a current-thread runtime and so
+    /// only exercises the dedicated-thread fallback. This one pins the path the
+    /// server actually takes, where `block_in_place` has to hand the worker's
+    /// queued tasks off rather than panic or deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn party_block_on_reuses_a_multi_thread_runtime() {
+        let from_worker =
+            party_block_on(async { Ok::<u32, crate::error::AppError>(7) }).expect("worker thread");
+        assert_eq!(from_worker, 7);
+
+        // The tick loop reaches this bridge from the blocking pool, where
+        // `block_in_place` is a no-op and `block_on` must still be allowed.
+        let from_blocking =
+            tokio::task::spawn_blocking(|| party_block_on(async { Ok::<u32, _>(9) }))
+                .await
+                .expect("blocking task joins")
+                .expect("blocking pool");
+        assert_eq!(from_blocking, 9);
+
+        // Errors propagate unchanged rather than being remapped by the bridge.
+        let failure = party_block_on(async {
+            Err::<u32, _>(crate::error::AppError::internal("directory unavailable"))
+        })
+        .expect_err("error propagates");
+        assert_eq!(failure.category(), crate::error::ErrorCategory::Internal);
+    }
+
+    /// A current-thread runtime must take the fallback instead of panicking:
+    /// `block_in_place` is not permitted there.
+    #[tokio::test]
+    async fn party_block_on_falls_back_on_a_current_thread_runtime() {
+        let value =
+            party_block_on(async { Ok::<u32, crate::error::AppError>(11) }).expect("fallback path");
+        assert_eq!(value, 11);
+    }
+
+    /// And with no runtime at all, which is how plain `#[test]` callers arrive.
+    #[test]
+    fn party_block_on_falls_back_without_a_runtime() {
+        let value =
+            party_block_on(async { Ok::<u32, crate::error::AppError>(13) }).expect("fallback path");
+        assert_eq!(value, 13);
+    }
 
     /// Build a test authenticated identity for a user id.
     fn test_identity(user_id: &str) -> ParticipantIdentity {
