@@ -1095,6 +1095,14 @@ pub struct TransportTlsConfig {
     pub certificate_file: Option<String>,
     /// PEM private key corresponding to `certificate_file`.
     pub private_key_file: Option<String>,
+    /// Permit the generated development certificate on a reachable bind.
+    ///
+    /// The generated certificate carries only a `localhost` SAN, so no real
+    /// client can validate it; accepting it off-loopback pushes integrators
+    /// toward disabling verification, which turns a configuration gap into a
+    /// fleet-wide interception risk. Set this only for a closed LAN test where
+    /// that trade-off is understood and deliberate.
+    pub allow_self_signed: bool,
 }
 
 impl TransportTlsConfig {
@@ -1112,6 +1120,25 @@ impl TransportTlsConfig {
                 "transport.tls.certificate_file and transport.tls.private_key_file must be set together and not be empty",
             )),
         }
+    }
+
+    /// Reject a reachable listener that would fall back to the generated
+    /// development certificate.
+    ///
+    /// Previously this was announced with a single `info` line and the node
+    /// started anyway, so a deployment could serve real traffic on a throwaway
+    /// certificate without anything failing.
+    fn validate_listener_exposure(&self, listener: &str, bind: &str) -> AppResult<()> {
+        if self.is_configured() || self.allow_self_signed || bind_is_loopback_only(bind) {
+            return Ok(());
+        }
+        Err(AppError::config(format!(
+            "{listener} binds '{bind}', which is reachable beyond this host, but \
+             transport.tls is not configured. Set transport.tls.certificate_file \
+             and transport.tls.private_key_file, or set \
+             transport.tls.allow_self_signed = true to accept the generated \
+             development certificate on this bind."
+        )))
     }
 }
 
@@ -1381,27 +1408,32 @@ impl Default for HttpConfig {
 
 impl HttpConfig {
     /// Whether [`Self::bind`] can only be reached from this host.
-    ///
-    /// Parsed as a socket address first so IPv6 forms (`[::1]:7350`) and the
-    /// unspecified addresses (`0.0.0.0`, `[::]`) are classified correctly.
-    /// Anything that does not parse is treated as exposed: a hostname may
-    /// resolve anywhere, and guessing in the permissive direction would defeat
-    /// the guard it feeds.
     #[must_use]
     pub fn binds_loopback_only(&self) -> bool {
-        use std::net::SocketAddr;
-
-        let bind = self.bind.trim();
-        if let Ok(addr) = bind.parse::<SocketAddr>() {
-            return addr.ip().is_loopback();
-        }
-        // Accept the common `localhost:PORT` spelling, which is not a valid
-        // `SocketAddr` but is unambiguously loopback.
-        matches!(
-            bind.rsplit_once(':'),
-            Some((host, _)) if host.eq_ignore_ascii_case("localhost")
-        )
+        bind_is_loopback_only(&self.bind)
     }
+}
+
+/// Whether a `host:port` bind string can only be reached from this host.
+///
+/// Parsed as a socket address first so IPv6 forms (`[::1]:7350`) and the
+/// unspecified addresses (`0.0.0.0`, `[::]`) are classified correctly. Anything
+/// that does not parse is treated as exposed: a hostname may resolve anywhere,
+/// and guessing in the permissive direction would defeat the guards this feeds.
+#[must_use]
+pub fn bind_is_loopback_only(bind: &str) -> bool {
+    use std::net::SocketAddr;
+
+    let bind = bind.trim();
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+    // Accept the common `localhost:PORT` spelling, which is not a valid
+    // `SocketAddr` but is unambiguously loopback.
+    matches!(
+        bind.rsplit_once(':'),
+        Some((host, _)) if host.eq_ignore_ascii_case("localhost")
+    )
 }
 
 /// Admin console authentication settings.
@@ -1745,6 +1777,9 @@ impl Config {
         self.transport.network_peer.validate()?;
         if self.transport.quic.enabled {
             validate_socket_addr("transport.quic.bind", &self.transport.quic.bind)?;
+            self.transport
+                .tls
+                .validate_listener_exposure("transport.quic.bind", &self.transport.quic.bind)?;
             if self.transport.quic.outbound_queue_capacity == 0 {
                 return Err(AppError::config(
                     "transport.quic.outbound_queue_capacity must be >= 1",
@@ -1768,6 +1803,10 @@ impl Config {
         }
         if self.transport.webtransport.enabled {
             validate_socket_addr(
+                "transport.webtransport.bind",
+                &self.transport.webtransport.bind,
+            )?;
+            self.transport.tls.validate_listener_exposure(
                 "transport.webtransport.bind",
                 &self.transport.webtransport.bind,
             )?;
@@ -3030,6 +3069,55 @@ fields = ["region"]
             };
             assert!(!http.binds_loopback_only(), "{bind} is not loopback");
         }
+    }
+
+    #[test]
+    fn self_signed_transports_are_rejected_on_a_reachable_bind() {
+        let mut config = Config::default();
+        config.transport.quic.enabled = true;
+
+        // Loopback keeps the zero-setup local demo and the test suite working.
+        config.transport.quic.bind = "127.0.0.1:7351".to_string();
+        config.validate().expect("loopback dev cert allowed");
+
+        // A reachable bind with no PEM would have served real traffic on a
+        // throwaway certificate after only an info-level log line.
+        config.transport.quic.bind = "0.0.0.0:7351".to_string();
+        let error = config
+            .validate()
+            .expect_err("public bind without TLS material rejected");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains("transport.quic.bind"),
+            "names the listener"
+        );
+        assert!(
+            rendered.contains("allow_self_signed"),
+            "offers the explicit opt-in"
+        );
+
+        // The opt-in is honoured for a deliberate closed-network test.
+        config.transport.tls.allow_self_signed = true;
+        config.validate().expect("explicit opt-in allowed");
+
+        // Real PEM material clears the guard without the opt-in.
+        config.transport.tls.allow_self_signed = false;
+        config.transport.tls.certificate_file = Some("/etc/citadel/fullchain.pem".to_string());
+        config.transport.tls.private_key_file = Some("/etc/citadel/privkey.pem".to_string());
+        config.validate().expect("configured PEM allowed");
+
+        // The same guard covers the browser listener.
+        let mut webtransport = Config::default();
+        webtransport.transport.webtransport.enabled = true;
+        webtransport.transport.webtransport.bind = "0.0.0.0:7352".to_string();
+        let error = webtransport
+            .validate()
+            .expect_err("public webtransport bind without TLS rejected");
+        assert!(
+            format!("{error}").contains("transport.webtransport.bind"),
+            "names the listener"
+        );
     }
 
     #[test]
