@@ -10,6 +10,10 @@ name = "citadel"
 # feature set are still stabilizing. See docs/release-process.md.
 version = "0.9.14"
 edition = "2024"
+# The server is distributed as release archives, not on crates.io. Stating this
+# prevents an accidental `cargo publish` and lets the supply-chain gate tell
+# first-party crates apart from vendored ones.
+publish = false
 
 [features]
 default = []

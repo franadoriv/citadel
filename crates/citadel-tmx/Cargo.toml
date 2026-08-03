@@ -2,6 +2,7 @@
 name = "citadel-tmx"
 version = "0.1.0"
 edition = "2024"
+publish = false
 description = "Bounded Tiled TMX collision import for Citadel maps."
 
 [dependencies]
