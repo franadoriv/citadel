@@ -36,6 +36,21 @@ impl AuthenticationRateLimitPolicy {
         plan
     }
 
+    /// Limit console operator login by both source and presented username.
+    ///
+    /// The operator surface has no KDF and a small credential space, so it is
+    /// held to the stricter of the configured windows rather than the general
+    /// per-source one: the username key throttles a distributed campaign against
+    /// a single operator account, and the source key throttles one host walking
+    /// a password list.
+    #[must_use]
+    pub fn console_login(&self, source: &str, username: &str) -> Vec<ChatRateLimit> {
+        vec![
+            rule("console-source", &[source], self.limits.console_login),
+            rule("console-user", &[username], self.limits.console_login),
+        ]
+    }
+
     /// Limit email authentication by both source and normalized email. The
     /// email key works across a distributed password-guessing campaign.
     #[must_use]

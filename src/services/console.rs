@@ -11,13 +11,15 @@
 //! (read-only). Which configured password matched decides the role.
 
 use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::config::ConsoleConfig;
 use crate::error::{AppError, AppResult};
+
+/// Entropy drawn per console bearer token. 256 bits matches the player session
+/// tokens issued by [`RandomTokenIssuer`](crate::services::token).
+const TOKEN_ENTROPY_BYTES: usize = 32;
 
 /// Access level of an authenticated console operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,8 +148,12 @@ impl ConsoleTokenStore {
     }
 
     /// Issue a fresh bearer token for `identity`.
-    #[must_use]
-    pub fn issue(&self, identity: ConsoleIdentity) -> String {
+    ///
+    /// # Errors
+    /// Returns an [`Internal`](crate::error::ErrorCategory::Internal) error when
+    /// the operating system CSPRNG is unavailable. Issuing a guessable operator
+    /// token instead is never an acceptable fallback.
+    pub fn issue(&self, identity: ConsoleIdentity) -> AppResult<String> {
         self.issue_at(identity, Instant::now())
     }
 
@@ -163,8 +169,8 @@ impl ConsoleTokenStore {
     }
 
     /// Clock-injectable issue, the unit-testable core of [`Self::issue`].
-    fn issue_at(&self, identity: ConsoleIdentity, now: Instant) -> String {
-        let token = random_token();
+    fn issue_at(&self, identity: ConsoleIdentity, now: Instant) -> AppResult<String> {
+        let token = random_token()?;
         let mut tokens = self.lock();
         // Lazy purge keeps the map bounded by the number of live logins.
         tokens.retain(|_, entry| entry.expires_at > now);
@@ -175,7 +181,7 @@ impl ConsoleTokenStore {
                 expires_at: now + self.ttl,
             },
         );
-        token
+        Ok(token)
     }
 
     /// Clock-injectable validate, the unit-testable core of [`Self::validate`].
@@ -199,22 +205,24 @@ impl ConsoleTokenStore {
 
 /// Generate an unpredictable 256-bit bearer token, hex-encoded.
 ///
-/// Each [`RandomState`] is seeded with fresh OS entropy per construction (the
-/// same dependency-free source `random_instance_prefix` uses for repository
-/// ids); hashing the wall clock and a lane index through four independent
-/// states concatenates four 64-bit unpredictable values. No `rand` dependency
-/// is introduced for this single call site.
-fn random_token() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let mut token = String::with_capacity(64);
-    for lane in 0u64..4 {
-        let word = RandomState::new().hash_one((nanos, std::process::id(), lane));
-        token.push_str(&format!("{word:016x}"));
+/// Entropy comes straight from the operating system CSPRNG, matching the player
+/// session tokens issued by [`RandomTokenIssuer`](crate::services::token). A
+/// non-cryptographic hasher is deliberately not used here: `RandomState` is
+/// SipHash-1-3 seeded from a thread-local key that is reused (with a counter
+/// bump) for every token the thread issues, so observing one token would leak
+/// information about the others.
+fn random_token() -> AppResult<String> {
+    use std::fmt::Write as _;
+
+    let mut bytes = [0u8; TOKEN_ENTROPY_BYTES];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| AppError::internal(format!("CSPRNG unavailable for console token: {e}")))?;
+    let mut token = String::with_capacity(TOKEN_ENTROPY_BYTES * 2);
+    for byte in bytes {
+        // Infallible: writing to a String never fails.
+        let _ = write!(token, "{byte:02x}");
     }
-    token
+    Ok(token)
 }
 
 #[cfg(test)]
@@ -270,7 +278,7 @@ mod tests {
     fn issued_tokens_validate_until_expiry() {
         let store = ConsoleTokenStore::new(Duration::from_secs(60));
         let now = Instant::now();
-        let token = store.issue_at(admin(), now);
+        let token = store.issue_at(admin(), now).expect("CSPRNG available");
         let identity = store
             .validate_at(&token, now + Duration::from_secs(59))
             .expect("token still valid before expiry");
@@ -287,7 +295,7 @@ mod tests {
     fn unknown_and_revoked_tokens_do_not_validate() {
         let store = ConsoleTokenStore::new(Duration::from_secs(60));
         assert!(store.validate("no-such-token").is_none());
-        let token = store.issue(admin());
+        let token = store.issue(admin()).expect("CSPRNG available");
         assert!(store.revoke(&token));
         assert!(store.validate(&token).is_none());
         assert!(!store.revoke(&token), "second revoke is a no-op");
@@ -297,9 +305,11 @@ mod tests {
     fn expired_entries_are_purged_on_issue() {
         let store = ConsoleTokenStore::new(Duration::from_secs(10));
         let now = Instant::now();
-        let stale = store.issue_at(admin(), now);
+        let stale = store.issue_at(admin(), now).expect("CSPRNG available");
         // Issuing far past the first token's expiry purges it from the map.
-        let _fresh = store.issue_at(admin(), now + Duration::from_secs(3_600));
+        let _fresh = store
+            .issue_at(admin(), now + Duration::from_secs(3_600))
+            .expect("CSPRNG available");
         assert!(!store.lock().contains_key(&stale), "stale token purged");
     }
 
@@ -308,7 +318,7 @@ mod tests {
         let store = ConsoleTokenStore::new(Duration::from_secs(60));
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
-            let token = store.issue(admin());
+            let token = store.issue(admin()).expect("CSPRNG available");
             assert_eq!(token.len(), 64);
             assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(seen.insert(token), "issued tokens must never repeat");
@@ -329,7 +339,7 @@ mod tests {
     #[test]
     fn debug_never_renders_tokens() {
         let store = ConsoleTokenStore::new(Duration::from_secs(60));
-        let token = store.issue(admin());
+        let token = store.issue(admin()).expect("CSPRNG available");
         let rendered = format!("{store:?}");
         assert!(!rendered.contains(&token));
     }

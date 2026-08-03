@@ -119,6 +119,45 @@ async fn login(addr: SocketAddr, username: &str, password: &str) -> Response {
     .await
 }
 
+/// Password guessing against the operator login must be bounded.
+///
+/// The console credential is static, unhashed, and grants full read/write over
+/// every section, so the endpoint has to fail closed under repeated attempts
+/// rather than merely recording them in the audit trail.
+#[tokio::test]
+async fn console_login_is_rate_limited_after_repeated_failures() {
+    let mut config = console_config();
+    // Keep the fixture explicit rather than depending on the shipped default.
+    config.authentication.limits.console_login = citadel::config::AuthRateLimitRule {
+        limit: 3,
+        window_ms: 300_000,
+    };
+    config.validate().expect("test config must validate");
+    let (addr, tx, server) = spawn_server(App::new(config)).await;
+
+    // The configured budget is spent on wrong passwords, each a uniform 401.
+    for attempt in 0..3 {
+        let rejected = login(addr, "ops", "wrong").await;
+        assert_eq!(rejected.status, 401, "attempt {attempt} should be a 401");
+    }
+
+    // The next attempt is refused by the limiter, not the credential check.
+    let throttled = login(addr, "ops", "wrong").await;
+    assert_eq!(throttled.status, 429, "further guesses must be throttled");
+
+    // Crucially, the throttle also holds for the *correct* password: an
+    // attacker must not be able to distinguish a hit from a miss by spending
+    // the budget, and a exhausted window cannot be bypassed by guessing right.
+    let correct = login(addr, "ops", "operator-secret").await;
+    assert_eq!(
+        correct.status, 429,
+        "the window applies regardless of credential validity"
+    );
+
+    let _ = tx.send(());
+    let _ = server.await;
+}
+
 #[tokio::test]
 async fn console_login_guard_and_section_stubs() {
     let (addr, tx, server) = spawn_server(App::new(console_config())).await;
