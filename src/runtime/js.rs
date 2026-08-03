@@ -3840,19 +3840,85 @@ mod tests {
         assert_disabled(&runtime);
     }
 
+    #[test]
+    fn async_http_state_contract_is_stable_for_javascript() {
+        for state in [
+            OutboundHttpRequestState::Pending,
+            OutboundHttpRequestState::Timeout,
+            OutboundHttpRequestState::Cancelled,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(
+                &outbound_http_state_to_js(state).expect("state maps to JavaScript"),
+            )
+            .expect("mapped state is JSON");
+            assert!(value.get("error_code").is_none());
+        }
+        let timeout: serde_json::Value = serde_json::from_str(
+            &outbound_http_state_to_js(OutboundHttpRequestState::Timeout).expect("timeout maps"),
+        )
+        .expect("timeout JSON");
+        assert_eq!(timeout["state"], "timeout");
+        let cancelled: serde_json::Value = serde_json::from_str(
+            &outbound_http_state_to_js(OutboundHttpRequestState::Cancelled)
+                .expect("cancelled maps"),
+        )
+        .expect("cancelled JSON");
+        assert_eq!(cancelled["state"], "cancelled");
+        let success: serde_json::Value = serde_json::from_str(
+            &outbound_http_state_to_js(OutboundHttpRequestState::Success(
+                crate::runtime::outbound_http::OutboundHttpResponse {
+                    status: 201,
+                    body: vec![0, 255],
+                },
+            ))
+            .expect("success maps"),
+        )
+        .expect("success JSON");
+        assert_eq!(success["status"], 201);
+        assert_eq!(success["body"], serde_json::json!([0, 255]));
+    }
+
+    #[test]
+    fn async_http_rejects_oversized_javascript_bodies_before_network_io() {
+        let runtime = runtime(&format!(
+            r#"
+citadel.on_message(1, () => {{
+  try {{
+    citadel.http.start("https://example.test/", {{ body: "x".repeat({}) }});
+  }} catch (error) {{
+    citadel.broadcast(2, error.message);
+  }}
+}});
+"#,
+            crate::runtime::outbound_http::MAX_OUTBOUND_HTTP_REQUEST_BYTES + 1
+        ));
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"request_too_large".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn async_http_handles_return_uint8array_bytes_without_blocking_javascript() {
         let listener = TcpListener::bind(("localhost", 0)).expect("bind test HTTP server");
         let port = listener.local_addr().expect("test server address").port();
         let (served, served_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept test HTTP request");
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).expect("read test HTTP request");
+            served.send(()).expect("notify request read");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("release delayed response");
             stream
                 .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\0\xffA")
                 .expect("write test HTTP response");
-            served.send(()).expect("notify response written");
         });
         let dir = TempDir::new("js-async-http-bytes");
         dir.write_main(&format!(
@@ -3899,6 +3965,12 @@ citadel.on_message(2, () => {{
         served_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("async request reaches test server");
+        assert_eq!(
+            first_broadcast_body(runtime.dispatch(1, None, 2, b"")),
+            b"pending",
+            "poll returns immediately while the server holds its response"
+        );
+        release.send(()).expect("release response");
         let response = (0..100)
             .map(|_| {
                 let commands = runtime.dispatch(1, None, 2, b"");

@@ -827,6 +827,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_runtime_handle_table_aborts_pending_work() {
+        struct DropSignal(Option<oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let async_client = AsyncOutboundHttp::new(TrustedHttpClient::new().expect("client"));
+        let (started, started_rx) = oneshot::channel::<()>();
+        let (dropped, dropped_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped));
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        async_client.entries.lock().expect("table").insert(
+            7,
+            AsyncRequestEntry::Pending {
+                receiver: oneshot::channel().1,
+                task,
+            },
+        );
+        started_rx.await.expect("pending task started");
+
+        drop(async_client);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+                .await
+                .expect("dropping the runtime must abort its HTTP task")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn async_handle_limit_refuses_new_pending_work() {
         let async_client = AsyncOutboundHttp::new(TrustedHttpClient::new().expect("client"));
         let mut entries = async_client.entries.lock().expect("table");

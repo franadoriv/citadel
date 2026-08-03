@@ -3680,19 +3680,106 @@ def handle(ctx, body):
         assert_disabled(&runtime);
     }
 
+    #[test]
+    fn async_http_state_contract_is_stable_for_python() {
+        Python::attach(|py| -> PyResult<()> {
+            for state in [
+                OutboundHttpRequestState::Pending,
+                OutboundHttpRequestState::Timeout,
+                OutboundHttpRequestState::Cancelled,
+            ] {
+                let result = outbound_http_state_to_python(py, state)?;
+                assert!(result.bind(py).get_item("error_code")?.is_none());
+            }
+            let timeout = outbound_http_state_to_python(py, OutboundHttpRequestState::Timeout)?;
+            assert_eq!(
+                timeout
+                    .bind(py)
+                    .get_item("state")?
+                    .expect("timeout state")
+                    .extract::<String>()?,
+                "timeout"
+            );
+            let cancelled = outbound_http_state_to_python(py, OutboundHttpRequestState::Cancelled)?;
+            assert_eq!(
+                cancelled
+                    .bind(py)
+                    .get_item("state")?
+                    .expect("cancelled state")
+                    .extract::<String>()?,
+                "cancelled"
+            );
+            let success = outbound_http_state_to_python(
+                py,
+                OutboundHttpRequestState::Success(
+                    crate::runtime::outbound_http::OutboundHttpResponse {
+                        status: 201,
+                        body: vec![0, 255],
+                    },
+                ),
+            )?;
+            let success = success.bind(py);
+            assert_eq!(
+                success
+                    .get_item("status")?
+                    .expect("success status")
+                    .extract::<u16>()?,
+                201
+            );
+            assert_eq!(
+                success
+                    .get_item("body")?
+                    .expect("success body")
+                    .extract::<Vec<u8>>()?,
+                vec![0, 255]
+            );
+            Ok(())
+        })
+        .expect("all async HTTP states map to the documented Python contract");
+    }
+
+    #[test]
+    fn async_http_rejects_oversized_python_bodies_before_network_io() {
+        let runtime = runtime(&format!(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    try:
+        citadel.http.start("https://example.test/", {{"body": b"x" * {}}})
+    except RuntimeError as error:
+        citadel.broadcast(2, str(error).encode())
+"#,
+            crate::runtime::outbound_http::MAX_OUTBOUND_HTTP_REQUEST_BYTES + 1
+        ));
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"request_too_large".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn async_http_handles_return_bytes_without_blocking_python() {
         let listener = TcpListener::bind(("localhost", 0)).expect("bind test HTTP server");
         let port = listener.local_addr().expect("test server address").port();
         let (served, served_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept test HTTP request");
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).expect("read test HTTP request");
+            served.send(()).expect("notify request read");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("release delayed response");
             stream
                 .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\0\xffA")
                 .expect("write test HTTP response");
-            served.send(()).expect("notify response written");
         });
         let dir = TempDir::new("python-async-http-bytes");
         dir.write_main(&format!(
@@ -3743,6 +3830,16 @@ def poll(ctx, body):
         served_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("async request reaches test server");
+        assert_eq!(
+            runtime.dispatch(1, None, 2, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"pending".to_vec(),
+                unreliable: false,
+            }],
+            "poll returns immediately while the server holds its response"
+        );
+        release.send(()).expect("release response");
         let response = (0..100)
             .map(|_| {
                 let commands = runtime.dispatch(1, None, 2, b"");

@@ -71,6 +71,15 @@ citadel.on_tick((_dt) => {
 });
 ```
 
+### Migration limits
+
+There is no native `await`, `Promise`, callback, or automatic fetch rewrite:
+retain the runtime-local handle yourself and poll it from a later tick or
+handler. A handle cannot survive a successful reload or runtime shutdown; those
+lifecycle transitions cancel and forget outstanding work, so callers must
+discard stored handles and start a fresh request when the replacement runtime is
+ready.
+
 The same operator policy applies to `fetch`, `start`, `poll`, and `cancel`:
 hostname/port allowlists, public-address and DNS-rebinding checks, proxy and
 redirect denial, a 64 KiB request body cap, 1 MiB response cap, 64 headers/

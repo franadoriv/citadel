@@ -3545,6 +3545,10 @@ fn script_error(context: &str, err: &mlua::Error) -> AppError {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
     use super::*;
 
     const RELAY_SCRIPT: &str = r#"
@@ -3589,6 +3593,228 @@ mod tests {
             !detail.contains("api.example.test"),
             "host-policy errors must not expose request target details: {detail}"
         );
+    }
+
+    #[test]
+    fn async_http_state_contract_is_stable_for_lua() {
+        let lua = Lua::new();
+        for state in [
+            OutboundHttpRequestState::Pending,
+            OutboundHttpRequestState::Timeout,
+            OutboundHttpRequestState::Cancelled,
+        ] {
+            let table = outbound_http_state_to_lua(&lua, state).expect("state maps to Lua");
+            assert!(matches!(
+                table.get::<Option<mlua::String>>("error_code"),
+                Ok(None)
+            ));
+        }
+        assert_eq!(
+            outbound_http_state_to_lua(&lua, OutboundHttpRequestState::Timeout)
+                .expect("timeout maps")
+                .get::<String>("state")
+                .expect("timeout state"),
+            "timeout"
+        );
+        assert_eq!(
+            outbound_http_state_to_lua(&lua, OutboundHttpRequestState::Cancelled)
+                .expect("cancelled maps")
+                .get::<String>("state")
+                .expect("cancelled state"),
+            "cancelled"
+        );
+        let success = outbound_http_state_to_lua(
+            &lua,
+            OutboundHttpRequestState::Success(
+                crate::runtime::outbound_http::OutboundHttpResponse {
+                    status: 201,
+                    body: vec![0, 255],
+                },
+            ),
+        )
+        .expect("success maps");
+        assert_eq!(success.get::<u16>("status").expect("status"), 201);
+        assert_eq!(
+            success
+                .get::<mlua::String>("body")
+                .expect("body")
+                .as_bytes(),
+            &[0, 255]
+        );
+    }
+
+    #[test]
+    fn trusted_lua_async_http_rejects_oversized_body_before_network_io() {
+        let dir = TempDir::new("lua-async-http-oversized");
+        dir.write_main(&format!(
+            r#"
+            citadel.on_message(1, function()
+                local ok, err = pcall(function()
+                    citadel.http.start("https://example.test/", {{ body = string.rep("x", {}) }})
+                end)
+                citadel.broadcast(2, (not ok and string.find(tostring(err), "request_too_large", 1, true)) and "request_too_large" or "unexpected")
+            end)
+            "#,
+            crate::runtime::outbound_http::MAX_OUTBOUND_HTTP_REQUEST_BYTES + 1
+        ));
+        let runtime = LuaRuntime::load_with_static_data_and_mode_and_http_policy(
+            &dir.0,
+            DEFAULT_DEADLINE_MS,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            LuaExecutionMode::Trusted,
+            OutboundHttpPolicy::default(),
+        )
+        .expect("load file runtime")
+        .expect("main.lua present");
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 2,
+                body: b"request_too_large".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_http_handles_are_pending_until_a_delayed_lua_response_arrives() {
+        let listener = TcpListener::bind(("localhost", 0)).expect("bind test HTTP server");
+        let port = listener.local_addr().expect("test server address").port();
+        let (served, served_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test HTTP request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read test HTTP request");
+            served.send(()).expect("notify request read");
+            release_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("release delayed response");
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\0\xffA")
+                .expect("write test HTTP response");
+        });
+        let dir = TempDir::new("lua-async-http-delayed");
+        dir.write_main(&format!(
+            r#"
+            local handle = nil
+            citadel.on_message(1, function()
+                handle = citadel.http.start("http://localhost:{port}/", {{ body = "request" }})
+                citadel.broadcast(9, type(handle))
+            end)
+            citadel.on_message(2, function()
+                local result = citadel.http.poll(handle)
+                if result.state == "success" then
+                    citadel.broadcast(9, "success:" .. result.status .. ":" .. #result.body)
+                else
+                    citadel.broadcast(9, result.state)
+                end
+            end)
+            "#
+        ));
+        let runtime = LuaRuntime::load_with_static_data_and_mode_and_http_policy(
+            &dir.0,
+            DEFAULT_DEADLINE_MS,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            LuaExecutionMode::Trusted,
+            OutboundHttpPolicy {
+                allowed_hosts: vec!["localhost".to_owned()],
+                allowed_ports: vec![port],
+                allow_private_networks: true,
+                ..OutboundHttpPolicy::default()
+            },
+        )
+        .expect("load file runtime")
+        .expect("main.lua present");
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"number".to_vec(),
+                unreliable: false,
+            }]
+        );
+        served_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("async request reaches test server");
+        assert_eq!(
+            runtime.dispatch(1, None, 2, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 9,
+                body: b"pending".to_vec(),
+                unreliable: false,
+            }],
+            "poll returns immediately while the server holds its response"
+        );
+        release.send(()).expect("release response");
+        let response = (0..100)
+            .map(|_| {
+                let commands = runtime.dispatch(1, None, 2, b"");
+                let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+                    panic!("expected HTTP state broadcast");
+                };
+                if body.starts_with(b"success:") {
+                    Some(body.clone())
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                }
+            })
+            .find_map(std::convert::identity)
+            .expect("completed async response");
+        assert_eq!(response, b"success:201:3");
+    }
+
+    #[test]
+    fn trusted_lua_http_policy_survives_reload() {
+        let dir = TempDir::new("lua-http-policy");
+        let source = r#"
+            citadel.on_message(1, function()
+                local failures = {}
+                for _, operation in ipairs({
+                    function() citadel.http.fetch("https://api.example.test/") end,
+                    function() citadel.http.start("https://api.example.test/") end,
+                    function() citadel.http.poll(7) end,
+                    function() citadel.http.cancel(7) end,
+                }) do
+                    local ok, err = pcall(operation)
+                    if not ok then
+                        table.insert(failures, string.find(tostring(err), "capability_disabled", 1, true) and "capability_disabled" or "unexpected")
+                    end
+                end
+                citadel.broadcast(2, table.concat(failures, ","))
+            end)
+        "#;
+        dir.write_main(source);
+        let runtime = LuaRuntime::load_with_static_data_and_mode_and_http_policy(
+            &dir.0,
+            DEFAULT_DEADLINE_MS,
+            None,
+            crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES,
+            LuaExecutionMode::Trusted,
+            OutboundHttpPolicy {
+                enabled: false,
+                ..OutboundHttpPolicy::default()
+            },
+        )
+        .expect("load file runtime")
+        .expect("main.lua present");
+        let assert_disabled = |runtime: &LuaRuntime| {
+            assert_eq!(
+                runtime.dispatch(1, None, 1, b""),
+                vec![OutboundCommand::Broadcast {
+                    kind: 2,
+                    body: b"capability_disabled,capability_disabled,capability_disabled,capability_disabled".to_vec(),
+                    unreliable: false,
+                }]
+            );
+        };
+        assert_disabled(&runtime);
+        dir.write_main(source);
+        assert_eq!(runtime.reload(), ReloadOutcome::Reloaded);
+        assert_disabled(&runtime);
     }
 
     #[test]
