@@ -1396,12 +1396,57 @@ impl Default for ServerConfig {
 pub struct HttpConfig {
     /// Socket address the HTTP server binds to.
     pub bind: String,
+    /// Optional PEM material terminating TLS directly on this listener.
+    ///
+    /// Set this to serve `https://` without a reverse proxy. It is independent
+    /// of `transport.tls`, which covers the QUIC and WebTransport listeners:
+    /// the two surfaces are usually issued different certificates, and a
+    /// deployment may terminate one without the other.
+    pub tls: HttpTlsConfig,
+    /// Acknowledge that a TLS-terminating reverse proxy fronts this listener.
+    ///
+    /// The HTTP surface carries the operator console password, console bearer
+    /// tokens, and every player session token. Serving it unencrypted on a
+    /// reachable address is only safe when something else provides the
+    /// encryption, so the server requires that to be stated rather than
+    /// assumed.
+    pub behind_tls_proxy: bool,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:7350".to_string(),
+            tls: HttpTlsConfig::default(),
+            behind_tls_proxy: false,
+        }
+    }
+}
+
+/// Optional PEM certificate chain and private key for the HTTP listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpTlsConfig {
+    /// PEM certificate chain presented to HTTP clients.
+    pub certificate_file: Option<String>,
+    /// PEM private key corresponding to `certificate_file`.
+    pub private_key_file: Option<String>,
+}
+
+impl HttpTlsConfig {
+    /// Whether both PEM paths were provided.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.certificate_file.is_some() && self.private_key_file.is_some()
+    }
+
+    fn validate(&self) -> AppResult<()> {
+        match (&self.certificate_file, &self.private_key_file) {
+            (None, None) => Ok(()),
+            (Some(cert), Some(key)) if !cert.trim().is_empty() && !key.trim().is_empty() => Ok(()),
+            _ => Err(AppError::config(
+                "http.tls.certificate_file and http.tls.private_key_file must be set together and not be empty",
+            )),
         }
     }
 }
@@ -1861,7 +1906,9 @@ impl Config {
         self.authentication.limits.validate()?;
         self.database.validate()?;
         self.console.validate()?;
+        self.http.tls.validate()?;
         self.validate_console_exposure()?;
+        self.validate_http_exposure()?;
         Ok(())
     }
 
@@ -1883,6 +1930,31 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// Refuse to serve the HTTP surface in cleartext on a reachable address.
+    ///
+    /// This listener carries the operator console password, the console bearer
+    /// tokens issued from it, and every player session token. Encryption is
+    /// therefore not optional off-loopback; the only question is who provides
+    /// it. Terminate here with `http.tls`, or state that something in front
+    /// does with `http.behind_tls_proxy`.
+    fn validate_http_exposure(&self) -> AppResult<()> {
+        if self.http.tls.is_configured()
+            || self.http.behind_tls_proxy
+            || self.http.binds_loopback_only()
+        {
+            return Ok(());
+        }
+        Err(AppError::config(format!(
+            "http.bind is '{}', which is reachable beyond this host, but the HTTP \
+             surface would be served in cleartext. It carries the console password, \
+             console bearer tokens, and player session tokens. Set \
+             http.tls.certificate_file and http.tls.private_key_file to terminate \
+             TLS here, or set http.behind_tls_proxy = true if a TLS-terminating \
+             reverse proxy fronts this listener.",
+            self.http.bind
+        )))
     }
 }
 
@@ -3051,6 +3123,7 @@ fields = ["region"]
         for bind in loopback {
             let http = HttpConfig {
                 bind: bind.to_string(),
+                ..HttpConfig::default()
             };
             assert!(http.binds_loopback_only(), "{bind} is loopback");
         }
@@ -3066,6 +3139,7 @@ fields = ["region"]
         for bind in exposed {
             let http = HttpConfig {
                 bind: bind.to_string(),
+                ..HttpConfig::default()
             };
             assert!(!http.binds_loopback_only(), "{bind} is not loopback");
         }
@@ -3121,12 +3195,67 @@ fields = ["region"]
     }
 
     #[test]
+    fn cleartext_http_is_rejected_on_a_reachable_bind() {
+        let mut config = Config::default();
+        // Keep the console credentials out of the picture: this guard is about
+        // the transport, not the password.
+        config.console.password = "an-operator-chosen-secret".to_string();
+
+        // Loopback stays cleartext so the zero-setup local demo still works.
+        config.http.bind = "127.0.0.1:7350".to_string();
+        config.validate().expect("loopback cleartext allowed");
+
+        // A reachable bind would put the console password, the console bearer
+        // tokens and every player session token on the wire in the clear.
+        config.http.bind = "0.0.0.0:7350".to_string();
+        let error = config
+            .validate()
+            .expect_err("reachable cleartext bind rejected");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains("0.0.0.0:7350"),
+            "names the offending bind"
+        );
+        assert!(
+            rendered.contains("http.tls"),
+            "offers in-process termination"
+        );
+        assert!(
+            rendered.contains("http.behind_tls_proxy"),
+            "offers the proxy acknowledgement"
+        );
+
+        // Terminating in-process clears the guard.
+        config.http.tls.certificate_file = Some("/etc/citadel/fullchain.pem".to_string());
+        config.http.tls.private_key_file = Some("/etc/citadel/privkey.pem".to_string());
+        config.validate().expect("configured http TLS allowed");
+
+        // So does acknowledging that a proxy terminates in front.
+        config.http.tls = HttpTlsConfig::default();
+        config.http.behind_tls_proxy = true;
+        config.validate().expect("acknowledged proxy allowed");
+    }
+
+    #[test]
+    fn partial_http_tls_material_is_rejected() {
+        let mut config = Config::default();
+        config.http.tls.certificate_file = Some("/etc/citadel/fullchain.pem".to_string());
+        let error = config.validate().expect_err("half-configured TLS rejected");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+        assert!(format!("{error}").contains("must be set together"));
+    }
+
+    #[test]
     fn default_console_credentials_are_rejected_on_a_public_bind() {
         let mut config = Config::default();
         assert!(
             config.console.uses_default_credentials(),
             "fixture relies on the built-in defaults"
         );
+        // Isolate the credential guard from the cleartext-transport guard, which
+        // would otherwise reject the reachable bind for its own reason.
+        config.http.behind_tls_proxy = true;
 
         // Loopback keeps the zero-setup local demo working.
         config.http.bind = "127.0.0.1:7350".to_string();

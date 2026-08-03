@@ -12,6 +12,7 @@ pub mod dashboard;
 pub mod error;
 pub mod player;
 mod runtime_endpoint;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -141,6 +142,41 @@ where
     })
 }
 
+/// Serve on `listener` using whichever scheme the configuration selects.
+///
+/// With `http.tls` configured this terminates TLS in-process; otherwise it
+/// serves cleartext, which configuration validation only permits on loopback or
+/// with `http.behind_tls_proxy` acknowledged.
+///
+/// # Errors
+/// Propagates the underlying serve error, or a
+/// [`Config`](crate::error::ErrorCategory::Config) error if the TLS material
+/// cannot be loaded.
+pub async fn serve_configured<F>(listener: TcpListener, app: App, shutdown: F) -> AppResult<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let http_tls = app.config().http.tls.clone();
+    let Some((certificate_file, private_key_file)) = http_tls
+        .certificate_file
+        .as_deref()
+        .zip(http_tls.private_key_file.as_deref())
+    else {
+        tracing::info!(
+            behind_tls_proxy = app.config().http.behind_tls_proxy,
+            "serving HTTP without in-process TLS"
+        );
+        return serve(listener, app, shutdown).await;
+    };
+
+    let config = tls::server_config(
+        std::path::Path::new(certificate_file),
+        std::path::Path::new(private_key_file),
+    )?;
+    tracing::info!(addr = ?tls::local_addr(&listener).ok(), "serving HTTPS with configured PEM TLS");
+    tls::serve(listener, app, config, shutdown).await
+}
+
 /// A future that resolves on an interactive Ctrl-C or a container stop signal.
 ///
 /// Used as the default graceful-shutdown trigger for `citadel serve`. A failure
@@ -225,7 +261,7 @@ pub async fn run(app: App) -> AppResult<()> {
         shutdown_cancel.cancel();
     };
 
-    let http_result = serve(listener, app, shutdown).await;
+    let http_result = serve_configured(listener, app, shutdown).await;
     // Ensure transports are signalled and joined regardless of the HTTP result.
     cancel.cancel();
     let transport_result = transports.shutdown().await;
