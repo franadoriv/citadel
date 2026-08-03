@@ -1,13 +1,11 @@
 name: ci
 
 on:
+  # Pull requests are the gate. Direct pushes are deliberately not built here:
+  # develop was removed from the push trigger on purpose (see "ci: skip direct
+  # develop pushes"), and release is owned by release.yml, so triggering on it
+  # would run the whole matrix twice for one cut.
   pull_request:
-  push:
-    branches:
-      # The integration branch and the release branch. `main`/`master` do not
-      # exist in this repository, so listing them silently disabled push CI.
-      - develop
-      - release
 
 jobs:
   runtime-ingress-media:
