@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
-CATALOG = ROOT / "docs" / "capability-matrix.json"
+CATALOG = ROOT / "manifests" / "capability-matrix.json"
 START = "## Capability snapshot\n"
 END = "\n## Roadmap\n"
 def render(data: dict[str, object]) -> str:
@@ -20,10 +20,10 @@ def render(data: dict[str, object]) -> str:
     lines = [
         "## Capability snapshot",
         "",
-        "<!-- Generated from docs/capability-matrix.json; do not edit this section by hand. -->",
+        "<!-- Generated from manifests/capability-matrix.json; do not edit this section by hand. -->",
         "",
         "Citadel is deliberately honest about its current surface. The full,",
-        "machine-readable [capability matrix](docs/capability-matrix.json) is the",
+        "machine-readable [capability matrix](manifests/capability-matrix.json) is the",
         "source of truth; this is the useful-at-a-glance version.",
         "",
         "| Area | What ships today |",

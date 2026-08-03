@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / "website/src/content/docs/reference"
 MANIFEST = ROOT / "tests/fixtures/reference-contract-manifest.json"
 PROTOCOL = ROOT / "crates/citadel-wire/src/protocol.rs"
-MATRIX = ROOT / "docs/capability-matrix.json"
+MATRIX = ROOT / "manifests/capability-matrix.json"
 LINK = re.compile(r"(?<!!)\[[^]]*]\(([^)\s]+)(?:\s+[^)]*)?\)")
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$")
 CONST = re.compile(r"pub const (KIND_[A-Z0-9_]+): u16 = (\d+);")

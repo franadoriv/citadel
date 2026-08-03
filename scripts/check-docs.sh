@@ -10,7 +10,7 @@ set -euo pipefail
 #      NOT satisfy this — the website is the canonical developer-facing
 #      documentation.
 #   2. Other production code changes require at least internal docs
-#      (docs/**, README.md, CHANGELOG.md) or website docs.
+#      (manifests/**, README.md, CHANGELOG.md) or website docs.
 #   3. Test-only / tooling-only changes require nothing.
 #
 # Escape hatch: a commit in the range (or HEAD when diffing the worktree) may
@@ -73,7 +73,7 @@ while IFS= read -r file; do
     website/src/content/docs/*)
       website_docs_changed="true"
       ;;
-    docs/*|website/README.md|README.md|CHANGELOG.md)
+    manifests/*|website/README.md|README.md|CHANGELOG.md)
       internal_docs_changed="true"
       ;;
   esac
@@ -112,7 +112,7 @@ if [[ "$internal_code_changed" == "true" && "$website_docs_changed" != "true" &&
     echo "check-docs: WARNING — code changed without docs; Docs-Exempt: $docs_exempt"
   else
     echo "check-docs: FAIL — code changed without documentation updates."
-    echo "Update website/src/content/docs/, docs/, README.md, or CHANGELOG.md,"
+    echo "Update website/src/content/docs/, manifests/, README.md, or CHANGELOG.md,"
     echo "or add a 'Docs-Exempt: <reason>' commit trailer."
     exit 1
   fi

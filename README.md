@@ -108,7 +108,7 @@ client the authority.
 | Build a small authoritative game | [Knights vs Monsters](website/src/content/docs/tutorials/knights-vs-monsters.mdx) |
 | Connect an existing engine project | [Install a client SDK](website/src/content/docs/guides/install-client-sdk.mdx) |
 | Deploy a release | [Install a server release](website/src/content/docs/guides/install-server.mdx) |
-| See every exact capability and boundary | [Capability matrix](docs/capability-matrix.json) |
+| See every exact capability and boundary | [Capability matrix](manifests/capability-matrix.json) |
 
 ## Build Citadel from source (advanced)
 
@@ -129,10 +129,10 @@ for the complete path.
 
 ## Capability snapshot
 
-<!-- Generated from docs/capability-matrix.json; do not edit this section by hand. -->
+<!-- Generated from manifests/capability-matrix.json; do not edit this section by hand. -->
 
 Citadel is deliberately honest about its current surface. The full,
-machine-readable [capability matrix](docs/capability-matrix.json) is the
+machine-readable [capability matrix](manifests/capability-matrix.json) is the
 source of truth; this is the useful-at-a-glance version.
 
 | Area | What ships today |

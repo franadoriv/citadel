@@ -110,7 +110,7 @@ def check_manifest(root: Path, manifest_path: Path) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", default="docs/client-feature-manifest.json")
+    parser.add_argument("--manifest", default="manifests/client-feature-manifest.json")
     parser.add_argument("--expect-failure", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
