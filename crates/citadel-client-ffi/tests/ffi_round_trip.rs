@@ -156,7 +156,7 @@ fn ffi_authenticate_with_valid_token_returns_user_id() {
     let handle = connect_ws(addr);
     let token_bytes = token.as_bytes();
     let mut auth_status = CitadelAuthStatus::Rejected;
-    let mut user_buf = [0i8; 256];
+    let mut user_buf = [0u8; 256];
     let mut user_len = 0usize;
     let mut reason = u8::MAX;
 
@@ -199,7 +199,7 @@ fn ffi_authenticate_guest_is_rejected_when_auth_required() {
 
     let handle = connect_ws(addr);
     let mut auth_status = CitadelAuthStatus::Guest;
-    let mut user_buf = [0i8; 16];
+    let mut user_buf = [0u8; 16];
     let mut user_len = usize::MAX;
     let mut reason = u8::MAX;
 
@@ -390,7 +390,7 @@ fn ffi_quic_receives_reliable_uni_stream_frames() {
 /// Present the guest handshake over the dedicated FFI auth helper.
 fn ffi_guest_handshake(handle: *mut CitadelClient) {
     let mut auth_status = CitadelAuthStatus::Rejected;
-    let mut user_buf = [0i8; 64];
+    let mut user_buf = [0u8; 64];
     let mut user_len = usize::MAX;
     let mut reason = u8::MAX;
     // SAFETY: `handle` is live; null token + len 0 requests a guest session; all

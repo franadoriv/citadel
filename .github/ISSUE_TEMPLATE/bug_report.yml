@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible problem in Citadel
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not use this form for security vulnerabilities; follow SECURITY.md instead."
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: State the observed behavior and the behavior you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      placeholder: "1. ...\n2. ...\n3. ..."
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Citadel version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and logs
+      description: Include OS, runtime/client path, configuration relevant to the problem, and sanitized logs.
