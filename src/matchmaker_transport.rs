@@ -36,6 +36,10 @@ use crate::matchmaker_cluster::{
     TicketStatusHandler, TicketSubmissionHandler,
 };
 use crate::party::{PartyId, PartySnapshot};
+use crate::party_presence::{
+    PartyPresenceCommand, PartyPresenceDeliveryDisposition, PartyPresenceLease,
+    PartyPresenceUpdate, PartyPresenceWithdrawal, RemotePartyPresenceDelivery,
+};
 use crate::runtime::cluster::{RuntimeCacheMutation, RuntimeCacheWrite, RuntimeClusterEvent};
 use crate::services::party_directory::PartyOwnerLease;
 use crate::session::NodeId;
@@ -192,6 +196,9 @@ enum NodeCommand {
     DeliverChat(RemoteChatDelivery),
     AdvertiseChatPresence(ChatPresenceLease),
     WithdrawChatPresence(ChatPresenceWithdrawal),
+    AdvertisePartyPresence(PartyPresenceLease),
+    WithdrawPartyPresence(PartyPresenceWithdrawal),
+    DeliverPartyPresence(RemotePartyPresenceDelivery),
     DeliverRuntimeEvent(RuntimeClusterEvent),
     ApplyRuntimeCacheMutation(RuntimeCacheMutation),
     SubmitRuntimeCacheWrite(RuntimeCacheWrite),
@@ -298,6 +305,12 @@ enum ControlResponse {
     ChatPresence {
         update: ChatLeaseUpdate,
     },
+    PartyPresence {
+        update: PartyPresenceUpdate,
+    },
+    PartyPresenceDelivery {
+        disposition: PartyPresenceDeliveryDisposition,
+    },
     RuntimePropagation {
         accepted: bool,
     },
@@ -348,6 +361,8 @@ struct RouterState {
     status_handler: Mutex<Option<TicketStatusHandler>>,
     chat_delivery_handler: Mutex<Option<ChatDeliveryHandler>>,
     chat_presence_handler: Mutex<Option<ChatPresenceHandler>>,
+    party_presence_handler: Mutex<Option<PartyPresenceHandler>>,
+    party_presence_delivery_handler: Mutex<Option<PartyPresenceDeliveryHandler>>,
     party_handler: Mutex<Option<PartyControlHandler>>,
     chat_dedupe: ChatCommandDedupe,
     runtime_event_handler: Mutex<Option<RuntimeEventHandler>>,
@@ -376,6 +391,15 @@ pub type ChatDeliveryHandler =
 /// session or participant handle.
 pub type ChatPresenceHandler =
     Arc<dyn Fn(NodeId, ChatPresenceCommand) -> ChatLeaseUpdate + Send + Sync>;
+/// Callback for one authenticated privacy-safe party/node lease transition.
+/// It receives no member, participant, socket, or invitation identity.
+pub type PartyPresenceHandler =
+    Arc<dyn Fn(NodeId, PartyPresenceCommand) -> PartyPresenceUpdate + Send + Sync>;
+/// Receiver for one member-only party presence snapshot. mTLS authenticates
+/// the source; the callback must still reauthorize local durable membership.
+pub type PartyPresenceDeliveryHandler = Arc<
+    dyn Fn(NodeId, RemotePartyPresenceDelivery) -> PartyPresenceDeliveryDisposition + Send + Sync,
+>;
 
 /// Receiver for one authenticated, at-least-once runtime event.
 pub type RuntimeEventHandler = Arc<dyn Fn(NodeId, RuntimeClusterEvent) -> bool + Send + Sync>;
@@ -492,6 +516,8 @@ impl TlsMatchmakerHandoffRouter {
                 status_handler: Mutex::new(None),
                 chat_delivery_handler: Mutex::new(None),
                 chat_presence_handler: Mutex::new(None),
+                party_presence_handler: Mutex::new(None),
+                party_presence_delivery_handler: Mutex::new(None),
                 party_handler: Mutex::new(None),
                 chat_dedupe: ChatCommandDedupe::new(MAX_DEDUPED_COMMANDS),
                 runtime_event_handler: Mutex::new(None),
@@ -563,6 +589,22 @@ impl TlsMatchmakerHandoffRouter {
     /// The mTLS source identity is rechecked before the callback is invoked.
     pub fn register_chat_presence_handler(&self, handler: ChatPresenceHandler) {
         if let Ok(mut slot) = self.state.chat_presence_handler.lock() {
+            *slot = Some(handler);
+        }
+    }
+
+    /// Install the local party presence directory boundary. The authenticated
+    /// source must match the node named in the lease before this callback runs.
+    pub fn register_party_presence_handler(&self, handler: PartyPresenceHandler) {
+        if let Ok(mut slot) = self.state.party_presence_handler.lock() {
+            *slot = Some(handler);
+        }
+    }
+
+    /// Install the authenticated cross-node member-presence receiver. It is a
+    /// typed snapshot command, never a generic realtime forwarding surface.
+    pub fn register_party_presence_delivery_handler(&self, handler: PartyPresenceDeliveryHandler) {
+        if let Ok(mut slot) = self.state.party_presence_delivery_handler.lock() {
             *slot = Some(handler);
         }
     }
@@ -820,6 +862,42 @@ impl TlsMatchmakerHandoffRouter {
     ) -> Result<ChatLeaseUpdate, MatchmakerRouterError> {
         match self.send(destination, NodeCommand::WithdrawChatPresence(withdrawal))? {
             ControlResponse::ChatPresence { update } => Ok(update),
+            _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
+        }
+    }
+
+    /// Broadcast one privacy-safe party/node lease to a configured peer.
+    pub fn advertise_party_presence(
+        &self,
+        destination: &NodeId,
+        lease: PartyPresenceLease,
+    ) -> Result<PartyPresenceUpdate, MatchmakerRouterError> {
+        match self.send(destination, NodeCommand::AdvertisePartyPresence(lease))? {
+            ControlResponse::PartyPresence { update } => Ok(update),
+            _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
+        }
+    }
+
+    /// Broadcast one fenced final-local-member withdrawal to a configured peer.
+    pub fn withdraw_party_presence(
+        &self,
+        destination: &NodeId,
+        withdrawal: PartyPresenceWithdrawal,
+    ) -> Result<PartyPresenceUpdate, MatchmakerRouterError> {
+        match self.send(destination, NodeCommand::WithdrawPartyPresence(withdrawal))? {
+            ControlResponse::PartyPresence { update } => Ok(update),
+            _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
+        }
+    }
+
+    /// Deliver one source-node party-presence snapshot to a destination lease.
+    pub fn deliver_party_presence(
+        &self,
+        destination: &NodeId,
+        delivery: RemotePartyPresenceDelivery,
+    ) -> Result<PartyPresenceDeliveryDisposition, MatchmakerRouterError> {
+        match self.send(destination, NodeCommand::DeliverPartyPresence(delivery))? {
+            ControlResponse::PartyPresenceDelivery { disposition } => Ok(disposition),
             _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
         }
     }
@@ -1176,6 +1254,64 @@ fn dispatch(
                 }),
             })
         }
+        NodeCommand::AdvertisePartyPresence(lease) => {
+            if lease.node_id != source || lease.party_id.is_empty() || lease.party_id.len() > 128 {
+                return Ok(ControlResponse::Rejected);
+            }
+            let handler = state
+                .party_presence_handler
+                .lock()
+                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
+                .clone();
+            Ok(ControlResponse::PartyPresence {
+                update: handler.map_or(PartyPresenceUpdate::Stale, |handler| {
+                    handler(source, PartyPresenceCommand::Advertise(lease))
+                }),
+            })
+        }
+        NodeCommand::WithdrawPartyPresence(withdrawal) => {
+            if withdrawal.node_id != source
+                || withdrawal.party_id.is_empty()
+                || withdrawal.party_id.len() > 128
+            {
+                return Ok(ControlResponse::Rejected);
+            }
+            let handler = state
+                .party_presence_handler
+                .lock()
+                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
+                .clone();
+            Ok(ControlResponse::PartyPresence {
+                update: handler.map_or(PartyPresenceUpdate::Stale, |handler| {
+                    handler(source, PartyPresenceCommand::Withdraw(withdrawal))
+                }),
+            })
+        }
+        NodeCommand::DeliverPartyPresence(delivery) => {
+            let now = SystemClock.now();
+            if delivery.origin_node != source
+                || delivery.party_id.is_empty()
+                || delivery.party_id.len() > 128
+                || delivery.snapshot.party_id != delivery.party_id
+                || delivery.snapshot.online_members.len() > 8
+                || delivery.deadline <= now
+            {
+                return Ok(ControlResponse::PartyPresenceDelivery {
+                    disposition: PartyPresenceDeliveryDisposition::Rejected,
+                });
+            }
+            let handler = state
+                .party_presence_delivery_handler
+                .lock()
+                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
+                .clone();
+            Ok(ControlResponse::PartyPresenceDelivery {
+                disposition: handler
+                    .map_or(PartyPresenceDeliveryDisposition::Rejected, |handler| {
+                        handler(source, delivery)
+                    }),
+            })
+        }
         NodeCommand::Party(command) => {
             if command.lease.owner_node != state.local_node
                 || command.party_id != command.lease.party_id
@@ -1420,6 +1556,7 @@ mod tests {
         let node_a = node("node-a");
         let node_b = node("node-b");
         let chat_deliveries = Arc::new(AtomicUsize::new(0));
+        let party_presence_deliveries = Arc::new(AtomicUsize::new(0));
         let runtime_events = Arc::new(AtomicUsize::new(0));
         let runtime_mutations = Arc::new(AtomicUsize::new(0));
         let runtime_writes = Arc::new(AtomicUsize::new(0));
@@ -1506,6 +1643,19 @@ mod tests {
             chat_deliveries_for_handler.fetch_add(1, Ordering::SeqCst);
             ChatDeliveryDisposition::Delivered
         }));
+        let party_presence_deliveries_for_handler = Arc::clone(&party_presence_deliveries);
+        router_b.register_party_presence_delivery_handler(Arc::new(move |source, delivery| {
+            if source.as_str() != "node-a"
+                || delivery.origin_node != source
+                || delivery.party_id != "party-42"
+                || delivery.snapshot.party_id != "party-42"
+                || delivery.snapshot.online_members != vec!["alice".to_owned()]
+            {
+                return crate::party_presence::PartyPresenceDeliveryDisposition::Rejected;
+            }
+            party_presence_deliveries_for_handler.fetch_add(1, Ordering::SeqCst);
+            crate::party_presence::PartyPresenceDeliveryDisposition::Delivered
+        }));
         let chat_directory_for_presence = Arc::clone(&chat_directory);
         router_b.register_chat_presence_handler(Arc::new(move |_source, command| match command {
             ChatPresenceCommand::Advertise(lease) => {
@@ -1590,6 +1740,28 @@ mod tests {
             OwnershipGeneration::new(6),
             TimestampMillis::from_unix_millis(0),
         ));
+        assert_eq!(
+            router_a
+                .deliver_party_presence(
+                    &node_b,
+                    crate::party_presence::RemotePartyPresenceDelivery {
+                        party_id: "party-42".to_owned(),
+                        origin_node: node_a.clone(),
+                        origin_generation: OwnershipGeneration::new(4),
+                        destination_generation: OwnershipGeneration::new(9),
+                        snapshot: crate::party_presence::PartyPresenceSnapshot {
+                            party_id: "party-42".to_owned(),
+                            party_revision: 3,
+                            sequence: 1,
+                            online_members: vec!["alice".to_owned()],
+                        },
+                        deadline: TimestampMillis::from_unix_millis(u64::MAX),
+                    },
+                )
+                .expect("mutual TLS party-presence delivery"),
+            crate::party_presence::PartyPresenceDeliveryDisposition::Delivered
+        );
+        assert_eq!(party_presence_deliveries.load(Ordering::SeqCst), 1);
         let handoff = RemoteMatchmakerHandoff {
             ticket_id: TicketId::parse("remote-ticket").expect("ticket"),
             user_id: "alice".to_owned(),

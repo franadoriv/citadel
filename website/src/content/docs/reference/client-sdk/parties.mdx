@@ -12,8 +12,9 @@ ticket represents every connected member, so it either forms as a whole or not a
 all. Each member later receives and accepts their own matchmaker handoff.
 
 All methods below use the generic realtime RPC envelope. Guests receive
-`"authentication required"`. Party state is local to one node and is cleared on
-restart; cross-node party ownership is not implemented.
+`"authentication required"`. Clustered PostgreSQL and CockroachDB deployments
+use durable party ownership; clustered SQLite is rejected rather than claiming
+durable cross-node behavior.
 
 ## Response shape
 
@@ -148,6 +149,26 @@ request id replays the original result, including after an owner restart; a
 stale owner response is rejected and the client should retry from a fresh
 `party.status` snapshot. Clustered SQLite is rejected at startup rather than
 being treated as distributed durable storage.
+
+## Clustered presence and privacy
+
+Citadel advertises party presence between nodes as a fenced, expiring
+`(party_id, node_id)` lease. The directory never contains account, participant,
+socket, invitation, or member-online data. A joining or reconnecting local
+member renews its node lease; final local departure withdraws it. If a node is
+lost, its destination expires; a delayed renewal or withdrawal cannot override a
+newer lease tombstone.
+
+Cross-node member snapshots travel only over the authenticated node-control
+channel, one command per current destination node. The receiving gateway checks
+both source and destination lease fences, reloads durable membership, and then
+fans out solely to its currently authorized local members. Invitees receive no
+member-online detail, and nonmembers receive neither presence nor a
+party-existence signal. Multiple devices for one account resolve to one visible
+member. Client transitions are monotonic by `(party revision, presence sequence)`:
+duplicates and reordered updates are ignored. If a bounded local delivery queue
+drops an update, Citadel sends a reliable `party.presence.resync` barrier followed
+by a fresh authorized snapshot before resuming live deltas.
 
 ## Queueing the party
 

@@ -41,6 +41,11 @@ use crate::matchmaker_transport::{
 };
 use crate::observability::NodeMetrics;
 use crate::party::{PartyId, PartyRegistry, PartySnapshot};
+use crate::party_presence::{
+    LocalPartyPresence, PartyPresenceCommand, PartyPresenceDelivery,
+    PartyPresenceDeliveryDisposition, PartyPresenceDirectory, PartyPresenceLease,
+    PartyPresenceSnapshot, PartyPresenceWithdrawal, RemotePartyPresenceDelivery,
+};
 use crate::realtime::auth::{AuthOutcome, Authenticator, PresentedCredential};
 use crate::realtime::chat_presence::{ChatPresenceRegistry, ChatSubscription};
 use crate::realtime::netpeer::layout::RepLayout;
@@ -63,8 +68,8 @@ use crate::services::{
     PlayerNotificationDelivery, PlayerNotificationService, UpdateGroupRequest, WalletService,
     validate_chat_content,
 };
-use crate::session::NodeId;
 use crate::session::SessionTokenSecret;
+use crate::session::{NodeId, OwnershipGeneration};
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 use crate::transport::{Delivery, Envelope};
 use citadel_wire::netpeer::RepSchema;
@@ -84,6 +89,149 @@ const MATCHMAKER_HANDOFF_TTL_MS: u64 = 30_000;
 /// ephemeral: it has no durable event id and never participates in resync.
 const CHAT_TYPING_TTL_MS: u64 = 5_000;
 const PARTY_OWNER_LEASE_MS: u64 = 15_000;
+const PARTY_PRESENCE_LEASE_MS: u64 = 15_000;
+
+/// Session-node presence state. It is intentionally separate from the durable
+/// party directory: it contains only local sockets and is discarded on crash.
+#[derive(Debug)]
+struct PartyPresenceGateway {
+    directory: Arc<PartyPresenceDirectory>,
+    local: LocalPartyPresence,
+    remote: Mutex<HashMap<String, HashMap<NodeId, PartyPresenceSnapshot>>>,
+    source_sequences: Mutex<HashMap<String, u64>>,
+    generations: Mutex<HashMap<String, u64>>,
+    active: Mutex<HashMap<String, OwnershipGeneration>>,
+}
+
+impl PartyPresenceGateway {
+    fn new(directory: Arc<PartyPresenceDirectory>) -> Self {
+        Self {
+            directory,
+            local: LocalPartyPresence::default(),
+            remote: Mutex::new(HashMap::new()),
+            source_sequences: Mutex::new(HashMap::new()),
+            generations: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn renew(
+        &self,
+        party_id: &str,
+        node_id: NodeId,
+        revision: u64,
+        now: TimestampMillis,
+    ) -> Option<PartyPresenceLease> {
+        let mut active = self.active.lock().ok()?;
+        let generation = match active.get(party_id) {
+            Some(generation) => *generation,
+            None => {
+                let mut generations = self.generations.lock().ok()?;
+                let next = generations.entry(party_id.to_owned()).or_insert(0);
+                *next = next.saturating_add(1);
+                let generation = OwnershipGeneration::new(*next);
+                active.insert(party_id.to_owned(), generation);
+                generation
+            }
+        };
+        let expires_at = now
+            .checked_add(DurationMillis::from_millis(PARTY_PRESENCE_LEASE_MS))
+            .ok()?;
+        Some(PartyPresenceLease {
+            party_id: party_id.to_owned(),
+            node_id,
+            generation,
+            expires_at,
+            party_revision: revision,
+        })
+    }
+
+    fn withdraw(&self, party_id: &str, node_id: NodeId) -> Option<PartyPresenceWithdrawal> {
+        self.active
+            .lock()
+            .ok()?
+            .remove(party_id)
+            .map(|generation| PartyPresenceWithdrawal {
+                party_id: party_id.to_owned(),
+                node_id,
+                generation,
+            })
+    }
+
+    fn active_generation(&self, party_id: &str) -> Option<OwnershipGeneration> {
+        self.active.lock().ok()?.get(party_id).copied()
+    }
+
+    /// Replace one remote node's most recent local-member snapshot. A source
+    /// sequence is monotonic only within that source node, which is exactly the
+    /// scope used here; the receiving node creates the client-visible sequence.
+    fn replace_remote(
+        &self,
+        party_id: &str,
+        source: NodeId,
+        snapshot: PartyPresenceSnapshot,
+    ) -> bool {
+        let Ok(mut remote) = self.remote.lock() else {
+            return false;
+        };
+        let snapshots = remote.entry(party_id.to_owned()).or_default();
+        if snapshots.get(&source).is_some_and(|current| {
+            (snapshot.party_revision, snapshot.sequence)
+                <= (current.party_revision, current.sequence)
+        }) {
+            return false;
+        }
+        snapshots.insert(source, snapshot);
+        true
+    }
+
+    fn clear_remote(&self, party_id: &str, source: &NodeId) {
+        let Ok(mut remote) = self.remote.lock() else {
+            return;
+        };
+        if let Some(snapshots) = remote.get_mut(party_id) {
+            snapshots.remove(source);
+            if snapshots.is_empty() {
+                remote.remove(party_id);
+            }
+        }
+    }
+
+    fn merged_online_members(&self, party_id: &str) -> Vec<String> {
+        let mut members = self.local.online_members(party_id);
+        if let Ok(remote) = self.remote.lock()
+            && let Some(snapshots) = remote.get(party_id)
+        {
+            members.extend(
+                snapshots
+                    .values()
+                    .flat_map(|snapshot| snapshot.online_members.iter().cloned()),
+            );
+        }
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    fn source_snapshot(&self, party_id: &str, party_revision: u64) -> PartyPresenceSnapshot {
+        let sequence = self
+            .source_sequences
+            .lock()
+            .ok()
+            .map(|mut sequences| {
+                let sequence = sequences.entry(party_id.to_owned()).or_insert(0);
+                *sequence = sequence.saturating_add(1);
+                *sequence
+            })
+            .unwrap_or(0);
+        PartyPresenceSnapshot {
+            party_id: party_id.to_owned(),
+            party_revision,
+            sequence,
+            online_members: self.local.online_members(party_id),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct DurablePartyGateway {
@@ -2123,6 +2271,7 @@ pub struct Gateway {
     /// Durable, fenced party authority. `None` preserves standalone/local test
     /// compatibility while production startup attaches it before listeners bind.
     durable_parties: Option<DurablePartyGateway>,
+    party_presence: Option<PartyPresenceGateway>,
     cluster_matchmaker: Option<ClusterMatchmakerGateway>,
     /// Durable, live multi-node matchmaker path. When configured it owns the
     /// queue through a bounded worker rather than the local in-process index.
@@ -2402,6 +2551,7 @@ impl Gateway {
             matchmaker: Matchmaker::new(),
             parties: PartyRegistry::new(),
             durable_parties: None,
+            party_presence: None,
             cluster_matchmaker: None,
             live_matchmaker: None,
             handoffs: Mutex::new(MatchmakerHandoffs::default()),
@@ -2432,6 +2582,9 @@ impl Gateway {
             node_id,
             router,
         });
+        self.party_presence = Some(PartyPresenceGateway::new(Arc::new(
+            PartyPresenceDirectory::default(),
+        )));
         self
     }
 
@@ -2451,6 +2604,288 @@ impl Gateway {
                     gateway.apply_remote_party_command(command)
                 })
         }));
+        self.register_party_presence_endpoint();
+    }
+
+    /// Register the narrow party-presence control boundary on this gateway's
+    /// authenticated router. The remote command carries only a party/node lease;
+    /// member-level visibility is authorized and emitted locally.
+    pub fn register_party_presence_endpoint(self: &Arc<Self>) {
+        let (Some(parties), Some(presence)) = (&self.durable_parties, &self.party_presence) else {
+            return;
+        };
+        let directory = Arc::clone(&presence.directory);
+        let gateway_for_leases = Arc::downgrade(self);
+        parties
+            .router
+            .register_party_presence_handler(Arc::new(move |_source, command| match command {
+                PartyPresenceCommand::Advertise(lease) => {
+                    let source = lease.node_id.clone();
+                    let party_id = lease.party_id.clone();
+                    let update = directory.advertise(lease, SystemClock.now());
+                    if update == crate::party_presence::PartyPresenceUpdate::Applied
+                        && let Some(gateway) = gateway_for_leases.upgrade()
+                        && let Some(presence) = &gateway.party_presence
+                    {
+                        // A rejoin receives a newer fence; an old source
+                        // snapshot must not remain visible while awaiting its
+                        // first snapshot under that fence.
+                        presence.clear_remote(&party_id, &source);
+                    }
+                    update
+                }
+                PartyPresenceCommand::Withdraw(withdrawal) => {
+                    let source = withdrawal.node_id.clone();
+                    let party_id = withdrawal.party_id.clone();
+                    let update = directory.withdraw(withdrawal);
+                    if update == crate::party_presence::PartyPresenceUpdate::Applied
+                        && let Some(gateway) = gateway_for_leases.upgrade()
+                        && let Some(presence) = &gateway.party_presence
+                    {
+                        presence.clear_remote(&party_id, &source);
+                    }
+                    update
+                }
+            }));
+        let gateway = Arc::downgrade(self);
+        parties
+            .router
+            .register_party_presence_delivery_handler(Arc::new(move |source, delivery| {
+                gateway
+                    .upgrade()
+                    .map_or(PartyPresenceDeliveryDisposition::Rejected, |gateway| {
+                        gateway.deliver_remote_party_presence(source, delivery)
+                    })
+            }));
+    }
+
+    /// Apply one mTLS-authenticated source-node snapshot. The transport has
+    /// already checked framing/deadlines; this method fences both node leases,
+    /// then reloads durable membership before touching a local socket queue.
+    fn deliver_remote_party_presence(
+        &self,
+        source: NodeId,
+        delivery: RemotePartyPresenceDelivery,
+    ) -> PartyPresenceDeliveryDisposition {
+        let (Some(parties), Some(presence)) = (&self.durable_parties, &self.party_presence) else {
+            return PartyPresenceDeliveryDisposition::Rejected;
+        };
+        let now = SystemClock.now();
+        if delivery.origin_node != source
+            || delivery.deadline <= now
+            || !presence.directory.matches_destination(
+                &delivery.party_id,
+                &parties.node_id,
+                delivery.destination_generation,
+                now,
+            )
+            || !presence.directory.matches_destination(
+                &delivery.party_id,
+                &source,
+                delivery.origin_generation,
+                now,
+            )
+        {
+            return PartyPresenceDeliveryDisposition::Stale;
+        }
+        let Ok(party_id) = PartyId::parse(&delivery.party_id) else {
+            return PartyPresenceDeliveryDisposition::Rejected;
+        };
+        let directory = Arc::clone(&parties.directory);
+        let Ok(snapshot) = party_block_on(async move { directory.snapshot(&party_id).await })
+        else {
+            return PartyPresenceDeliveryDisposition::Unauthorized;
+        };
+        if snapshot.revision != delivery.snapshot.party_revision
+            || delivery
+                .snapshot
+                .online_members
+                .iter()
+                .any(|member| !snapshot.members.contains(member))
+        {
+            return PartyPresenceDeliveryDisposition::Stale;
+        }
+        if !presence.replace_remote(&delivery.party_id, source, delivery.snapshot) {
+            return PartyPresenceDeliveryDisposition::Stale;
+        }
+        let update = presence.local.snapshot_for_online_members(
+            snapshot.party_id.as_str(),
+            snapshot.revision,
+            presence.merged_online_members(snapshot.party_id.as_str()),
+        );
+        self.emit_party_presence(&snapshot.members, update);
+        PartyPresenceDeliveryDisposition::Delivered
+    }
+
+    /// Resolve accepted membership after a socket connects. Invitation claims
+    /// deliberately return no presence state, preserving the party privacy
+    /// boundary even during reconnect.
+    fn sync_party_presence_for_session(&self, user_id: &str, participant: ParticipantId) {
+        let (Some(parties), Some(_)) = (&self.durable_parties, &self.party_presence) else {
+            return;
+        };
+        let directory = Arc::clone(&parties.directory);
+        let user_id = user_id.to_owned();
+        if let Ok(Some(snapshot)) =
+            party_block_on(async move { directory.member_snapshot_for(&user_id).await })
+        {
+            self.reconcile_party_presence(snapshot);
+        }
+        let _ = participant; // participant is included by the registry snapshot above.
+    }
+
+    /// Reconcile local socket state from one committed durable party snapshot,
+    /// then fan out only to its accepted local members through SessionRegistry.
+    fn reconcile_party_presence(&self, snapshot: PartySnapshot) {
+        let (Some(parties), Some(presence)) = (&self.durable_parties, &self.party_presence) else {
+            return;
+        };
+        let members = snapshot.members.clone();
+        let sessions: Vec<_> = members
+            .iter()
+            .flat_map(|member| {
+                self.registry
+                    .participants_for_user(member)
+                    .into_iter()
+                    .map(move |id| (member.clone(), id.get()))
+            })
+            .collect();
+        let changed = presence
+            .local
+            .reconcile(snapshot.party_id.as_str(), &sessions);
+        if !changed {
+            return;
+        }
+        let now = SystemClock.now();
+        let active_lease = if presence
+            .local
+            .has_online_members(snapshot.party_id.as_str())
+        {
+            let lease = presence.renew(
+                snapshot.party_id.as_str(),
+                parties.node_id.clone(),
+                snapshot.revision,
+                now,
+            );
+            if let Some(lease) = &lease {
+                for peer in parties.router.peer_nodes() {
+                    let _ = parties
+                        .router
+                        .advertise_party_presence(&peer, lease.clone());
+                }
+            }
+            lease
+        } else {
+            None
+        };
+        let source_update = presence.source_snapshot(snapshot.party_id.as_str(), snapshot.revision);
+        let update = presence.local.snapshot_for_online_members(
+            snapshot.party_id.as_str(),
+            snapshot.revision,
+            presence.merged_online_members(snapshot.party_id.as_str()),
+        );
+        // Fan out exactly one typed source snapshot per live destination node.
+        // On a final local leave this happens before withdrawal, so the empty
+        // snapshot is still fenced by the source's current advertisement.
+        if let Some(origin_generation) = active_lease
+            .as_ref()
+            .map(|lease| lease.generation)
+            .or_else(|| presence.active_generation(snapshot.party_id.as_str()))
+        {
+            for destination in presence
+                .directory
+                .destinations(snapshot.party_id.as_str(), now)
+            {
+                if destination.node_id == parties.node_id {
+                    continue;
+                }
+                let _ = parties.router.deliver_party_presence(
+                    &destination.node_id,
+                    RemotePartyPresenceDelivery {
+                        party_id: snapshot.party_id.as_str().to_owned(),
+                        origin_node: parties.node_id.clone(),
+                        origin_generation,
+                        destination_generation: destination.generation,
+                        snapshot: source_update.clone(),
+                        deadline: now
+                            .checked_add(DurationMillis::from_millis(PARTY_PRESENCE_LEASE_MS))
+                            .unwrap_or(now),
+                    },
+                );
+            }
+        }
+        if active_lease.is_none()
+            && let Some(withdrawal) =
+                presence.withdraw(snapshot.party_id.as_str(), parties.node_id.clone())
+        {
+            for peer in parties.router.peer_nodes() {
+                let _ = parties
+                    .router
+                    .withdraw_party_presence(&peer, withdrawal.clone());
+            }
+        }
+        self.emit_party_presence(&members, update);
+    }
+
+    fn emit_party_presence(&self, members: &[String], update: PartyPresenceSnapshot) {
+        let Some(presence) = &self.party_presence else {
+            return;
+        };
+        for member in members {
+            for recipient in self.registry.participants_for_user(member) {
+                let recipient_key = recipient.to_string();
+                let delivery = presence.local.delivery_for(&recipient_key, update.clone());
+                let send = |kind: &str, snapshot: &PartyPresenceSnapshot, delivery: Delivery| {
+                    let body = serde_json::json!({
+                        "type": kind,
+                        "party_id": snapshot.party_id,
+                        "party_revision": snapshot.party_revision,
+                        "presence_sequence": snapshot.sequence,
+                        "online_members": snapshot.online_members,
+                    })
+                    .to_string()
+                    .into_bytes();
+                    // Presence is latest-state traffic. Keeping it on the
+                    // registry's bounded replacement queue prevents a slow
+                    // party client from delaying its RPC reply; a replacement
+                    // failure is converted to snapshot+resync below.
+                    self.registry.send_to(
+                        recipient,
+                        &Outbound::new(delivery, Envelope::new(KIND_NOTIFICATION, body)),
+                    )
+                };
+                let delivered = match delivery {
+                    PartyPresenceDelivery::Delta(snapshot) => {
+                        send("party.presence.delta", &snapshot, Delivery::Unreliable)
+                    }
+                    PartyPresenceDelivery::Snapshot(snapshot) => {
+                        send("party.presence.snapshot", &snapshot, Delivery::Unreliable)
+                    }
+                    PartyPresenceDelivery::ResyncRequired {
+                        party_id,
+                        party_revision,
+                        sequence,
+                    } => {
+                        let resync = PartyPresenceSnapshot {
+                            party_id,
+                            party_revision,
+                            sequence,
+                            online_members: Vec::new(),
+                        };
+                        // The resync barrier is reliable so it cannot be
+                        // replaced by the immediately following latest-wins
+                        // snapshot in the same notification mailbox.
+                        send("party.presence.resync", &resync, Delivery::Reliable)
+                            && send("party.presence.snapshot", &update, Delivery::Unreliable)
+                    }
+                };
+                if !delivered {
+                    presence
+                        .local
+                        .mark_queue_drop(update.party_id.as_str(), &recipient_key);
+                }
+            }
+        }
     }
 
     /// Attach the optional fenced cluster-presence lifecycle before sharing the
@@ -2733,6 +3168,10 @@ impl Gateway {
     ) -> LatestOutboundReceiver {
         let id = handle.id;
         let authenticated = handle.is_authenticated();
+        let authenticated_user = handle
+            .identity
+            .as_ref()
+            .map(|identity| identity.user_id.as_str().to_owned());
         let unreliable = self.registry.register_with_initial(handle, initial);
         // A durable revocation that completed after token validation but before
         // publication leaves a registry tombstone. Do not run lifecycle work or
@@ -2745,6 +3184,9 @@ impl Gateway {
         self.metrics.participant_opened();
         if authenticated {
             self.metrics.session_opened();
+            if let Some(user_id) = authenticated_user.as_deref() {
+                self.sync_party_presence_for_session(user_id, id);
+            }
         }
         // The default global match is only the gateway lifecycle seam, not
         // match-scoped AOI. Match owners can immediately rebind through
@@ -2855,7 +3297,25 @@ impl Gateway {
                 );
             }
         }
+        let affected_parties = self
+            .party_presence
+            .as_ref()
+            .map(|presence| presence.local.parties_for_session(id.get()))
+            .unwrap_or_default();
         let removed = self.registry.unregister(id);
+        // Rebuild presence only after unregistering, so this socket cannot be
+        // reintroduced by the registry snapshot used for fan-out.
+        if let Some(parties) = &self.durable_parties {
+            for party_id in affected_parties {
+                let Ok(id) = PartyId::parse(&party_id) else {
+                    continue;
+                };
+                let directory = Arc::clone(&parties.directory);
+                if let Ok(snapshot) = party_block_on(async move { directory.snapshot(&id).await }) {
+                    self.reconcile_party_presence(snapshot);
+                }
+            }
+        }
         self.metrics.participant_closed();
         // Decrement the authenticated-session gauge exactly when it was
         // incremented (an account-bound participant left).
@@ -3267,7 +3727,10 @@ impl Gateway {
                         )
                         .await
                 })
-                .map(|(snapshot, _)| party_json(snapshot))
+                .map(|(snapshot, _)| {
+                    self.reconcile_party_presence(snapshot.clone());
+                    party_json(snapshot)
+                })
                 .map_err(|error| error.to_string())
             })
         } else if method == "party.status" {
@@ -3369,7 +3832,7 @@ impl Gateway {
                     expected_revision,
                     operation,
                 };
-                return match parties.router.party_command(&lease.owner_node, command) {
+                let result = match parties.router.party_command(&lease.owner_node, command) {
                     Ok(PartyControlReply::Snapshot(snapshot, reply_lease))
                         if reply_lease == lease =>
                     {
@@ -3386,6 +3849,12 @@ impl Gateway {
                     | Ok(PartyControlReply::Rejected)
                     | Err(_) => Err("party owner is unavailable".to_owned()),
                 };
+                if let Ok(snapshot) = &result
+                    && method != "party.close"
+                {
+                    self.reconcile_party_presence(snapshot.clone());
+                }
+                return result;
             }
         };
         let command = PartyControlCommand {
@@ -3397,7 +3866,7 @@ impl Gateway {
             operation,
         };
         let expected_reply_lease = command.lease.clone();
-        match self.apply_remote_party_command(command) {
+        let result = match self.apply_remote_party_command(command) {
             PartyControlReply::Snapshot(snapshot, reply_lease)
                 if reply_lease == expected_reply_lease =>
             {
@@ -3409,7 +3878,13 @@ impl Gateway {
             PartyControlReply::Snapshot(_, _)
             | PartyControlReply::QueueAdmission(_)
             | PartyControlReply::Rejected => Err("party command rejected".to_owned()),
+        };
+        if let Ok(snapshot) = &result
+            && method != "party.close"
+        {
+            self.reconcile_party_presence(snapshot.clone());
         }
+        result
     }
 
     fn apply_remote_party_command(&self, command: PartyControlCommand) -> PartyControlReply {
@@ -7274,6 +7749,174 @@ mod domain_rpc_tests {
         assert!(
             alice_rx.try_recv().is_err(),
             "scalar payload must not fan out"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_party_presence_mtls_reauthorizes_and_resyncs_before_live_deltas() {
+        let node_a = NodeId::new("presence-node-a").expect("node a");
+        let node_b = NodeId::new("presence-node-b").expect("node b");
+        let (identity_a, cert_a) = control_identity();
+        let (identity_b, cert_b) = control_identity();
+        let router_a = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_a.clone(),
+                identity_a,
+                BTreeMap::from([(node_b.clone(), cert_b)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router a"),
+        );
+        let router_b = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_b.clone(),
+                identity_b,
+                BTreeMap::from([(node_a.clone(), cert_a)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router b"),
+        );
+        let storage: Arc<dyn crate::repository::StorageRepository> =
+            Arc::new(InMemoryStorageRepository::new());
+        let directory = Arc::new(StoragePartyDirectory::new(storage));
+        let party_id = PartyId::parse("party-presence-mtls").expect("party id");
+        let now = SystemClock.now();
+        directory
+            .create(
+                party_id.clone(),
+                "alice",
+                node_b.clone(),
+                now.checked_add(DurationMillis::from_millis(30_000))
+                    .expect("party lease expiry"),
+                now,
+            )
+            .await
+            .expect("durable party");
+        let gateway_b = Arc::new(Gateway::new().with_storage_party_directory(
+            Arc::clone(&directory),
+            node_b.clone(),
+            Arc::clone(&router_b),
+        ));
+        gateway_b.register_party_directory_endpoint();
+        let listener = router_b
+            .serve("127.0.0.1:0".parse().expect("loopback"))
+            .expect("listener b");
+        router_a.register_endpoint(
+            node_b.clone(),
+            MatchmakerControlEndpoint {
+                address: listener.local_addr(),
+                server_name: "localhost".to_owned(),
+            },
+        );
+
+        let recipient = gateway_b.next_participant_id();
+        let (reliable, reliable_rx) = mpsc::channel(4);
+        let unreliable = gateway_b.register_session(SessionHandle {
+            id: recipient,
+            kind: TransportKind::WebSocket,
+            outbound: reliable,
+            identity: Some(ParticipantIdentity {
+                user_id: UserId::new("alice").expect("user"),
+                session_id: SessionId::new("presence-session").expect("session"),
+                expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+            }),
+        });
+        let mut outbound = TestOutboundReceiver {
+            reliable: reliable_rx,
+            unreliable,
+        };
+        let presence = gateway_b.party_presence.as_ref().expect("presence");
+        assert_eq!(
+            presence.directory.advertise(
+                PartyPresenceLease {
+                    party_id: party_id.as_str().to_owned(),
+                    node_id: node_b.clone(),
+                    generation: OwnershipGeneration::new(9),
+                    expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                    party_revision: 1,
+                },
+                now,
+            ),
+            crate::party_presence::PartyPresenceUpdate::Applied
+        );
+        assert_eq!(
+            presence.directory.advertise(
+                PartyPresenceLease {
+                    party_id: party_id.as_str().to_owned(),
+                    node_id: node_a.clone(),
+                    generation: OwnershipGeneration::new(7),
+                    expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                    party_revision: 1,
+                },
+                now,
+            ),
+            crate::party_presence::PartyPresenceUpdate::Applied
+        );
+        let delivery = |sequence, members: Vec<String>| RemotePartyPresenceDelivery {
+            party_id: party_id.as_str().to_owned(),
+            origin_node: node_a.clone(),
+            origin_generation: OwnershipGeneration::new(7),
+            destination_generation: OwnershipGeneration::new(9),
+            snapshot: PartyPresenceSnapshot {
+                party_id: party_id.as_str().to_owned(),
+                party_revision: 1,
+                sequence,
+                online_members: members,
+            },
+            deadline: TimestampMillis::from_unix_millis(u64::MAX),
+        };
+        assert_eq!(
+            router_a
+                .deliver_party_presence(&node_b, delivery(1, vec!["alice".to_owned()]))
+                .expect("mTLS delivery"),
+            PartyPresenceDeliveryDisposition::Delivered
+        );
+        let first = tokio::time::timeout(Duration::from_secs(2), outbound.unreliable.recv())
+            .await
+            .expect("snapshot before deadline");
+        let first_json: serde_json::Value =
+            serde_json::from_slice(&first.envelope.body).expect("json");
+        assert_eq!(first_json["type"], "party.presence.delta");
+        assert_eq!(first_json["online_members"], serde_json::json!(["alice"]));
+
+        // A local latest-queue drop turns the next authenticated remote update
+        // into a reliable resync barrier followed by a fresh snapshot.
+        presence
+            .local
+            .mark_queue_drop(party_id.as_str(), &recipient.to_string());
+        assert_eq!(
+            router_a
+                .deliver_party_presence(&node_b, delivery(2, vec!["alice".to_owned()]))
+                .expect("mTLS resync delivery"),
+            PartyPresenceDeliveryDisposition::Delivered
+        );
+        let resync = tokio::time::timeout(Duration::from_secs(2), outbound.reliable.recv())
+            .await
+            .expect("resync barrier before deadline")
+            .expect("session open");
+        let resync_json: serde_json::Value =
+            serde_json::from_slice(&resync.envelope.body).expect("json");
+        assert_eq!(resync_json["type"], "party.presence.resync");
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), outbound.unreliable.recv())
+            .await
+            .expect("snapshot before deadline");
+        let snapshot_json: serde_json::Value =
+            serde_json::from_slice(&snapshot.envelope.body).expect("json");
+        assert_eq!(snapshot_json["type"], "party.presence.snapshot");
+
+        // The receiver fetches the durable aggregate for every delivery; a
+        // source cannot disclose a nonmember merely by holding mTLS access.
+        assert_eq!(
+            router_a
+                .deliver_party_presence(&node_b, delivery(3, vec!["mallory".to_owned()]))
+                .expect("mTLS rejected delivery"),
+            PartyPresenceDeliveryDisposition::Stale
+        );
+        assert!(
+            outbound.try_recv().is_err(),
+            "nonmember payload never fans out"
         );
     }
 

@@ -733,6 +733,23 @@ impl StoragePartyDirectory {
             ))
         }
     }
+
+    /// Return the current aggregate only when this account is an accepted
+    /// member. This is an internal realtime-presence lookup: unlike
+    /// [`snapshot_for`](Self::snapshot_for), invitations are intentionally not
+    /// sufficient because invitees must learn no member online state.
+    pub async fn member_snapshot_for(&self, requester: &str) -> AppResult<Option<PartySnapshot>> {
+        let Some((claim, _)) = self.member(requester).await? else {
+            return Ok(None);
+        };
+        if claim.invitation {
+            return Ok(None);
+        }
+        let id = PartyId::parse(&claim.party_id).map_err(|error| {
+            AppError::internal(format!("invalid stored party membership: {error}"))
+        })?;
+        self.snapshot(&id).await.map(Some)
+    }
     pub async fn queue_snapshot(
         &self,
         lease: &PartyOwnerLease,

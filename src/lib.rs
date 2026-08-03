@@ -27,6 +27,7 @@ pub mod matchmaker_live;
 pub mod matchmaker_transport;
 pub mod observability;
 pub mod party;
+pub mod party_presence;
 pub mod realtime;
 pub mod repository;
 pub mod runtime;
