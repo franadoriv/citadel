@@ -2,6 +2,7 @@
 name = "citadel-client-ffi"
 version = "0.1.0"
 edition = "2024"
+publish = false
 description = "C ABI over citadel-client for native engines (Unity/Unreal/Godot)."
 
 # Produce a Rust lib (for in-crate tests), plus the dynamic/static libraries that

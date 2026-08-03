@@ -2,6 +2,7 @@
 name = "citadel-wire"
 version = "0.1.0"
 edition = "2024"
+publish = false
 description = "Shared realtime wire format (envelope + codec) for Citadel server and clients."
 
 [dependencies]

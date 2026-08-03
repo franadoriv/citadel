@@ -2,6 +2,7 @@
 name = "citadel-map"
 version = "0.1.0"
 edition = "2024"
+publish = false
 description = "Citadel `.map` (CMAP) level-geometry file format: metadata + world-space collision mesh, with a reserved, forward-compatible navmesh section."
 
 # Deliberately std-only: the format is a small, hand-rolled big-endian binary

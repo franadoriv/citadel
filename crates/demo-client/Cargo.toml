@@ -2,6 +2,7 @@
 name = "demo-client"
 version = "0.1.0"
 edition = "2024"
+publish = false
 description = "Native visual demo client for Citadel QUIC transport (quinn + macroquad)."
 
 [dependencies]

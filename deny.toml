@@ -1,0 +1,88 @@
+# Supply-chain policy for `cargo deny`.
+#
+# Citadel is a network-facing server that links QUIC/TLS, four database
+# drivers, and three embedded script runtimes, several of which vendor C code.
+# The dependency tree is therefore worth gating on, not merely reviewing.
+#
+# Run locally with: cargo deny check
+
+[advisories]
+version = 2
+# Withdrawn crates are a maintenance signal rather than an exploitable defect,
+# so they are surfaced without failing the build.
+yanked = "warn"
+# Every entry needs a written reason and a reachability argument. Re-check these
+# whenever the lockfile moves: the point of the gate is that an accepted risk
+# stays visible, not that it disappears.
+ignore = [
+    # quick-xml 0.31 reaches the tree through tiled 0.16, which is the latest
+    # release and pins a semver-incompatible quick-xml, so there is no upgrade
+    # available from here. Both advisories are denial of service in the XML
+    # reader, and the only two callers of citadel-tmx are operator-controlled:
+    # the `citadel cook-tmx` CLI command, and the startup scan of the server's
+    # own maps directory. Neither parses network input, so exploiting this
+    # requires feeding the server a map file you already control. Drop these
+    # once tiled ships a release on quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quadratic parse in quick-xml, reachable only via operator-supplied TMX map files" },
+    { id = "RUSTSEC-2026-0195", reason = "namespace allocation DoS in quick-xml, reachable only via operator-supplied TMX map files" },
+    # rustls-pemfile is archived with no successor release. It parses the
+    # operator's own PEM material at startup, and the advisory reports no
+    # vulnerability. Migrating to rustls-pki-types' PemObject trait is the
+    # documented path and is tracked as separate work.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained, not vulnerable; migration to rustls-pki-types tracked separately" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses only. Copyleft terms are deliberately absent: the server
+# ships as a redistributable binary, so anything file- or work-level copyleft
+# needs a considered decision rather than silent inclusion.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+    # Mozilla's CA root bundle (webpki-roots, webpki-root-certs) ships under the
+    # Community Data License Agreement. It is permissive and data-only.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# The workspace crates carry no `license` field and none are published, so they
+# have nothing to check. This is not a substitute for deciding the project's own
+# license, which is still missing at the repository root.
+private = { ignore = true }
+
+[bans]
+# The tree carries several duplicated majors (rand, getrandom, windows-sys) that
+# arrive transitively and cannot be unified from here. Warn so the count stays
+# visible and does not quietly grow, rather than failing on a state we do not
+# control. The crypto stack is the part that genuinely matters, and it is
+# already pinned to one rustls and one ring by the root manifest's feature
+# choices; `deny` entries below keep it that way.
+multiple-versions = "warn"
+# Intra-workspace `path` dependencies carry no version requirement by design.
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # A second TLS implementation must never enter the tree by accident: the
+    # whole stack is deliberately rustls + ring, with no aws-lc-rs churn.
+    { name = "native-tls" },
+    { name = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
