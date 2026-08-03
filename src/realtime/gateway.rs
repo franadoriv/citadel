@@ -3728,6 +3728,7 @@ impl Gateway {
                         .await
                 })
                 .map(|(snapshot, _)| {
+                    self.metrics.record_party_owner_lease_acquire();
                     self.reconcile_party_presence(snapshot.clone());
                     party_json(snapshot)
                 })
@@ -3824,6 +3825,7 @@ impl Gateway {
         let lease = match resolution {
             PartyOwnerResolution::Local(lease) => lease,
             PartyOwnerResolution::Remote(lease) => {
+                self.metrics.record_party_owner_forward();
                 let command = PartyControlCommand {
                     party_id,
                     lease: lease.clone(),
@@ -3843,6 +3845,7 @@ impl Gateway {
                             .to_owned(),
                     ),
                     Ok(PartyControlReply::StaleOwnerFence) => {
+                        self.metrics.record_party_owner_stale_reject();
                         Err("party owner fence is stale; retry with a fresh snapshot".to_owned())
                     }
                     Ok(PartyControlReply::QueueAdmission(_))
@@ -3857,6 +3860,11 @@ impl Gateway {
                 return result;
             }
         };
+        if !self.recover_durable_party_owner(parties, &lease, now)? {
+            // Generation did not advance, so acquire_or_resolve renewed the
+            // existing local owner fence rather than recovering a takeover.
+            self.metrics.record_party_owner_lease_renew();
+        }
         let command = PartyControlCommand {
             party_id: party_id.clone(),
             lease,
@@ -3873,6 +3881,7 @@ impl Gateway {
                 Ok(snapshot)
             }
             PartyControlReply::StaleOwnerFence => {
+                self.metrics.record_party_owner_stale_reject();
                 Err("party owner fence is stale; retry with a fresh snapshot".to_owned())
             }
             PartyControlReply::Snapshot(_, _)
@@ -3887,6 +3896,81 @@ impl Gateway {
         result
     }
 
+    /// Finish a successful higher-generation owner takeover before allowing a
+    /// mutation. The durable directory is the source of both the snapshot and
+    /// the one-per-generation resync claim; node-local presence is rebuilt only
+    /// from that committed membership state.
+    fn recover_durable_party_owner(
+        &self,
+        parties: &DurablePartyGateway,
+        lease: &crate::services::party_directory::PartyOwnerLease,
+        now: TimestampMillis,
+    ) -> Result<bool, String> {
+        let directory = Arc::clone(&parties.directory);
+        let recovery_lease = lease.clone();
+        let recovered =
+            party_block_on(
+                async move { directory.claim_failover_resync(&recovery_lease, now).await },
+            )
+            .map_err(|error| error.to_string())?;
+        let Some(snapshot) = recovered else {
+            return Ok(false);
+        };
+        let party_revision = snapshot.revision;
+
+        // The control route is installed before listeners bind; replaying this
+        // path never changes routing. Reconcile the committed snapshot before
+        // publishing the recoverable client barrier and opening mutations.
+        self.reconcile_party_presence(snapshot.clone());
+        self.emit_party_failover_resync(snapshot, lease);
+        self.metrics.record_party_owner_lease_acquire();
+        self.metrics.record_party_owner_failover();
+        self.metrics.record_party_resync();
+        tracing::info!(
+            owner_generation = lease.generation.get(),
+            party_revision,
+            "party owner failover recovery completed"
+        );
+        Ok(true)
+    }
+
+    /// Notify only current party members that their next authoritative view is
+    /// a recovery snapshot. The payload deliberately contains no node address,
+    /// token, request body, or raw presence/user-list audit data; the snapshot
+    /// is sent only through each member's authenticated local session.
+    fn emit_party_failover_resync(
+        &self,
+        snapshot: PartySnapshot,
+        lease: &crate::services::party_directory::PartyOwnerLease,
+    ) {
+        let resync = serde_json::json!({
+            "type": "party.resync_required",
+            "party_id": snapshot.party_id.as_str(),
+            "party_revision": snapshot.revision,
+            "generation": lease.generation.get(),
+            "reason": "owner_failover",
+        })
+        .to_string()
+        .into_bytes();
+        let state = serde_json::json!({
+            "type": "party.snapshot",
+            "party_id": snapshot.party_id.as_str(),
+            "leader_user_id": snapshot.leader_user_id,
+            "members": snapshot.members,
+            "invitations": snapshot.invitations,
+            "revision": snapshot.revision,
+            "generation": lease.generation.get(),
+        })
+        .to_string()
+        .into_bytes();
+        for member in &snapshot.members {
+            for recipient in self.registry.participants_for_user(member) {
+                let _ = self.send_reliable(recipient, KIND_NOTIFICATION, resync.clone());
+                let _ = self.send_reliable(recipient, KIND_NOTIFICATION, state.clone());
+            }
+        }
+    }
+
     fn apply_remote_party_command(&self, command: PartyControlCommand) -> PartyControlReply {
         let Some(parties) = &self.durable_parties else {
             return PartyControlReply::Rejected;
@@ -3897,7 +3981,17 @@ impl Gateway {
         // can read the shared storage.
         if parties.node_id != command.lease.owner_node || command.party_id != command.lease.party_id
         {
+            self.metrics.record_party_owner_stale_reject();
             return PartyControlReply::StaleOwnerFence;
+        }
+        if let Err(error) =
+            self.recover_durable_party_owner(parties, &command.lease, SystemClock.now())
+        {
+            if error.contains("fence") {
+                self.metrics.record_party_owner_stale_reject();
+                return PartyControlReply::StaleOwnerFence;
+            }
+            return PartyControlReply::Rejected;
         }
         let directory = Arc::clone(&parties.directory);
         let lease = command.lease.clone();
@@ -9126,5 +9220,165 @@ mod domain_rpc_tests {
             String::from_utf8_lossy(&body),
             "matchmaker shard is unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn owner_failover_emits_one_resync_then_snapshot_before_mutation() {
+        let node_a = NodeId::new("failover-node-a").expect("node a");
+        let node_b = NodeId::new("failover-node-b").expect("node b");
+        let (_identity_a, cert_a) = control_identity();
+        let (identity_b, _cert_b) = control_identity();
+        let router_b = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_b.clone(),
+                identity_b,
+                BTreeMap::from([(node_a.clone(), cert_a)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router b"),
+        );
+        let storage: Arc<dyn crate::repository::StorageRepository> =
+            Arc::new(InMemoryStorageRepository::new());
+        let directory = Arc::new(StoragePartyDirectory::new(storage));
+        let party_id = PartyId::parse("party-owner-failover").expect("party id");
+        let created_at = SystemClock.now();
+        let initial_expiry = created_at
+            .checked_add(DurationMillis::from_millis(60_000))
+            .expect("initial expiry");
+        let invite_at = created_at
+            .checked_add(DurationMillis::from_millis(1))
+            .expect("invite time");
+        let takeover_at = created_at
+            .checked_add(DurationMillis::from_millis(60_001))
+            .expect("takeover time");
+        let (created, stale_lease) = directory
+            .create(
+                party_id.clone(),
+                "alice",
+                node_a,
+                initial_expiry,
+                created_at,
+            )
+            .await
+            .expect("initial owner");
+        let invited = directory
+            .invite(
+                &stale_lease,
+                "alice",
+                "invite-bob",
+                "bob",
+                created.revision,
+                invite_at,
+            )
+            .await
+            .expect("committed membership before owner loss");
+        let before_takeover = directory
+            .accept(
+                &stale_lease,
+                "bob",
+                "accept-bob",
+                invited.revision,
+                invite_at
+                    .checked_add(DurationMillis::from_millis(1))
+                    .expect("accept time"),
+            )
+            .await
+            .expect("bob joins before owner loss");
+        let recovery_lease = match directory
+            .acquire_or_resolve(
+                &party_id,
+                node_b.clone(),
+                takeover_at
+                    .checked_add(DurationMillis::from_millis(60_000))
+                    .expect("recovery expiry"),
+                takeover_at,
+            )
+            .await
+            .expect("durable higher-generation takeover")
+        {
+            PartyOwnerResolution::Local(lease) => Some(lease),
+            PartyOwnerResolution::Remote(_) => None,
+        }
+        .expect("expired owner must be replaced");
+        assert!(recovery_lease.generation > stale_lease.generation);
+
+        let metrics = Arc::new(NodeMetrics::new());
+        let gateway = Gateway::with_metrics(Arc::clone(&metrics)).with_storage_party_directory(
+            Arc::clone(&directory),
+            node_b,
+            router_b,
+        );
+        let (_alice, mut alice_rx) = register(&gateway, Some("alice"));
+        let (_bob, mut bob_rx) = register(&gateway, Some("bob"));
+
+        let stale = PartyControlCommand {
+            party_id: party_id.clone(),
+            lease: stale_lease,
+            actor: "alice".to_owned(),
+            request_id: "stale-owner".to_owned(),
+            expected_revision: before_takeover.revision,
+            operation: PartyControlOperation::Promote {
+                target: "bob".to_owned(),
+            },
+        };
+        assert!(
+            matches!(
+                gateway.apply_remote_party_command(stale),
+                PartyControlReply::StaleOwnerFence
+            ),
+            "the replacement endpoint rejects a delayed old-owner command"
+        );
+
+        let command = PartyControlCommand {
+            party_id: party_id.clone(),
+            lease: recovery_lease.clone(),
+            actor: "alice".to_owned(),
+            request_id: "promote-after-recovery".to_owned(),
+            expected_revision: before_takeover.revision,
+            operation: PartyControlOperation::Promote {
+                target: "bob".to_owned(),
+            },
+        };
+        let result = gateway.apply_remote_party_command(command.clone());
+        let (mutated, reply_lease) = match result {
+            PartyControlReply::Snapshot(snapshot, lease) => Some((snapshot, lease)),
+            PartyControlReply::StaleOwnerFence
+            | PartyControlReply::QueueAdmission(_)
+            | PartyControlReply::Rejected => None,
+        }
+        .expect("recovered mutation must commit once");
+        assert_eq!(reply_lease, recovery_lease);
+        assert_eq!(mutated.revision, before_takeover.revision + 1);
+
+        // Every current member receives the recovery barrier and committed
+        // pre-mutation snapshot before the first recovered mutation can alter
+        // the revision. This is deterministic and does not rely on a sleep.
+        for receiver in [&mut alice_rx, &mut bob_rx] {
+            let resync = receiver.recv().await.expect("resync delivered");
+            let resync = json(&resync.envelope.body);
+            assert_eq!(resync["type"], "party.resync_required");
+            assert_eq!(resync["party_revision"], before_takeover.revision);
+            assert_eq!(resync["generation"], recovery_lease.generation.get());
+            let snapshot = receiver.recv().await.expect("snapshot delivered");
+            let snapshot = json(&snapshot.envelope.body);
+            assert_eq!(snapshot["type"], "party.snapshot");
+            assert_eq!(snapshot["revision"], before_takeover.revision);
+        }
+
+        // Retrying the same owner command gets the durable idempotent result;
+        // the restart-safe recovery marker suppresses a second transition.
+        assert!(matches!(
+            gateway.apply_remote_party_command(command),
+            PartyControlReply::Snapshot(snapshot, lease)
+                if snapshot == mutated && lease == recovery_lease
+        ));
+        assert!(alice_rx.try_recv().is_err());
+        assert!(bob_rx.try_recv().is_err());
+        let metrics = metrics.snapshot();
+        assert_eq!(metrics.party_owner_lease_acquire_total, 1);
+        assert_eq!(metrics.party_owner_failover_total, 1);
+        assert_eq!(metrics.party_resync_total, 1);
+        assert_eq!(metrics.party_owner_stale_reject_total, 1);
     }
 }

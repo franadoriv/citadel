@@ -147,8 +147,15 @@ any gateway. Citadel routes each mutation to a durably leased party owner and
 fences it by owner generation and snapshot revision. Repeating the same client
 request id replays the original result, including after an owner restart; a
 stale owner response is rejected and the client should retry from a fresh
-`party.status` snapshot. Clustered SQLite is rejected at startup rather than
-being treated as distributed durable storage.
+`party.status` snapshot.
+
+After an expired owner is replaced, the new owner reloads the last committed
+snapshot and emits one reliable `party.resync_required` transition followed by
+that snapshot before it accepts a new mutation. Clients should discard any
+stale local party view, apply the supplied snapshot, then resume normal RPCs;
+the transition is fenced by generation and may be safely deduplicated. SQLite
+and MongoDB clustered configurations are rejected at startup rather than being
+treated as distributed durable storage.
 
 ## Clustered presence and privacy
 

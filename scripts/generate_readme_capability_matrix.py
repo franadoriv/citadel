@@ -31,7 +31,7 @@ def render(data: dict[str, object]) -> str:
         "| **Game logic** | Lua by default, with trusted embedded Python and JavaScript builds. All share message, lifecycle, tick, RPC, room, storage, and social-service hooks. |",
         "| **Realtime** | QUIC for native clients, WebTransport for modern browsers, and WebSocket as the broad fallback; rooms, authoritative state, transform sync, actors, maps, and server physics are available. |",
         "| **Game services** | Accounts and sessions, storage, friends, groups, chat, leaderboards, notifications, wallet, purchases, audit records, and an operator dashboard. |",
-        "| **Data** | SQLite for the zero-setup default, plus PostgreSQL, CockroachDB, and transaction-capable MongoDB for durable deployments. |",
+        "| **Data** | SQLite for the zero-setup default; PostgreSQL, CockroachDB, and transaction-capable MongoDB for durable deployments. Clustered party/matchmaker authority requires PostgreSQL or CockroachDB—SQLite and MongoDB clusters are rejected. |",
         "| **Client paths** | Unity, Unreal, Godot, Rust, and browser/JavaScript SDK surfaces. Their exact engine and OS coverage is in the matrix. |",
         "| **Operations** | Release archives, config validation, health/status endpoints, structured logs, error journal, optional Sentry-compatible telemetry, and TLS/reverse-proxy guidance. |",
         "",

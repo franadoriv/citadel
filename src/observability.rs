@@ -46,6 +46,12 @@ pub struct NodeMetrics {
     runtime_events_queued_total: AtomicU64,
     runtime_events_dropped_total: AtomicU64,
     runtime_shared_cache_evictions_total: AtomicU64,
+    party_owner_lease_acquire_total: AtomicU64,
+    party_owner_lease_renew_total: AtomicU64,
+    party_owner_failover_total: AtomicU64,
+    party_owner_stale_reject_total: AtomicU64,
+    party_owner_forward_total: AtomicU64,
+    party_resync_total: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -162,6 +168,42 @@ impl NodeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a durable party-owner lease acquisition. No party, account, or
+    /// request identifiers are retained in node metrics.
+    pub fn record_party_owner_lease_acquire(&self) {
+        self.party_owner_lease_acquire_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a successful renewal of the local fenced party-owner lease.
+    pub fn record_party_owner_lease_renew(&self) {
+        self.party_owner_lease_renew_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a completed higher-generation party-owner recovery.
+    pub fn record_party_owner_failover(&self) {
+        self.party_owner_failover_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a stale party command/reply rejection.
+    pub fn record_party_owner_stale_reject(&self) {
+        self.party_owner_stale_reject_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a party command forwarded to its current durable owner.
+    pub fn record_party_owner_forward(&self) {
+        self.party_owner_forward_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one durable, generation-fenced party resync transition.
+    pub fn record_party_resync(&self) {
+        self.party_resync_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a consistent-enough snapshot for reporting.
     ///
     /// Values are read independently, so a snapshot may interleave concurrent
@@ -196,6 +238,18 @@ impl NodeMetrics {
             runtime_shared_cache_evictions_total: self
                 .runtime_shared_cache_evictions_total
                 .load(Ordering::Relaxed),
+            party_owner_lease_acquire_total: self
+                .party_owner_lease_acquire_total
+                .load(Ordering::Relaxed),
+            party_owner_lease_renew_total: self
+                .party_owner_lease_renew_total
+                .load(Ordering::Relaxed),
+            party_owner_failover_total: self.party_owner_failover_total.load(Ordering::Relaxed),
+            party_owner_stale_reject_total: self
+                .party_owner_stale_reject_total
+                .load(Ordering::Relaxed),
+            party_owner_forward_total: self.party_owner_forward_total.load(Ordering::Relaxed),
+            party_resync_total: self.party_resync_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -241,6 +295,18 @@ pub struct NodeMetricsSnapshot {
     pub runtime_events_dropped_total: u64,
     /// Entries evicted because the node-local runtime cache reached its entry bound.
     pub runtime_shared_cache_evictions_total: u64,
+    /// Durable party-owner lease acquisitions on this node.
+    pub party_owner_lease_acquire_total: u64,
+    /// Durable party-owner lease renewals on this node.
+    pub party_owner_lease_renew_total: u64,
+    /// Successful higher-generation durable party-owner recoveries.
+    pub party_owner_failover_total: u64,
+    /// Fenced party commands or replies rejected as stale.
+    pub party_owner_stale_reject_total: u64,
+    /// Party commands forwarded to a remote durable owner.
+    pub party_owner_forward_total: u64,
+    /// Generation-fenced party client resync transitions emitted locally.
+    pub party_resync_total: u64,
 }
 
 /// Build the [`EnvFilter`] for the given level directive.
@@ -367,6 +433,33 @@ mod tests {
         assert_eq!(value["http_requests_total"], 1);
         assert_eq!(value["connections_active"], 0);
         assert!(value.get("bytes_out_total").is_some());
+    }
+
+    #[test]
+    fn party_recovery_metrics_are_redacted_monotonic_counters() {
+        let m = NodeMetrics::new();
+        m.record_party_owner_lease_acquire();
+        m.record_party_owner_lease_renew();
+        m.record_party_owner_failover();
+        m.record_party_owner_stale_reject();
+        m.record_party_owner_forward();
+        m.record_party_resync();
+
+        let snapshot = m.snapshot();
+        assert_eq!(snapshot.party_owner_lease_acquire_total, 1);
+        assert_eq!(snapshot.party_owner_lease_renew_total, 1);
+        assert_eq!(snapshot.party_owner_failover_total, 1);
+        assert_eq!(snapshot.party_owner_stale_reject_total, 1);
+        assert_eq!(snapshot.party_owner_forward_total, 1);
+        assert_eq!(snapshot.party_resync_total, 1);
+
+        // This telemetry is aggregate-only: neither client payloads nor
+        // identity-bearing member lists are represented in the snapshot.
+        let value = serde_json::to_value(snapshot).expect("serializes");
+        assert!(value.get("party_id").is_none());
+        assert!(value.get("members").is_none());
+        assert!(value.get("payload").is_none());
+        assert!(value.get("token").is_none());
     }
 
     #[test]

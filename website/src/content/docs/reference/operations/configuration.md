@@ -382,13 +382,17 @@ run, with no migration command or `mkdir`.
 
 ### `[cluster]` and `[cluster.tls]`
 
-The optional cluster section enables the live cross-node matchmaker. It is a
-**durable** feature: startup rejects `cluster.enabled = true` without a
-`database.url`. The active shard owner is selected by a stored generation-fenced
-lease; a non-owner forwards ticket submit/cancel/status, handoff delivery, and
-admission through a bounded mutual-TLS connection. The same typed control plane
-also carries bounded runtime-event fan-out and fenced cache mutations; Citadel
-does not proxy realtime sockets or expose a general inter-node message tunnel.
+The optional cluster section enables the live cross-node matchmaker and party
+authority. It is a **durable** feature: startup rejects `cluster.enabled = true`
+without a `database.url`, and accepts only PostgreSQL or CockroachDB. SQLite and
+MongoDB are supported in their appropriate non-clustered deployments but are
+rejected for clusters because this owner/fencing path requires portable atomic
+multi-object writes. The active shard or party owner is selected by a stored
+generation-fenced lease; a non-owner forwards ticket submit/cancel/status,
+handoff delivery, admission, and party mutations through a bounded mutual-TLS
+connection. The same typed control plane also carries bounded runtime-event
+fan-out and fenced cache mutations; Citadel does not proxy realtime sockets or
+expose a general inter-node message tunnel.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |

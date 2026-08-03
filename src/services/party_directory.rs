@@ -123,6 +123,12 @@ struct StoredParty {
     ticket_freeze: Option<StoredTicketFreeze>,
     #[serde(default)]
     max_admission_generation: u64,
+    /// Highest owner generation for which recovery has published its one
+    /// client resync barrier. Keeping this beside the durable owner fence makes
+    /// replay/restart of a completed takeover idempotent without retaining a
+    /// client payload or member list.
+    #[serde(default)]
+    last_resync_generation: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemberProjection {
@@ -262,6 +268,7 @@ impl StoragePartyDirectory {
                 closed: false,
                 ticket_freeze: None,
                 max_admission_generation: 0,
+                last_resync_generation: 0,
             };
             let create_replay = if let Some(request_id) = request_id {
                 let (mut projection, expected) = self.create_projection(leader).await?;
@@ -388,6 +395,53 @@ impl StoragePartyDirectory {
         }
         Err(AppError::conflict(
             "party ownership changed repeatedly while resolving",
+        ))
+    }
+
+    /// Claim the sole recoverable client-transition for an already acquired
+    /// replacement-owner generation, and return the committed snapshot that
+    /// must follow that transition.  The durable marker is intentionally
+    /// written before gateway delivery: a restarted gateway can safely reload
+    /// the snapshot rather than emitting a duplicate resync for the same
+    /// fencing generation.
+    ///
+    /// Generation one is the initial owner, not a failover, so it has no
+    /// recovery transition to publish.
+    pub async fn claim_failover_resync(
+        &self,
+        lease: &PartyOwnerLease,
+        now: TimestampMillis,
+    ) -> AppResult<Option<PartySnapshot>> {
+        if lease.generation.get() <= 1 {
+            return Ok(None);
+        }
+        self.migrate(&lease.party_id).await?;
+        for _ in 0..MAX_RETRIES {
+            let (mut party, expected) = self.party(&lease.party_id).await?;
+            ensure_fence(&party, lease, now)?;
+            if party.closed {
+                return Err(AppError::not_found("party not found"));
+            }
+            if party.last_resync_generation >= lease.generation.get() {
+                return Ok(None);
+            }
+            party.last_resync_generation = lease.generation.get();
+            let recovered = snapshot(&lease.party_id, &party);
+            match self
+                .batch(vec![write(
+                    party_object(&lease.party_id),
+                    &party,
+                    expected,
+                )?])
+                .await
+            {
+                Ok(()) => return Ok(Some(recovered)),
+                Err(error) if error.category() == ErrorCategory::Conflict => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AppError::conflict(
+            "party ownership changed repeatedly while claiming recovery resync",
         ))
     }
 
@@ -1497,6 +1551,7 @@ mod tests {
             closed: false,
             ticket_freeze: None,
             max_admission_generation: 0,
+            last_resync_generation: 0,
         };
         let state = LegacyState {
             parties: BTreeMap::from([("legacy".into(), p)]),
@@ -1552,6 +1607,7 @@ mod tests {
                     closed: false,
                     ticket_freeze: None,
                     max_admission_generation: 0,
+                    last_resync_generation: 0,
                 },
             )]),
             membership: BTreeMap::from([("alice".into(), "legacy-invite".into())]),
@@ -1614,6 +1670,7 @@ mod tests {
                     closed: false,
                     ticket_freeze: None,
                     max_admission_generation: 0,
+                    last_resync_generation: 0,
                 },
             )]),
             membership: BTreeMap::from([("alice".into(), "legacy-overlap".into())]),
@@ -1688,6 +1745,7 @@ mod tests {
                     closed: false,
                     ticket_freeze: None,
                     max_admission_generation: 0,
+                    last_resync_generation: 0,
                 },
             )]),
             membership: BTreeMap::from([("alice".into(), "legacy-create-overlap".into())]),
@@ -1761,6 +1819,7 @@ mod tests {
                     closed: false,
                     ticket_freeze: None,
                     max_admission_generation: 0,
+                    last_resync_generation: 0,
                 },
             )]),
             membership: BTreeMap::from([("alice".into(), "legacy-race".into())]),
@@ -1846,6 +1905,7 @@ mod tests {
                     closed: false,
                     ticket_freeze: None,
                     max_admission_generation: 0,
+                    last_resync_generation: 0,
                 },
             );
             membership.insert(user, party);
@@ -1972,6 +2032,79 @@ mod tests {
         let projection = restarted.create_projection("alice").await.unwrap().0;
         assert_eq!(projection.results.len(), 1);
         assert!(projection.party_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_claims_one_resync_per_generation_after_expiry() {
+        let store: Arc<dyn StorageRepository> = Arc::new(InMemoryStorageRepository::new());
+        let initial = StoragePartyDirectory::new(Arc::clone(&store));
+        let party_id = id("failover-resync");
+        let (created, stale_lease) = initial
+            .create(party_id.clone(), "alice", node("a"), now(10), now(1))
+            .await
+            .unwrap();
+
+        // The replacement may acquire only after the durable lease expires;
+        // the resulting fence is strictly newer than the old owner fence.
+        let replacement = StoragePartyDirectory::new(Arc::clone(&store));
+        let PartyOwnerResolution::Local(recovery_lease) = replacement
+            .acquire_or_resolve(&party_id, node("b"), now(30), now(11))
+            .await
+            .unwrap()
+        else {
+            panic!("expired owner must be taken over")
+        };
+        assert!(recovery_lease.generation > stale_lease.generation);
+
+        let recovered = replacement
+            .claim_failover_resync(&recovery_lease, now(11))
+            .await
+            .unwrap()
+            .expect("the first replacement generation emits a recovery snapshot");
+        assert_eq!(recovered, created);
+        assert!(
+            replacement
+                .claim_failover_resync(&recovery_lease, now(12))
+                .await
+                .unwrap()
+                .is_none(),
+            "a retry must not claim a second client transition"
+        );
+        let next_replacement = StoragePartyDirectory::new(Arc::clone(&store));
+        let PartyOwnerResolution::Local(next_lease) = next_replacement
+            .acquire_or_resolve(&party_id, node("c"), now(50), now(31))
+            .await
+            .unwrap()
+        else {
+            panic!("the replacement lease must also expire before another takeover")
+        };
+        assert!(next_lease.generation > recovery_lease.generation);
+        assert!(
+            replacement
+                .claim_failover_resync(&recovery_lease, now(31))
+                .await
+                .is_err(),
+            "a stale replacement owner must never claim a later recovery"
+        );
+        assert!(
+            next_replacement
+                .claim_failover_resync(&next_lease, now(31))
+                .await
+                .unwrap()
+                .is_some(),
+            "each successfully acquired replacement generation claims once"
+        );
+
+        // The durable marker survives restart, so replaying the completed
+        // takeover cannot duplicate a client resync notification.
+        let restarted = StoragePartyDirectory::new(store);
+        assert!(
+            restarted
+                .claim_failover_resync(&next_lease, now(32))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
