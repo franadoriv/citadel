@@ -50,6 +50,15 @@ impl RestartCircuitBreaker {
         !self.is_open()
     }
 
+    pub fn next_restart_delay(&mut self) -> Option<Duration> {
+        let attempt = self.failures;
+        if self.record_failure() {
+            Some(restart_backoff(attempt))
+        } else {
+            None
+        }
+    }
+
     pub fn record_healthy(&mut self) {
         self.failures = 0;
     }
@@ -238,6 +247,10 @@ impl SupervisedWorker {
         result
     }
 
+    pub fn has_exited(&mut self) -> io::Result<bool> {
+        Ok(self.child.try_wait()?.is_some())
+    }
+
     pub fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
@@ -254,6 +267,37 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn crashed_worker_requires_a_permitted_restart_delay() {
+        let mut breaker = super::RestartCircuitBreaker::new(1);
+        let mut worker =
+            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[9; 32])
+                .expect("spawn");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(worker.has_exited().expect("child status"));
+        assert_eq!(breaker.next_restart_delay(), None);
+    }
+
+    #[test]
+    fn reports_when_child_has_exited() {
+        let mut worker =
+            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[7; 32])
+                .expect("spawn");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(worker.has_exited().expect("child status"));
+    }
+
+    #[test]
+    fn restart_policy_combines_backoff_and_circuit_breaker() {
+        let mut breaker = super::RestartCircuitBreaker::new(2);
+        assert_eq!(
+            breaker.next_restart_delay(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(breaker.next_restart_delay(), None);
+        assert!(breaker.is_open());
+    }
+
     #[test]
     fn circuit_breaker_opens_at_restart_limit() {
         let mut breaker = super::RestartCircuitBreaker::new(3);
