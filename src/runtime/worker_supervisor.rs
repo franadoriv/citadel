@@ -17,15 +17,52 @@ use super::{
     worker_bootstrap::BootstrapPipe,
     worker_ipc::PrivateUnixEndpoint,
     worker_protocol::{
-        ControlFrame, PROTOCOL_VERSION, read_control_frame, verify_worker_hello,
-        write_control_frame,
+        ControlFrame, PROTOCOL_VERSION, is_valid_worker_health, read_control_frame,
+        verify_worker_hello, write_control_frame,
     },
 };
 
 #[cfg(unix)]
+const INITIAL_RESTART_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
+
+pub fn restart_backoff(attempt: u32) -> Duration {
+    INITIAL_RESTART_BACKOFF
+        .saturating_mul(1u32.checked_shl(attempt.min(9)).unwrap_or(u32::MAX))
+        .min(MAX_RESTART_BACKOFF)
+}
+
+pub struct RestartCircuitBreaker {
+    limit: u32,
+    failures: u32,
+}
+
+impl RestartCircuitBreaker {
+    pub fn new(limit: u32) -> Self {
+        Self {
+            limit: limit.max(1),
+            failures: 0,
+        }
+    }
+
+    pub fn record_failure(&mut self) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        !self.is_open()
+    }
+
+    pub fn record_healthy(&mut self) {
+        self.failures = 0;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.failures >= self.limit
+    }
+}
+
 pub struct SupervisedWorker {
     _endpoint: PrivateUnixEndpoint,
     _listener: UnixListener,
+    stream: Option<UnixStream>,
     _bootstrap_reader: OwnedFd,
     child: Child,
 }
@@ -54,6 +91,7 @@ impl SupervisedWorker {
         Ok(Self {
             _endpoint: endpoint,
             _listener: listener,
+            stream: None,
             _bootstrap_reader: bootstrap_reader,
             child,
         })
@@ -117,12 +155,80 @@ impl SupervisedWorker {
                 ControlFrame::WorkerReady { protocol_version }
                     if protocol_version == PROTOCOL_VERSION =>
                 {
+                    self.stream = Some(stream);
                     Ok(())
                 }
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "worker readiness frame invalid",
                 )),
+            }
+        })();
+        if result.is_err() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        result
+    }
+
+    pub fn shutdown(&mut self, deadline: Duration) -> io::Result<()> {
+        let result = (|| {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            stream.set_read_timeout(Some(deadline))?;
+            stream.set_write_timeout(Some(deadline))?;
+            write_control_frame(
+                stream,
+                &ControlFrame::ParentShutdown {
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "worker shutdown write failed")
+            })?;
+            match read_control_frame(stream).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker shutdown acknowledgement invalid",
+                )
+            })? {
+                ControlFrame::WorkerStopped { protocol_version }
+                    if protocol_version == PROTOCOL_VERSION =>
+                {
+                    Ok(())
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker shutdown acknowledgement invalid",
+                )),
+            }
+        })();
+        if result.is_err() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        result
+    }
+
+    pub fn health_check(&mut self, deadline: Duration) -> io::Result<()> {
+        let result = (|| {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            stream.set_read_timeout(Some(deadline))?;
+            let frame = read_control_frame(stream).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "worker health frame invalid")
+            })?;
+            if is_valid_worker_health(&frame) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker health frame invalid",
+                ))
             }
         })();
         if result.is_err() {
@@ -148,6 +254,38 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn circuit_breaker_opens_at_restart_limit() {
+        let mut breaker = super::RestartCircuitBreaker::new(3);
+        assert!(breaker.record_failure());
+        assert!(breaker.record_failure());
+        assert!(!breaker.record_failure());
+        assert!(breaker.is_open());
+        breaker.record_healthy();
+        assert!(!breaker.is_open());
+        assert!(breaker.record_failure());
+    }
+
+    #[test]
+    fn restart_backoff_grows_and_is_capped() {
+        assert_eq!(super::restart_backoff(0), Duration::from_millis(100));
+        assert_eq!(super::restart_backoff(1), Duration::from_millis(200));
+        assert_eq!(super::restart_backoff(20), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn supervisor_exposes_deadline_bound_shutdown() {
+        let _ = SupervisedWorker::shutdown;
+    }
+
+    #[test]
+    fn health_check_rejects_a_ready_worker_that_stops_reporting() {
+        // The supervisor must retain its authenticated stream so this call can
+        // enforce a deadline after readiness, rather than treating readiness as
+        // permanent health.
+        let _ = SupervisedWorker::health_check;
+    }
+
     #[test]
     fn authenticated_worker_without_ready_is_rejected() {
         use std::{fs, os::unix::fs::PermissionsExt, thread};

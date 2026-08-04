@@ -15,4 +15,10 @@ fn same_binary_worker_completes_authenticated_bootstrap() {
     worker
         .authenticate(&secret, nonce, Duration::from_secs(2))
         .expect("worker must complete the authenticated bootstrap");
+    worker
+        .health_check(Duration::from_secs(2))
+        .expect("worker must report health after readiness");
+    worker
+        .shutdown(Duration::from_secs(2))
+        .expect("worker must acknowledge orderly shutdown");
 }

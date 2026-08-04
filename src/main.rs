@@ -52,6 +52,24 @@ fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32) -> Result<()> {
         &citadel::runtime::worker_protocol::ControlFrame::WorkerReady { protocol_version },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerHealth { protocol_version },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker health write failed"))?;
+    match citadel::runtime::worker_protocol::read_control_frame(&mut stream)
+        .map_err(|_| anyhow::anyhow!("runtime worker shutdown frame invalid"))?
+    {
+        citadel::runtime::worker_protocol::ControlFrame::ParentShutdown {
+            protocol_version: shutdown_version,
+        } if shutdown_version == protocol_version => {}
+        _ => anyhow::bail!("runtime worker expected parent shutdown"),
+    }
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerStopped { protocol_version },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker stopped acknowledgement write failed"))?;
     Ok(())
 }
 

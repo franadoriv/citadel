@@ -28,6 +28,12 @@ pub enum ControlFrame {
         protocol_version: u16,
         nonce: Vec<u8>,
     },
+    ParentShutdown {
+        protocol_version: u16,
+    },
+    WorkerStopped {
+        protocol_version: u16,
+    },
     WorkerHealth {
         protocol_version: u16,
     },
@@ -209,6 +215,24 @@ mod tests {
         };
         assert!(super::verify_worker_hello(&secret, b"nonce", &frame));
         assert!(!super::verify_worker_hello(&secret, b"other", &frame));
+    }
+
+    #[test]
+    fn control_frame_round_trips_worker_stopped() {
+        let frame = super::ControlFrame::WorkerStopped {
+            protocol_version: super::PROTOCOL_VERSION,
+        };
+        let encoded = super::encode_frame(&frame).expect("encode");
+        assert_eq!(super::decode_frame(&encoded).expect("decode"), frame);
+    }
+
+    #[test]
+    fn control_frame_round_trips_parent_shutdown() {
+        let frame = super::ControlFrame::ParentShutdown {
+            protocol_version: super::PROTOCOL_VERSION,
+        };
+        let encoded = super::encode_frame(&frame).expect("encode");
+        assert_eq!(super::decode_frame(&encoded).expect("decode"), frame);
     }
 
     #[test]
