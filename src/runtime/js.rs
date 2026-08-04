@@ -83,6 +83,8 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "set_move_intent",
     "physics_state",
     "map_info",
+    "map_names",
+    "find_path",
     "raycast",
     "sphere_overlap",
     "ground_height",
@@ -496,6 +498,14 @@ const JS_HOST_PRELUDE: &str = r#"
     map_info(name) {
       if (!globalThis.__citadel_map_info) return null;
       return JSON.parse(globalThis.__citadel_map_info(String(name)));
+    },
+    map_names() {
+      if (!globalThis.__citadel_map_names) return [];
+      return JSON.parse(globalThis.__citadel_map_names());
+    },
+    find_path(name, start, goal) {
+      if (!globalThis.__citadel_find_path) return null;
+      return JSON.parse(globalThis.__citadel_find_path(String(name), start, goal));
     },
     raycast(origin, direction) {
       if (!globalThis.__citadel_raycast) return null;
@@ -3501,10 +3511,12 @@ fn apply_map_catalog(context: &Context, maps: &Option<Arc<MapCatalog>>) {
     };
     let maps = Arc::clone(maps);
     let _ = context.with(|ctx| -> JsHostResult<()> {
+        let map_info_maps = Arc::clone(&maps);
         let map_info = caught(
             &ctx,
             Function::new(ctx.clone(), move |name: String| -> String {
-                maps.info(&name)
+                map_info_maps
+                    .info(&name)
                     .map(|info| {
                         serde_json::json!({
                             "bounds_min": info.bounds_min,
@@ -3518,6 +3530,37 @@ fn apply_map_catalog(context: &Context, maps: &Option<Arc<MapCatalog>>) {
             }),
         )?;
         caught(&ctx, ctx.globals().set("__citadel_map_info", map_info))?;
+        let map_names_maps = Arc::clone(&maps);
+        let map_names = caught(
+            &ctx,
+            Function::new(ctx.clone(), move || -> String {
+                serde_json::to_string(&map_names_maps.names().collect::<Vec<_>>())
+                    .unwrap_or_else(|_| "[]".to_owned())
+            }),
+        )?;
+        caught(&ctx, ctx.globals().set("__citadel_map_names", map_names))?;
+        let find_path_maps = Arc::clone(&maps);
+        let find_path = caught(
+            &ctx,
+            Function::new(
+                ctx.clone(),
+                move |name: String, start: Vec<f32>, goal: Vec<f32>| -> String {
+                    let Some(start) = vector3(&start) else {
+                        return "null".to_owned();
+                    };
+                    let Some(goal) = vector3(&goal) else {
+                        return "null".to_owned();
+                    };
+                    find_path_maps
+                        .find_path(&name, start, goal)
+                        .ok()
+                        .flatten()
+                        .map(|path| serde_json::json!(path).to_string())
+                        .unwrap_or_else(|| "null".to_owned())
+                },
+            ),
+        )?;
+        caught(&ctx, ctx.globals().set("__citadel_find_path", find_path))?;
         Ok(())
     });
 }

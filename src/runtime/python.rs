@@ -91,6 +91,8 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "set_move_intent",
     "physics_state",
     "map_info",
+    "map_names",
+    "find_path",
     "raycast",
     "sphere_overlap",
     "ground_height",
@@ -428,6 +430,18 @@ def map_info(name):
     if "_map_catalog_bridge" not in globals():
         return None
     return _map_catalog_bridge.map_info(str(name))
+
+def map_names():
+    """Return loaded map keys in deterministic order."""
+    if "_map_catalog_bridge" not in globals():
+        return []
+    return _map_catalog_bridge.map_names()
+
+def find_path(name, start, goal):
+    """Return Rust/Detour navigation points, or None when no route exists."""
+    if "_map_catalog_bridge" not in globals():
+        return None
+    return _map_catalog_bridge.find_path(str(name), tuple(start), tuple(goal))
 
 def raycast(origin, direction):
     """Return the nearest active-map hit for a finite ray segment, or None."""
@@ -1122,6 +1136,35 @@ impl MapCatalogBridge {
         dict.set_item("vertex_count", info.vertex_count)?;
         dict.set_item("triangle_count", info.triangle_count)?;
         Ok(Some(dict.unbind()))
+    }
+
+    #[pyo3(name = "map_names")]
+    fn map_names(&self) -> Vec<String> {
+        self.maps.names().map(str::to_owned).collect()
+    }
+
+    #[pyo3(name = "find_path")]
+    fn find_path(
+        &self,
+        name: &str,
+        start: (f32, f32, f32),
+        goal: (f32, f32, f32),
+    ) -> PyResult<Option<Vec<(f32, f32, f32)>>> {
+        let start = [start.0, start.1, start.2];
+        let goal = [goal.0, goal.1, goal.2];
+        if !start.into_iter().chain(goal).all(f32::is_finite) {
+            return Err(PyRuntimeError::new_err("navigation points must be finite"));
+        }
+        Ok(self
+            .maps
+            .find_path(name, start, goal)
+            .ok()
+            .flatten()
+            .map(|path| {
+                path.into_iter()
+                    .map(|point| (point[0], point[1], point[2]))
+                    .collect()
+            }))
     }
 }
 
