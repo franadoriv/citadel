@@ -1,0 +1,22 @@
+[package]
+name = "citadel-transform"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Shared transform-sync types and the client-side world reconstruction used by both the Citadel server and the engine SDK C ABI."
+
+# Deliberately a leaf beside `citadel-wire`. This crate exists so the engine SDK
+# (`citadel-client-ffi`) can reconstruct replicated transforms without depending
+# on the server crate, which previously meant compiling sqlx, mongodb, axum,
+# quinn and a vendored Lua just to link two structs into a game engine plugin.
+[dependencies]
+citadel-wire = { path = "../citadel-wire" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

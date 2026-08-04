@@ -14,10 +14,11 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # The Rust SDK this crate exposes over a C ABI.
 citadel-client = { path = "../citadel-client" }
 citadel-wire = { path = "../citadel-wire" }
-# The tested snapshot reconstruction runtime is owned by the server library.
-# Re-export it through this narrow C ABI so native engines never fork the
-# codec/interpolation/reconciliation contract.
-citadel = { path = "../.." }
+# The tested snapshot reconstruction runtime, re-exported through this narrow C
+# ABI so native engines never fork the codec/interpolation/reconciliation
+# contract. It lives in its own leaf crate precisely so this plugin does not
+# have to build the server to link it.
+citadel-transform = { path = "../citadel-transform" }
 # Background runtime for the async client, driven behind a poll-based C API.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
@@ -27,7 +28,8 @@ cbindgen = "0.29"
 
 [dev-dependencies]
 # Round-trip tests run against an in-process Citadel server. Also gives the
-# contract-manifest generator the canonical HTTP auth route consts.
+# contract-manifest generator the canonical HTTP auth route consts. This stays a
+# dev-dependency on purpose: it never reaches the shipped cdylib/staticlib.
 citadel = { path = "../.." }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # The contract-manifest generator/stale-guard test emits crates/citadel-wire/

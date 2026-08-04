@@ -30,7 +30,6 @@
 //!   and the `HELLO`/`ACK` handling.
 
 mod authority;
-mod client;
 mod congestion;
 mod hub;
 mod input;
@@ -39,8 +38,12 @@ mod rewind;
 mod snapshot;
 mod world;
 
-pub use authority::{TransformAuthority, TransformState};
-pub use client::{RemoteObject, RemoteWorldView};
+pub use authority::TransformAuthority;
+// The client-side reconstruction and the shared per-object state now live in
+// the `citadel-transform` leaf crate, so the engine SDK can use them without
+// depending on this crate. Re-exported here so server code and the existing
+// `crate::realtime::transform::*` paths are unchanged.
+pub use citadel_transform::{RemoteObject, RemoteWorldView, TransformState};
 pub use congestion::{CongestionConfig, CongestionController, CongestionSignals, SendMode};
 pub use hub::{OwnerMovementMode, TransformHub, TransformHubConfig};
 pub use input::{InputLimits, InputOutcome, OwnerInputQueue, integrate_owner_frame};
@@ -52,9 +55,5 @@ pub use rewind::{
 pub use snapshot::ClientSnapshotState;
 pub use world::{Frame, FrameObject, PhysicsState, TransformWorld};
 
-/// A match-unique replicated-object id. 32-bit on the wire (design §8); widened
-/// to the interest grid's `u64` key internally.
-pub type ObjectId = u32;
-
-// Re-export the wire roles so server code speaks one vocabulary with the wire.
-pub use citadel_wire::tsync::SyncRole;
+// The object id and the wire role are defined alongside the shared state.
+pub use citadel_transform::{ObjectId, SyncRole};
