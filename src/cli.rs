@@ -95,6 +95,14 @@ pub enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Internal supervised GameScript worker; not an operator-facing command.
+    #[command(hide = true)]
+    RuntimeWorker {
+        #[arg(long)]
+        bootstrap_endpoint: String,
+        #[arg(long)]
+        bootstrap_fd: i32,
+    },
 }
 
 /// Execute `citadel check`: resolve and validate configuration.
@@ -114,6 +122,27 @@ pub fn run_check(global: &GlobalArgs) -> AppResult<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_runtime_worker_only_with_bootstrap_endpoint() {
+        let cli = Cli::try_parse_from([
+            "citadel",
+            "runtime-worker",
+            "--bootstrap-endpoint",
+            "/tmp/citadel.sock",
+            "--bootstrap-fd",
+            "3",
+        ])
+        .expect("internal worker parses with endpoint");
+        assert_eq!(
+            cli.command(),
+            Command::RuntimeWorker {
+                bootstrap_endpoint: "/tmp/citadel.sock".to_string(),
+                bootstrap_fd: 3,
+            }
+        );
+        assert!(Cli::try_parse_from(["citadel", "runtime-worker"]).is_err());
+    }
 
     #[test]
     fn parses_check_subcommand() {

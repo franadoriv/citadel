@@ -9,6 +9,8 @@
 
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -17,6 +19,36 @@ use citadel::cli::{self, Cli, Command};
 use citadel::config::Config;
 use citadel::startup::{self, StdioPrompt, WizardPaths, WizardReport};
 use citadel::{App, error_reporting, http, observability};
+
+#[cfg(unix)]
+fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32) -> Result<()> {
+    let secret = citadel::runtime::worker_bootstrap::read_secret_from_fd(bootstrap_fd)
+        .context("runtime worker bootstrap secret unavailable")?;
+    let mut stream =
+        UnixStream::connect(endpoint).context("runtime worker bootstrap connect failed")?;
+    let frame = citadel::runtime::worker_protocol::read_control_frame(&mut stream)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent hello invalid"))?;
+    let (protocol_version, nonce) = match frame {
+        citadel::runtime::worker_protocol::ControlFrame::ParentHello {
+            protocol_version,
+            nonce,
+        } => (protocol_version, nonce),
+        _ => anyhow::bail!("runtime worker expected parent hello"),
+    };
+    if protocol_version != citadel::runtime::worker_protocol::PROTOCOL_VERSION {
+        anyhow::bail!("runtime worker protocol version unsupported");
+    }
+    let proof = citadel::runtime::worker_protocol::challenge_proof(&secret, &nonce);
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerHello {
+            protocol_version,
+            proof: proof.to_vec(),
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker hello write failed"))?;
+    Ok(())
+}
 
 fn main() -> Result<()> {
     // MongoDB's TLS stack may pull aws-lc-rs alongside Citadel's ring-backed
@@ -48,6 +80,10 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::RuntimeWorker {
+            bootstrap_endpoint,
+            bootstrap_fd,
+        } => run_runtime_worker(&bootstrap_endpoint, bootstrap_fd),
         Command::Check => {
             let config = cli::run_check(&cli.global).context("configuration check failed")?;
             // Initialize logging after a successful check so diagnostics honor
