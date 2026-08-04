@@ -21,7 +21,20 @@ public_addr = "127.0.0.1:7350"
 # (/dashboard). Bind to 0.0.0.0:7350 to accept connections from other machines.
 # Binding a non-loopback address requires real console credentials below: the
 # server refuses to start while the built-in operator password is still in use.
+# It also requires encryption, since this listener carries the console password,
+# the console bearer tokens, and every player session token. Either set
+# [http.tls] below, or set behind_tls_proxy when a TLS-terminating reverse proxy
+# fronts this listener. Loopback binds are exempt.
 bind = "127.0.0.1:7350"
+# behind_tls_proxy = true
+
+# [http.tls]
+# Terminate HTTPS directly on this listener, with no reverse proxy needed. The
+# key may be PKCS#8, RSA/PKCS#1 or SEC1 PEM. ALPN advertises HTTP/2 and
+# HTTP/1.1. This is independent of [transport.tls], which covers the QUIC and
+# WebTransport listeners: those are usually issued a different certificate.
+# certificate_file = "/etc/citadel/tls/fullchain.pem"
+# private_key_file = "/etc/citadel/tls/privkey.pem"
 
 # [console]
 # Credentials for the operator console at /dashboard and its /console/v1/* API.

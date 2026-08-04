@@ -43,6 +43,18 @@ tokio = { version = "1", features = [
 ] }
 # HTTP server stack for health/admin/API routes ( wires the listener).
 axum = "0.7"
+# Native TLS termination for the HTTP surface. axum 0.7's `serve` takes a
+# concrete `TcpListener`, so an https listener drives hyper directly: hyper-util
+# supplies the HTTP/1.1+HTTP/2 auto-negotiating connection builder and the tower
+# bridge, and tokio-rustls the accept-side handshake. All three are already in
+# the tree transitively; the pinned rustls stays the single rustls/ring version.
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "service", "tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# `service_fn` for the per-connection adapter that injects the peer address the
+# auth and console rate limiters key on. Already present as a dev-dependency and
+# as an axum dependency; the https listener needs it at build time too.
+tower = { version = "0.5", features = ["util"] }
 # Bounded, Rust-owned outbound HTTP for trusted game scripts. TLS is
 # rustls-only and default features stay off so script requests never inherit an
 # ambient system proxy configuration.
