@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use citadel_wire::baseline::AckField;
 use citadel_wire::tsync::{self, Snapshot, TransformCodec};
 
-use super::ObjectId;
-use super::authority::TransformState;
+use crate::ObjectId;
+use crate::state::TransformState;
 
 /// A reconstructed object as the client holds it.
 #[derive(Debug, Clone, Copy, PartialEq)]

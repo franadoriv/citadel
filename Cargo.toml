@@ -26,6 +26,9 @@ citadel-wire = { path = "crates/citadel-wire" }
 citadel-map = { path = "crates/citadel-map" }
 citadel-nav = { path = "crates/citadel-nav" }
 citadel-physics = { path = "crates/citadel-physics" }
+# Shared transform state + client-side reconstruction, also linked by the
+# engine SDK C ABI without pulling in this crate.
+citadel-transform = { path = "crates/citadel-transform" }
 citadel-tmx = { path = "crates/citadel-tmx" }
 # Async runtime. Feature-gated to what the skeleton needs today; expand as
 # networking and process management tasks land.

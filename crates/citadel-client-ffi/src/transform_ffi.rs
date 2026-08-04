@@ -1,13 +1,13 @@
 //! C ABI for the shared transform-sync client runtime.
 //!
-//! The Rust [`RemoteWorldView`](citadel::realtime::transform::RemoteWorldView)
+//! The Rust [`RemoteWorldView`](citadel_transform::RemoteWorldView)
 //! remains the sole snapshot decoder, adaptive-buffer implementation, and source
 //! of reconciliation targets. Unity/Godot own only engine-facing transform
 //! application and local input glue.
 
 use std::sync::Mutex;
 
-use citadel::realtime::transform::{RemoteWorldView, TransformState};
+use citadel_transform::{RemoteWorldView, TransformState};
 use citadel_wire::tsync::{Hello, InputBundle, InputFrame, TransformCodec};
 
 use crate::{CitadelStatus, guard};

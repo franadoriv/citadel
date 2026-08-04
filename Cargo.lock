@@ -439,6 +439,7 @@ dependencies = [
  "citadel-physics",
  "citadel-process-env",
  "citadel-tmx",
+ "citadel-transform",
  "citadel-wire",
  "clap",
  "csv",
@@ -497,6 +498,7 @@ dependencies = [
  "cbindgen",
  "citadel",
  "citadel-client",
+ "citadel-transform",
  "citadel-wire",
  "serde_json",
  "tokio",
@@ -531,6 +533,13 @@ version = "0.1.0"
 dependencies = [
  "citadel-map",
  "tiled",
+]
+
+[[package]]
+name = "citadel-transform"
+version = "0.1.0"
+dependencies = [
+ "citadel-wire",
 ]
 
 [[package]]
