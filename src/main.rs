@@ -47,6 +47,11 @@ fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32) -> Result<()> {
         },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker hello write failed"))?;
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerReady { protocol_version },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
     Ok(())
 }
 

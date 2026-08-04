@@ -28,10 +28,20 @@ pub enum ControlFrame {
         protocol_version: u16,
         nonce: Vec<u8>,
     },
+    WorkerHealth {
+        protocol_version: u16,
+    },
+    WorkerReady {
+        protocol_version: u16,
+    },
     WorkerHello {
         protocol_version: u16,
         proof: Vec<u8>,
     },
+}
+
+pub fn is_valid_worker_health(frame: &ControlFrame) -> bool {
+    matches!(frame, ControlFrame::WorkerHealth { protocol_version } if *protocol_version == PROTOCOL_VERSION)
 }
 
 pub fn verify_worker_hello(secret: &[u8; 32], nonce: &[u8], frame: &ControlFrame) -> bool {
@@ -199,6 +209,32 @@ mod tests {
         };
         assert!(super::verify_worker_hello(&secret, b"nonce", &frame));
         assert!(!super::verify_worker_hello(&secret, b"other", &frame));
+    }
+
+    #[test]
+    fn health_check_accepts_a_versioned_worker_health_frame() {
+        let worker = super::ControlFrame::WorkerHealth {
+            protocol_version: super::PROTOCOL_VERSION,
+        };
+        assert!(super::is_valid_worker_health(&worker));
+    }
+
+    #[test]
+    fn control_frame_round_trips_worker_health() {
+        let frame = super::ControlFrame::WorkerHealth {
+            protocol_version: super::PROTOCOL_VERSION,
+        };
+        let encoded = super::encode_frame(&frame).expect("encode");
+        assert_eq!(super::decode_frame(&encoded).expect("decode"), frame);
+    }
+
+    #[test]
+    fn control_frame_round_trips_worker_ready() {
+        let frame = super::ControlFrame::WorkerReady {
+            protocol_version: super::PROTOCOL_VERSION,
+        };
+        let encoded = super::encode_frame(&frame).expect("encode");
+        assert_eq!(super::decode_frame(&encoded).expect("decode"), frame);
     }
 
     #[test]

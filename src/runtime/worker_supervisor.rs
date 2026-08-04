@@ -105,13 +105,24 @@ impl SupervisedWorker {
             let frame = read_control_frame(&mut stream).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "worker bootstrap frame invalid")
             })?;
-            if verify_worker_hello(secret, &nonce, &frame) {
-                Ok(())
-            } else {
-                Err(io::Error::new(
+            if !verify_worker_hello(secret, &nonce, &frame) {
+                return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "worker authentication failed",
-                ))
+                ));
+            }
+            match read_control_frame(&mut stream).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
+            })? {
+                ControlFrame::WorkerReady { protocol_version }
+                    if protocol_version == PROTOCOL_VERSION =>
+                {
+                    Ok(())
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker readiness frame invalid",
+                )),
             }
         })();
         if result.is_err() {
@@ -138,13 +149,114 @@ impl Drop for SupervisedWorker {
 mod tests {
     use super::*;
     #[test]
+    fn authenticated_worker_without_ready_is_rejected() {
+        use std::{fs, os::unix::fs::PermissionsExt, thread};
+
+        let script =
+            std::env::temp_dir().join(format!("citadel-worker-test-{}.sh", uuid::Uuid::new_v4()));
+        fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
+        let secret = [5; 32];
+        let nonce = vec![6; 32];
+        let client_nonce = nonce.clone();
+        let mut worker =
+            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &secret).expect("spawn");
+        let endpoint = worker._endpoint.path().to_path_buf();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(endpoint).expect("connect");
+            let _ = read_control_frame(&mut stream).expect("parent hello");
+            write_control_frame(
+                &mut stream,
+                &ControlFrame::WorkerHello {
+                    protocol_version: PROTOCOL_VERSION,
+                    proof: crate::runtime::worker_protocol::challenge_proof(&secret, &client_nonce)
+                        .to_vec(),
+                },
+            )
+            .expect("hello");
+            thread::sleep(Duration::from_millis(100));
+        });
+        let error = worker
+            .authenticate(&secret, nonce, Duration::from_millis(20))
+            .expect_err("ready required");
+        client.join().expect("client");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::TimedOut
+        ));
+        assert!(worker.child.try_wait().expect("child status").is_some());
+        let _ = fs::remove_file(script);
+    }
+
+    #[test]
+    fn worker_that_stalls_after_connect_is_killed_and_reaped() {
+        use std::{fs, os::unix::fs::PermissionsExt, thread};
+
+        let script =
+            std::env::temp_dir().join(format!("citadel-worker-test-{}.sh", uuid::Uuid::new_v4()));
+        fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
+        let mut worker =
+            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &[4; 32]).expect("spawn");
+        let endpoint = worker._endpoint.path().to_path_buf();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(endpoint).expect("connect");
+            let _ = read_control_frame(&mut stream).expect("parent hello");
+            thread::sleep(Duration::from_millis(100));
+        });
+        let error = worker
+            .authenticate(&[4; 32], vec![1; 32], Duration::from_millis(20))
+            .expect_err("stalled hello");
+        client.join().expect("client");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::TimedOut
+        ));
+        assert!(worker.child.try_wait().expect("child status").is_some());
+        let _ = fs::remove_file(script);
+    }
+
+    #[test]
+    fn invalid_worker_hello_kills_and_reaps_the_child() {
+        use std::{fs, os::unix::fs::PermissionsExt, thread};
+
+        let script =
+            std::env::temp_dir().join(format!("citadel-worker-test-{}.sh", uuid::Uuid::new_v4()));
+        fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
+        let mut worker =
+            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &[3; 32]).expect("spawn");
+        let endpoint = worker._endpoint.path().to_path_buf();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(endpoint).expect("connect");
+            let _ = read_control_frame(&mut stream).expect("parent hello");
+            write_control_frame(
+                &mut stream,
+                &ControlFrame::WorkerHello {
+                    protocol_version: PROTOCOL_VERSION,
+                    proof: vec![0; 32],
+                },
+            )
+            .expect("invalid hello");
+        });
+        let error = worker
+            .authenticate(&[3; 32], vec![1; 32], Duration::from_secs(1))
+            .expect_err("invalid proof");
+        client.join().expect("client");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(worker.child.try_wait().expect("child status").is_some());
+        let _ = fs::remove_file(script);
+    }
+
+    #[test]
     fn bootstrap_acceptance_times_out_fail_closed() {
         let parent = std::env::temp_dir();
-        let worker =
+        let mut worker =
             SupervisedWorker::spawn(Path::new("/bin/true"), &parent, &[7; 32]).expect("spawn");
         let error = worker
             .accept_with_deadline(Duration::from_millis(10))
             .expect_err("must timeout");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(worker.child.try_wait().expect("child status").is_some());
     }
 }
