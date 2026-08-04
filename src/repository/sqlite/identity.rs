@@ -42,7 +42,7 @@ use crate::identity::{
     EmailAddress, PasswordVerifier, User, UserId, UserMetadata, Username,
 };
 use crate::repository::{AuthIdentityRepository, UserRepository};
-use crate::time::TimestampMillis;
+use crate::time::{Clock, TimestampMillis};
 
 use super::{SqliteExecutor, db_err, get, millis_to_ts, ts_to_millis, tx_closed};
 
@@ -108,6 +108,16 @@ ON CONFLICT (provider, external_id) DO NOTHING";
 
 const DELETE_IDENTITY_SQL: &str = "\
 DELETE FROM auth_identities WHERE provider = ? AND external_id = ?";
+
+const SCOPED_DELETE_IDENTITY_SQL: &str = "\
+DELETE FROM auth_identities WHERE provider = ? AND external_id = ? AND user_id = ?";
+
+const COUNT_USER_IDENTITIES_SQL: &str = "SELECT COUNT(*) FROM auth_identities WHERE user_id = ?";
+
+const INSERT_IDENTITY_CHANGE_OUTBOX_SQL: &str = "\
+INSERT INTO identity_change_outbox \
+    (user_id, event_type, provider, external_id_redacted, password_verifier, created_at) \
+VALUES (?, 'credential_unlinked', ?, '[redacted]', NULL, ?)";
 
 // --- mapping helpers --------------------------------------------------------
 
@@ -581,6 +591,33 @@ impl AuthIdentityRepository for SqliteAuthIdentityRepository {
             }
         }
     }
+
+    async fn unlink_auth_identity_for_user(
+        &self,
+        user_id: &UserId,
+        credential: &AuthCredential,
+    ) -> AppResult<crate::repository::UnlinkResult> {
+        match &self.executor {
+            SqliteExecutor::Pool(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE;").await.map_err(db_err)?;
+                match scoped_unlink_identity_conn(&mut tx, user_id, credential).await {
+                    Ok(result) => {
+                        tx.commit().await.map_err(db_err)?;
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+            SqliteExecutor::Tx(cell) => {
+                let mut guard = cell.lock().await;
+                let tx = guard.as_mut().ok_or_else(tx_closed)?;
+                scoped_unlink_identity_conn(&mut *tx, user_id, credential).await
+            }
+        }
+    }
 }
 
 async fn get_identity_conn(
@@ -663,9 +700,54 @@ async fn unlink_identity_conn(
     Ok(())
 }
 
+async fn scoped_unlink_identity_conn(
+    conn: &mut SqliteConnection,
+    user_id: &UserId,
+    credential: &AuthCredential,
+) -> AppResult<crate::repository::UnlinkResult> {
+    let (provider, external_id) = credential_columns(credential);
+    let owned: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM auth_identities WHERE provider = ? AND external_id = ? AND user_id = ?",
+    )
+    .bind(provider)
+    .bind(external_id)
+    .bind(user_id.as_str())
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    if owned.is_none() {
+        return Ok(crate::repository::UnlinkResult::NotOwned);
+    }
+    let count: i64 = sqlx::query_scalar(COUNT_USER_IDENTITIES_SQL)
+        .bind(user_id.as_str())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    if count <= 1 {
+        return Ok(crate::repository::UnlinkResult::LastCredential);
+    }
+    sqlx::query(SCOPED_DELETE_IDENTITY_SQL)
+        .bind(provider)
+        .bind(external_id)
+        .bind(user_id.as_str())
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    sqlx::query(INSERT_IDENTITY_CHANGE_OUTBOX_SQL)
+        .bind(user_id.as_str())
+        .bind(provider)
+        .bind(i64::try_from(crate::time::SystemClock.now().unix_millis()).unwrap_or(i64::MAX))
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    Ok(crate::repository::UnlinkResult::Unlinked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DatabaseConfig;
+    use crate::repository::{SqliteDatabase, UnlinkResult};
 
     #[test]
     fn account_state_tokens_round_trip() {
@@ -710,5 +792,97 @@ mod tests {
         assert_eq!(metadata_from_text(text).expect("decode"), Some(metadata));
         assert_eq!(metadata_to_text(None).expect("encode none"), None);
         assert_eq!(metadata_from_text(None).expect("decode none"), None);
+    }
+
+    #[tokio::test]
+    async fn scoped_unlink_rolls_back_or_commits_its_redacted_outbox_audit_with_the_identity() {
+        let db = SqliteDatabase::connect(&DatabaseConfig {
+            url: Some("sqlite::memory:".to_owned()),
+            ..DatabaseConfig::default()
+        })
+        .await
+        .expect("connect");
+        let user = UserId::new("unlink-user").expect("user");
+        let removed =
+            AuthCredential::Email(EmailAddress::new("unlink@example.test").expect("email"));
+        let retained = AuthCredential::Device(DeviceId::new("unlink-device").expect("device"));
+        let email_identity = AuthIdentity::new(
+            removed.clone(),
+            user.clone(),
+            TimestampMillis::from_unix_millis(1),
+            TimestampMillis::from_unix_millis(1),
+        )
+        .expect("email identity")
+        .with_password_verifier(
+            PasswordVerifier::new("test-verifier".to_owned()).expect("verifier"),
+        )
+        .expect("attach verifier");
+        db.auth_identity_repository()
+            .link_auth_identity(email_identity)
+            .await
+            .expect("link email");
+        db.auth_identity_repository()
+            .link_auth_identity(
+                AuthIdentity::new(
+                    retained,
+                    user.clone(),
+                    TimestampMillis::from_unix_millis(1),
+                    TimestampMillis::from_unix_millis(1),
+                )
+                .expect("device identity"),
+            )
+            .await
+            .expect("link device");
+
+        let tx = db.begin().await.expect("begin");
+        assert_eq!(
+            tx.auth_identity_repository()
+                .unlink_auth_identity_for_user(&user, &removed)
+                .await
+                .expect("unlink in transaction"),
+            UnlinkResult::Unlinked
+        );
+        tx.rollback().await.expect("rollback");
+        assert!(
+            db.auth_identity_repository()
+                .get_auth_identity(&removed)
+                .await
+                .expect("read after rollback")
+                .is_some()
+        );
+        let rolled_back_audits: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM identity_change_outbox WHERE user_id = ?")
+                .bind(user.as_str())
+                .fetch_one(&db.pool)
+                .await
+                .expect("query audit outbox");
+        assert_eq!(rolled_back_audits, 0);
+
+        assert_eq!(
+            db.auth_identity_repository()
+                .unlink_auth_identity_for_user(&user, &removed)
+                .await
+                .expect("unlink"),
+            UnlinkResult::Unlinked
+        );
+        assert!(
+            db.auth_identity_repository()
+                .get_auth_identity(&removed)
+                .await
+                .expect("read after unlink")
+                .is_none()
+        );
+        let event = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT event_type, provider, external_id_redacted, password_verifier \
+             FROM identity_change_outbox WHERE user_id = ?",
+        )
+        .bind(user.as_str())
+        .fetch_one(&db.pool)
+        .await
+        .expect("redacted outbox record");
+        assert_eq!(event.0, "credential_unlinked");
+        assert_eq!(event.1, "email");
+        assert_eq!(event.2, "[redacted]");
+        assert!(event.3.is_none(), "outbox must never retain a verifier");
     }
 }

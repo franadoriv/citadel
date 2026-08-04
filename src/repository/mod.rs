@@ -49,8 +49,8 @@ pub use groups::{
     InMemoryGroupsRepository, Membership, UpdateGroupRequest,
 };
 pub use identity::{
-    AuthIdentityRepository, InMemoryAuthIdentityRepository, InMemoryUserRepository, UserPage,
-    UserRepository,
+    AuthIdentityRepository, InMemoryAuthIdentityRepository, InMemoryUserRepository, UnlinkResult,
+    UserPage, UserRepository,
 };
 pub use leaderboards::{
     CreateLeaderboardRequest, InMemoryLeaderboardsRepository, LeaderboardDefinition,

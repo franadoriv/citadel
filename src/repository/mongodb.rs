@@ -72,11 +72,16 @@ use crate::storage::{
     ListQuery, ObjectId, Owner, Page, Precondition, StorageIndexDefinition, StorageIndexMembership,
     StorageIndexQuery, StorageObject, Version, WriteRequest,
 };
-use crate::time::{DurationMillis, TimestampMillis};
+use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 
 const USERS: &str = "users";
 const IDENTITIES: &str = "auth_identities";
 const SESSIONS: &str = "sessions";
+const IDENTITY_CHANGE_OUTBOX: &str = "identity_change_outbox";
+// A per-account write fence used only inside scoped-unlink transactions. Mongo
+// snapshot reads alone do not make two deletes of different identity documents
+// conflict, so this shared document serializes last-credential decisions.
+const IDENTITY_UNLINK_LOCKS: &str = "identity_unlink_locks";
 const FRIEND_EDGES: &str = "friend_edges";
 const GROUPS: &str = "groups";
 const GROUP_MEMBERSHIPS: &str = "group_memberships";
@@ -104,7 +109,7 @@ const TOURNAMENT_SETTLEMENT_OUTBOX: &str = "tournament_settlement_outbox";
 
 const SCHEMA_COLLECTION: &str = "citadel_schema";
 const SCHEMA_ID: &str = "mongodb-foundation";
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 // MongoDB recommends retrying a whole transaction on
 // `TransientTransactionError`, but retrying *only* the commit when the result
 // is unknown.  A direct `UnitOfWork` has no replayable user closure, so it can
@@ -216,6 +221,22 @@ const SCHEMA: &[CollectionSpec] = &[
                 unique: false,
             },
         ],
+    },
+    CollectionSpec {
+        name: IDENTITY_CHANGE_OUTBOX,
+        indexes: &[IndexSpec {
+            name: "identity_change_outbox_user_created",
+            keys: &[("user_id", 1), ("created_at_unix_ms", 1)],
+            unique: false,
+        }],
+    },
+    CollectionSpec {
+        name: IDENTITY_UNLINK_LOCKS,
+        indexes: &[IndexSpec {
+            name: "identity_unlink_lock_user_uq",
+            keys: &[("user_id", 1)],
+            unique: true,
+        }],
     },
     CollectionSpec {
         name: "sessions",
@@ -635,6 +656,9 @@ pub struct MongoUserRepository {
 }
 pub struct MongoAuthIdentityRepository {
     executor: MongoExecutor,
+    // Pooled scoped unlink owns a replayable transaction; a UoW-bound handle
+    // instead uses its caller's existing session.
+    client: Option<Client>,
 }
 pub struct MongoSessionRepository {
     executor: MongoExecutor,
@@ -812,7 +836,17 @@ impl MongoUserRepository {
 }
 impl MongoAuthIdentityRepository {
     fn new(executor: MongoExecutor) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            client: None,
+        }
+    }
+
+    fn pooled(client: Client, database: Database) -> Self {
+        Self {
+            executor: MongoExecutor::Database(database),
+            client: Some(client),
+        }
     }
 }
 impl MongoSessionRepository {
@@ -5743,6 +5777,71 @@ impl UserRepository for MongoUserRepository {
     }
 }
 
+async fn scoped_unlink_identity_mongo(
+    database: &Database,
+    session: &mut ClientSession,
+    user_id: &UserId,
+    credential: &AuthCredential,
+) -> Result<crate::repository::UnlinkResult, mongodb::error::Error> {
+    let (provider, external_id) = credential_columns(credential);
+    // Writing this shared, per-user fence makes concurrent scoped unlinks
+    // conflict/retry even when they target two different identity documents.
+    database
+        .collection::<Document>(IDENTITY_UNLINK_LOCKS)
+        .update_one(
+            doc! { "user_id": user_id.as_str() },
+            doc! { "$set": { "updated_at_unix_ms": i64::try_from(SystemClock.now().unix_millis()).unwrap_or(i64::MAX) } },
+        )
+        .upsert(true)
+        .session(&mut *session)
+        .await?;
+
+    let identities = database.collection::<Document>(IDENTITIES);
+    let Some(identity) = identities
+        .find_one(doc! { "provider": provider, "external_id": external_id })
+        .session(&mut *session)
+        .await?
+    else {
+        return Ok(crate::repository::UnlinkResult::NotOwned);
+    };
+    if identity.get_str("user_id").ok() != Some(user_id.as_str()) {
+        return Ok(crate::repository::UnlinkResult::NotOwned);
+    }
+    if identities
+        .count_documents(doc! { "user_id": user_id.as_str() })
+        .session(&mut *session)
+        .await?
+        <= 1
+    {
+        return Ok(crate::repository::UnlinkResult::LastCredential);
+    }
+    let deleted = identities
+        .delete_one(doc! {
+            "provider": provider,
+            "external_id": external_id,
+            "user_id": user_id.as_str(),
+        })
+        .session(&mut *session)
+        .await?;
+    if deleted.deleted_count != 1 {
+        return Ok(crate::repository::UnlinkResult::NotOwned);
+    }
+    // The outbox contains only routing-safe metadata. The email address and its
+    // password verifier disappeared with the identity document above.
+    database
+        .collection::<Document>(IDENTITY_CHANGE_OUTBOX)
+        .insert_one(doc! {
+            "user_id": user_id.as_str(),
+            "event_type": "credential_unlinked",
+            "provider": provider,
+            "external_id_redacted": "[redacted]",
+            "created_at_unix_ms": i64::try_from(SystemClock.now().unix_millis()).unwrap_or(i64::MAX),
+        })
+        .session(&mut *session)
+        .await?;
+    Ok(crate::repository::UnlinkResult::Unlinked)
+}
+
 #[async_trait]
 impl AuthIdentityRepository for MongoAuthIdentityRepository {
     async fn get_auth_identity(
@@ -5878,6 +5977,39 @@ impl AuthIdentityRepository for MongoAuthIdentityRepository {
             }
         }
         Ok(())
+    }
+
+    async fn unlink_auth_identity_for_user(
+        &self,
+        user_id: &UserId,
+        credential: &AuthCredential,
+    ) -> AppResult<crate::repository::UnlinkResult> {
+        match &self.executor {
+            MongoExecutor::Database(database) => {
+                let client = self.client.as_ref().ok_or_else(|| {
+                    AppError::internal("MongoDB pooled identity repository is missing its client")
+                })?;
+                let user_id = user_id.clone();
+                let credential = credential.clone();
+                run_mongo_transaction(client, database, move |database, session| {
+                    let user_id = user_id.clone();
+                    let credential = credential.clone();
+                    Box::pin(async move {
+                        scoped_unlink_identity_mongo(database, session, &user_id, &credential).await
+                    })
+                })
+                .await
+            }
+            MongoExecutor::Transaction(cell, database) => {
+                let mut session = cell.lock().await;
+                let session = session
+                    .as_mut()
+                    .ok_or_else(|| AppError::internal("MongoDB transaction is already closed"))?;
+                scoped_unlink_identity_mongo(database, &mut *session, user_id, credential)
+                    .await
+                    .map_err(mongo_error)
+            }
+        }
     }
 }
 
@@ -6195,7 +6327,13 @@ impl MongoDatabase {
     ///
     /// Test callers must use an isolated database selected solely for testing.
     pub async fn clear_identity_session_data_for_tests(&self) -> AppResult<()> {
-        for collection in [USERS, IDENTITIES, SESSIONS] {
+        for collection in [
+            USERS,
+            IDENTITIES,
+            SESSIONS,
+            IDENTITY_CHANGE_OUTBOX,
+            IDENTITY_UNLINK_LOCKS,
+        ] {
             self.database
                 .collection::<Document>(collection)
                 .delete_many(doc! {})
@@ -6621,9 +6759,10 @@ impl Backend for MongoDatabase {
         )))
     }
     fn auth_identity_repository(&self) -> Arc<dyn AuthIdentityRepository> {
-        Arc::new(MongoAuthIdentityRepository::new(MongoExecutor::Database(
+        Arc::new(MongoAuthIdentityRepository::pooled(
+            self.client.clone(),
             self.database.clone(),
-        )))
+        ))
     }
     fn session_repository(&self) -> Arc<dyn SessionRepository> {
         Arc::new(MongoSessionRepository::new(MongoExecutor::Database(
@@ -6804,8 +6943,8 @@ mod tests {
     #[test]
     fn foundation_manifest_covers_every_existing_domain_projection() {
         let plan = MongoSchemaPlan::foundation();
-        assert_eq!(plan.version, 5);
-        assert_eq!(plan.collections, 31);
+        assert_eq!(plan.version, 6);
+        assert_eq!(plan.collections, 33);
         assert!(plan.indexes >= 48);
     }
 

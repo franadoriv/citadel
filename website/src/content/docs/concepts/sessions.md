@@ -74,6 +74,9 @@ revoke a single session through the player HTTP logout endpoint.
 
 ## Current limits
 
+- Link/unlink HTTP and SDK operations are not public yet. The server-side identity
+  core preserves exclusive credential ownership and protects against removing an
+  account's final credential; the public contract will ship separately.
 - A reconnect always creates a new realtime participant.
 - The current session-token index is in process, so tokens do not survive a
   server restart; the client authenticates again over HTTP.

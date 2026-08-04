@@ -33,7 +33,7 @@ use crate::identity::{
     EmailAddress, PasswordVerifier, User, UserId, UserMetadata, Username,
 };
 use crate::repository::{AuthIdentityRepository, UserRepository};
-use crate::time::TimestampMillis;
+use crate::time::{Clock, TimestampMillis};
 
 use super::{PgExecutor, db_err, get, millis_to_ts, ts_to_millis, tx_closed};
 
@@ -98,6 +98,17 @@ ON CONFLICT (provider, external_id) DO NOTHING";
 
 const DELETE_IDENTITY_SQL: &str = "\
 DELETE FROM auth_identities WHERE provider = $1 AND external_id = $2";
+
+const LOCK_USER_IDENTITIES_SQL: &str = "\
+SELECT provider, external_id FROM auth_identities WHERE user_id = $1 FOR UPDATE";
+
+const SCOPED_DELETE_IDENTITY_SQL: &str = "\
+DELETE FROM auth_identities WHERE provider = $1 AND external_id = $2 AND user_id = $3";
+
+const INSERT_IDENTITY_CHANGE_OUTBOX_SQL: &str = "\
+INSERT INTO identity_change_outbox \
+    (user_id, event_type, provider, external_id_redacted, password_verifier, created_at) \
+VALUES ($1, 'credential_unlinked', $2, '[redacted]', NULL, $3)";
 
 // --- mapping helpers --------------------------------------------------------
 
@@ -553,6 +564,33 @@ impl AuthIdentityRepository for PgAuthIdentityRepository {
             }
         }
     }
+
+    async fn unlink_auth_identity_for_user(
+        &self,
+        user_id: &UserId,
+        credential: &AuthCredential,
+    ) -> AppResult<crate::repository::UnlinkResult> {
+        match &self.executor {
+            PgExecutor::Pool(pool) => {
+                let mut tx = pool.begin().await.map_err(db_err)?;
+                match scoped_unlink_identity_conn(&mut tx, user_id, credential).await {
+                    Ok(result) => {
+                        tx.commit().await.map_err(db_err)?;
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+            PgExecutor::Tx(cell) => {
+                let mut guard = cell.lock().await;
+                let tx = guard.as_mut().ok_or_else(tx_closed)?;
+                scoped_unlink_identity_conn(&mut *tx, user_id, credential).await
+            }
+        }
+    }
 }
 
 async fn get_identity_conn(
@@ -633,6 +671,46 @@ async fn unlink_identity_conn(
         .await
         .map_err(db_err)?;
     Ok(())
+}
+
+async fn scoped_unlink_identity_conn(
+    conn: &mut PgConnection,
+    user_id: &UserId,
+    credential: &AuthCredential,
+) -> AppResult<crate::repository::UnlinkResult> {
+    // Lock every current credential for this account in one statement. Under
+    // Read Committed, a concurrent scoped unlink waits here and then observes the
+    // post-delete set, so two removals cannot strand an account credentialless.
+    let rows = sqlx::query(LOCK_USER_IDENTITIES_SQL)
+        .bind(user_id.as_str())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    let (provider, external_id) = credential_columns(credential);
+    if !rows.iter().any(|row| {
+        get::<String>(row, "provider").ok().as_deref() == Some(provider)
+            && get::<String>(row, "external_id").ok().as_deref() == Some(external_id)
+    }) {
+        return Ok(crate::repository::UnlinkResult::NotOwned);
+    }
+    if rows.len() <= 1 {
+        return Ok(crate::repository::UnlinkResult::LastCredential);
+    }
+    sqlx::query(SCOPED_DELETE_IDENTITY_SQL)
+        .bind(provider)
+        .bind(external_id)
+        .bind(user_id.as_str())
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    sqlx::query(INSERT_IDENTITY_CHANGE_OUTBOX_SQL)
+        .bind(user_id.as_str())
+        .bind(provider)
+        .bind(i64::try_from(crate::time::SystemClock.now().unix_millis()).unwrap_or(i64::MAX))
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    Ok(crate::repository::UnlinkResult::Unlinked)
 }
 
 #[cfg(test)]

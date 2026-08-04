@@ -26,6 +26,17 @@ pub struct UserPage {
     pub total: u64,
 }
 
+/// The outcome of a current-account scoped unlink attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlinkResult {
+    /// The credential was removed from the caller's identity set.
+    Unlinked,
+    /// The credential is absent or belongs to another account.
+    NotOwned,
+    /// Removing the credential would leave the account with none.
+    LastCredential,
+}
+
 /// Persistence boundary for user accounts.
 #[async_trait]
 pub trait UserRepository: Send + Sync {
@@ -112,6 +123,27 @@ pub trait AuthIdentityRepository: Send + Sync {
     /// # Errors
     /// Returns a backend error; unlinking an absent credential is idempotent.
     async fn unlink_auth_identity(&self, credential: &AuthCredential) -> AppResult<()>;
+
+    /// Remove a credential only when it belongs to `user_id`, refusing to leave
+    /// that account without an authentication credential. Implementations make
+    /// the ownership check, count, and delete one atomic operation.
+    async fn unlink_auth_identity_for_user(
+        &self,
+        user_id: &UserId,
+        credential: &AuthCredential,
+    ) -> AppResult<UnlinkResult> {
+        let Some(identity) = self.get_auth_identity(credential).await? else {
+            return Ok(UnlinkResult::NotOwned);
+        };
+        if &identity.user_id != user_id {
+            return Ok(UnlinkResult::NotOwned);
+        }
+        if self.list_auth_identities(user_id).await?.len() <= 1 {
+            return Ok(UnlinkResult::LastCredential);
+        }
+        self.unlink_auth_identity(credential).await?;
+        Ok(UnlinkResult::Unlinked)
+    }
 }
 
 /// A contract-faithful, in-memory [`UserRepository`].
@@ -362,6 +394,30 @@ impl AuthIdentityRepository for InMemoryAuthIdentityRepository {
         self.guard()?.remove(credential);
         Ok(())
     }
+
+    async fn unlink_auth_identity_for_user(
+        &self,
+        user_id: &UserId,
+        credential: &AuthCredential,
+    ) -> AppResult<UnlinkResult> {
+        let mut store = self.guard()?;
+        let Some(identity) = store.get(credential) else {
+            return Ok(UnlinkResult::NotOwned);
+        };
+        if &identity.user_id != user_id {
+            return Ok(UnlinkResult::NotOwned);
+        }
+        if store
+            .values()
+            .filter(|identity| &identity.user_id == user_id)
+            .count()
+            <= 1
+        {
+            return Ok(UnlinkResult::LastCredential);
+        }
+        store.remove(credential);
+        Ok(UnlinkResult::Unlinked)
+    }
 }
 
 #[cfg(test)]
@@ -434,7 +490,7 @@ mod list_users_tests {
 mod tests {
     use super::*;
     use crate::error::ErrorCategory;
-    use crate::identity::{DeviceId, Username};
+    use crate::identity::{CustomId, DeviceId, Username};
 
     fn ts(v: u64) -> TimestampMillis {
         TimestampMillis::from_unix_millis(v)
@@ -631,5 +687,55 @@ mod tests {
             .await
             .expect("idempotent unlink");
         assert!(repo.get_auth_identity(&cred).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_unlink_refuses_foreign_and_last_credential() {
+        let repo = InMemoryAuthIdentityRepository::new();
+        let alice = UserId::new("alice").expect("alice");
+        let bob = UserId::new("bob").expect("bob");
+        let alice_device = AuthCredential::Device(DeviceId::new("alice-device").expect("device"));
+        let alice_custom = AuthCredential::Custom(CustomId::new("alice-custom").expect("custom"));
+        let bob_device = AuthCredential::Device(DeviceId::new("bob-device").expect("device"));
+        repo.link_auth_identity(
+            AuthIdentity::new(alice_device.clone(), alice.clone(), ts(1), ts(1)).expect("identity"),
+        )
+        .await
+        .expect("link");
+        repo.link_auth_identity(
+            AuthIdentity::new(alice_custom.clone(), alice.clone(), ts(1), ts(1)).expect("identity"),
+        )
+        .await
+        .expect("link");
+        repo.link_auth_identity(
+            AuthIdentity::new(bob_device.clone(), bob, ts(1), ts(1)).expect("identity"),
+        )
+        .await
+        .expect("link");
+
+        assert_eq!(
+            repo.unlink_auth_identity_for_user(&alice, &bob_device)
+                .await
+                .expect("foreign no-op"),
+            UnlinkResult::NotOwned
+        );
+        assert_eq!(
+            repo.unlink_auth_identity_for_user(&alice, &alice_device)
+                .await
+                .expect("unlink"),
+            UnlinkResult::Unlinked
+        );
+        assert_eq!(
+            repo.unlink_auth_identity_for_user(&alice, &alice_custom)
+                .await
+                .expect("last refused"),
+            UnlinkResult::LastCredential
+        );
+        assert!(
+            repo.get_auth_identity(&alice_custom)
+                .await
+                .expect("get")
+                .is_some()
+        );
     }
 }

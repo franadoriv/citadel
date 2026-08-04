@@ -91,6 +91,7 @@ cargo test --test mongodb_foundation -- --nocapture
 for target in \
   storage_repository_contract \
   identity_session_reference_impls \
+  mongodb_identity_unlink_repository \
   friends_repository_contract \
   groups_repository_contract \
   leaderboards_repository_contract \

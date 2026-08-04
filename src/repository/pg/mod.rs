@@ -199,6 +199,7 @@ const TEST_RESET_TABLES: &[&str] = &[
     "storage_index_definitions",
     "storage_objects",
     "sessions",
+    "identity_change_outbox",
     "auth_identities",
     "users",
     "friend_edges",
@@ -693,6 +694,8 @@ mod tests {
         include_str!("../../../migrations-crdb/20260702090000_create_storage_objects.sql");
     const CRDB_IDENTITY_SESSION: &str =
         include_str!("../../../migrations-crdb/20260702100000_create_identity_session.sql");
+    const CRDB_IDENTITY_CHANGE_OUTBOX: &str =
+        include_str!("../../../migrations-crdb/20260804120000_add_identity_change_outbox.sql");
     const CRDB_FRIENDS: &str =
         include_str!("../../../migrations-crdb/20260709120000_create_friend_edges.sql");
     const CRDB_GROUPS: &str =
@@ -776,6 +779,7 @@ mod tests {
             ("storage_index_memberships", CRDB_STORAGE_INDEX_MEMBERSHIPS),
             ("storage_index_definitions", CRDB_STORAGE_INDEX_MEMBERSHIPS),
             ("storage_objects", CRDB_STORAGE),
+            ("identity_change_outbox", CRDB_IDENTITY_CHANGE_OUTBOX),
             ("sessions", CRDB_IDENTITY_SESSION),
             ("auth_identities", CRDB_IDENTITY_SESSION),
             ("users", CRDB_IDENTITY_SESSION),
