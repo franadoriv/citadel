@@ -1075,3 +1075,212 @@ const fn state_name(state: TicketState) -> &'static str {
         TicketState::Removed => "removed",
     }
 }
+
+#[cfg(test)]
+// A `panic!` in a match arm reports which resolution was returned, which an
+// `assert!(matches!(..))` cannot.
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+
+    use rustls::pki_types::CertificateDer;
+
+    use crate::matchmaker_cluster::MatchmakerShardLease;
+    use crate::matchmaker_transport::MatchmakerControlIdentity;
+    use crate::repository::InMemoryStorageRepository;
+    use crate::session::OwnershipGeneration;
+
+    fn control_identity() -> (MatchmakerControlIdentity, CertificateDer<'static>) {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("certificate");
+        let key = certificate.key_pair.serialize_der();
+        let leaf = CertificateDer::from(certificate.cert);
+        (
+            MatchmakerControlIdentity::from_der(vec![leaf.clone()], key).expect("control identity"),
+            leaf,
+        )
+    }
+
+    fn directory() -> StorageMatchmakerLeaseDirectory {
+        let storage: Arc<dyn crate::repository::StorageRepository> =
+            Arc::new(InMemoryStorageRepository::new());
+        StorageMatchmakerLeaseDirectory::new(storage)
+    }
+
+    /// Build a live node with a well-formed control router.
+    ///
+    /// The router needs at least one trust anchor to construct, so a throwaway
+    /// peer is registered. No connection is ever made: these tests drive the
+    /// durable fencing path, which resolves before any peer is contacted.
+    fn node(node_id: &str, directory: &StorageMatchmakerLeaseDirectory) -> Arc<LiveMatchmakerNode> {
+        let node_id = NodeId::new(node_id).expect("node id");
+        let (identity, _cert) = control_identity();
+        let (_peer_identity, peer_cert) = control_identity();
+        let peer = NodeId::new("unused-peer").expect("peer id");
+        let router = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_id.clone(),
+                identity,
+                BTreeMap::from([(peer, peer_cert)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router"),
+        );
+        LiveMatchmakerNode::new(LiveMatchmakerConfig {
+            node_id,
+            shard: QueueShardId::new(0),
+            lease_ttl: DurationMillis::from_millis(500),
+            handoff_ttl: DurationMillis::from_millis(5_000),
+            command_timeout: Duration::from_secs(2),
+            directory: directory.clone(),
+            router,
+        })
+        .expect("live node")
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_acquires_an_unowned_shard() {
+        let directory = directory();
+        let node = node("node-a", &directory);
+        let now = SystemClock.now();
+
+        match resolve_owner(&node.inner, now).await.expect("resolution") {
+            MatchmakerShardLeaseResolution::Local(lease) => {
+                assert_eq!(lease.owner_node.as_str(), "node-a");
+                assert_eq!(lease.shard, QueueShardId::new(0));
+            }
+            MatchmakerShardLeaseResolution::Remote(owner) => {
+                panic!("an unowned shard must resolve locally, got remote {owner:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_defers_to_a_live_remote_owner() {
+        let directory = directory();
+        let now = SystemClock.now();
+        let remote = NodeId::new("node-b").expect("node b");
+        directory
+            .acquire(
+                MatchmakerShardLease {
+                    shard: QueueShardId::new(0),
+                    owner_node: remote.clone(),
+                    generation: OwnershipGeneration::new(1),
+                    expires_at: now
+                        .checked_add(DurationMillis::from_millis(5_000))
+                        .expect("expiry"),
+                },
+                now,
+            )
+            .await
+            .expect("node b takes the shard");
+
+        let node = node("node-a", &directory);
+        match resolve_owner(&node.inner, now).await.expect("resolution") {
+            MatchmakerShardLeaseResolution::Remote(owner) => {
+                assert_eq!(owner.owner_node, remote, "must forward to the live owner");
+            }
+            MatchmakerShardLeaseResolution::Local(lease) => panic!(
+                "a live remote lease must not be stolen; acquired {:?}",
+                lease.owner_node
+            ),
+        }
+    }
+
+    /// The load-bearing invariant: an owner that has been superseded must not be
+    /// able to form matches, even though it still holds a lease value in memory.
+    ///
+    /// Without this fence, two nodes could each believe they own the shard after
+    /// a partition and form overlapping matches from the same tickets.
+    #[tokio::test]
+    async fn a_superseded_owner_cannot_claim_formations() {
+        let directory = directory();
+        let now = SystemClock.now();
+        let ttl = DurationMillis::from_millis(500);
+
+        // node-a owns the shard and holds its lease.
+        let node_a = node("node-a", &directory);
+        let stale_lease = match resolve_owner(&node_a.inner, now).await.expect("resolution") {
+            MatchmakerShardLeaseResolution::Local(lease) => lease,
+            MatchmakerShardLeaseResolution::Remote(owner) => {
+                panic!("node-a should own an unowned shard, got {owner:?}")
+            }
+        };
+
+        // The lease lapses and node-b takes over with a higher generation.
+        let after_expiry = now
+            .checked_add(ttl)
+            .expect("expiry")
+            .checked_add(ttl)
+            .expect("lapse");
+        let node_b = node("node-b", &directory);
+        let fresh_lease = match resolve_owner(&node_b.inner, after_expiry)
+            .await
+            .expect("resolution")
+        {
+            MatchmakerShardLeaseResolution::Local(lease) => lease,
+            MatchmakerShardLeaseResolution::Remote(owner) => {
+                panic!("node-b should take an expired shard, got {owner:?}")
+            }
+        };
+        assert!(
+            fresh_lease.generation > stale_lease.generation,
+            "takeover must bump the fencing generation: {:?} then {:?}",
+            stale_lease.generation,
+            fresh_lease.generation
+        );
+
+        // node-a, still holding its old lease, is now fenced out.
+        let tickets = [TicketId::parse("ticket-1").expect("ticket id")];
+        let fenced = directory
+            .claim_formations(&tickets, &stale_lease, after_expiry)
+            .await;
+        assert!(
+            fenced.is_err(),
+            "a superseded owner must not be able to claim a formation"
+        );
+
+        // The current owner still can, so the fence rejects staleness rather
+        // than formation itself.
+        directory
+            .claim_formations(&tickets, &fresh_lease, after_expiry)
+            .await
+            .expect("the current owner forms the match");
+    }
+
+    /// A ticket may only be formed once, so a retry after a partial failure
+    /// cannot place the same players into a second room.
+    #[tokio::test]
+    async fn a_ticket_cannot_be_formed_twice() {
+        let directory = directory();
+        let now = SystemClock.now();
+        let node = node("node-a", &directory);
+        let lease = match resolve_owner(&node.inner, now).await.expect("resolution") {
+            MatchmakerShardLeaseResolution::Local(lease) => lease,
+            MatchmakerShardLeaseResolution::Remote(owner) => {
+                panic!("expected local ownership, got {owner:?}")
+            }
+        };
+        let tickets = [TicketId::parse("ticket-1").expect("ticket id")];
+
+        directory
+            .claim_formations(&tickets, &lease, now)
+            .await
+            .expect("first formation is claimed");
+        let repeat = directory.claim_formations(&tickets, &lease, now).await;
+        assert!(
+            repeat.is_err(),
+            "the same ticket must not be formed a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_node_reports_no_queued_ticket() {
+        let directory = directory();
+        let node = node("node-a", &directory);
+        assert!(!node.has_queued_ticket_for_user("alice"));
+    }
+}
