@@ -1,5 +1,5 @@
 // Tier-B compile-against-header parity translation unit for the Citadel Unreal
-// SDK (docs/architecture/client-sdk-sync.md section 2 / task ).
+// SDK (see scripts/check_sdk_parity.py).
 //
 // This is the ONLY automatic native-signature check across the three engines.
 // It is deliberately Unreal-free so it compiles on any bare C++ compiler in CI

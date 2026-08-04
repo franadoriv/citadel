@@ -7,8 +7,7 @@
 //!
 //! The log is a bounded in-process ring: the newest [`AuditLog::capacity`]
 //! entries are kept, older ones are dropped, and a node restart clears it.
-//! Durable audit persistence is recorded technical debt (see
-//! `docs/architecture/technical-debt.md`).
+//! Durable audit persistence is recorded technical debt.
 //!
 //! Entries must never carry secrets: passwords, tokens, and raw payloads stay
 //! out of `details` by construction at every call site.

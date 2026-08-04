@@ -2,7 +2,7 @@
 // C++ SDK. This turns clients/unreal/ into a real UE plugin module
 // that compiles against real UE headers + the canonical Citadel C ABI header.
 //
-// The SDK is HEADER-DRIVEN (docs/architecture/client-sdk-sync.md §3): it includes
+// The SDK is HEADER-DRIVEN: it includes
 // the cbindgen-generated crates/citadel-client-ffi/include/citadel_client.h
 // VERBATIM and never re-declares the C prototypes. CITADEL_WITH_UNREAL=1 tells
 // CitadelWire.h to use Unreal's own sized-int aliases instead of the <cstdint>

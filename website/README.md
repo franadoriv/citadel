@@ -5,10 +5,9 @@ with [Starlight](https://starlight.astro.build/) (Astro). It is for people
 building **against** Citadel: clients, SDKs, the C ABI, the CLI, config,
 transports, guides, quickstarts, and public references.
 
-- Internal engineering docs live in `../docs/`: architecture, testing policy,
-  AI collaboration, design research, and non-public engineering notes.
-- Existing `../docs/features/` pages are legacy source material until migrated
-  into this site or retired.
+- This site is the only prose documentation tree in the repository. There is no
+  separate internal `docs/` tree; `../manifests/` holds generated machine-readable
+  contracts, not documentation.
 - This site documents only **implemented** behavior and clearly marks anything
   deferred.
 - The source pages are Markdown/MDX under `src/content/docs/`, so humans,

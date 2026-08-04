@@ -9,7 +9,7 @@
 //! (`Pin<Box<dyn Future + Send>>`), which is what keeps the trait dyn-compatible
 //! — native `async fn in trait` is not. The Phase 5 Postgres implementation
 //! introduces its own provider and transaction context (per
-//! `docs/architecture/database-abstraction.md`) without changing the domain
+//! `website/src/content/docs/guides/choose-a-database.mdx`) without changing the domain
 //! types these methods exchange. The in-memory reference impls keep synchronous
 //! bodies (they return ready futures and never `.await`).
 //!

@@ -24,7 +24,7 @@
 //! *different* `(user, currency)` pairs racing on the same global `MAX(id) + 1`
 //! can collide on the ledger primary key (mapped to `Conflict`); this is the same
 //! accepted tradeoff as the chat/notifications global-id producers and is fine for
-//! the console-scale writer today (see `docs/architecture/technical-debt.md`).
+//! the console-scale writer today.
 
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnection, PgRow};

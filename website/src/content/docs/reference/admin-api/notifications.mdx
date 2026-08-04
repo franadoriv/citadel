@@ -31,7 +31,7 @@ recipient only sees a notification by polling `GET
 repository seam (durable on the Postgres and SQLite backends; the in-memory
 backend stays non-durable by design). Realtime push delivery
 (deliver-if-online over the session/routing seam) is still out of scope and
-recorded as technical debt in `docs/architecture/technical-debt.md`.
+recorded as known technical debt.
 :::
 
 ## Recipients: `user_id` vs. broadcast
@@ -245,8 +245,8 @@ application-defined notification kind must be **27 or higher**.
 
 :::note[Future work — not implemented]
 The store is now persisted, but session-aware "deliver if online, otherwise
-queue for next poll" **push delivery** is still **future work**
-(`docs/architecture/technical-debt.md`). The pattern below is a manual fan-out
+queue for next poll" **push delivery** is still **future work**. The pattern
+below is a manual fan-out
 convention your Lua script defines and drives yourself — the server does not
 automatically forward a `POST /console/v1/notifications` call onto the realtime
 socket, and there is no built-in binding between a stored notification's
@@ -347,7 +347,7 @@ while client.poll(out) == CitadelClient.Status.OK:
 :::note[Godot client is a skeleton]
 `clients/godot/citadel/client.gd` is a documented skeleton: the native
 GDExtension backing `send`/`poll` is not wired up in this repo yet (see
-`docs/features/godot-sdk-skeleton.md`). The call above is the intended
+`website/src/content/docs/reference/client-sdk/godot-web.mdx`). The call above is the intended
 surface and will work once the native extension lands; today `poll` returns
 an error status instead of moving bytes.
 :::

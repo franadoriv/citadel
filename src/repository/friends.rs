@@ -1,7 +1,7 @@
 //! Friend-relationship repository contract.
 //!
 //! Persists the pairwise, directed friend graph designed in
-//! `docs/architecture/social-graph-friends.md` behind the same
+//! `website/src/content/docs/reference/client-sdk/friends.mdx` behind the same
 //! repository seam as identity/session/storage, so friend relations survive a
 //! node restart. Two directed edges represent one relationship (`(owner, other)`
 //! and `(other, owner)`), each carrying one of Nakama's four

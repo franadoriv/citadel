@@ -4,7 +4,7 @@
 //! [`ServiceLifecycle`] trait and the [`Health`] reporting type used by the
 //! bootstrap layer and the (future) health endpoint. Concrete services such as
 //! identity, sessions, realtime gateway, router, runtime host, and repositories
-//! are defined by their own tasks per `docs/architecture/service-boundaries.md`.
+//! are defined by their own tasks.
 //!
 //! Identity/session scope (, async in ): this module also
 //! declares the [`AuthenticationService`], [`SessionService`], and

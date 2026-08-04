@@ -1146,7 +1146,7 @@ function Invoke-BenchmarkServe {
 }
 
 # --- Client SDK staging (bin\clients\<engine>) -----------------------------
-# Copy-into-project SDK source per docs/architecture/client-sdk-layout.md:
+# Copy-into-project SDK source per website/src/content/docs/guides/engines.md:
 # ship the SDK SOURCE (the engine compiles/interprets it) plus the built
 # native FFI cdylib only where that SDK actually loads one (Unity, Unreal).
 # Godot (skeleton) and JS are pure source over the wire protocol -- no native
@@ -1328,7 +1328,7 @@ function Resolve-DatabaseUrl {
 
 function Invoke-DbUp {
     # Start a throwaway Postgres container and apply migrations. Not for
-    # production; see docs/features/persistence.md.
+    # production; see website/src/content/docs/guides/choose-a-database.mdx.
     & docker rm -f $PgContainer 2>$null | Out-Null
 
     Invoke-Native -FilePath "docker" -Arguments @(

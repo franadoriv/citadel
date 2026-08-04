@@ -1,6 +1,6 @@
 //! Session ownership and routing types.
 //!
-//! Ownership is explicit, per `docs/architecture/node-ownership-and-routing.md`.
+//! Ownership is explicit, per `website/src/content/docs/guides/distributed-matchmaker.md`.
 //! A session is owned by exactly one node under a monotonically increasing
 //! [`OwnershipGeneration`] lease. Resolving a [`SessionId`] returns a
 //! [`SessionOwnership`] that distinguishes local delivery, remote forwarding, an

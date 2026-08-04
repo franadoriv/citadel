@@ -1,7 +1,7 @@
 -- : friend-relationship edges.
 --
 -- Backs `repository::pg::friends` (`PgFriendsRepository`). Persists the pairwise,
--- directed friend graph designed in `docs/architecture/social-graph-friends.md`
+-- directed friend graph designed in `website/src/content/docs/reference/client-sdk/friends.mdx`
 --: one relationship is two directed edges, `(owner_id, other_id)` and
 -- `(other_id, owner_id)`, each carrying one of Nakama's four states. Every
 -- Postgres-specific choice stays behind the repository implementation; the schema

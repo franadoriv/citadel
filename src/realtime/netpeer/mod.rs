@@ -1,7 +1,7 @@
 //! `NetworkPeer` property replication — Phase 1: the property table + push/shadow
 //! dirty tracking. This is the Rust mirror of the Unreal
 //! `UCitadelNetworkPeer` / `FCitadelRepLayout` change-detection layer described in
-//! `docs/architecture/network-peer-property-replication.md` §2-§3.
+//! `website/src/content/docs/reference/server-sdk/networkpeer-authority.md` §2-§3.
 //!
 //! # What this module provides
 //!

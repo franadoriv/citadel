@@ -1,7 +1,7 @@
 //! Typed configuration model for Citadel.
 //!
 //!  defined the typed structs and defaults.  adds layered
-//! loading and validation per `docs/architecture/cli-and-config.md`:
+//! loading and validation per `website/src/content/docs/reference/operations/cli.md`:
 //!
 //! 1. built-in defaults
 //! 2. config file (default path or `--config`)
@@ -46,7 +46,7 @@ pub fn discover_config_in(dir: &Path) -> Option<PathBuf> {
 
 /// Top-level Citadel configuration.
 ///
-/// Sections mirror `docs/architecture/cli-and-config.md`. Only the sections
+/// Sections mirror `website/src/content/docs/reference/operations/cli.md`. Only the sections
 /// needed by the current skeleton are modeled; database, runtime, cluster, and
 /// socket sections are introduced by their owning tasks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1143,7 +1143,7 @@ impl TransportTlsConfig {
 }
 
 /// Authoritative transform-sync settings (, design
-/// `docs/architecture/transform-sync.md`).
+/// `website/src/content/docs/reference/client-sdk/transform-sync.md`).
 ///
 /// When `enabled`, the shared gateway attaches a transform-sync hub: clients that
 /// send `KIND_TSYNC_HELLO` negotiate the world/precision and then receive

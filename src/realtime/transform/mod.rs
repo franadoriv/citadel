@@ -1,7 +1,7 @@
 //! Authoritative transform synchronization (, transform-sync P1).
 //!
 //! This is the server half of the transform-sync MVP (design
-//! `docs/architecture/transform-sync.md` §7): an authoritative-first snapshot
+//! `website/src/content/docs/reference/client-sdk/transform-sync.md` §7): an authoritative-first snapshot
 //! system for `RemoteInterpolated` / `ServerSimulated` / `StaticReplicated`
 //! objects (no owner prediction — that is P2/). It consumes the shared
 //!  wire foundation (`citadel_wire::{bits, codec, baseline, interest,

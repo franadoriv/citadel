@@ -3,11 +3,11 @@
 //
 // This mirrors the Rust `citadel::realtime::netpeer` module field-for-field so
 // both ends derive the same layout identity. Design:
-// docs/architecture/network-peer-property-replication.md sections 2-3.
+// website/src/content/docs/reference/server-sdk/networkpeer-authority.md sections 2-3.
 //
 // SKELETON / NOT CI-COMPILED. Unreal C++ (UObject reflection) cannot be built in
 // Citadel CI, so this file is verified by the MANUAL in-editor step documented in
-// docs/features/network-peer-replication.md ("Manual Unreal verification"). Keep
+// website/src/content/docs/reference/client-sdk/networkpeer-replication.md ("Manual Unreal verification"). Keep
 // it in exact structural parity with the Rust mirror; the schema_hash / wire
 // encode of a DeltaBunch is .
 //

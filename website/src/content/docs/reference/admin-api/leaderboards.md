@@ -406,8 +406,7 @@ All console errors share the JSON shape:
   restart clears it). The authoritative records are persisted; a record's rank
   is derived on read (ordered by `(score, subscore)` in the board's sort
   direction, then `user_id` as a stable tie-break). A durable rank cache is not
-  implemented yet (tracked as a follow-up in
-  `docs/architecture/technical-debt.md`).
+  implemented yet, and is tracked as a follow-up.
 - **`reset_schedule` is stored, not executed.** The string round-trips
   through create/list responses, but Citadel does not parse or run it — no
   board resets automatically on a schedule today.

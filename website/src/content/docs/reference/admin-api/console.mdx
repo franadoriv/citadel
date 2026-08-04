@@ -418,8 +418,8 @@ GET /console/v1/leaderboards/points/records
 ### Known limitations
 
 - **In-memory only.** Boards and records live in process memory; a node
-  restart clears every leaderboard. Durable persistence is tracked in
-  `docs/architecture/technical-debt.md`.
+  restart clears every leaderboard. Durable persistence is tracked as known
+  technical debt.
 - **`reset_schedule` is stored, not executed.** The string round-trips through
   create/list responses but Citadel does not parse or run it — no board ever
   resets automatically yet.

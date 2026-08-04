@@ -3,7 +3,7 @@
 -- Citadel loads this file on startup (runtime.scripts_dir in citadel.toml) and
 -- routes realtime traffic to the handlers you register below. With hot_reload on,
 -- just save this file to reload live — no server restart.
--- Docs: https://citadel.dev/reference/embedded-lua-runtime  (or docs/features/embedded-lua-runtime.md)
+-- Docs: https://citadel.dev/reference/embedded-lua-runtime  (or website/src/content/docs/reference/server-sdk/lua-runtime.md)
 --
 -- Host API (available as the global `citadel`):
 --   citadel.log(message, level)                     -- level: "info" | "warn" | "error"
