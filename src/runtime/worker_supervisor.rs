@@ -32,6 +32,13 @@ pub fn restart_backoff(attempt: u32) -> Duration {
         .min(MAX_RESTART_BACKOFF)
 }
 
+pub fn fresh_bootstrap_secret() -> io::Result<[u8; 32]> {
+    let mut secret = [0; 32];
+    getrandom::fill(&mut secret)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "bootstrap entropy unavailable"))?;
+    Ok(secret)
+}
+
 pub struct RestartCircuitBreaker {
     limit: u32,
     failures: u32,
@@ -267,6 +274,13 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn restart_secrets_are_fresh_32_byte_values() {
+        let first = super::fresh_bootstrap_secret().expect("first secret");
+        let second = super::fresh_bootstrap_secret().expect("second secret");
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn crashed_worker_requires_a_permitted_restart_delay() {
         let mut breaker = super::RestartCircuitBreaker::new(1);
