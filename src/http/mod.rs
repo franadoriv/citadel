@@ -10,6 +10,7 @@ pub mod console;
 pub mod console_api;
 pub mod dashboard;
 pub mod error;
+mod headers;
 pub mod player;
 mod runtime_endpoint;
 pub mod tls;
@@ -90,6 +91,12 @@ pub fn router(app: App) -> Router {
         .merge(player::routes())
         .merge(console_api::routes())
         .merge(runtime_endpoint::routes())
+        // Applied last so it wraps every route above, including the console SPA
+        // and the 404 fallback.
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            headers::apply,
+        ))
         .with_state(app)
 }
 
