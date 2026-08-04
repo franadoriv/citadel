@@ -23,8 +23,7 @@
 //! console/HTTP consumers keep their `crate::services::…` paths.
 //!
 //! `reset_schedule` is validated as strict UTC five-field CRON and normalized to
-//! the scheduler's seconds-first representation, but is not executed yet (see
-//! `docs/architecture/technical-debt.md`).
+//! the scheduler's seconds-first representation, but is not executed yet.
 
 use std::str::FromStr;
 use std::sync::Arc;

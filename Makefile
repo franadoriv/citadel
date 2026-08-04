@@ -68,7 +68,7 @@ DATABASE_URL ?= postgres://$(PG_USER):$(PG_PASSWORD)@localhost:$(PG_PORT)/$(PG_D
 # packaging share one definition. `DIST_DIR` is git-ignored build output.
 DIST_DIR ?= dist
 BIN_DIR  ?= bin
-# Copy-into-project client SDK staging (see docs/architecture/client-sdk-layout.md).
+# Copy-into-project client SDK staging (see website/src/content/docs/guides/engines.md).
 CLIENTS_DIR ?= $(BIN_DIR)/clients
 VERSION  := $(shell grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 # macOS packages are built natively on each architecture's runner. GitHub
@@ -551,7 +551,7 @@ benchmark-serve: bin-benchmark ## Stage, run server, serve HTML, and open the be
 	wait $$SRV $$WEB
 
 # --- Client SDK staging (bin/clients/<engine>) -----------------------------
-# Copy-into-project SDK source per docs/architecture/client-sdk-layout.md:
+# Copy-into-project SDK source per website/src/content/docs/guides/engines.md:
 # ship the SDK SOURCE (the engine compiles/interprets it) plus the built
 # native FFI cdylib only where that SDK actually loads one (Unity, Unreal).
 # Godot release packages compile a GDExtension over the FFI; its lightweight

@@ -2,7 +2,7 @@
 //!
 //! These are the portable, database-agnostic domain types that storage and
 //! future database-backed services depend on, following
-//! `docs/architecture/database-abstraction.md`. Service and runtime code must
+//! `website/src/content/docs/guides/choose-a-database.mdx`. Service and runtime code must
 //! depend on these typed models and the
 //! [`StorageRepository`](crate::repository::StorageRepository) trait rather than
 //! on SQL, concrete database handles, or loosely structured JSON maps.
@@ -224,7 +224,7 @@ impl ObjectId {
 /// A storage object value.
 ///
 /// Values are JSON objects, mirroring the `jsonb` decision in
-/// `docs/architecture/database-abstraction.md`. Opaque-bytes support with a
+/// `website/src/content/docs/guides/choose-a-database.mdx`. Opaque-bytes support with a
 /// content type is an open question deferred to the persistence task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StorageValue(serde_json::Value);

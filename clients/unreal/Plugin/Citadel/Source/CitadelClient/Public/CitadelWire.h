@@ -5,7 +5,7 @@
 // `scripts/check_sdk_parity.py` (the `cpp` format) can diff the literals against
 // `crates/citadel-wire/contract.json`. Change a value here and Tier-A fails.
 //
-// The Unreal SDK is HEADER-DRIVEN (see docs/architecture/client-sdk-sync.md
+// The Unreal SDK is HEADER-DRIVEN (see crates/citadel-wire/contract.json
 // section 3): it `#include`s the canonical, cbindgen-generated
 // `citadel_client.h` verbatim and NEVER re-declares the C ABI prototypes. These
 // constants are the wire-protocol layer (envelope kinds, RPC statuses, body byte

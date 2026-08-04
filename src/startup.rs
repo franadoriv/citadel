@@ -160,7 +160,7 @@ const STARTER_LUA: &str = r#"-- Citadel starter gameplay script (created by the 
 -- This is a minimal, working example. It relays player positions to peers and
 -- answers a "ping" RPC. Edit it freely, then restart the server (or enable
 -- runtime.hot_reload in citadel.toml to reload on save). Delete this file to
--- fall back to the built-in relay. See docs/features/embedded-lua-runtime.md
+-- fall back to the built-in relay. See website/src/content/docs/reference/server-sdk/lua-runtime.md
 -- for the full host API.
 
 local KIND_POSITION = 1      -- client -> server: "my position update"

@@ -4,7 +4,7 @@
 //! folder handle inbound realtime messages instead of (or on top of) the built-in
 //! relay. It is the smallest real "write your game logic in a script" slice.
 //!
-//! Design (see the task's decision log and `docs/features/embedded-lua-runtime.md`):
+//! Design (see the task's decision log and `website/src/content/docs/reference/server-sdk/lua-runtime.md`):
 //!
 //! - The runtime is a **serialized, bounded, fallible command generator**. It owns
 //!   no transport or registry state. [`LuaRuntime::dispatch`] runs the registered
@@ -35,7 +35,7 @@
 //! Language-neutral trajectory: this is Lua-only today, but the host API
 //! (`on_message`/`on_join`/`on_leave`/`on_tick`/`broadcast`/`send`/`log`) and
 //! the command model line up with the runtime contract
-//! (`docs/architecture/runtime-contract.md`) so other languages can adopt the
+//! (`website/src/content/docs/reference/server-sdk/index.mdx`) so other languages can adopt the
 //! same shape later.
 
 pub mod cache_lease;

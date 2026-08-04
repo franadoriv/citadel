@@ -332,7 +332,7 @@ pub const RPC_REQUEST_ID_BYTES: usize = 8;
 /// Public because client SDKs depend on this byte count to encode/decode RPC
 /// request bodies; it is a value the client-contract manifest
 /// (`crates/citadel-wire/contract.json`) and the Tier-A SDK parity check compare
-/// against (see `docs/architecture/client-sdk-sync.md`).
+/// against (see `scripts/check_sdk_parity.py`).
 pub const RPC_METHOD_LEN_BYTES: usize = 2;
 
 /// Bytes in a `KIND_POSITION` / `KIND_PEER_POSITION` position payload: two
@@ -341,7 +341,7 @@ pub const RPC_METHOD_LEN_BYTES: usize = 2;
 /// This is a shared wire convention (not demo-local): every client SDK encodes a
 /// position as exactly these bytes, so it is part of the canonical client
 /// contract compared by the Tier-A SDK parity check
-/// (see `docs/architecture/client-sdk-sync.md`).
+/// (see `crates/citadel-wire/contract.json` and `scripts/check_sdk_parity.py`).
 pub const POSITION_BYTES: usize = 8;
 
 /// Minimum RPC request body: `request_id` (8) + `method_len` (2), zero-length

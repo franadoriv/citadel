@@ -3,7 +3,7 @@
 //! [`SessionService`] owns session issuance and lifecycle (create, validate,
 //! refresh, revoke) independent of any storage or transport. [`SessionDirectory`]
 //! owns the explicit session-to-node ownership resolution described in
-//! `docs/architecture/node-ownership-and-routing.md`.
+//! `website/src/content/docs/guides/distributed-matchmaker.md`.
 //!
 //! Both traits are async (via [`async_trait`]) and object-safe, matching the
 //! async repository contracts they build on. Token signing,

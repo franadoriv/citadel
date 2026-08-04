@@ -19,8 +19,7 @@
 //!
 //! Ranks are derived on read (order the authoritative records by
 //! `(score, subscore)` in the [`SortOrder`] direction, then `user_id` as a stable
-//! tie-break); a durable rank cache is intentionally out of scope (see the task's
-//! Known Gaps and `docs/architecture/technical-debt.md`).
+//! tie-break); a durable rank cache is intentionally out of scope.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

@@ -7,7 +7,8 @@ members = ["crates/*"]
 name = "citadel"
 # Bump this per milestone before pushing develop -> release; the release workflow
 # reads it and names the GitHub Release v{version}. Pre-1.0 while the API and
-# feature set are still stabilizing. See docs/release-process.md.
+# feature set are still stabilizing. The release workflow is
+# .github/workflows/release.yml.
 version = "0.9.14"
 edition = "2024"
 # The server is distributed as release archives, not on crates.io. Stating this

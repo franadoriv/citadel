@@ -1,7 +1,7 @@
 //! Typed application error model for Citadel.
 //!
 //! This module defines the stable error categories from
-//! `docs/architecture/observability-and-errors.md` and a minimal [`AppError`]
+//! `website/src/content/docs/reference/operations/telemetry.md` and a minimal [`AppError`]
 //! type that library code returns. The categories are the contract surface;
 //! later tasks (observability, HTTP mapping, repositories, runtime) attach
 //! richer context and source errors without changing the category set.
@@ -17,7 +17,7 @@ use std::fmt;
 ///
 /// Categories are intentionally coarse and stable so client-facing responses,
 /// metrics labels, and logs can rely on them across releases. The exhaustive
-/// set mirrors `docs/architecture/observability-and-errors.md`.
+/// set mirrors `website/src/content/docs/reference/operations/telemetry.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCategory {
     /// Invalid CLI/config, missing files, invalid runtime manifest.

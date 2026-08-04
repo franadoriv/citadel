@@ -6,6 +6,7 @@
 
 ## Documentation
 
-- [ ] Updated feature docs in `docs/features/`
-- [ ] Updated architecture docs in `docs/architecture/`, if applicable
+- [ ] Updated the developer documentation in `website/src/content/docs/`
+- [ ] Updated `manifests/capability-matrix.json` or
+      `manifests/client-feature-manifest.json`, if the surface changed
 - [ ] No documentation change needed; reason:

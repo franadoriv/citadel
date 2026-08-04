@@ -20,8 +20,7 @@
 //! Leaderboards are persisted behind the repository seam, so boards
 //! and records survive a node restart on the Postgres and SQLite backends (the
 //! in-memory backend stays non-durable by design). `reset_schedule` is still
-//! stored verbatim but never executed; that limitation is recorded in
-//! `docs/architecture/technical-debt.md`.
+//! stored verbatim but never executed; that limitation is known and tracked.
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;

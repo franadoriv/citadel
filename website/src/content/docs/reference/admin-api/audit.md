@@ -134,8 +134,8 @@ The audit trail is a **bounded, in-process ring** holding at most
 `capacity` entries (1024 by default). Once the ring is full, the **oldest
 entry is evicted** for every new one recorded — there is no overflow to disk
 or a database. A **node restart clears the trail entirely**. Durable audit
-persistence has not shipped yet; it is tracked as known technical debt (see
-`docs/architecture/technical-debt.md`). Do not rely on this trail for
+persistence has not shipped yet; it is tracked as known technical debt. Do
+not rely on this trail for
 long-term compliance or forensic retention until that lands.
 :::
 

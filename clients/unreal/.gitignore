@@ -1,5 +1,5 @@
 # Unreal build artifacts — never committed (SDK source only; see README.md and
-# docs/architecture/client-sdk-layout.md). Patterns are unanchored so they also
+# website/src/content/docs/guides/engines.md). Patterns are unanchored so they also
 # match under the drop-in plugin at Plugin/Citadel/. The gated UE 5.8 compile
 # check (ue-plugin-build.sh) generates a scratch host project + these dirs.
 Binaries/

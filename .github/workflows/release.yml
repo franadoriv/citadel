@@ -119,7 +119,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # macOS signing/notarization steps are intentionally disabled pending the
-      # six Apple secrets documented in docs/release-process.md. Do not publish
+      # six Apple signing secrets, which are not configured yet. Do not publish
       # unsigned macOS developer archives from this workflow.
 
       - name: Package server and SDKs (Windows)

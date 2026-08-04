@@ -15,7 +15,7 @@
 # Degradation contract (from the task): if NO C/C++ compiler is available on the
 # runner, this hook reports a clear SKIP and exits 0 — a missing compiler must
 # NOT fail the build. The signature guarantee then holds only where a compiler is
-# present (documented in docs/features/unreal-sdk-skeleton.md and the release
+# present (documented in website/src/content/docs/guides/engines.md and the release
 # checklist).
 set -euo pipefail
 
@@ -123,5 +123,5 @@ fi
 
 echo "unreal Tier-B: SKIP — no C/C++ compiler (c++/g++/clang++/cl) found on this runner."
 echo "unreal Tier-B: native-signature parity was NOT verified here; it holds only"
-echo "unreal Tier-B: where a compiler is present. See docs/features/unreal-sdk-skeleton.md."
+echo "unreal Tier-B: where a compiler is present. See website/src/content/docs/guides/engines.md."
 exit 0

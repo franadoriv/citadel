@@ -1,5 +1,5 @@
 // Editor-only CMAP v1 collision exporter. Import under Assets/Citadel/Editor.
-// ; terrain normalization rules: docs/architecture/cmap-terrain-export.md.
+// ; terrain normalization rules: website/src/content/docs/reference/client-sdk/maps.mdx.
 #if UNITY_EDITOR
 using System;
 using System.Collections.Generic;

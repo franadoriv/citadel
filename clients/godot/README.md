@@ -17,7 +17,7 @@ Every `clients/<lang-or-engine>/` directory holds **only the client SDK**: the
 source bindings and an import README. Build outputs — the native GDExtension
 library (`.dll` / `.so` / `.dylib`) — are produced at package time, **not
 committed**. The repo does not track a full Godot project (`.godot/`, scenes,
-per-developer editor state). See `docs/architecture/client-sdk-layout.md`.
+per-developer editor state). See `website/src/content/docs/guides/engines.md`.
 
 ## What's here
 
@@ -260,7 +260,7 @@ bash scripts/check-sdk-parity.sh
   console.
 - The editor run of `sample/peer_sync.gd`, desktop-native signature correctness,
   and native marshaling endianness remain **manual pre-release** items (see
-  `docs/architecture/client-sdk-sync.md` §6).
+  `scripts/check_sdk_parity.py`).
 - Native binaries are release artifacts rather than repository files. The build
   currently publishes the platforms supported by the C ABI package; add a
   descriptor entry only together with its verified package output.

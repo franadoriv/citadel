@@ -19,7 +19,7 @@ Every `clients/<lang-or-engine>/` directory holds **only the client SDK**: the
 source bindings and an import README. Build outputs — such as the native plugin
 DLL — are produced at package time (or by `make unity-plugin`), **not committed**.
 The repo does not track a full engine project. See
-`docs/architecture/client-sdk-layout.md` for the convention and how it applies to
+`website/src/content/docs/guides/engines.md` for the convention and how it applies to
 future SDKs.
 
 ## What's here

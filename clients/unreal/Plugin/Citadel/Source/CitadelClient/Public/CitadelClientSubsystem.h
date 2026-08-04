@@ -1,6 +1,6 @@
 // CitadelClientSubsystem.h — thin, UE-idiomatic wrapper over the Citadel C ABI.
 //
-// Design (docs/architecture/client-sdk-sync.md section 3): Unreal is
+// Design: Unreal is
 // header-driven. This wrapper `#include`s the canonical, cbindgen-generated
 // `citadel_client.h` VERBATIM and calls its functions directly. It NEVER
 // re-declares the C prototypes — the compiler binding against the real header is

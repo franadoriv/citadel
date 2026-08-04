@@ -5,8 +5,8 @@ Unreal is C++, so it consumes the canonical, cbindgen-generated
 `citadel_client.h` **verbatim** and hand-writes only a UE-idiomatic wrapper. The
 compiler binding against that header *is* the drift check (Tier-B), which makes
 this the strongest-verified of the three engine SDKs. See
-`docs/architecture/client-sdk-sync.md` (sections 2, 3, 6) and
-`docs/features/unreal-sdk-skeleton.md`.
+`crates/citadel-wire/contract.json`, `scripts/check_sdk_parity.py`, and
+`website/src/content/docs/guides/engines.md`.
 
 The shippable plugin is the self-contained **drop-in folder**
 `clients/unreal/Plugin/Citadel/` — copy it into a game's `Plugins/` and you have
@@ -14,7 +14,7 @@ The shippable plugin is the self-contained **drop-in folder**
 `sdk.manifest.json`, the parity/build scripts, `tier_b/`, `.gitignore`) stays in
 `clients/unreal/`, **outside** the plugin. The plugin is **compile-verified
 against UE 5.8** (see [Compile verification](#compile-verification-against-ue-58)).
-It is **SDK source only** (per `docs/architecture/client-sdk-layout.md`): no
+It is **SDK source only** (per `website/src/content/docs/guides/engines.md`): no
 committed engine project, `Binaries/`, `Intermediate/`, or native libraries —
 those are build artifacts (git-ignored). The native `citadel_client_ffi` library
 is built at package time.
@@ -230,7 +230,7 @@ interpolated transform every frame.
 
 `UCitadelNetworkedActorSubsystem` is the out-of-the-box, drop-in player
 replication built on top of transform sync (full reference:
-[networked actors](../../website/src/content/docs/reference/networked-actors.md)).
+[networked actors](../../website/src/content/docs/reference/client-sdk/networked-actors.md)).
 Instead of pre-placing actors with fixed object ids, you register an actor class
 per archetype and announce your pawn; the server spawns your avatar on every peer,
 hands you everyone already present, and despawns on disconnect. Movement is

@@ -2,7 +2,7 @@
 // table + push/shadow dirty tracking on the Unreal client.
 //
 // SKELETON / NOT CI-COMPILED (see the header). Verified by the manual in-editor
-// step in docs/features/network-peer-replication.md. Keep in structural parity
+// step in website/src/content/docs/reference/client-sdk/networkpeer-replication.md. Keep in structural parity
 // with src/realtime/netpeer/*.rs.
 
 #include "CitadelNetworkPeer.h"

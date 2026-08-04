@@ -12,7 +12,7 @@ The check is intentionally toolchain-free: it never compiles the SDKs or runs a
 language runtime, it only regex-parses declared constant literals. That covers
 constant/layout parity for every engine; marshaling/endianness and native
 signature correctness are covered by per-SDK tests and (for Unreal) the Tier-B
-hook, per docs/architecture/client-sdk-sync.md.
+hook. The canonical constants live in crates/citadel-wire/contract.json.
 """
 
 from __future__ import annotations

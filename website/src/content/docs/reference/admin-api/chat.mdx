@@ -421,7 +421,7 @@ while client.poll(out) == CitadelClient.Status.OK:
 :::note[Godot client is a skeleton]
 `clients/godot/citadel/client.gd` is a documented skeleton: the native
 GDExtension backing `send`/`poll` is not wired up in this repo yet (see
-`docs/features/godot-sdk-skeleton.md`). The calls above are the intended
+`website/src/content/docs/reference/client-sdk/godot-web.mdx`). The calls above are the intended
 surface and will work once the native extension lands; today `send`/`poll`
 return an error status instead of moving bytes.
 :::

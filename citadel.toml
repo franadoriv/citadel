@@ -100,7 +100,7 @@ enabled = true
 adapter = "embedded"
 tier = "trusted"
 # Folder holding your game scripts (created empty on first run). Drop a
-# `main.lua` here to add Lua game logic. See docs/features/embedded-lua-runtime.md.
+# `main.lua` here to add Lua game logic. See website/src/content/docs/reference/server-sdk/lua-runtime.md.
 scripts_dir = "./game"
 # Per-invocation time budget for message/lifecycle handlers (milliseconds).
 deadline_ms = 100

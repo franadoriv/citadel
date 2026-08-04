@@ -2,7 +2,7 @@
 //!
 //! This module holds Citadel's durable repository implementations and the
 //! transaction machinery they share. It follows
-//! `docs/architecture/database-abstraction.md`: every Postgres-specific choice
+//! `website/src/content/docs/guides/choose-a-database.mdx`: every Postgres-specific choice
 //! stays behind this module. Nothing here leaks a `sqlx::PgPool` or
 //! `sqlx::Transaction` across a repository contract — callers only ever see
 //! `Arc<dyn StorageRepository>` / `Arc<dyn UserRepository>` /

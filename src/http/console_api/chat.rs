@@ -6,8 +6,7 @@
 //! (tombstone delete). This is a **history and moderation surface only** —
 //! realtime chat delivery over the socket has not landed yet, so
 //! `POST .../messages` is the console standing in as the producer until wire
-//! delivery exists. History is in-process and a node restart clears it (see
-//! `docs/architecture/technical-debt.md`).
+//! delivery exists. History is in-process and a node restart clears it.
 //!
 //! - `GET /console/v1/chat` — every channel with its message count and last
 //!   activity, most-recently-active first.

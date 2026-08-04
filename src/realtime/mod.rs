@@ -1,7 +1,7 @@
 //! Realtime gateway: transport-agnostic session registry and message routing.
 //!
 //! This module realizes the single-node, in-memory subset of the routing design
-//! (see `docs/architecture/node-ownership-and-routing.md`): a [`SessionRegistry`]
+//! (see `website/src/content/docs/guides/distributed-matchmaker.md`): a [`SessionRegistry`]
 //! of active connections and a [`Gateway`] that relays application messages
 //! between sessions. It depends only on the transport abstraction's `Envelope`
 //! and `Delivery` types plus an abstract outbound `mpsc` sink, never on a
