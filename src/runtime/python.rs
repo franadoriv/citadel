@@ -75,6 +75,7 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "on_join",
     "on_leave",
     "on_tick",
+    "on_leaderboard_reset",
     "on_rpc",
     "on_room_create",
     "on_room_join",
@@ -105,6 +106,7 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "notifications.mark_read",
     "groups.call",
     "leaderboards.call",
+    "tournaments.call",
     "chat.call",
     "wallet.call",
     "storage.read",
@@ -143,6 +145,7 @@ _storage_index_filters = {}
 _on_join = None
 _on_leave = None
 _on_tick = None
+_on_leaderboard_reset = None
 _on_room_create = None
 _on_room_join = None
 _on_before_realtime = None
@@ -240,6 +243,9 @@ def on_leave(handler=None):
 
 def on_tick(handler=None):
     return _single("_on_tick", handler)
+
+def on_leaderboard_reset(handler=None):
+    return _single("_on_leaderboard_reset", handler)
 
 def on_room_create(handler=None):
     return _single("_on_room_create", handler)
@@ -555,6 +561,12 @@ def _call_runtime_event_subscriber(key, index, event):
 def _has_tick_handler():
     return _on_tick is not None
 
+def _call_leaderboard_reset(ctx):
+    if _on_leaderboard_reset is None:
+        return False
+    _on_leaderboard_reset(dict(ctx))
+    return True
+
 def _has_any_handler():
     return (
         bool(_message_handlers)
@@ -562,6 +574,7 @@ def _has_any_handler():
         or _on_join is not None
         or _on_leave is not None
         or _on_tick is not None
+        or _on_leaderboard_reset is not None
         or _on_room_create is not None
         or _on_room_join is not None
         or _on_before_realtime is not None
@@ -578,6 +591,8 @@ def _introspect():
         hooks.append("on_leave")
     if _on_tick is not None:
         hooks.append("on_tick")
+    if _on_leaderboard_reset is not None:
+        hooks.append("on_leaderboard_reset")
     if _on_room_create is not None:
         hooks.append("on_room_create")
     if _on_room_join is not None:
@@ -676,6 +691,9 @@ def groups_call(actor, operation, payload_json):
 
 def leaderboards_call(actor, operation, payload_json):
     return json.loads(_domain_host_bridge.leaderboards_call(str(actor), str(operation), str(payload_json)))
+
+def tournaments_call(actor, operation, payload_json):
+    return json.loads(_domain_host_bridge.tournaments_call(str(actor), str(operation), str(payload_json)))
 
 def chat_call(actor, operation, payload_json):
     return json.loads(_domain_host_bridge.chat_call(str(actor), str(operation), str(payload_json)))
@@ -1306,6 +1324,19 @@ impl DomainHostBridge {
             .map_err(PyRuntimeError::new_err)
     }
 
+    #[pyo3(name = "tournaments_call")]
+    fn tournaments_call(
+        &self,
+        actor: &str,
+        operation: &str,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_realtime_effects_allowed()?;
+        self.host
+            .tournaments_call(actor, operation, payload_json)
+            .map_err(PyRuntimeError::new_err)
+    }
+
     #[pyo3(name = "chat_call")]
     fn chat_call(&self, actor: &str, operation: &str, payload_json: &str) -> PyResult<String> {
         self.ensure_realtime_effects_allowed()?;
@@ -1920,6 +1951,37 @@ impl PythonRuntime {
     }
 
     /// Dispatch `on_join` or `on_leave`.
+    pub fn on_leaderboard_reset(
+        &self,
+        epoch: &crate::leaderboard_scheduler::ResetEpoch,
+        fencing_token: crate::leaderboard_scheduler::SchedulerFencingToken,
+    ) -> AppResult<()> {
+        let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Python::attach(|py| -> PyResult<()> {
+                let module = guard.citadel.bind(py);
+                clear_commands(module);
+                let ctx = PyDict::new(py);
+                ctx.set_item("leaderboard_id", &epoch.leaderboard_id)?;
+                ctx.set_item("due_at_unix_ms", epoch.due_at.unix_millis())?;
+                ctx.set_item("fencing_token", fencing_token.get())?;
+                run_with_python_deadline(module, self.budget, || {
+                    module.getattr("_call_leaderboard_reset")?.call1((ctx,))?;
+                    Ok(())
+                })?;
+                clear_commands(module);
+                Ok(())
+            })
+        }));
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(AppError::internal("leaderboard reset callback failed")
+                .with_detail(error.to_string())),
+            Err(_) => Err(AppError::internal("leaderboard reset callback panicked")),
+        }
+    }
+
+    /// Dispatch `on_join` or `on_leave`.
     pub fn dispatch_lifecycle(
         &self,
         hook: LifecycleHook,
@@ -2439,6 +2501,14 @@ impl Runtime for PythonRuntime {
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand> {
         PythonRuntime::dispatch_lifecycle(self, hook, sender, user_id)
+    }
+
+    fn on_leaderboard_reset(
+        &self,
+        epoch: &crate::leaderboard_scheduler::ResetEpoch,
+        fencing_token: crate::leaderboard_scheduler::SchedulerFencingToken,
+    ) -> AppResult<()> {
+        PythonRuntime::on_leaderboard_reset(self, epoch, fencing_token)
     }
 
     fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
@@ -4011,6 +4081,44 @@ citadel.on_join(joined)
     }
 
     #[test]
+    fn leaderboard_reset_handler_receives_epoch_context_and_surfaces_failures() {
+        let rt = runtime(
+            r#"
+import citadel
+
+@citadel.on_leaderboard_reset
+def reset(ctx):
+    assert ctx["leaderboard_id"] == "weekly"
+    assert ctx["due_at_unix_ms"] == 60_000
+    assert ctx["fencing_token"] == 7
+    raise RuntimeError("leaderboard reset reached")
+"#,
+        );
+        let epoch = crate::leaderboard_scheduler::ResetEpoch::new(
+            "weekly".to_owned(),
+            crate::time::TimestampMillis::from_unix_millis(60_000),
+        );
+
+        let error = rt
+            .on_leaderboard_reset(
+                &epoch,
+                crate::leaderboard_scheduler::SchedulerFencingToken::new(7),
+            )
+            .expect_err("registered leaderboard reset hook must run");
+
+        assert!(
+            error
+                .message()
+                .contains("leaderboard reset callback failed")
+        );
+        assert!(
+            error
+                .log_detail()
+                .is_some_and(|detail| detail.contains("leaderboard reset reached"))
+        );
+    }
+
+    #[test]
     fn tick_handler_receives_dt() {
         let rt = runtime(
             r#"
@@ -4257,12 +4365,12 @@ def leave(ctx): pass
         use crate::repository::{
             InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
             InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryStorageRepository,
-            InMemoryWalletRepository,
+            InMemoryTournamentsRepository, InMemoryWalletRepository,
         };
         use crate::runtime::ServiceDomainHost;
         use crate::services::{
             ChatChannelAuthorizer, ChatService, FriendsService, GroupsService, LeaderboardService,
-            PlayerNotificationService, WalletService,
+            PlayerNotificationService, TournamentDiscoveryService, WalletService,
         };
         use crate::storage::{
             Collection, StorageIndexDefinition, StorageIndexField, StorageIndexName,
@@ -4295,6 +4403,9 @@ def leave(ctx): pass
                 .with_groups(groups)
                 .with_leaderboards(Arc::new(LeaderboardService::new(Arc::new(
                     InMemoryLeaderboardsRepository::new(),
+                ))))
+                .with_tournaments(Arc::new(TournamentDiscoveryService::new(Arc::new(
+                    InMemoryTournamentsRepository::new(),
                 ))))
                 .with_chat(chat)
                 .with_chat_authorizer(authorizer)
@@ -4341,8 +4452,9 @@ def exercise(ctx, body):
     read = citadel.notifications_mark_read(u, [notification["id"]])
     group = citadel.groups_call(u, "create", '{"name":"probers"}')
     boards = citadel.leaderboards_call(u, "list", "{}")
+    tournaments = citadel.tournaments_call(u, "list", "{}")
     wallet = citadel.wallet_call(u, "balances", "{}")
-    return (added + "|" + str(n1) + "|" + blocked + "|" + str(removed) + "|" + str(n2) + "|" + str(len(page["items"])) + "|" + str(len(read)) + "|" + group["name"] + "|" + str(len(boards)) + "|" + str(chat["id"]) + "|" + str(len(wallet))).encode()
+    return (added + "|" + str(n1) + "|" + blocked + "|" + str(removed) + "|" + str(n2) + "|" + str(len(page["items"])) + "|" + str(len(read)) + "|" + group["name"] + "|" + str(len(boards)) + "|" + str(len(tournaments)) + "|" + str(chat["id"]) + "|" + str(len(wallet))).encode()
 "#,
         )
         .with_domain_host(friends_host());
@@ -4351,7 +4463,7 @@ def exercise(ctx, body):
             panic!("domain host functions must be wired, not stubbed");
         };
         // Python `str(True)` is "True".
-        assert_eq!(reply, b"invited_sent|1|blocked|True|0|1|1|probers|0|1|0");
+        assert_eq!(reply, b"invited_sent|1|blocked|True|0|1|1|probers|0|0|1|0");
 
         let exercised: HashSet<&str> = [
             "friends.add",
@@ -4363,6 +4475,7 @@ def exercise(ctx, body):
             "notifications.mark_read",
             "groups.call",
             "leaderboards.call",
+            "tournaments.call",
             "chat.call",
             "wallet.call",
         ]

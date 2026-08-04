@@ -154,6 +154,20 @@ async fn scenario_incr_operator_adds(repo: &dyn LeaderboardsRepository) {
     assert_eq!(record.submissions, 2);
 }
 
+async fn scenario_decr_operator_subtracts(repo: &dyn LeaderboardsRepository) {
+    make_board(repo, "board", SortOrder::Desc, Operator::Decr).await;
+    repo.submit("board", "u1", 5, 1, None, ts(1))
+        .await
+        .expect("init");
+    let record = repo
+        .submit("board", "u1", 8, 2, None, ts(2))
+        .await
+        .expect("subtract");
+    assert_eq!(record.score, -3);
+    assert_eq!(record.subscore, -1);
+    assert_eq!(record.submissions, 2);
+}
+
 async fn scenario_best_operator_desc_keeps_better(repo: &dyn LeaderboardsRepository) {
     make_board(repo, "board", SortOrder::Desc, Operator::Best).await;
     repo.submit("board", "u1", 50, 1, None, ts(1))
@@ -329,6 +343,7 @@ fn all_scenarios() -> Vec<Scenario> {
         scenario_list_is_id_ordered,
         scenario_set_operator_overwrites_and_counts,
         scenario_incr_operator_adds,
+        scenario_decr_operator_subtracts,
         scenario_best_operator_desc_keeps_better,
         scenario_best_operator_asc_keeps_lower,
         scenario_submit_against_unknown_board_is_not_found,

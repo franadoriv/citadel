@@ -35,6 +35,7 @@ pub mod purchases;
 pub mod session;
 pub mod session_revocation;
 pub mod token;
+pub mod tournaments;
 pub mod wallet;
 
 pub use audit::{AuditEntry, AuditFilter, AuditLog, DEFAULT_AUDIT_CAPACITY};
@@ -90,6 +91,7 @@ pub use session_revocation::{
     RevocationDispatch, SessionRevocationCommand, SessionRevocationCoordinator,
 };
 pub use token::{CountingTokenIssuer, IssuedTokenSet, RandomTokenIssuer, TokenIssuer};
+pub use tournaments::{TournamentDiscoveryService, TournamentRegistrationState};
 
 /// Coarse health state for a service or the assembled application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

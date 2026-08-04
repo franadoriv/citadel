@@ -34,6 +34,9 @@ use crate::config::DatabaseConfig;
 use crate::database_explorer::DatabaseExplorer;
 use crate::error::AppResult;
 use crate::identity::{AccountState, AuthCredential, AuthIdentity, User, Username};
+use crate::leaderboard_scheduler::{
+    InMemoryLeaderboardResetRepository, LeaderboardResetRepository,
+};
 use crate::session::{Session, SessionId, SessionTokenRef};
 use crate::storage::{
     Accessor, AtomicBatchOperation, AtomicBatchResult, ListQuery, ObjectId, Page, Precondition,
@@ -52,9 +55,9 @@ use super::{
     InMemoryAuthIdentityRepository, InMemoryChatRepository, InMemoryFriendsRepository,
     InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryNotificationsRepository,
     InMemoryPurchasesRepository, InMemorySessionRepository, InMemoryStorageRepository,
-    InMemoryUserRepository, InMemoryWalletRepository, LeaderboardsRepository,
-    NotificationsRepository, PurchasesRepository, SessionRepository, StorageRepository,
-    UserRepository, WalletRepository,
+    InMemoryTournamentsRepository, InMemoryUserRepository, InMemoryWalletRepository,
+    LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
+    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 
 /// Which persistence backend a node is running on.
@@ -173,6 +176,12 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// accessor and deliberately absent from [`UnitOfWork`].
     fn leaderboards_repository(&self) -> Arc<dyn LeaderboardsRepository>;
 
+    /// A pooled durable repository for leaderboard-reset leases, epochs, and outbox.
+    fn leaderboard_reset_repository(&self) -> Arc<dyn LeaderboardResetRepository>;
+
+    /// A pooled repository for tournament lifecycle and immutable results.
+    fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository>;
+
     /// A pooled (autocommit) chat repository.
     ///
     /// Chat channel history is a standalone feature — not part of the
@@ -272,6 +281,8 @@ pub struct InMemoryBackend {
     friends: Arc<InMemoryFriendsRepository>,
     groups: Arc<InMemoryGroupsRepository>,
     leaderboards: Arc<InMemoryLeaderboardsRepository>,
+    leaderboard_resets: Arc<InMemoryLeaderboardResetRepository>,
+    tournaments: Arc<InMemoryTournamentsRepository>,
     chat: Arc<InMemoryChatRepository>,
     notifications: Arc<InMemoryNotificationsRepository>,
     wallet: Arc<InMemoryWalletRepository>,
@@ -293,6 +304,8 @@ impl InMemoryBackend {
             friends: Arc::new(InMemoryFriendsRepository::new()),
             groups: Arc::new(InMemoryGroupsRepository::new()),
             leaderboards: Arc::new(InMemoryLeaderboardsRepository::new()),
+            leaderboard_resets: Arc::new(InMemoryLeaderboardResetRepository::new()),
+            tournaments: Arc::new(InMemoryTournamentsRepository::new()),
             chat: Arc::new(InMemoryChatRepository::new()),
             notifications: Arc::new(InMemoryNotificationsRepository::new()),
             wallet: Arc::new(InMemoryWalletRepository::new()),
@@ -340,6 +353,14 @@ impl Backend for InMemoryBackend {
 
     fn leaderboards_repository(&self) -> Arc<dyn LeaderboardsRepository> {
         Arc::clone(&self.leaderboards) as Arc<dyn LeaderboardsRepository>
+    }
+
+    fn leaderboard_reset_repository(&self) -> Arc<dyn LeaderboardResetRepository> {
+        Arc::clone(&self.leaderboard_resets) as Arc<dyn LeaderboardResetRepository>
+    }
+
+    fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
+        Arc::clone(&self.tournaments) as Arc<dyn TournamentsRepository>
     }
 
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {

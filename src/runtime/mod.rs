@@ -57,6 +57,9 @@ pub(crate) mod static_data;
 
 use std::time::Duration;
 
+use crate::error::AppResult;
+use crate::leaderboard_scheduler::{ResetEpoch, SchedulerFencingToken};
+
 pub use event_bus::{
     MAX_RUNTIME_EVENTS_PER_INVOCATION, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
     RuntimeEventEmitOutcome, RuntimeEventError, RuntimeEventPolicy, RuntimeEventPublisher,
@@ -225,6 +228,20 @@ pub trait Runtime: Send + Sync + 'static {
         sender: u64,
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand>;
+
+    /// Invoke the registered leaderboard-reset hook for one durable epoch.
+    ///
+    /// Scheduler delivery uses this result to decide whether to acknowledge the
+    /// durable outbox record; implementations must surface handler failures so
+    /// the occurrence can be retried.
+    fn on_leaderboard_reset(
+        &self,
+        epoch: &ResetEpoch,
+        fencing_token: SchedulerFencingToken,
+    ) -> AppResult<()> {
+        let _ = (epoch, fencing_token);
+        Ok(())
+    }
 
     /// Run the server game-loop handler with elapsed `dt`, bounded by `budget`.
     fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand>;

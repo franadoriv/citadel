@@ -438,6 +438,18 @@ impl App {
         &self.leaderboards
     }
 
+    /// Scheduler persistence owned by the selected backend.
+    ///
+    /// Durable backends return their transactional scheduler adapter; the
+    /// in-memory backend returns its process-local reference adapter for tests
+    /// and development.
+    #[must_use]
+    pub fn leaderboard_reset_repository(
+        &self,
+    ) -> Arc<dyn crate::leaderboard_scheduler::LeaderboardResetRepository> {
+        self.backend.leaderboard_reset_repository()
+    }
+
     /// The validated purchase / subscription record store (, persisted
     /// in ).
     ///

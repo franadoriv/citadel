@@ -61,6 +61,11 @@ tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Derive-based CLI parsing ( builds the actual command surface).
 clap = { version = "4", features = ["derive"] }
+# Strict UTC reset-schedule parsing for leaderboard cycles. Citadel accepts a
+# normalized five-field surface and delegates occurrence calculation to this crate.
+cron = "0.17"
+# Convert Citadel's UTC epoch-millisecond timestamps at the CRON boundary.
+chrono = "0.4"
 # Serialization baseline for config, manifests, and JSON payloads.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

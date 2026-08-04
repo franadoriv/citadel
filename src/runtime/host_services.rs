@@ -33,7 +33,7 @@ use crate::services::{
     AdmissionOutcome, ChatChannelAuthorizer, ChatRateLimitPolicy, ChatService, ChatTarget,
     CreateGroupRequest, FriendsService, Group, GroupFilter, GroupsService, LeaderboardService,
     PlayerNotification, PlayerNotificationPage, PlayerNotificationService, SendPlayerNotification,
-    UpdateGroupRequest, WalletService,
+    TournamentDiscoveryService, TournamentRegistrationState, UpdateGroupRequest, WalletService,
 };
 use crate::storage::{
     Accessor, Collection, Key, ObjectId, Owner, Permissions, Precondition, ReadPermission,
@@ -201,6 +201,13 @@ pub trait DomainHost: Send + Sync {
         operation: &str,
         payload_json: &str,
     ) -> Result<String, String>;
+    /// Execute player-facing tournament discovery as `actor`.
+    fn tournaments_call(
+        &self,
+        actor: &str,
+        operation: &str,
+        payload_json: &str,
+    ) -> Result<String, String>;
     /// Execute durable chat send/history as `actor`, using client-RPC JSON.
     fn chat_call(&self, actor: &str, operation: &str, payload_json: &str)
     -> Result<String, String>;
@@ -261,6 +268,7 @@ pub struct ServiceDomainHost {
     player_notifications: Option<Arc<PlayerNotificationService>>,
     groups: Option<Arc<GroupsService>>,
     leaderboards: Option<Arc<LeaderboardService>>,
+    tournaments: Option<Arc<TournamentDiscoveryService>>,
     chat: Option<Arc<ChatService>>,
     chat_authorizer: Option<Arc<ChatChannelAuthorizer>>,
     chat_rate_limits: Option<ChatRateLimitPolicy>,
@@ -279,6 +287,7 @@ impl ServiceDomainHost {
             player_notifications: None,
             groups: None,
             leaderboards: None,
+            tournaments: None,
             chat: None,
             chat_authorizer: None,
             chat_rate_limits: None,
@@ -315,6 +324,13 @@ impl ServiceDomainHost {
     #[must_use]
     pub fn with_leaderboards(mut self, service: Arc<LeaderboardService>) -> Self {
         self.leaderboards = Some(service);
+        self
+    }
+
+    /// Add player-facing tournament discovery to this runtime host.
+    #[must_use]
+    pub fn with_tournaments(mut self, service: Arc<TournamentDiscoveryService>) -> Self {
+        self.tournaments = Some(service);
         self
     }
 
@@ -686,6 +702,54 @@ impl DomainHost for ServiceDomainHost {
         result
             .map(|value| value.to_string())
             .map_err(|err| err.to_string())
+    }
+
+    fn tournaments_call(
+        &self,
+        actor: &str,
+        operation: &str,
+        payload_json: &str,
+    ) -> Result<String, String> {
+        let service = self
+            .tournaments
+            .as_ref()
+            .ok_or_else(|| "tournaments host not available".to_string())?;
+        let payload = domain_json_object(payload_json, "tournaments")?;
+        let id = || {
+            payload
+                .get("tournament_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "tournaments validation: missing string field: tournament_id".to_string()
+                })
+        };
+        let result = match operation {
+            "list" => Self::block(service.list_active_and_upcoming()).and_then(|items| {
+                serde_json::to_value(items)
+                    .map_err(|error| crate::AppError::internal(error.to_string()))
+            }),
+            "get" => Self::block(service.get(id()?)).and_then(|tournament| {
+                serde_json::to_value(tournament)
+                    .map_err(|error| crate::AppError::internal(error.to_string()))
+            }),
+            "results" => Self::block(service.results(id()?)).and_then(|items| {
+                serde_json::to_value(items)
+                    .map_err(|error| crate::AppError::internal(error.to_string()))
+            }),
+            "registration" => {
+                Self::block(service.registration_state(id()?, actor, SystemClock.now()))
+                    .map(|state| match state {
+                        TournamentRegistrationState::Registered => "registered",
+                        TournamentRegistrationState::Open => "open",
+                        TournamentRegistrationState::Closed => "closed",
+                    })
+                    .map(|state| serde_json::json!({"state": state}))
+            }
+            _ => return Err("tournaments validation: unknown operation".to_string()),
+        };
+        result
+            .map(|value| value.to_string())
+            .map_err(|error| error.to_string())
     }
 
     fn chat_call(

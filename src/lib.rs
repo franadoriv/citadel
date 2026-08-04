@@ -19,6 +19,7 @@ pub mod error_reporting;
 pub mod host_telemetry;
 pub mod http;
 pub mod identity;
+pub mod leaderboard_scheduler;
 pub mod lifecycle;
 pub mod maps;
 pub mod matchmaker;
@@ -57,6 +58,7 @@ pub fn startup_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::TimestampMillis;
 
     #[test]
     fn startup_message_identifies_project() {
@@ -64,5 +66,27 @@ mod tests {
             startup_message(),
             "citadel: Rust-native game server foundation"
         );
+    }
+
+    #[test]
+    fn leaderboard_scheduler_lease_rejects_stale_fencing_tokens() {
+        let lease = crate::leaderboard_scheduler::SchedulerLease::new(
+            "node-a".to_string(),
+            crate::leaderboard_scheduler::SchedulerFencingToken::new(8),
+            TimestampMillis::from_unix_millis(100),
+        );
+        assert!(lease.is_current_at(TimestampMillis::from_unix_millis(99)));
+        assert!(!lease.accepts(
+            crate::leaderboard_scheduler::SchedulerFencingToken::new(7),
+            TimestampMillis::from_unix_millis(99)
+        ));
+        assert!(lease.accepts(
+            crate::leaderboard_scheduler::SchedulerFencingToken::new(8),
+            TimestampMillis::from_unix_millis(99)
+        ));
+        assert!(!lease.accepts(
+            crate::leaderboard_scheduler::SchedulerFencingToken::new(8),
+            TimestampMillis::from_unix_millis(100)
+        ));
     }
 }

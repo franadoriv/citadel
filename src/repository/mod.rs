@@ -30,6 +30,7 @@ pub mod pg;
 pub mod purchases;
 pub mod session;
 pub mod sqlite;
+pub mod tournaments;
 pub mod wallet;
 
 pub use backend::{
@@ -56,7 +57,10 @@ pub use leaderboards::{
     LeaderboardRecord, LeaderboardSummary, LeaderboardsRepository, Operator, RankedRecord,
     RecordsPage, SortOrder,
 };
-pub use mongodb::{MongoChatRepository, MongoDatabase, MongoSchemaPlan, MongoUnitOfWork};
+pub use mongodb::{
+    MongoChatRepository, MongoDatabase, MongoLeaderboardResetRepository, MongoSchemaPlan,
+    MongoUnitOfWork,
+};
 pub use notifications::{
     DEFAULT_NOTIFICATION_CAPACITY, InMemoryNotificationsRepository, Notification, NotificationPage,
     NotificationsRepository, Recipient,
@@ -67,6 +71,11 @@ pub use purchases::{
 };
 pub use session::{InMemorySessionRepository, SessionRepository};
 pub use sqlite::{SqliteDatabase, SqliteUnitOfWork};
+pub use tournaments::{
+    CreateTournamentRequest, InMemoryTournamentsRepository, Tournament, TournamentEntry,
+    TournamentResult, TournamentSettlementCallback, TournamentSettlementOutboxDispatcher,
+    TournamentSettlementOutboxRecord, TournamentState, TournamentsRepository,
+};
 pub use wallet::{
     DEFAULT_LEDGER_CAPACITY, InMemoryWalletRepository, LedgerEntry, WalletRepository,
 };

@@ -342,6 +342,9 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         .with_player_notifications(Arc::clone(app.player_notifications()))
         .with_groups(Arc::clone(app.groups()))
         .with_leaderboards(Arc::clone(app.leaderboards()))
+        .with_tournaments(Arc::new(crate::services::TournamentDiscoveryService::new(
+            app.backend().tournaments_repository(),
+        )))
         .with_chat(Arc::clone(app.chat()))
         .with_chat_authorizer(Arc::new(ChatChannelAuthorizer::with_access_coordinator(
             Arc::clone(app.friends()),
@@ -710,6 +713,33 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             sim_period,
             snapshot_every,
         ));
+    }
+
+    // One scheduler process is supervised alongside the transports. Its durable
+    // backend lease makes this safe across nodes; the runtime bridge invokes the
+    // script hook that the selected language adapter actually registered.
+    if let Some(runtime) = runtime.as_ref() {
+        let callback: Arc<dyn crate::leaderboard_scheduler::LeaderboardResetCallback> = Arc::new(
+            crate::leaderboard_scheduler::RuntimeLeaderboardResetCallback::from_runtime(
+                Arc::clone(runtime),
+            ),
+        );
+        let scheduler =
+            crate::leaderboard_scheduler::LeaderboardResetSchedulerService::from_repositories(
+                app.backend().leaderboards_repository(),
+                app.leaderboard_reset_repository(),
+                callback,
+                app.node_id().to_owned(),
+                DurationMillis::from_millis(120_000),
+                128,
+                128,
+            );
+        supervisor.spawn(
+            crate::leaderboard_scheduler::LeaderboardResetSchedulerLoop::new(
+                scheduler,
+                Duration::from_secs(60),
+            ),
+        );
     }
 
     // Spawn the server game-loop tick only when the script actually

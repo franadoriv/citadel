@@ -67,6 +67,7 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "on_join",
     "on_leave",
     "on_tick",
+    "on_leaderboard_reset",
     "on_rpc",
     "on_room_create",
     "on_room_join",
@@ -97,6 +98,7 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "notifications.mark_read",
     "groups.call",
     "leaderboards.call",
+    "tournaments.call",
     "chat.call",
     "wallet.call",
     "storage.read",
@@ -130,6 +132,7 @@ const JS_HOST_PRELUDE: &str = r#"
   let onJoin = null;
   let onLeave = null;
   let onTick = null;
+  let onLeaderboardReset = null;
   let onRoomCreate = null;
   let onRoomJoin = null;
   let beforeRealtime = null;
@@ -321,6 +324,9 @@ const JS_HOST_PRELUDE: &str = r#"
     },
     on_tick(handler) {
       return singleRegistration((fn) => { onTick = fn; }, handler);
+    },
+    on_leaderboard_reset(handler) {
+      return singleRegistration((fn) => { onLeaderboardReset = fn; }, handler);
     },
     on_rpc(method, handler) {
       return handlerRegistration(rpcHandlers, String(method), handler);
@@ -546,6 +552,7 @@ const JS_HOST_PRELUDE: &str = r#"
       return JSON.parse(globalThis.__citadel_groups(String(actor), String(operation), JSON.stringify(payload)));
     },
     leaderboards_call(actor, operation, payload) { return __citadel_domain_call("leaderboards", actor, operation, payload); },
+    tournaments_call(actor, operation, payload) { return __citadel_domain_call("tournaments", actor, operation, payload); },
     chat_call(actor, operation, payload) { return __citadel_domain_call("chat", actor, operation, payload); },
     wallet_call(actor, operation, payload) { return __citadel_domain_call("wallet", actor, operation, payload); },
     storage_read(user, collection, key) {
@@ -723,6 +730,14 @@ const JS_HOST_PRELUDE: &str = r#"
     return true;
   };
 
+  globalThis.__citadel_call_leaderboard_reset = function (ctx) {
+    if (!onLeaderboardReset) {
+      return false;
+    }
+    onLeaderboardReset(ctx);
+    return true;
+  };
+
   globalThis.__citadel_call_rpc = function (method, ctx, body) {
     const handler = rpcHandlers.get(String(method));
     if (!handler) {
@@ -779,6 +794,7 @@ const JS_HOST_PRELUDE: &str = r#"
       || onJoin !== null
       || onLeave !== null
       || onTick !== null
+      || onLeaderboardReset !== null
       || onRoomCreate !== null
       || onRoomJoin !== null
       || beforeRealtime !== null
@@ -792,6 +808,7 @@ const JS_HOST_PRELUDE: &str = r#"
     if (onJoin) hooks.push("on_join");
     if (onLeave) hooks.push("on_leave");
     if (onTick) hooks.push("on_tick");
+    if (onLeaderboardReset) hooks.push("on_leaderboard_reset");
     if (onRoomCreate) hooks.push("on_room_create");
     if (onRoomJoin) hooks.push("on_room_join");
     if (beforeRealtime) hooks.push("before_realtime");
@@ -1382,6 +1399,54 @@ impl JsRuntime {
         })
     }
 
+    /// Invoke the optional leaderboard-reset callback for one durable epoch.
+    ///
+    /// The callback has the same VM lock, deadline, and panic isolation as
+    /// other runtime invocations. Failures are returned so the scheduler leaves
+    /// the durable outbox record pending for retry.
+    pub fn on_leaderboard_reset(
+        &self,
+        epoch: &crate::leaderboard_scheduler::ResetEpoch,
+        fencing_token: crate::leaderboard_scheduler::SchedulerFencingToken,
+    ) -> AppResult<()> {
+        let guard = self.lock_vm();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_with_js_deadline(&guard.runtime, self.budget, || {
+                guard.context.with(|ctx| {
+                    clear_commands(&ctx);
+                    let globals = ctx.globals();
+                    let callback: Function =
+                        caught(&ctx, globals.get("__citadel_call_leaderboard_reset"))?;
+                    let callback_ctx = caught(&ctx, Object::new(ctx.clone()))?;
+                    caught(
+                        &ctx,
+                        callback_ctx.set("leaderboard_id", epoch.leaderboard_id.as_str()),
+                    )?;
+                    caught(
+                        &ctx,
+                        callback_ctx.set("due_at_unix_ms", epoch.due_at.unix_millis()),
+                    )?;
+                    caught(&ctx, callback_ctx.set("fencing_token", fencing_token.get()))?;
+                    let _: bool = caught(&ctx, callback.call((callback_ctx,)))?;
+                    clear_commands(&ctx);
+                    Ok(())
+                })
+            })
+        }));
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                clear_vm_commands(&guard);
+                Err(AppError::internal("leaderboard reset callback failed")
+                    .with_detail(error.to_string()))
+            }
+            Err(_) => {
+                clear_vm_commands(&guard);
+                Err(AppError::internal("leaderboard reset callback panicked"))
+            }
+        }
+    }
+
     /// Dispatch an RPC handler.
     pub fn call_rpc(
         &self,
@@ -1870,6 +1935,14 @@ impl Runtime for JsRuntime {
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand> {
         JsRuntime::dispatch_lifecycle(self, hook, sender, user_id)
+    }
+
+    fn on_leaderboard_reset(
+        &self,
+        epoch: &crate::leaderboard_scheduler::ResetEpoch,
+        fencing_token: crate::leaderboard_scheduler::SchedulerFencingToken,
+    ) -> AppResult<()> {
+        JsRuntime::on_leaderboard_reset(self, epoch, fencing_token)
     }
 
     fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
@@ -3286,6 +3359,7 @@ fn apply_domain_host(
             ensure_realtime_effects_allowed(&ctx, &domain_mode)?;
             let result = match domain.as_str() {
                 "leaderboards" => domain_host.leaderboards_call(&actor, &operation, &payload),
+                "tournaments" => domain_host.tournaments_call(&actor, &operation, &payload),
                 "chat" => domain_host.chat_call(&actor, &operation, &payload),
                 "wallet" => domain_host.wallet_call(&actor, &operation, &payload),
                 _ => Err("unknown domain".to_string()),
@@ -4327,12 +4401,12 @@ citadel.on_message(2, () => {{
         use crate::repository::{
             InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
             InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryStorageRepository,
-            InMemoryWalletRepository,
+            InMemoryTournamentsRepository, InMemoryWalletRepository,
         };
         use crate::runtime::ServiceDomainHost;
         use crate::services::{
             ChatChannelAuthorizer, ChatService, FriendsService, GroupsService, LeaderboardService,
-            PlayerNotificationService, WalletService,
+            PlayerNotificationService, TournamentDiscoveryService, WalletService,
         };
         use crate::storage::{
             Collection, StorageIndexDefinition, StorageIndexField, StorageIndexName,
@@ -4365,6 +4439,9 @@ citadel.on_message(2, () => {{
                 .with_groups(groups)
                 .with_leaderboards(Arc::new(LeaderboardService::new(Arc::new(
                     InMemoryLeaderboardsRepository::new(),
+                ))))
+                .with_tournaments(Arc::new(TournamentDiscoveryService::new(Arc::new(
+                    InMemoryTournamentsRepository::new(),
                 ))))
                 .with_chat(chat)
                 .with_chat_authorizer(authorizer)
@@ -4408,8 +4485,9 @@ citadel.on_rpc("exercise", (ctx, body) => {
   const read = citadel.notifications_mark_read(u, [notification.id]);
   const group = citadel.groups_call(u, "create", {name: "probers"});
   const boards = citadel.leaderboards_call(u, "list", {});
+  const tournaments = citadel.tournaments_call(u, "list", {});
   const wallet = citadel.wallet_call(u, "balances", {});
-  return added + "|" + n1 + "|" + blocked + "|" + removed + "|" + n2 + "|" + page.items.length + "|" + read.read_ids.length + "|" + group.name + "|" + boards.length + "|" + chat.id + "|" + Object.keys(wallet).length;
+  return added + "|" + n1 + "|" + blocked + "|" + removed + "|" + n2 + "|" + page.items.length + "|" + read.read_ids.length + "|" + group.name + "|" + boards.length + "|" + tournaments.length + "|" + chat.id + "|" + Object.keys(wallet).length;
 });
 "#,
         )
@@ -4418,7 +4496,7 @@ citadel.on_rpc("exercise", (ctx, body) => {
         let RpcOutcome::Ok(reply) = rt.call_rpc(1, Some("prober"), "exercise", b"") else {
             panic!("domain host functions must be wired, not stubbed");
         };
-        assert_eq!(reply, b"invited_sent|1|blocked|true|0|1|1|probers|0|1|0");
+        assert_eq!(reply, b"invited_sent|1|blocked|true|0|1|1|probers|0|0|1|0");
 
         let exercised: HashSet<&str> = [
             "friends.add",
@@ -4430,6 +4508,7 @@ citadel.on_rpc("exercise", (ctx, body) => {
             "notifications.mark_read",
             "groups.call",
             "leaderboards.call",
+            "tournaments.call",
             "chat.call",
             "wallet.call",
         ]
@@ -4535,6 +4614,44 @@ citadel.on_join(joined);
                 body: b"joined".to_vec(),
                 unreliable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn leaderboard_reset_handler_receives_epoch_context_and_surfaces_failures() {
+        let rt = runtime(
+            r#"
+citadel.on_leaderboard_reset((ctx) => {
+  if (ctx.leaderboard_id !== "weekly"
+      || ctx.due_at_unix_ms !== 60_000
+      || ctx.fencing_token !== 7) {
+    throw new Error("invalid leaderboard reset context");
+  }
+  throw new Error("leaderboard reset reached");
+});
+"#,
+        );
+        let epoch = crate::leaderboard_scheduler::ResetEpoch::new(
+            "weekly".to_owned(),
+            crate::time::TimestampMillis::from_unix_millis(60_000),
+        );
+
+        let error = rt
+            .on_leaderboard_reset(
+                &epoch,
+                crate::leaderboard_scheduler::SchedulerFencingToken::new(7),
+            )
+            .expect_err("registered leaderboard reset hook must run");
+
+        assert!(
+            error
+                .message()
+                .contains("leaderboard reset callback failed")
+        );
+        assert!(
+            error
+                .log_detail()
+                .is_some_and(|detail| detail.contains("leaderboard reset reached"))
         );
     }
 

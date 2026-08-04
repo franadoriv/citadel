@@ -34,6 +34,8 @@ pub enum HostApiCategory {
     LifecycleHook,
     /// Periodic tick hook registration.
     TickHook,
+    /// Leaderboard reset callback registration.
+    LeaderboardHook,
     /// Request/response RPC hook registration.
     RpcHook,
     /// Room creation/join hook registration.
@@ -117,6 +119,14 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "void",
         status: HostApiStatus::Shipped,
         since: "pre-1.0",
+    },
+    HostApiFn {
+        name: "on_leaderboard_reset",
+        category: HostApiCategory::LeaderboardHook,
+        params: &["handler:fn(ctx:{leaderboard_id:string,due_at_unix_ms:u64,fencing_token:u64})"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
     },
     HostApiFn {
         name: "on_rpc",
@@ -369,6 +379,18 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "json",
         status: HostApiStatus::Shipped,
         since: "pre-1.0",
+    },
+    HostApiFn {
+        name: "tournaments.call",
+        category: HostApiCategory::Domain,
+        params: &[
+            "actor:string",
+            "operation:list|get|results|registration",
+            "payload_json:string",
+        ],
+        returns: "json",
+        status: HostApiStatus::Shipped,
+        since: "IMPL-20260803-TOURNAMENTS-DISCOVERY",
     },
     HostApiFn {
         name: "chat.call",

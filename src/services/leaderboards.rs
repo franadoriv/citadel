@@ -22,10 +22,14 @@
 //! [`LeaderboardRecord`], [`RankedRecord`], …) are re-exported here so existing
 //! console/HTTP consumers keep their `crate::services::…` paths.
 //!
-//! `reset_schedule` is stored verbatim but never interpreted (see
+//! `reset_schedule` is validated as strict UTC five-field CRON and normalized to
+//! the scheduler's seconds-first representation, but is not executed yet (see
 //! `docs/architecture/technical-debt.md`).
 
+use std::str::FromStr;
 use std::sync::Arc;
+
+use cron::Schedule;
 
 use crate::error::{AppError, AppResult};
 use crate::repository::LeaderboardsRepository;
@@ -70,10 +74,11 @@ impl LeaderboardService {
     /// error if a board with the same id already exists.
     pub async fn create(
         &self,
-        request: CreateLeaderboardRequest,
+        mut request: CreateLeaderboardRequest,
         now: TimestampMillis,
     ) -> AppResult<LeaderboardDefinition> {
         validate_id("leaderboard id", &request.id, MAX_BOARD_ID_LEN)?;
+        request.reset_schedule = normalize_reset_schedule(request.reset_schedule)?;
         self.repo.create(request, now).await
     }
 
@@ -168,6 +173,29 @@ impl LeaderboardService {
 /// The stable "no such leaderboard" error.
 fn board_not_found(id: &str) -> AppError {
     AppError::not_found(format!("no such leaderboard '{id}'"))
+}
+
+/// Normalize Citadel's UTC-only five-field CRON dialect to the seconds-first
+/// grammar accepted by the `cron` crate.
+///
+/// `None` remains unscheduled. A schedule must contain exactly five ASCII
+/// whitespace-separated fields; timezone prefixes and six/seven-field forms are
+/// intentionally rejected instead of silently changing when a reset occurs.
+fn normalize_reset_schedule(schedule: Option<String>) -> AppResult<Option<String>> {
+    let Some(schedule) = schedule else {
+        return Ok(None);
+    };
+    let fields = schedule.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5 || fields.iter().any(|field| field.starts_with("TZ=")) {
+        return Err(AppError::validation(
+            "reset_schedule must be a UTC five-field CRON expression",
+        ));
+    }
+    let normalized = format!("0 {}", fields.join(" "));
+    Schedule::from_str(&normalized).map_err(|_| {
+        AppError::validation("reset_schedule must be a valid UTC five-field CRON expression")
+    })?;
+    Ok(Some(normalized))
 }
 
 /// Validate a leaderboard/user id: non-empty, bounded, no control characters.
@@ -327,5 +355,23 @@ mod tests {
         assert_eq!(page.total, 2);
         assert_eq!(page.items[0].user_id, "u2", "higher score ranks first");
         assert_eq!(page.items[0].rank, 1);
+    }
+
+    #[test]
+    fn reset_schedule_accepts_only_utc_five_field_cron_and_normalizes_seconds() {
+        assert_eq!(
+            normalize_reset_schedule(Some("0 12 * * *".to_string())).expect("five fields valid"),
+            Some("0 0 12 * * *".to_string())
+        );
+        assert_eq!(normalize_reset_schedule(None).expect("none valid"), None);
+        for schedule in ["0 0 12 * * *", "TZ=America/New_York 0 12 * * *", "daily"] {
+            assert_eq!(
+                normalize_reset_schedule(Some(schedule.to_string()))
+                    .expect_err("unsupported schedule rejected")
+                    .category(),
+                ErrorCategory::Validation,
+                "{schedule} must be rejected"
+            );
+        }
     }
 }

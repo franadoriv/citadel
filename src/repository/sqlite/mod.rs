@@ -58,7 +58,7 @@ use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWor
 use crate::repository::{
     AuthIdentityRepository, ChatRepository, FriendsRepository, GroupsRepository,
     LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
-    StorageRepository, UserRepository, WalletRepository,
+    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
@@ -66,22 +66,26 @@ mod chat;
 mod friends;
 mod groups;
 mod identity;
+mod leaderboard_scheduler;
 mod leaderboards;
 mod notifications;
 mod purchases;
 mod session;
 mod storage;
+mod tournaments;
 mod wallet;
 
 pub use chat::SqliteChatRepository;
 pub use friends::SqliteFriendsRepository;
 pub use groups::SqliteGroupsRepository;
 pub use identity::{SqliteAuthIdentityRepository, SqliteUserRepository};
+pub use leaderboard_scheduler::SqliteLeaderboardResetRepository;
 pub use leaderboards::SqliteLeaderboardsRepository;
 pub use notifications::SqliteNotificationsRepository;
 pub use purchases::SqlitePurchasesRepository;
 pub use session::SqliteSessionRepository;
 pub use storage::SqliteStorageRepository;
+pub use tournaments::SqliteTournamentsRepository;
 pub use wallet::SqliteWalletRepository;
 
 // --- Shared error / decode helpers ------------------------------------------
@@ -338,6 +342,24 @@ impl SqliteDatabase {
         )))
     }
 
+    /// A pooled durable tournament repository.
+    #[must_use]
+    pub fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
+        Arc::new(SqliteTournamentsRepository::new(SqliteExecutor::Pool(
+            self.pool.clone(),
+        )))
+    }
+
+    /// A pooled durable repository for leaderboard reset scheduler state.
+    #[must_use]
+    pub fn leaderboard_reset_repository(
+        &self,
+    ) -> Arc<dyn crate::leaderboard_scheduler::LeaderboardResetRepository> {
+        Arc::new(SqliteLeaderboardResetRepository::new(SqliteExecutor::Pool(
+            self.pool.clone(),
+        )))
+    }
+
     /// A pooled (autocommit) chat repository handle.
     #[must_use]
     pub fn chat_repository(&self) -> Arc<dyn ChatRepository> {
@@ -398,11 +420,15 @@ impl SqliteDatabase {
     /// Test-only: remove every stored row across all repository tables.
     ///
     /// Used by the un-gated SQLite contract tests to isolate scenarios. Not part
-    /// of the supported API. No cross-table foreign keys are declared, so the
-    /// repositories can be reset independently.
+    /// of the supported API. Scheduler outbox tables are cleared before their
+    /// leaderboard parent table to preserve their foreign-key relationship.
     #[doc(hidden)]
     pub async fn reset_storage_for_tests(&self) -> AppResult<()> {
         for table in [
+            "leaderboard_reset_outbox",
+            "leaderboard_reset_snapshot_records",
+            "leaderboard_reset_epochs",
+            "leaderboard_reset_scheduler_lease",
             "storage_objects",
             "sessions",
             "auth_identities",
@@ -543,6 +569,16 @@ impl BackendTrait for SqliteDatabase {
 
     fn leaderboards_repository(&self) -> Arc<dyn LeaderboardsRepository> {
         SqliteDatabase::leaderboards_repository(self)
+    }
+
+    fn leaderboard_reset_repository(
+        &self,
+    ) -> Arc<dyn crate::leaderboard_scheduler::LeaderboardResetRepository> {
+        SqliteDatabase::leaderboard_reset_repository(self)
+    }
+
+    fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
+        SqliteDatabase::tournaments_repository(self)
     }
 
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {

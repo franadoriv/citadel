@@ -47,7 +47,7 @@ use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWor
 use crate::repository::{
     AuthIdentityRepository, ChatRepository, FriendsRepository, GroupsRepository,
     LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
-    StorageRepository, UserRepository, WalletRepository,
+    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
@@ -55,22 +55,26 @@ mod chat;
 mod friends;
 mod groups;
 mod identity;
+mod leaderboard_scheduler;
 mod leaderboards;
 mod notifications;
 mod purchases;
 mod session;
 mod storage;
+mod tournaments;
 mod wallet;
 
 pub use chat::PgChatRepository;
 pub use friends::PgFriendsRepository;
 pub use groups::PgGroupsRepository;
 pub use identity::{PgAuthIdentityRepository, PgUserRepository};
+pub use leaderboard_scheduler::PgLeaderboardResetRepository;
 pub use leaderboards::PgLeaderboardsRepository;
 pub use notifications::PgNotificationsRepository;
 pub use purchases::PgPurchasesRepository;
 pub use session::PgSessionRepository;
 pub use storage::PgStorageRepository;
+pub use tournaments::PgTournamentsRepository;
 pub use wallet::PgWalletRepository;
 
 // --- Shared error / decode helpers ------------------------------------------
@@ -183,6 +187,14 @@ pub struct PgDatabase {
 /// coverage test below makes a new entry fail fast unless its table is also
 /// present in the CRDB migration set.
 const TEST_RESET_TABLES: &[&str] = &[
+    "tournament_results",
+    "tournament_entries",
+    "tournament_settlement_outbox",
+    "tournaments",
+    "leaderboard_reset_snapshot_records",
+    "leaderboard_reset_outbox",
+    "leaderboard_reset_epochs",
+    "leaderboard_reset_scheduler_lease",
     "storage_index_memberships",
     "storage_index_definitions",
     "storage_objects",
@@ -382,6 +394,24 @@ impl PgDatabase {
         )))
     }
 
+    /// A pooled durable tournament repository.
+    #[must_use]
+    pub fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
+        Arc::new(PgTournamentsRepository::new(PgExecutor::Pool(
+            self.pool.clone(),
+        )))
+    }
+
+    /// A pooled durable repository for leaderboard reset scheduler state.
+    #[must_use]
+    pub fn leaderboard_reset_repository(
+        &self,
+    ) -> Arc<dyn crate::leaderboard_scheduler::LeaderboardResetRepository> {
+        Arc::new(PgLeaderboardResetRepository::new(PgExecutor::Pool(
+            self.pool.clone(),
+        )))
+    }
+
     /// A pooled (autocommit) chat repository handle.
     #[must_use]
     pub fn chat_repository(&self) -> Arc<dyn ChatRepository> {
@@ -573,6 +603,16 @@ impl BackendTrait for PgDatabase {
         PgDatabase::leaderboards_repository(self)
     }
 
+    fn leaderboard_reset_repository(
+        &self,
+    ) -> Arc<dyn crate::leaderboard_scheduler::LeaderboardResetRepository> {
+        PgDatabase::leaderboard_reset_repository(self)
+    }
+
+    fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
+        PgDatabase::tournaments_repository(self)
+    }
+
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {
         PgDatabase::chat_repository(self)
     }
@@ -677,6 +717,16 @@ mod tests {
         include_str!("../../../migrations-crdb/20260709160000_create_notifications.sql");
     const CRDB_WALLET: &str =
         include_str!("../../../migrations-crdb/20260709170000_create_wallet.sql");
+    const CRDB_TOURNAMENTS: &str =
+        include_str!("../../../migrations-crdb/20260803150000_create_tournaments.sql");
+    const CRDB_TOURNAMENT_SETTLEMENT_OUTBOX: &str = include_str!(
+        "../../../migrations-crdb/20260803151000_create_tournament_settlement_outbox.sql"
+    );
+    const CRDB_LEADERBOARD_RESET_SCHEDULER: &str = include_str!(
+        "../../../migrations-crdb/20260803141000_create_leaderboard_reset_scheduler.sql"
+    );
+    const CRDB_LEADERBOARD_RESET_SNAPSHOTS: &str =
+        include_str!("../../../migrations-crdb/20260803142000_add_leaderboard_reset_snapshots.sql");
 
     #[test]
     fn timestamp_round_trips_through_millis() {
@@ -706,6 +756,23 @@ mod tests {
     #[test]
     fn cockroach_migrations_cover_every_contract_reset_table() {
         let coverage = [
+            ("tournament_results", CRDB_TOURNAMENTS),
+            ("tournament_entries", CRDB_TOURNAMENTS),
+            (
+                "tournament_settlement_outbox",
+                CRDB_TOURNAMENT_SETTLEMENT_OUTBOX,
+            ),
+            ("tournaments", CRDB_TOURNAMENTS),
+            (
+                "leaderboard_reset_snapshot_records",
+                CRDB_LEADERBOARD_RESET_SNAPSHOTS,
+            ),
+            ("leaderboard_reset_outbox", CRDB_LEADERBOARD_RESET_SCHEDULER),
+            ("leaderboard_reset_epochs", CRDB_LEADERBOARD_RESET_SCHEDULER),
+            (
+                "leaderboard_reset_scheduler_lease",
+                CRDB_LEADERBOARD_RESET_SCHEDULER,
+            ),
             ("storage_index_memberships", CRDB_STORAGE_INDEX_MEMBERSHIPS),
             ("storage_index_definitions", CRDB_STORAGE_INDEX_MEMBERSHIPS),
             ("storage_objects", CRDB_STORAGE),

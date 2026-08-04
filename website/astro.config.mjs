@@ -159,6 +159,7 @@ export default defineConfig({
 								{ label: 'Friends', slug: 'reference/admin-api/friends' },
 								{ label: 'Groups', slug: 'reference/admin-api/groups' },
 								{ label: 'Leaderboards', slug: 'reference/admin-api/leaderboards' },
+								{ label: 'Tournaments', slug: 'reference/admin-api/tournaments' },
 								{ label: 'Notifications', slug: 'reference/admin-api/notifications' },
 								{ label: 'Storage', slug: 'reference/admin-api/storage' },
 								{ label: 'Database Explorer', slug: 'reference/admin-api/database-explorer' },

@@ -61,6 +61,16 @@
     "since": "pre-1.0"
   },
   {
+    "name": "on_leaderboard_reset",
+    "category": "leaderboard_hook",
+    "params": [
+      "handler:fn(ctx:{leaderboard_id:string,due_at_unix_ms:u64,fencing_token:u64})"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "on_rpc",
     "category": "rpc_hook",
     "params": [
@@ -377,6 +387,18 @@
     "returns": "json",
     "status": "shipped",
     "since": "pre-1.0"
+  },
+  {
+    "name": "tournaments.call",
+    "category": "domain",
+    "params": [
+      "actor:string",
+      "operation:list|get|results|registration",
+      "payload_json:string"
+    ],
+    "returns": "json",
+    "status": "shipped",
+    "since": "IMPL-20260803-TOURNAMENTS-DISCOVERY"
   },
   {
     "name": "chat.call",

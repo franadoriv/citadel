@@ -29,6 +29,10 @@ use crate::identity::{
     AccountState, AuthCredential, AuthIdentity, AuthProvider, CustomId, DeviceId, EmailAddress,
     PasswordVerifier, User, UserId, Username,
 };
+use crate::leaderboard_scheduler::{
+    LeaderboardResetRepository, LeaderboardResetSnapshot, ResetEpoch, ResetOutboxRecord,
+    SchedulerFencingToken, SchedulerLease,
+};
 use crate::repository::UserPage;
 use crate::repository::backend::{Backend, BackendKind, UnitOfWork};
 use crate::repository::chat::{
@@ -51,6 +55,11 @@ use crate::repository::notifications::{
 use crate::repository::purchases::{
     Purchase, PurchaseStore, SubscriptionRow, duplicate_transaction, subscription_rows,
 };
+use crate::repository::tournaments::{
+    CreateTournamentRequest, Tournament, TournamentEntry, TournamentResult,
+    TournamentSettlementOutboxRecord, TournamentState, TournamentsRepository, can_transition,
+    validate_schedule,
+};
 use crate::repository::wallet::{LedgerEntry, apply_delta, ledger_overflow};
 use crate::repository::{
     AuthIdentityRepository, ChatRepository, FriendRow, FriendState, FriendsRepository,
@@ -63,7 +72,7 @@ use crate::storage::{
     ListQuery, ObjectId, Owner, Page, Precondition, StorageIndexDefinition, StorageIndexMembership,
     StorageIndexQuery, StorageObject, Version, WriteRequest,
 };
-use crate::time::TimestampMillis;
+use crate::time::{DurationMillis, TimestampMillis};
 
 const USERS: &str = "users";
 const IDENTITIES: &str = "auth_identities";
@@ -84,10 +93,18 @@ const CHAT_EVENTS: &str = "chat_events";
 const CHAT_MODERATION_AUDIT: &str = "chat_moderation_audit";
 const CHAT_RATE_LIMITS: &str = "chat_rate_limits";
 const CHAT_DELIVERY_OUTBOX: &str = "chat_delivery_outbox";
+const LEADERBOARD_RESET_SCHEDULER_LEASE: &str = "leaderboard_reset_scheduler_lease";
+const LEADERBOARD_RESET_EPOCHS: &str = "leaderboard_reset_epochs";
+const LEADERBOARD_RESET_OUTBOX: &str = "leaderboard_reset_outbox";
+const LEADERBOARD_RESET_SNAPSHOT_RECORDS: &str = "leaderboard_reset_snapshot_records";
+const TOURNAMENTS: &str = "tournaments";
+const TOURNAMENT_ENTRIES: &str = "tournament_entries";
+const TOURNAMENT_RESULTS: &str = "tournament_results";
+const TOURNAMENT_SETTLEMENT_OUTBOX: &str = "tournament_settlement_outbox";
 
 const SCHEMA_COLLECTION: &str = "citadel_schema";
 const SCHEMA_ID: &str = "mongodb-foundation";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 5;
 // MongoDB recommends retrying a whole transaction on
 // `TransientTransactionError`, but retrying *only* the commit when the result
 // is unknown.  A direct `UnitOfWork` has no replayable user closure, so it can
@@ -306,6 +323,119 @@ const SCHEMA: &[CollectionSpec] = &[
                     ("score", -1),
                     ("subscore", -1),
                     ("owner_id", 1),
+                ],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        name: LEADERBOARD_RESET_SCHEDULER_LEASE,
+        indexes: &[IndexSpec {
+            name: "scheduler_lease_key_uq",
+            keys: &[("lease_key", 1)],
+            unique: true,
+        }],
+    },
+    CollectionSpec {
+        name: LEADERBOARD_RESET_EPOCHS,
+        indexes: &[IndexSpec {
+            name: "scheduler_epoch_uq",
+            keys: &[("leaderboard_id", 1), ("due_at_unix_ms", 1)],
+            unique: true,
+        }],
+    },
+    CollectionSpec {
+        name: LEADERBOARD_RESET_OUTBOX,
+        indexes: &[
+            IndexSpec {
+                name: "scheduler_outbox_epoch_uq",
+                keys: &[("leaderboard_id", 1), ("due_at_unix_ms", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "scheduler_outbox_pending_order",
+                keys: &[
+                    ("created_at_unix_ms", 1),
+                    ("leaderboard_id", 1),
+                    ("due_at_unix_ms", 1),
+                ],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        // The compound key is both the immutable snapshot identity and the
+        // deterministic owner-id read order used by `snapshot`.
+        name: LEADERBOARD_RESET_SNAPSHOT_RECORDS,
+        indexes: &[IndexSpec {
+            name: "scheduler_snapshot_record_uq",
+            keys: &[
+                ("leaderboard_id", 1),
+                ("due_at_unix_ms", 1),
+                ("owner_id", 1),
+            ],
+            unique: true,
+        }],
+    },
+    CollectionSpec {
+        name: TOURNAMENTS,
+        indexes: &[
+            IndexSpec {
+                name: "tournament_id_uq",
+                keys: &[("id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "tournament_lifecycle",
+                keys: &[("state", 1), ("ends_at_unix_ms", 1)],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        name: TOURNAMENT_ENTRIES,
+        indexes: &[
+            IndexSpec {
+                name: "tournament_entry_uq",
+                keys: &[("tournament_id", 1), ("user_id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "tournament_entry_order",
+                keys: &[("tournament_id", 1), ("registered_at_unix_ms", 1)],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        name: TOURNAMENT_RESULTS,
+        indexes: &[
+            IndexSpec {
+                name: "tournament_result_user_uq",
+                keys: &[("tournament_id", 1), ("user_id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "tournament_result_rank_uq",
+                keys: &[("tournament_id", 1), ("rank", 1)],
+                unique: true,
+            },
+        ],
+    },
+    CollectionSpec {
+        name: TOURNAMENT_SETTLEMENT_OUTBOX,
+        indexes: &[
+            IndexSpec {
+                name: "tournament_settlement_outbox_uq",
+                keys: &[("tournament_id", 1), ("due_at_unix_ms", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "tournament_settlement_outbox_pending_order",
+                keys: &[
+                    ("created_at_unix_ms", 1),
+                    ("tournament_id", 1),
+                    ("due_at_unix_ms", 1),
                 ],
                 unique: false,
             },
@@ -547,6 +677,21 @@ pub struct MongoLeaderboardsRepository {
     database: Database,
 }
 
+/// Durable MongoDB scheduler adapter. Every claim snapshots and clears the
+/// live records, then persists its epoch and callback outbox row in one
+/// replayable replica-set transaction.
+pub struct MongoLeaderboardResetRepository {
+    client: Client,
+    database: Database,
+}
+
+/// Durable MongoDB tournament adapter. Lifecycle mutations and epoch settlement
+/// are executed in replayable replica-set transactions.
+pub struct MongoTournamentsRepository {
+    client: Client,
+    database: Database,
+}
+
 /// Durable MongoDB notification store. Enqueues use a replica-set transaction
 /// so allocating the global id, retaining the bounded window, and evicting its
 /// oldest entries are one atomic transition.
@@ -744,6 +889,780 @@ impl MongoFriendsRepository {
 impl MongoLeaderboardsRepository {
     fn pooled(client: Client, database: Database) -> Self {
         Self { client, database }
+    }
+}
+
+impl MongoLeaderboardResetRepository {
+    fn pooled(client: Client, database: Database) -> Self {
+        Self { client, database }
+    }
+}
+
+impl MongoTournamentsRepository {
+    fn pooled(client: Client, database: Database) -> Self {
+        Self { client, database }
+    }
+}
+
+fn scheduler_i64(value: u64, field: &'static str) -> AppResult<i64> {
+    i64::try_from(value)
+        .map_err(|_| AppError::internal(format!("scheduler {field} is outside MongoDB range")))
+}
+
+fn scheduler_token(value: i64) -> AppResult<SchedulerFencingToken> {
+    u64::try_from(value)
+        .map(SchedulerFencingToken::new)
+        .map_err(|_| AppError::internal("invalid MongoDB scheduler fencing token"))
+}
+
+fn snapshot_record_doc(mut record: Document, due_at: i64) -> Document {
+    // A snapshot is a new immutable document, never an alias of the live row.
+    record.remove("_id");
+    record.insert("due_at_unix_ms", due_at);
+    record
+}
+
+fn snapshot_from_docs(
+    epoch: &ResetEpoch,
+    documents: Vec<Document>,
+) -> AppResult<LeaderboardResetSnapshot> {
+    let records = documents
+        .iter()
+        .map(leaderboard_record_from_doc)
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(LeaderboardResetSnapshot {
+        epoch: epoch.clone(),
+        records,
+    })
+}
+
+fn scheduler_lease_from_doc(document: &Document) -> AppResult<SchedulerLease> {
+    Ok(SchedulerLease::new(
+        document
+            .get_str("node_id")
+            .map_err(|_| AppError::internal("invalid MongoDB scheduler lease"))?
+            .to_owned(),
+        scheduler_token(
+            document
+                .get_i64("fencing_token")
+                .map_err(|_| AppError::internal("invalid MongoDB scheduler lease"))?,
+        )?,
+        TimestampMillis::from_unix_millis(
+            u64::try_from(
+                document
+                    .get_i64("expires_at_unix_ms")
+                    .map_err(|_| AppError::internal("invalid MongoDB scheduler lease"))?,
+            )
+            .map_err(|_| AppError::internal("invalid MongoDB scheduler lease"))?,
+        ),
+    ))
+}
+
+#[derive(Debug)]
+enum SchedulerTransactionError {
+    App(AppError),
+    Mongo(mongodb::error::Error),
+}
+
+impl From<AppError> for SchedulerTransactionError {
+    fn from(value: AppError) -> Self {
+        Self::App(value)
+    }
+}
+
+impl From<mongodb::error::Error> for SchedulerTransactionError {
+    fn from(value: mongodb::error::Error) -> Self {
+        Self::Mongo(value)
+    }
+}
+
+async fn scheduler_transaction<T, F>(
+    client: &Client,
+    database: &Database,
+    mut work: F,
+) -> AppResult<T>
+where
+    T: Send,
+    F: for<'a> FnMut(
+        &'a Database,
+        &'a mut ClientSession,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<T, SchedulerTransactionError>> + Send + 'a>,
+    >,
+{
+    for attempt in 0..TRANSACTION_RETRY_LIMIT {
+        let mut session = client.start_session().await.map_err(mongo_error)?;
+        session
+            .start_transaction()
+            .with_options(transaction_options())
+            .await
+            .map_err(mongo_error)?;
+        let value = match work(database, &mut session).await {
+            Ok(value) => value,
+            Err(SchedulerTransactionError::App(error)) => {
+                let _ = session.abort_transaction().await;
+                return Err(error);
+            }
+            Err(SchedulerTransactionError::Mongo(error))
+                if error.contains_label(TRANSIENT_TRANSACTION_ERROR)
+                    && attempt + 1 < TRANSACTION_RETRY_LIMIT =>
+            {
+                let _ = session.abort_transaction().await;
+                transaction_backoff(attempt).await;
+                continue;
+            }
+            Err(SchedulerTransactionError::Mongo(error)) => {
+                let _ = session.abort_transaction().await;
+                return Err(mongo_error(error));
+            }
+        };
+        for commit_attempt in 0..TRANSACTION_RETRY_LIMIT {
+            match session.commit_transaction().await {
+                Ok(()) => return Ok(value),
+                Err(error)
+                    if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT)
+                        && commit_attempt + 1 < TRANSACTION_RETRY_LIMIT =>
+                {
+                    transaction_backoff(commit_attempt).await;
+                }
+                Err(error)
+                    if error.contains_label(TRANSIENT_TRANSACTION_ERROR)
+                        && attempt + 1 < TRANSACTION_RETRY_LIMIT =>
+                {
+                    let _ = session.abort_transaction().await;
+                    transaction_backoff(attempt).await;
+                    break;
+                }
+                Err(error) => return Err(mongo_error(error)),
+            }
+        }
+    }
+    unreachable!("bounded scheduler transaction retry returns or continues")
+}
+
+#[async_trait]
+impl LeaderboardResetRepository for MongoLeaderboardResetRepository {
+    async fn acquire_lease(
+        &self,
+        node_id: &str,
+        now: TimestampMillis,
+        ttl: DurationMillis,
+    ) -> AppResult<Option<SchedulerLease>> {
+        let expires_at = scheduler_i64(now.checked_add(ttl)?.unix_millis(), "lease expiry")?;
+        let now = scheduler_i64(now.unix_millis(), "timestamp")?;
+        let leases = self
+            .database
+            .collection::<Document>(LEADERBOARD_RESET_SCHEDULER_LEASE);
+        let filter = doc! {
+            "lease_key": "leaderboards",
+            "$or": [
+                { "expires_at_unix_ms": { "$lte": now } },
+                { "node_id": node_id },
+            ],
+        };
+        // A matching live owner renews without changing its token; an expired
+        // owner is replaced with a strictly higher token. The unique lease_key
+        // index turns an attempted upsert while another live node owns the row
+        // into the normal no-lease result below.
+        let update = vec![doc! { "$set": {
+            "lease_key": "leaderboards",
+            "node_id": node_id,
+            "fencing_token": { "$cond": [
+                { "$lte": ["$expires_at_unix_ms", now] },
+                { "$add": [{ "$ifNull": ["$fencing_token", 0_i64] }, 1_i64] },
+                { "$ifNull": ["$fencing_token", 1_i64] },
+            ] },
+            "expires_at_unix_ms": expires_at,
+        }}];
+        let result = leases
+            .find_one_and_update(filter, update)
+            .upsert(true)
+            .return_document(ReturnDocument::After)
+            .await;
+        match result {
+            Ok(Some(document)) => scheduler_lease_from_doc(&document).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) if duplicate(&error) => Ok(None),
+            Err(error) => Err(mongo_error(error)),
+        }
+    }
+
+    async fn claim_epoch(
+        &self,
+        epoch: ResetEpoch,
+        token: SchedulerFencingToken,
+        now: TimestampMillis,
+    ) -> AppResult<bool> {
+        let now = scheduler_i64(now.unix_millis(), "timestamp")?;
+        let due_at = scheduler_i64(epoch.due_at.unix_millis(), "epoch timestamp")?;
+        let token = scheduler_i64(token.get(), "fencing token")?;
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            let epoch = epoch.clone();
+            Box::pin(async move {
+                let lease = database.collection::<Document>(LEADERBOARD_RESET_SCHEDULER_LEASE);
+                // This no-op value write is intentional: it makes the fence
+                // document part of the transaction's write set, so a concurrent
+                // lease takeover conflicts and retries rather than allowing a
+                // stale snapshot to stage an epoch.
+                let fenced = lease
+                    .update_one(
+                        doc! {
+                            "lease_key": "leaderboards",
+                            "fencing_token": token,
+                            "expires_at_unix_ms": { "$gt": now },
+                        },
+                        doc! { "$set": { "fencing_token": token } },
+                    )
+                    .session(&mut *session)
+                    .await?;
+                if fenced.matched_count == 0 {
+                    return Err(AppError::conflict("scheduler lease is no longer current").into());
+                }
+                let epochs = database.collection::<Document>(LEADERBOARD_RESET_EPOCHS);
+                match epochs
+                    .insert_one(doc! {
+                        "leaderboard_id": &epoch.leaderboard_id,
+                        "due_at_unix_ms": due_at,
+                        "fencing_token": token,
+                        "claimed_at_unix_ms": now,
+                    })
+                    .session(&mut *session)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) if duplicate(&error) => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                }
+                let live_records = database.collection::<Document>("leaderboard_records");
+                let mut cursor = live_records
+                    .find(doc! { "leaderboard_id": &epoch.leaderboard_id })
+                    .sort(doc! { "owner_id": 1 })
+                    .session(&mut *session)
+                    .await?;
+                let live = cursor.stream(&mut *session).try_collect::<Vec<_>>().await?;
+                let snapshot_records = live
+                    .into_iter()
+                    .map(|record| snapshot_record_doc(record, due_at))
+                    .collect::<Vec<_>>();
+                if !snapshot_records.is_empty() {
+                    database
+                        .collection::<Document>(LEADERBOARD_RESET_SNAPSHOT_RECORDS)
+                        .insert_many(snapshot_records)
+                        .session(&mut *session)
+                        .await?;
+                }
+                live_records
+                    .delete_many(doc! { "leaderboard_id": &epoch.leaderboard_id })
+                    .session(&mut *session)
+                    .await?;
+                database
+                    .collection::<Document>(LEADERBOARD_RESET_OUTBOX)
+                    .insert_one(doc! {
+                        "leaderboard_id": &epoch.leaderboard_id,
+                        "due_at_unix_ms": due_at,
+                        "fencing_token": token,
+                        "created_at_unix_ms": now,
+                    })
+                    .session(&mut *session)
+                    .await?;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    async fn snapshot(&self, epoch: &ResetEpoch) -> AppResult<Option<LeaderboardResetSnapshot>> {
+        let due_at = scheduler_i64(epoch.due_at.unix_millis(), "epoch timestamp")?;
+        let committed = self
+            .database
+            .collection::<Document>(LEADERBOARD_RESET_EPOCHS)
+            .find_one(doc! {
+                "leaderboard_id": &epoch.leaderboard_id,
+                "due_at_unix_ms": due_at,
+            })
+            .await
+            .map_err(mongo_error)?;
+        if committed.is_none() {
+            return Ok(None);
+        }
+        let records = self
+            .database
+            .collection::<Document>(LEADERBOARD_RESET_SNAPSHOT_RECORDS)
+            .find(doc! {
+                "leaderboard_id": &epoch.leaderboard_id,
+                "due_at_unix_ms": due_at,
+            })
+            .sort(doc! { "owner_id": 1 })
+            .await
+            .map_err(mongo_error)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(mongo_error)?;
+        snapshot_from_docs(epoch, records).map(Some)
+    }
+
+    async fn pending_outbox(&self, limit: usize) -> AppResult<Vec<ResetOutboxRecord>> {
+        let limit =
+            i64::try_from(limit).map_err(|_| AppError::validation("outbox limit out of range"))?;
+        let documents = self
+            .database
+            .collection::<Document>(LEADERBOARD_RESET_OUTBOX)
+            .find(doc! {})
+            .sort(doc! { "created_at_unix_ms": 1, "leaderboard_id": 1, "due_at_unix_ms": 1 })
+            .limit(limit)
+            .await
+            .map_err(mongo_error)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(mongo_error)?;
+        documents
+            .iter()
+            .map(|document| {
+                Ok(ResetOutboxRecord {
+                    epoch: ResetEpoch::new(
+                        document
+                            .get_str("leaderboard_id")
+                            .map_err(|_| AppError::internal("invalid MongoDB scheduler outbox"))?
+                            .to_owned(),
+                        TimestampMillis::from_unix_millis(
+                            u64::try_from(document.get_i64("due_at_unix_ms").map_err(|_| {
+                                AppError::internal("invalid MongoDB scheduler outbox")
+                            })?)
+                            .map_err(|_| AppError::internal("invalid MongoDB scheduler outbox"))?,
+                        ),
+                    ),
+                    fencing_token: scheduler_token(
+                        document
+                            .get_i64("fencing_token")
+                            .map_err(|_| AppError::internal("invalid MongoDB scheduler outbox"))?,
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    async fn acknowledge_outbox(&self, epoch: &ResetEpoch) -> AppResult<()> {
+        self.database
+            .collection::<Document>(LEADERBOARD_RESET_OUTBOX)
+            .delete_one(doc! {
+                "leaderboard_id": &epoch.leaderboard_id,
+                "due_at_unix_ms": scheduler_i64(epoch.due_at.unix_millis(), "epoch timestamp")?,
+            })
+            .await
+            .map_err(mongo_error)?;
+        Ok(())
+    }
+}
+
+fn mongo_tournament(doc: &Document) -> AppResult<Tournament> {
+    let state = TournamentState::from_token(
+        doc.get_str("state")
+            .map_err(|_| AppError::internal("invalid MongoDB tournament"))?,
+    )?;
+    let millis = |key| {
+        doc.get_i64(key)
+            .map_err(|_| AppError::internal("invalid MongoDB tournament"))
+            .and_then(|value| {
+                u64::try_from(value)
+                    .map(TimestampMillis::from_unix_millis)
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament"))
+            })
+    };
+    let leaderboard_id = doc
+        .get_str("leaderboard_id")
+        .map_err(|_| AppError::internal("invalid MongoDB tournament"))?
+        .to_owned();
+    Ok(Tournament {
+        id: doc
+            .get_str("id")
+            .map_err(|_| AppError::internal("invalid MongoDB tournament"))?
+            .to_owned(),
+        leaderboard_id: leaderboard_id.clone(),
+        state,
+        registration_opens_at: millis("registration_opens_at_unix_ms")?,
+        registration_closes_at: millis("registration_closes_at_unix_ms")?,
+        starts_at: millis("starts_at_unix_ms")?,
+        ends_at: millis("ends_at_unix_ms")?,
+        settled_epoch: doc
+            .get_i64("settled_due_at_unix_ms")
+            .ok()
+            .map(|due| {
+                u64::try_from(due)
+                    .map(|v| ResetEpoch::new(leaderboard_id, TimestampMillis::from_unix_millis(v)))
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament"))
+            })
+            .transpose()?,
+        created_at: millis("created_at_unix_ms")?,
+        updated_at: millis("updated_at_unix_ms")?,
+    })
+}
+
+/// Materialize a standalone tournament projection from immutable reset records.
+/// Only ranking columns are copied, so later live-leaderboard changes cannot
+/// alter already-settled tournament results.
+fn tournament_results_from_snapshot(
+    tournament_id: &str,
+    sort: SortOrder,
+    snapshot: Vec<Document>,
+) -> AppResult<Vec<Document>> {
+    let mut rows = snapshot
+        .into_iter()
+        .map(|document| {
+            Ok((
+                document
+                    .get_str("owner_id")
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament snapshot"))?
+                    .to_owned(),
+                document
+                    .get_i64("score")
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament snapshot"))?,
+                document
+                    .get_i64("subscore")
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament snapshot"))?,
+            ))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    rows.sort_by(|left, right| {
+        let score = match sort {
+            SortOrder::Asc => left.1.cmp(&right.1),
+            SortOrder::Desc => right.1.cmp(&left.1),
+        };
+        let subscore = match sort {
+            SortOrder::Asc => left.2.cmp(&right.2),
+            SortOrder::Desc => right.2.cmp(&left.2),
+        };
+        score.then(subscore).then_with(|| left.0.cmp(&right.0))
+    });
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, (user_id, score, subscore))| {
+            let rank = i64::try_from(
+                index
+                    .checked_add(1)
+                    .ok_or_else(|| AppError::internal("tournament rank out of range"))?,
+            )
+            .map_err(|_| AppError::internal("tournament rank out of range"))?;
+            Ok(doc! {
+                "tournament_id": tournament_id,
+                "user_id": user_id,
+                "rank": rank,
+                "score": score,
+                "subscore": subscore,
+            })
+        })
+        .collect()
+}
+
+#[async_trait]
+impl TournamentsRepository for MongoTournamentsRepository {
+    async fn create(
+        &self,
+        request: CreateTournamentRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Tournament> {
+        validate_schedule(&request)?;
+        let now = scheduler_i64(now.unix_millis(), "tournament timestamp")?;
+        let doc = doc! { "id": &request.id, "leaderboard_id": &request.leaderboard_id, "state": "draft", "registration_opens_at_unix_ms": scheduler_i64(request.registration_opens_at.unix_millis(), "tournament timestamp")?, "registration_closes_at_unix_ms": scheduler_i64(request.registration_closes_at.unix_millis(), "tournament timestamp")?, "starts_at_unix_ms": scheduler_i64(request.starts_at.unix_millis(), "tournament timestamp")?, "ends_at_unix_ms": scheduler_i64(request.ends_at.unix_millis(), "tournament timestamp")?, "created_at_unix_ms": now, "updated_at_unix_ms": now };
+        self.database
+            .collection::<Document>(TOURNAMENTS)
+            .insert_one(doc)
+            .await
+            .map_err(|error| mongo_write_error(error, "tournament already exists"))?;
+        self.get(&request.id)
+            .await?
+            .ok_or_else(|| AppError::internal("created tournament was not found"))
+    }
+    async fn get(&self, id: &str) -> AppResult<Option<Tournament>> {
+        self.database
+            .collection::<Document>(TOURNAMENTS)
+            .find_one(doc! {"id": id})
+            .await
+            .map_err(mongo_error)?
+            .as_ref()
+            .map(mongo_tournament)
+            .transpose()
+    }
+    async fn list(&self) -> AppResult<Vec<Tournament>> {
+        let mut cursor = self
+            .database
+            .collection::<Document>(TOURNAMENTS)
+            .find(doc! {})
+            .sort(doc! {"starts_at_unix_ms": 1, "id": 1})
+            .await
+            .map_err(mongo_error)?;
+        let mut tournaments = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            tournaments.push(mongo_tournament(&document)?);
+        }
+        Ok(tournaments)
+    }
+    async fn transition(
+        &self,
+        id: &str,
+        to: TournamentState,
+        now: TimestampMillis,
+    ) -> AppResult<Tournament> {
+        let current = self
+            .get(id)
+            .await?
+            .ok_or_else(|| AppError::not_found("no such tournament"))?;
+        if !can_transition(current.state, to) {
+            return Err(AppError::conflict("illegal tournament state transition"));
+        }
+        let update = self.database.collection::<Document>(TOURNAMENTS).update_one(doc! {"id": id, "state": current.state.as_str()}, doc! {"$set": {"state": to.as_str(), "updated_at_unix_ms": scheduler_i64(now.unix_millis(), "tournament timestamp")?}}).await.map_err(mongo_error)?;
+        if update.matched_count != 1 {
+            return Err(AppError::conflict("concurrent tournament state transition"));
+        }
+        Ok(Tournament {
+            state: to,
+            updated_at: now,
+            ..current
+        })
+    }
+    async fn register(
+        &self,
+        tournament_id: &str,
+        user_id: &str,
+        now: TimestampMillis,
+    ) -> AppResult<TournamentEntry> {
+        let tournament = self
+            .get(tournament_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("no such tournament"))?;
+        if tournament.state != TournamentState::RegistrationOpen
+            || now < tournament.registration_opens_at
+            || now >= tournament.registration_closes_at
+        {
+            return Err(AppError::conflict("tournament registration is closed"));
+        }
+        self.database.collection::<Document>(TOURNAMENT_ENTRIES).insert_one(doc! {"tournament_id": tournament_id, "user_id": user_id, "registered_at_unix_ms": scheduler_i64(now.unix_millis(), "tournament timestamp")?}).await.map_err(|error| mongo_write_error(error, "tournament entry already exists"))?;
+        Ok(TournamentEntry {
+            tournament_id: tournament_id.to_owned(),
+            user_id: user_id.to_owned(),
+            registered_at: now,
+        })
+    }
+    async fn entries(&self, tournament_id: &str) -> AppResult<Vec<TournamentEntry>> {
+        let mut cursor = self
+            .database
+            .collection::<Document>(TOURNAMENT_ENTRIES)
+            .find(doc! {"tournament_id": tournament_id})
+            .sort(doc! {"user_id": 1})
+            .await
+            .map_err(mongo_error)?;
+        let mut rows = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_error)? {
+            rows.push(TournamentEntry {
+                tournament_id: tournament_id.to_owned(),
+                user_id: doc
+                    .get_str("user_id")
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament entry"))?
+                    .to_owned(),
+                registered_at: TimestampMillis::from_unix_millis(
+                    u64::try_from(
+                        doc.get_i64("registered_at_unix_ms")
+                            .map_err(|_| AppError::internal("invalid MongoDB tournament entry"))?,
+                    )
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament entry"))?,
+                ),
+            });
+        }
+        Ok(rows)
+    }
+    async fn results(&self, tournament_id: &str) -> AppResult<Vec<TournamentResult>> {
+        let mut cursor = self
+            .database
+            .collection::<Document>(TOURNAMENT_RESULTS)
+            .find(doc! {"tournament_id": tournament_id})
+            .sort(doc! {"rank": 1, "user_id": 1})
+            .await
+            .map_err(mongo_error)?;
+        let mut rows = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_error)? {
+            rows.push(TournamentResult {
+                tournament_id: tournament_id.to_owned(),
+                user_id: doc
+                    .get_str("user_id")
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament result"))?
+                    .to_owned(),
+                rank: u64::try_from(
+                    doc.get_i64("rank")
+                        .map_err(|_| AppError::internal("invalid MongoDB tournament result"))?,
+                )
+                .map_err(|_| AppError::internal("invalid MongoDB tournament result"))?,
+                score: doc
+                    .get_i64("score")
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament result"))?,
+                subscore: doc
+                    .get_i64("subscore")
+                    .map_err(|_| AppError::internal("invalid MongoDB tournament result"))?,
+            });
+        }
+        Ok(rows)
+    }
+    async fn settle_from_epoch(
+        &self,
+        id: &str,
+        epoch: ResetEpoch,
+        now: TimestampMillis,
+    ) -> AppResult<bool> {
+        let id = id.to_owned();
+        let due_at = scheduler_i64(epoch.due_at.unix_millis(), "epoch timestamp")?;
+        let now = scheduler_i64(now.unix_millis(), "tournament timestamp")?;
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            let id = id.clone();
+            let epoch = epoch.clone();
+            Box::pin(async move {
+                let tournaments = database.collection::<Document>(TOURNAMENTS);
+                let tournament_doc = tournaments
+                    .find_one(doc! { "id": &id })
+                    .session(&mut *session)
+                    .await?
+                    .ok_or_else(|| AppError::not_found("no such tournament"))?;
+                let tournament = mongo_tournament(&tournament_doc)?;
+                if tournament.state == TournamentState::Completed
+                    && tournament.settled_epoch.as_ref() == Some(&epoch)
+                {
+                    return Ok(false);
+                }
+                if tournament.state != TournamentState::Running
+                    || tournament.leaderboard_id != epoch.leaderboard_id
+                {
+                    return Err(AppError::conflict(
+                        "tournament cannot settle from this reset epoch",
+                    )
+                    .into());
+                }
+
+                let epochs = database.collection::<Document>(LEADERBOARD_RESET_EPOCHS);
+                if epochs
+                    .find_one(doc! {
+                        "leaderboard_id": &epoch.leaderboard_id,
+                        "due_at_unix_ms": due_at,
+                    })
+                    .session(&mut *session)
+                    .await?
+                    .is_none()
+                {
+                    return Err(
+                        AppError::conflict("tournament reset epoch is not committed").into(),
+                    );
+                }
+                let leaderboard = database
+                    .collection::<Document>("leaderboards")
+                    .find_one(doc! { "id": &epoch.leaderboard_id })
+                    .session(&mut *session)
+                    .await?
+                    .ok_or_else(|| AppError::conflict("tournament leaderboard does not exist"))?;
+                let sort = leaderboard_definition_from_doc(&leaderboard)?.sort;
+                let snapshots = database.collection::<Document>(LEADERBOARD_RESET_SNAPSHOT_RECORDS);
+                let snapshot = snapshots
+                    .find(doc! {
+                        "leaderboard_id": &epoch.leaderboard_id,
+                        "due_at_unix_ms": due_at,
+                    })
+                    .session(&mut *session)
+                    .await?
+                    .stream(&mut *session)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                let results = tournament_results_from_snapshot(&id, sort, snapshot)?;
+                if !results.is_empty() {
+                    database
+                        .collection::<Document>(TOURNAMENT_RESULTS)
+                        .insert_many(results)
+                        .session(&mut *session)
+                        .await?;
+                }
+                database
+                    .collection::<Document>(TOURNAMENT_SETTLEMENT_OUTBOX)
+                    .insert_one(doc! {
+                        "tournament_id": &id,
+                        "leaderboard_id": &epoch.leaderboard_id,
+                        "due_at_unix_ms": due_at,
+                        "created_at_unix_ms": now,
+                    })
+                    .session(&mut *session)
+                    .await?;
+                let update = tournaments
+                    .update_one(
+                        doc! { "id": &id, "state": TournamentState::Running.as_str() },
+                        doc! { "$set": {
+                            "state": TournamentState::Completed.as_str(),
+                            "settled_due_at_unix_ms": due_at,
+                            "updated_at_unix_ms": now,
+                        }},
+                    )
+                    .session(&mut *session)
+                    .await?;
+                if update.matched_count != 1 {
+                    return Err(AppError::conflict("concurrent tournament settlement").into());
+                }
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    async fn pending_settlement_outbox(
+        &self,
+        limit: usize,
+    ) -> AppResult<Vec<TournamentSettlementOutboxRecord>> {
+        let limit =
+            i64::try_from(limit).map_err(|_| AppError::validation("outbox limit is too large"))?;
+        let mut cursor = self
+            .database
+            .collection::<Document>(TOURNAMENT_SETTLEMENT_OUTBOX)
+            .find(doc! {})
+            .sort(doc! { "created_at_unix_ms": 1, "tournament_id": 1, "due_at_unix_ms": 1 })
+            .limit(limit)
+            .await
+            .map_err(mongo_error)?;
+        let mut records = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            records.push(TournamentSettlementOutboxRecord {
+                tournament_id: document
+                    .get_str("tournament_id")
+                    .map_err(|_| {
+                        AppError::internal("invalid MongoDB tournament settlement outbox")
+                    })?
+                    .to_owned(),
+                epoch: ResetEpoch::new(
+                    document
+                        .get_str("leaderboard_id")
+                        .map_err(|_| {
+                            AppError::internal("invalid MongoDB tournament settlement outbox")
+                        })?
+                        .to_owned(),
+                    TimestampMillis::from_unix_millis(
+                        u64::try_from(document.get_i64("due_at_unix_ms").map_err(|_| {
+                            AppError::internal("invalid MongoDB tournament settlement outbox")
+                        })?)
+                        .map_err(|_| {
+                            AppError::internal("invalid MongoDB tournament settlement outbox")
+                        })?,
+                    ),
+                ),
+            });
+        }
+        Ok(records)
+    }
+
+    async fn acknowledge_settlement_outbox(
+        &self,
+        tournament_id: &str,
+        epoch: &ResetEpoch,
+    ) -> AppResult<()> {
+        self.database
+            .collection::<Document>(TOURNAMENT_SETTLEMENT_OUTBOX)
+            .delete_one(doc! {
+                "tournament_id": tournament_id,
+                "leaderboard_id": &epoch.leaderboard_id,
+                "due_at_unix_ms": scheduler_i64(epoch.due_at.unix_millis(), "epoch timestamp")?,
+            })
+            .await
+            .map_err(mongo_error)?;
+        Ok(())
     }
 }
 
@@ -5209,6 +6128,24 @@ impl MongoDatabase {
         MongoSchemaPlan::foundation()
     }
 
+    /// Pooled durable tournament repository.
+    #[must_use]
+    pub fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
+        Arc::new(MongoTournamentsRepository::pooled(
+            self.client.clone(),
+            self.database.clone(),
+        ))
+    }
+
+    /// Pooled durable repository for leaderboard reset scheduler state.
+    #[must_use]
+    pub fn leaderboard_reset_repository(&self) -> Arc<dyn LeaderboardResetRepository> {
+        Arc::new(MongoLeaderboardResetRepository::pooled(
+            self.client.clone(),
+            self.database.clone(),
+        ))
+    }
+
     /// Pooled Mongo-backed chat repository handle.
     #[must_use]
     pub fn mongo_chat_repository(&self) -> MongoChatRepository {
@@ -5314,6 +6251,25 @@ impl MongoDatabase {
     #[doc(hidden)]
     pub async fn clear_leaderboards_data_for_tests(&self) -> AppResult<()> {
         for collection in ["leaderboards", "leaderboard_records"] {
+            self.database
+                .collection::<Document>(collection)
+                .delete_many(doc! {})
+                .await
+                .map_err(mongo_error)?;
+        }
+        Ok(())
+    }
+
+    /// Clear only scheduler lease, epoch, and outbox documents in an isolated
+    /// MongoDB integration database.
+    #[doc(hidden)]
+    pub async fn clear_leaderboard_reset_data_for_tests(&self) -> AppResult<()> {
+        for collection in [
+            LEADERBOARD_RESET_OUTBOX,
+            LEADERBOARD_RESET_SNAPSHOT_RECORDS,
+            LEADERBOARD_RESET_EPOCHS,
+            LEADERBOARD_RESET_SCHEDULER_LEASE,
+        ] {
             self.database
                 .collection::<Document>(collection)
                 .delete_many(doc! {})
@@ -5692,6 +6648,12 @@ impl Backend for MongoDatabase {
             self.database.clone(),
         ))
     }
+    fn leaderboard_reset_repository(&self) -> Arc<dyn LeaderboardResetRepository> {
+        MongoDatabase::leaderboard_reset_repository(self)
+    }
+    fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
+        MongoDatabase::tournaments_repository(self)
+    }
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {
         Arc::new(self.mongo_chat_repository())
     }
@@ -5842,9 +6804,30 @@ mod tests {
     #[test]
     fn foundation_manifest_covers_every_existing_domain_projection() {
         let plan = MongoSchemaPlan::foundation();
-        assert_eq!(plan.version, 2);
-        assert_eq!(plan.collections, 23);
-        assert!(plan.indexes >= 41);
+        assert_eq!(plan.version, 5);
+        assert_eq!(plan.collections, 31);
+        assert!(plan.indexes >= 48);
+    }
+
+    #[test]
+    fn tournament_results_copy_snapshot_in_leaderboard_order_with_stable_ties() {
+        let snapshot = vec![
+            doc! { "owner_id": "alice", "score": 10_i64, "subscore": 1_i64 },
+            doc! { "owner_id": "zoe", "score": 20_i64, "subscore": 2_i64 },
+            doc! { "owner_id": "bob", "score": 20_i64, "subscore": 2_i64 },
+        ];
+
+        let results = tournament_results_from_snapshot("weekly", SortOrder::Desc, snapshot)
+            .expect("valid snapshot");
+
+        assert_eq!(
+            results,
+            vec![
+                doc! { "tournament_id": "weekly", "user_id": "bob", "rank": 1_i64, "score": 20_i64, "subscore": 2_i64 },
+                doc! { "tournament_id": "weekly", "user_id": "zoe", "rank": 2_i64, "score": 20_i64, "subscore": 2_i64 },
+                doc! { "tournament_id": "weekly", "user_id": "alice", "rank": 3_i64, "score": 10_i64, "subscore": 1_i64 },
+            ]
+        );
     }
 
     #[test]

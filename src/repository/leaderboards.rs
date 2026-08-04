@@ -78,6 +78,8 @@ pub enum Operator {
     Set,
     /// Add the submission to the existing totals.
     Incr,
+    /// Subtract the submission from existing totals, saturating at zero.
+    Decr,
 }
 
 impl Operator {
@@ -89,6 +91,7 @@ impl Operator {
             Self::Best => "best",
             Self::Set => "set",
             Self::Incr => "incr",
+            Self::Decr => "decr",
         }
     }
 
@@ -101,6 +104,7 @@ impl Operator {
             "best" => Ok(Self::Best),
             "set" => Ok(Self::Set),
             "incr" => Ok(Self::Incr),
+            "decr" => Ok(Self::Decr),
             other => Err(AppError::internal(format!(
                 "unknown leaderboard operator token `{other}`"
             ))),
@@ -117,10 +121,8 @@ pub struct LeaderboardDefinition {
     pub sort: SortOrder,
     /// How a new submission combines with the existing record.
     pub operator: Operator,
-    /// Free-form reset schedule string (e.g. a cron expression).
-    ///
-    /// Stored verbatim and returned as-is. Citadel does not parse or execute it
-    /// yet; see `docs/architecture/technical-debt.md`.
+    /// Strict UTC five-field CRON schedule normalized to the scheduler's
+    /// seconds-first grammar, or `None` for a leaderboard without resets.
     pub reset_schedule: Option<String>,
     /// When the leaderboard was created.
     pub created_at: TimestampMillis,
@@ -207,7 +209,8 @@ pub struct CreateLeaderboardRequest {
     pub sort: SortOrder,
     /// How a new submission combines with the existing record.
     pub operator: Operator,
-    /// Free-form reset schedule string, stored but not executed.
+    /// Strict UTC five-field CRON schedule. The service normalizes it to the
+    /// scheduler's seconds-first grammar before persistence.
     pub reset_schedule: Option<String>,
 }
 
@@ -264,6 +267,14 @@ pub fn apply_submission(
             user_id: existing.user_id.clone(),
             score: existing.score.saturating_add(score),
             subscore: existing.subscore.saturating_add(subscore),
+            metadata,
+            updated_at: now,
+            submissions,
+        },
+        Operator::Decr => LeaderboardRecord {
+            user_id: existing.user_id.clone(),
+            score: existing.score.saturating_sub(score),
+            subscore: existing.subscore.saturating_sub(subscore),
             metadata,
             updated_at: now,
             submissions,
@@ -637,6 +648,24 @@ mod tests {
         );
         assert_eq!(next.score, 8);
         assert_eq!(next.subscore, 3);
+        assert_eq!(next.submissions, 2);
+    }
+
+    #[test]
+    fn decr_operator_subtracts_existing_score_components() {
+        let existing = record("u1", 5, 1);
+        let next = apply_submission(
+            Operator::Decr,
+            SortOrder::Desc,
+            Some(&existing),
+            "u1",
+            8,
+            2,
+            None,
+            ts(2),
+        );
+        assert_eq!(next.score, -3);
+        assert_eq!(next.subscore, -1);
         assert_eq!(next.submissions, 2);
     }
 

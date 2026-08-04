@@ -136,6 +136,9 @@ const ON_LEAVE_KEY: &str = "citadel.on_leave";
 /// Registry key holding the `on_tick` game-loop handler (a single function).
 const ON_TICK_KEY: &str = "citadel.on_tick";
 
+/// Registry key holding the `on_leaderboard_reset` callback (a single function).
+const ON_LEADERBOARD_RESET_KEY: &str = "citadel.on_leaderboard_reset";
+
 /// Registry key holding the `on_room_create` handler (returns a room label spec).
 const ON_ROOM_CREATE_KEY: &str = "citadel.on_room_create";
 
@@ -840,6 +843,7 @@ impl LuaRuntime {
             ("on_join", ON_JOIN_KEY),
             ("on_leave", ON_LEAVE_KEY),
             ("on_tick", ON_TICK_KEY),
+            ("on_leaderboard_reset", ON_LEADERBOARD_RESET_KEY),
             ("on_room_create", ON_ROOM_CREATE_KEY),
             ("on_room_join", ON_ROOM_JOIN_KEY),
             ("before_realtime", BEFORE_REALTIME_KEY),
@@ -1172,6 +1176,49 @@ impl LuaRuntime {
             result?;
             Ok(true)
         });
+    }
+
+    /// Run the `on_join`/`on_leave` handler for `sender` and return its commands.
+    ///
+    /// Shares the exact isolation, per-invocation deadline, and command-sink
+    /// machinery as [`dispatch`](LuaRuntime::dispatch): a slow or erroring
+    /// lifecycle handler cannot wedge the node. When no handler is registered
+    /// this is a no-op returning no commands.
+    pub fn on_leaderboard_reset(
+        &self,
+        epoch: &crate::leaderboard_scheduler::ResetEpoch,
+        fencing_token: crate::leaderboard_scheduler::SchedulerFencingToken,
+    ) -> AppResult<()> {
+        let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+        let lua = &guard.lua;
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_sink(lua);
+            set_deadline(lua, Some(Instant::now() + self.budget));
+            let result = (|| -> mlua::Result<()> {
+                let Some(handler) =
+                    lua.named_registry_value::<Option<Function>>(ON_LEADERBOARD_RESET_KEY)?
+                else {
+                    return Ok(());
+                };
+                let ctx = lua.create_table()?;
+                ctx.set("leaderboard_id", epoch.leaderboard_id.clone())?;
+                ctx.set("due_at_unix_ms", epoch.due_at.unix_millis())?;
+                ctx.set("fencing_token", fencing_token.get())?;
+                handler.call::<()>(ctx)
+            })();
+            set_deadline(lua, None);
+            result
+        }));
+        clear_sink(lua);
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(AppError::internal("leaderboard reset callback failed")
+                .with_detail(error.to_string())),
+            Err(_) => {
+                set_deadline(lua, None);
+                Err(AppError::internal("leaderboard reset callback panicked"))
+            }
+        }
     }
 
     /// Run the `on_join`/`on_leave` handler for `sender` and return its commands.
@@ -1595,6 +1642,14 @@ impl Runtime for LuaRuntime {
         LuaRuntime::dispatch_lifecycle(self, hook, sender, user_id)
     }
 
+    fn on_leaderboard_reset(
+        &self,
+        epoch: &crate::leaderboard_scheduler::ResetEpoch,
+        fencing_token: crate::leaderboard_scheduler::SchedulerFencingToken,
+    ) -> AppResult<()> {
+        LuaRuntime::on_leaderboard_reset(self, epoch, fencing_token)
+    }
+
     fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
         LuaRuntime::tick(self, dt, budget)
     }
@@ -2002,6 +2057,11 @@ fn install_host_api(
     // RPC handlers are keyed by method name in their own registry table.
     let rpc_handlers = lua.create_table()?;
     lua.set_named_registry_value(RPC_HANDLERS_KEY, rpc_handlers)?;
+    let on_leaderboard_reset = lua.create_function(|lua, handler: Function| {
+        lua.set_named_registry_value(ON_LEADERBOARD_RESET_KEY, handler)
+    })?;
+    citadel.set("on_leaderboard_reset", on_leaderboard_reset)?;
+
     let on_rpc = lua.create_function(|lua, (method, handler): (String, Function)| {
         let handlers: Table = lua.named_registry_value(RPC_HANDLERS_KEY)?;
         handlers.set(method, handler)?;
@@ -2753,6 +2813,7 @@ fn install_host_api(
 
     for (name, domain) in [
         ("leaderboards_call", "leaderboards"),
+        ("tournaments_call", "tournaments"),
         ("chat_call", "chat"),
         ("wallet_call", "wallet"),
     ] {
@@ -2767,6 +2828,11 @@ fn install_host_api(
                     let host = domain_host(lua)?;
                     let call = match domain {
                         "leaderboards" => host.leaderboards_call(
+                            &actor.to_string_lossy(),
+                            &operation.to_string_lossy(),
+                            &payload_json.to_string_lossy(),
+                        ),
+                        "tournaments" => host.tournaments_call(
                             &actor.to_string_lossy(),
                             &operation.to_string_lossy(),
                             &payload_json.to_string_lossy(),
@@ -4291,6 +4357,7 @@ mod tests {
             "on_join",
             "on_leave",
             "on_tick",
+            "on_leaderboard_reset",
             "on_rpc",
             "on_room_create",
             "on_room_join",
@@ -4321,6 +4388,7 @@ mod tests {
             "notifications.mark_read",
             "groups.call",
             "leaderboards.call",
+            "tournaments.call",
             "chat.call",
             "wallet.call",
             "storage.read",
@@ -4354,12 +4422,12 @@ mod tests {
         use crate::repository::{
             InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
             InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryStorageRepository,
-            InMemoryWalletRepository,
+            InMemoryTournamentsRepository, InMemoryWalletRepository,
         };
         use crate::runtime::ServiceDomainHost;
         use crate::services::{
             ChatChannelAuthorizer, ChatService, FriendsService, GroupsService, LeaderboardService,
-            PlayerNotificationService, WalletService,
+            PlayerNotificationService, TournamentDiscoveryService, WalletService,
         };
         use crate::storage::{
             Collection, StorageIndexDefinition, StorageIndexField, StorageIndexName,
@@ -4392,6 +4460,9 @@ mod tests {
                 .with_groups(groups)
                 .with_leaderboards(Arc::new(LeaderboardService::new(Arc::new(
                     InMemoryLeaderboardsRepository::new(),
+                ))))
+                .with_tournaments(Arc::new(TournamentDiscoveryService::new(Arc::new(
+                    InMemoryTournamentsRepository::new(),
                 ))))
                 .with_chat(chat)
                 .with_chat_authorizer(authorizer)
@@ -4436,8 +4507,9 @@ mod tests {
                 local read = citadel.notifications_mark_read(u, { notification.id })
                 local group = citadel.groups_call(u, "create", '{"name":"probers"}')
                 local boards = citadel.leaderboards_call(u, "list", "{}")
+                local tournaments = citadel.tournaments_call(u, "list", "{}")
                 local wallet = citadel.wallet_call(u, "balances", "{}")
-                return added .. "|" .. n1 .. "|" .. blocked .. "|" .. tostring(removed) .. "|" .. n2 .. "|" .. #page.items .. "|" .. #read .. "|" .. tostring(string.find(group, "probers") ~= nil) .. "|" .. tostring(boards == "[]") .. "|" .. tostring(string.find(chat, '"id":1') ~= nil) .. "|" .. tostring(wallet == "{}")
+                return added .. "|" .. n1 .. "|" .. blocked .. "|" .. tostring(removed) .. "|" .. n2 .. "|" .. #page.items .. "|" .. #read .. "|" .. tostring(string.find(group, "probers") ~= nil) .. "|" .. tostring(boards == "[]") .. "|" .. tostring(tournaments == "[]") .. "|" .. tostring(string.find(chat, '"id":1') ~= nil) .. "|" .. tostring(wallet == "{}")
             end)
         "#,
         )
@@ -4448,7 +4520,7 @@ mod tests {
         };
         assert_eq!(
             reply,
-            b"invited_sent|1|blocked|true|0|1|1|true|true|true|true"
+            b"invited_sent|1|blocked|true|0|1|1|true|true|true|true|true"
         );
 
         // Forcing function: the script above must cover the whole shipped Domain
@@ -4463,6 +4535,7 @@ mod tests {
             "notifications.mark_read",
             "groups.call",
             "leaderboards.call",
+            "tournaments.call",
             "chat.call",
             "wallet.call",
         ]

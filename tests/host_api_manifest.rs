@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use citadel::runtime::HOST_API_SURFACE;
+use citadel::runtime::{HostApiCategory, HostApiStatus};
 
 fn manifest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -48,4 +49,42 @@ fn host_api_manifest_json_is_in_sync() {
          citadel::runtime::HOST_API_SURFACE. Regenerate with: \
          CITADEL_REGEN_CONTRACT=1 cargo test --test host_api_manifest"
     );
+}
+
+#[test]
+fn tournament_discovery_is_a_shipped_runtime_contract() {
+    let api = HOST_API_SURFACE
+        .iter()
+        .find(|entry| entry.name == "tournaments.call")
+        .expect("tournament discovery is declared");
+
+    assert_eq!(api.category, HostApiCategory::Domain);
+    assert_eq!(
+        api.params,
+        &[
+            "actor:string",
+            "operation:list|get|results|registration",
+            "payload_json:string",
+        ]
+    );
+    assert_eq!(api.returns, "json");
+    assert_eq!(api.status, HostApiStatus::Shipped);
+    assert_eq!(api.since, "IMPL-20260803-TOURNAMENTS-DISCOVERY");
+}
+
+#[test]
+fn leaderboard_reset_callback_is_a_shipped_runtime_contract() {
+    let callback = HOST_API_SURFACE
+        .iter()
+        .find(|entry| entry.name == "on_leaderboard_reset")
+        .expect("leaderboard reset callback is declared");
+
+    assert_eq!(callback.category, HostApiCategory::LeaderboardHook);
+    assert_eq!(
+        callback.params,
+        &["handler:fn(ctx:{leaderboard_id:string,due_at_unix_ms:u64,fencing_token:u64})"]
+    );
+    assert_eq!(callback.returns, "void");
+    assert_eq!(callback.status, HostApiStatus::Shipped);
+    assert_eq!(callback.since, "unreleased");
 }

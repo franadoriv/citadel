@@ -38,6 +38,7 @@ pub mod purchases;
 pub mod runtime;
 pub mod storage;
 pub mod telemetry;
+pub mod tournaments;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State};
@@ -68,6 +69,7 @@ pub use purchases::{PURCHASES_PATH, SUBSCRIPTIONS_PATH};
 pub use runtime::RUNTIME_PATH;
 pub use storage::STORAGE_PATH;
 pub use telemetry::TELEMETRY_PATH;
+pub use tournaments::TOURNAMENTS_PATH;
 
 /// Path prefix shared by every console API route.
 pub const CONSOLE_API_PREFIX: &str = "/console/v1";
@@ -95,6 +97,7 @@ pub const SECTION_PATHS: &[&str] = &[
     "/console/v1/chat",
     "/console/v1/notifications",
     "/console/v1/leaderboards",
+    "/console/v1/tournaments",
     "/console/v1/purchases",
     "/console/v1/subscriptions",
 ];
@@ -118,6 +121,7 @@ pub const IMPLEMENTED_SECTION_PATHS: &[&str] = &[
     chat::CHAT_PATH,
     notifications::NOTIFICATIONS_PATH,
     leaderboards::LEADERBOARDS_PATH,
+    tournaments::TOURNAMENTS_PATH,
     purchases::PURCHASES_PATH,
     purchases::SUBSCRIPTIONS_PATH,
 ];
@@ -319,6 +323,26 @@ pub(super) fn routes() -> Router<App> {
             delete(leaderboards::delete_record_handler),
         )
         .route(
+            tournaments::TOURNAMENTS_PATH,
+            get(tournaments::list_handler).post(tournaments::create_handler),
+        )
+        .route(
+            tournaments::TOURNAMENT_PATH,
+            get(tournaments::detail_handler),
+        )
+        .route(
+            tournaments::TOURNAMENT_TRANSITION_PATH,
+            post(tournaments::transition_handler),
+        )
+        .route(
+            tournaments::TOURNAMENT_ENTRIES_PATH,
+            get(tournaments::entries_handler),
+        )
+        .route(
+            tournaments::TOURNAMENT_RESULTS_PATH,
+            get(tournaments::results_handler),
+        )
+        .route(
             purchases::PURCHASES_PATH,
             get(purchases::list_handler).post(purchases::validate_handler),
         )
@@ -477,7 +501,7 @@ mod tests {
         assert_eq!(unique.len(), SECTION_PATHS.len());
         // One route per placeholder sidebar section (purchases splits into
         // purchases + subscriptions, and Status stays on the public /status).
-        assert_eq!(SECTION_PATHS.len(), 14);
+        assert_eq!(SECTION_PATHS.len(), 15);
     }
 
     #[test]
