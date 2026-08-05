@@ -145,6 +145,14 @@ const NOTIFICATION_TRANSACTION_RETRY_LIMIT: usize = 32;
 // allowing the full contractual burst to drain instead of returning a Database
 // error for a retryable transaction conflict.
 const WALLET_TRANSACTION_RETRY_LIMIT: usize = 64;
+// GameScript audit/outbox ids serialize through one sequence document per
+// kind, and activation generations through one document per scope, so a burst
+// of concurrent operator actions legitimately write-write conflicts far more
+// often than the scheduler's single-writer paths ever do. Mirror the wallet
+// budget: bounded, but deep enough to drain the full contractual burst
+// (the contract suite races eight submissions/allocations) instead of
+// surfacing a retryable conflict as a Database error.
+const GAMESCRIPT_TRANSACTION_RETRY_LIMIT: usize = 64;
 const TRANSACTION_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy)]
@@ -1176,6 +1184,78 @@ where
     unreachable!("bounded scheduler transaction retry returns or continues")
 }
 
+/// Replayable replica-set transaction runner for the GameScript adapter.
+///
+/// Identical retry semantics to [`scheduler_transaction`] (whole-closure
+/// replay on `TransientTransactionError`, commit-only retry on
+/// `UnknownTransactionCommitResult`, domain errors abort without retry), but
+/// with the deeper [`GAMESCRIPT_TRANSACTION_RETRY_LIMIT`] budget: gamescript
+/// operations funnel through shared sequence/counter documents, so concurrent
+/// bursts conflict pairwise and need wallet-depth retries to converge.
+async fn gamescript_transaction<T, F>(
+    client: &Client,
+    database: &Database,
+    mut work: F,
+) -> AppResult<T>
+where
+    T: Send,
+    F: for<'a> FnMut(
+        &'a Database,
+        &'a mut ClientSession,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<T, SchedulerTransactionError>> + Send + 'a>,
+    >,
+{
+    for attempt in 0..GAMESCRIPT_TRANSACTION_RETRY_LIMIT {
+        let mut session = client.start_session().await.map_err(mongo_error)?;
+        session
+            .start_transaction()
+            .with_options(transaction_options())
+            .await
+            .map_err(mongo_error)?;
+        let value = match work(database, &mut session).await {
+            Ok(value) => value,
+            Err(SchedulerTransactionError::App(error)) => {
+                let _ = session.abort_transaction().await;
+                return Err(error);
+            }
+            Err(SchedulerTransactionError::Mongo(error))
+                if error.contains_label(TRANSIENT_TRANSACTION_ERROR)
+                    && attempt + 1 < GAMESCRIPT_TRANSACTION_RETRY_LIMIT =>
+            {
+                let _ = session.abort_transaction().await;
+                transaction_backoff(attempt).await;
+                continue;
+            }
+            Err(SchedulerTransactionError::Mongo(error)) => {
+                let _ = session.abort_transaction().await;
+                return Err(mongo_error(error));
+            }
+        };
+        for commit_attempt in 0..GAMESCRIPT_TRANSACTION_RETRY_LIMIT {
+            match session.commit_transaction().await {
+                Ok(()) => return Ok(value),
+                Err(error)
+                    if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT)
+                        && commit_attempt + 1 < GAMESCRIPT_TRANSACTION_RETRY_LIMIT =>
+                {
+                    transaction_backoff(commit_attempt).await;
+                }
+                Err(error)
+                    if error.contains_label(TRANSIENT_TRANSACTION_ERROR)
+                        && attempt + 1 < GAMESCRIPT_TRANSACTION_RETRY_LIMIT =>
+                {
+                    let _ = session.abort_transaction().await;
+                    transaction_backoff(attempt).await;
+                    break;
+                }
+                Err(error) => return Err(mongo_error(error)),
+            }
+        }
+    }
+    unreachable!("bounded gamescript transaction retry returns or continues")
+}
+
 #[async_trait]
 impl LeaderboardResetRepository for MongoLeaderboardResetRepository {
     async fn acquire_lease(
@@ -2123,7 +2203,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
         let actor = actor.to_owned();
         let context = context.clone();
         let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
-        scheduler_transaction(&self.client, &self.database, move |database, session| {
+        gamescript_transaction(&self.client, &self.database, move |database, session| {
             let draft_id = draft_id.clone();
             let actor = actor.clone();
             let context = context.clone();
@@ -2263,7 +2343,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
         let source = source.to_owned();
         let message = message.to_owned();
         let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
-        scheduler_transaction(&self.client, &self.database, move |database, session| {
+        gamescript_transaction(&self.client, &self.database, move |database, session| {
             let revision_id = revision_id.clone();
             let source = source.clone();
             let message = message.clone();
@@ -2343,7 +2423,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
         let revision_id = revision_id.to_owned();
         let actor = actor.to_owned();
         let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
-        scheduler_transaction(&self.client, &self.database, move |database, session| {
+        gamescript_transaction(&self.client, &self.database, move |database, session| {
             let revision_id = revision_id.clone();
             let actor = actor.clone();
             Box::pin(async move {
@@ -2391,7 +2471,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
         let revision_id = revision_id.to_owned();
         let actor = actor.to_owned();
         let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
-        scheduler_transaction(&self.client, &self.database, move |database, session| {
+        gamescript_transaction(&self.client, &self.database, move |database, session| {
             let revision_id = revision_id.clone();
             let actor = actor.clone();
             Box::pin(async move {
@@ -2441,7 +2521,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
         let actor = actor.to_owned();
         let context = context.clone();
         let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
-        scheduler_transaction(&self.client, &self.database, move |database, session| {
+        gamescript_transaction(&self.client, &self.database, move |database, session| {
             let scope = scope.clone();
             let revision_id = revision_id.clone();
             let actor = actor.clone();
@@ -2562,7 +2642,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
         validate_limit(limit)?;
         let cutoff = scheduler_i64(updated_before.unix_millis(), "gamescript timestamp")?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        scheduler_transaction(&self.client, &self.database, move |database, session| {
+        gamescript_transaction(&self.client, &self.database, move |database, session| {
             Box::pin(async move {
                 let drafts = database.collection::<Document>(GAMESCRIPT_DRAFTS);
                 let mut cursor = drafts
@@ -2598,7 +2678,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
         validate_limit(limit)?;
         let cutoff = scheduler_i64(created_before.unix_millis(), "gamescript timestamp")?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        scheduler_transaction(&self.client, &self.database, move |database, session| {
+        gamescript_transaction(&self.client, &self.database, move |database, session| {
             Box::pin(async move {
                 // Snapshot-isolated candidate selection: pinned and
                 // activation-referenced revisions are excluded, and a
