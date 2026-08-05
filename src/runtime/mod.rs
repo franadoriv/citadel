@@ -55,6 +55,13 @@ mod python_bundle;
 pub mod python_payload;
 pub mod shared_cache;
 pub(crate) mod static_data;
+#[cfg(unix)]
+pub mod worker_bootstrap;
+#[cfg(any(unix, windows))]
+pub mod worker_ipc;
+pub mod worker_protocol;
+#[cfg(any(unix, windows))]
+pub mod worker_supervisor;
 
 use std::time::Duration;
 

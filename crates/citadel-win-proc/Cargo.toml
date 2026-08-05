@@ -1,0 +1,39 @@
+# Scoped Win32 FFI for the supervised runtime worker.
+#
+# The main `citadel` crate forbids unsafe code, but the Windows worker
+# transport needs a handful of Win32 calls with no safe std equivalent:
+# named-pipe security attributes (restrictive DACL), pipe peer validation,
+# anonymous-pipe handle inheritance, and Job Object lifecycle containment.
+# This crate is the single place those `unsafe` calls are allowed; every
+# public item is a safe wrapper with documented invariants.
+[package]
+name = "citadel-win-proc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+# `ServerOptions::create_with_security_attributes_mw` is the only supported
+# way to create a tokio named-pipe server with a caller-supplied DACL.
+tokio = { version = "1", features = ["net"] }
+# Raw Win32 bindings; already in the dependency tree transitively (tokio/mio,
+# socket2, sqlx, ...), so this adds no new supply-chain surface.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "macros", "time", "io-util"] }
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"

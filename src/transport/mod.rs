@@ -755,6 +755,37 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // `runtime.hot_reload` and a reloadable on-disk script is actually loaded.
     maybe_spawn_reload(&mut supervisor, runtime.as_ref(), &app.config().runtime);
 
+    // Supervise the external GameScript worker process when the operator
+    // opted into the external-worker adapter (unix and windows; config
+    // validation rejects it elsewhere). Script execution does not route
+    // through the worker yet — a present entrypoint is rejected by
+    // `resolve_selection` — but the worker's lifecycle (boot, periodic
+    // health, restart policy, shutdown) is owned by the same supervisor as
+    // every other service.
+    #[cfg(any(unix, windows))]
+    if app.config().runtime.enabled
+        && app.config().runtime.adapter == crate::config::RuntimeAdapter::ExternalWorker
+    {
+        let executable = std::env::current_exe().map_err(|error| {
+            AppError::new(
+                ErrorCategory::Runtime,
+                "failed to resolve the server executable for the runtime worker",
+            )
+            .with_detail(error.to_string())
+        })?;
+        tracing::info!(
+            executable = %executable.display(),
+            "starting supervised external runtime worker"
+        );
+        supervisor.spawn(
+            crate::runtime::worker_supervisor::WorkerLifecycleService::new(
+                executable,
+                std::env::temp_dir(),
+                crate::runtime::worker_supervisor::WorkerSupervisionPolicy::default(),
+            ),
+        );
+    }
+
     if cfg.quic.enabled {
         let bind = parse_bind("transport.quic.bind", &cfg.quic.bind)?;
         let cert = if cfg.tls.is_configured() {

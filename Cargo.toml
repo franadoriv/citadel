@@ -112,6 +112,10 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
 # SHA-256 of the dev cert for the browser `serverCertificateHashes` flow.
 sha2 = "0.10"
+# HMAC-SHA-256 authenticates the private parent/worker bootstrap challenge.
+hmac = "0.12"
+uuid = { version = "1", features = ["v4"] }
+nix = { version = "0.29", features = ["fs", "process", "resource", "signal"] }
 # Manifest signatures keep embedded payload metadata authentic before any cache write.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 # CSPRNG for unguessable session tokens. `getrandom` pulls OS entropy
@@ -172,6 +176,12 @@ mongodb = "3.8"
 # and disk collectors are enabled: no process list, users, network, or sensor
 # probing is needed for the status snapshot.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+
+[target.'cfg(windows)'.dependencies]
+# Scoped Win32 FFI for the supervised runtime worker (job objects, restrictive
+# named-pipe DACLs, inherited-handle bootstrap). This crate forbids unsafe
+# code; the helper crate is the single audited place those calls may live.
+citadel-win-proc = { path = "crates/citadel-win-proc" }
 
 [dev-dependencies]
 # URL parsing for the in-process WebTransport client used in integration tests.

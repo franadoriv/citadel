@@ -95,6 +95,30 @@ pub enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Internal supervised GameScript worker; not an operator-facing command.
+    #[command(hide = true)]
+    RuntimeWorker {
+        #[arg(long)]
+        bootstrap_endpoint: String,
+        #[arg(long)]
+        bootstrap_fd: i32,
+        /// Pid of the supervising parent, used to detect a parent that died
+        /// before the worker armed its parent-death signal (unix) and to
+        /// validate the pipe server's identity before the handshake
+        /// (windows).
+        #[arg(long)]
+        parent_pid: u32,
+        /// Open-file limit from the supervisor's resource policy. Applied
+        /// before the bootstrap secret is read on unix; surfaced as
+        /// kernel-unenforceable on windows, where containment comes from the
+        /// job object instead.
+        #[arg(long)]
+        max_open_files: u64,
+        /// How often (in milliseconds) the worker emits a health frame after
+        /// readiness; supplied by the supervisor's health policy.
+        #[arg(long)]
+        health_cadence_ms: u64,
+    },
 }
 
 /// Execute `citadel check`: resolve and validate configuration.
@@ -114,6 +138,80 @@ pub fn run_check(global: &GlobalArgs) -> AppResult<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_runtime_worker_only_with_bootstrap_endpoint() {
+        let cli = Cli::try_parse_from([
+            "citadel",
+            "runtime-worker",
+            "--bootstrap-endpoint",
+            "/tmp/citadel.sock",
+            "--bootstrap-fd",
+            "3",
+            "--parent-pid",
+            "42",
+            "--max-open-files",
+            "64",
+            "--health-cadence-ms",
+            "250",
+        ])
+        .expect("internal worker parses with endpoint");
+        assert_eq!(
+            cli.command(),
+            Command::RuntimeWorker {
+                bootstrap_endpoint: "/tmp/citadel.sock".to_string(),
+                bootstrap_fd: 3,
+                parent_pid: 42,
+                max_open_files: 64,
+                health_cadence_ms: 250,
+            }
+        );
+        assert!(Cli::try_parse_from(["citadel", "runtime-worker"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+                "--max-open-files",
+                "64",
+            ])
+            .is_err(),
+            "the supervising parent pid is mandatory"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+                "--parent-pid",
+                "42",
+            ])
+            .is_err(),
+            "the resource policy is mandatory"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+                "--parent-pid",
+                "42",
+                "--max-open-files",
+                "64",
+            ])
+            .is_err(),
+            "the health cadence is mandatory"
+        );
+    }
 
     #[test]
     fn parses_check_subcommand() {

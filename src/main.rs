@@ -9,6 +9,8 @@
 
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -17,6 +19,331 @@ use citadel::cli::{self, Cli, Command};
 use citadel::config::Config;
 use citadel::startup::{self, StdioPrompt, WizardPaths, WizardReport};
 use citadel::{App, error_reporting, http, observability};
+
+#[cfg(unix)]
+fn configure_parent_death_signal() -> Result<()> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent-death signal setup failed"))
+}
+
+#[cfg(unix)]
+fn disable_core_dumps() -> Result<()> {
+    nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+        .map_err(|_| anyhow::anyhow!("runtime worker core-dump limit setup failed"))
+}
+
+#[cfg(unix)]
+fn apply_open_file_limit(max_open_files: u64) -> Result<()> {
+    let (_, hard_limit) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+            .map_err(|_| anyhow::anyhow!("runtime worker open-file limit read failed"))?;
+    if hard_limit < max_open_files {
+        anyhow::bail!("runtime worker open-file hard limit is too low");
+    }
+    nix::sys::resource::setrlimit(
+        nix::sys::resource::Resource::RLIMIT_NOFILE,
+        max_open_files,
+        hard_limit,
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker open-file limit setup failed"))
+}
+
+#[cfg(unix)]
+fn ensure_supervising_parent(supervisor_pid: u32) -> Result<()> {
+    // PDEATHSIG only covers parent deaths that happen after it is armed. If
+    // the supervisor died between fork/exec and the arming in
+    // `run_runtime_worker`, no signal will ever arrive: this process was
+    // already reparented to init or a subreaper. Detect that by comparing the
+    // live parent pid against the pid the supervisor passed on the command
+    // line, and exit fail-closed instead of running unsupervised.
+    let live_parent = nix::unistd::getppid().as_raw();
+    if u32::try_from(live_parent) != Ok(supervisor_pid) {
+        anyhow::bail!("runtime worker lost its supervising parent before pdeathsig was armed");
+    }
+    Ok(())
+}
+
+/// Read one control frame, treating a receive-timeout as "no frame yet".
+///
+/// The socket read timeout doubles as the worker's health pacing. A timeout
+/// that fires mid-frame desynchronizes the stream, so any partial read fails
+/// closed on the next parse and the supervisor replaces the worker; in
+/// practice parent frames are tiny single-write messages.
+#[cfg(unix)]
+fn try_read_control_frame(
+    stream: &mut UnixStream,
+) -> Result<Option<citadel::runtime::worker_protocol::ControlFrame>> {
+    use std::io::Read;
+
+    let mut prefix = [0u8; 4];
+    match stream.read_exact(&mut prefix) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > citadel::runtime::worker_protocol::MAX_CONTROL_FRAME_BYTES {
+        anyhow::bail!("runtime worker received an oversized parent frame");
+    }
+    let mut payload = vec![0; length];
+    stream
+        .read_exact(&mut payload)
+        .context("runtime worker parent frame truncated")?;
+    citadel::runtime::worker_protocol::decode_frame(&payload)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent frame invalid"))
+}
+
+/// Verify the supervising parent is still alive before bootstrap (Windows).
+///
+/// The Job Object's kill-on-close covers any supervisor death after the
+/// worker was assigned to the job, and assignment is proven by the secret
+/// read below (the supervisor writes the secret only after assigning). The
+/// uncovered window is a supervisor that died before that; detect it here
+/// and exit fail-closed instead of running unsupervised.
+#[cfg(windows)]
+fn ensure_supervising_parent(supervisor_pid: u32) -> Result<()> {
+    let alive = citadel_win_proc::process_is_alive(supervisor_pid)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent liveness check failed"))?;
+    if !alive {
+        anyhow::bail!("runtime worker lost its supervising parent before bootstrap");
+    }
+    Ok(())
+}
+
+/// Surface the open-file limit as unenforceable on Windows.
+///
+/// `RLIMIT_NOFILE` has no Windows kernel equivalent and Job Objects cannot
+/// cap handle counts, so the supervisor's `--max-open-files` policy cannot be
+/// kernel-enforced here. It is reported loudly instead of silently ignored;
+/// Windows containment comes from the Job Object (kill-on-close, group
+/// termination) rather than per-resource rlimits.
+#[cfg(windows)]
+fn surface_unsupported_open_file_limit(max_open_files: u64) {
+    eprintln!(
+        "runtime worker: open-file limit {max_open_files} is not kernel-enforceable on windows; \
+         relying on job-object containment"
+    );
+}
+
+/// Read one control frame without blocking, or `None` when no frame waits.
+///
+/// Synchronous pipe handles have no read timeout, so the worker peeks for a
+/// complete length prefix before committing to a blocking read. Parent
+/// frames are tiny two-write messages: once the prefix is visible the
+/// payload follows immediately, so the blocking read cannot stall the loop.
+#[cfg(windows)]
+fn try_read_control_frame(
+    stream: &mut std::fs::File,
+) -> Result<Option<citadel::runtime::worker_protocol::ControlFrame>> {
+    if citadel_win_proc::named_pipe_bytes_available(stream)
+        .context("runtime worker pipe peek failed")?
+        < 4
+    {
+        return Ok(None);
+    }
+    citadel::runtime::worker_protocol::read_control_frame(stream)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent frame invalid"))
+}
+
+#[cfg(windows)]
+fn run_runtime_worker(
+    endpoint: &str,
+    bootstrap_fd: i32,
+    parent_pid: u32,
+    max_open_files: u64,
+    health_cadence_ms: u64,
+) -> Result<()> {
+    // Job containment is owned by the supervisor: the worker was assigned to
+    // a kill-on-close Job Object before the bootstrap secret below was
+    // written, so reading the secret proves containment is already armed —
+    // the same "applied before the secret is read" ordering as the unix
+    // resource limits.
+    ensure_supervising_parent(parent_pid)?;
+    surface_unsupported_open_file_limit(max_open_files);
+    let handle_value = usize::try_from(bootstrap_fd)
+        .map_err(|_| anyhow::anyhow!("runtime worker bootstrap handle invalid"))?;
+    let secret = citadel_win_proc::read_secret_from_handle(handle_value)
+        .context("runtime worker bootstrap secret unavailable")?;
+    let mut stream = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(endpoint)
+        .context("runtime worker bootstrap connect failed")?;
+    // Mutual peer validation: the pipe server must be the supervisor that
+    // spawned this worker, so a squatted endpoint never sees a proof.
+    let server_pid = citadel_win_proc::named_pipe_server_process_id(&stream)
+        .context("runtime worker pipe peer query failed")?;
+    if server_pid != parent_pid {
+        anyhow::bail!("runtime worker bootstrap endpoint is not owned by the supervisor");
+    }
+    let frame = citadel::runtime::worker_protocol::read_control_frame(&mut stream)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent hello invalid"))?;
+    let (protocol_version, nonce) = match frame {
+        citadel::runtime::worker_protocol::ControlFrame::ParentHello {
+            protocol_version,
+            nonce,
+        } => (protocol_version, nonce),
+        _ => anyhow::bail!("runtime worker expected parent hello"),
+    };
+    if protocol_version != citadel::runtime::worker_protocol::PROTOCOL_VERSION {
+        anyhow::bail!("runtime worker protocol version unsupported");
+    }
+    let proof = citadel::runtime::worker_protocol::challenge_proof(&secret, &nonce);
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerHello {
+            protocol_version,
+            proof: proof.to_vec(),
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker hello write failed"))?;
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerReady {
+            protocol_version,
+            // The protocol-stub worker loads no script yet; a future
+            // script-hosting worker reports its loaded revision here for
+            // revision fencing.
+            script_identity: None,
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
+    // Health is a continuous signal: emit one frame per cadence until the
+    // parent orders shutdown. Pacing polls the pipe with the same 5ms grain
+    // the unix supervisor uses in its accept loop — each cycle watches for a
+    // parent frame for up to one cadence before reporting health again.
+    let cadence = std::time::Duration::from_millis(health_cadence_ms.max(1));
+    let poll_grain = std::time::Duration::from_millis(5);
+    'health: loop {
+        citadel::runtime::worker_protocol::write_control_frame(
+            &mut stream,
+            &citadel::runtime::worker_protocol::ControlFrame::WorkerHealth { protocol_version },
+        )
+        .map_err(|_| anyhow::anyhow!("runtime worker health write failed"))?;
+        let cycle_end = std::time::Instant::now() + cadence;
+        loop {
+            match try_read_control_frame(&mut stream)? {
+                Some(citadel::runtime::worker_protocol::ControlFrame::ParentShutdown {
+                    protocol_version: shutdown_version,
+                }) if shutdown_version == protocol_version => break 'health,
+                Some(_) => anyhow::bail!("runtime worker expected parent shutdown"),
+                None => {}
+            }
+            if std::time::Instant::now() >= cycle_end {
+                break;
+            }
+            std::thread::sleep(poll_grain);
+        }
+    }
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerStopped { protocol_version },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker stopped acknowledgement write failed"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_runtime_worker(
+    endpoint: &str,
+    bootstrap_fd: i32,
+    parent_pid: u32,
+    max_open_files: u64,
+    health_cadence_ms: u64,
+) -> Result<()> {
+    // Process-group isolation is owned by the supervisor, which places this
+    // process in its own group pre-exec (see `SupervisedWorker::spawn`), so
+    // group membership cannot depend on worker cooperation.
+    //
+    // Arm the parent-death signal as the very first act: from here on the
+    // kernel delivers SIGKILL when the supervisor dies. Together with the
+    // parent re-check below this closes the classic pdeathsig race — a parent
+    // death before arming leaves the worker reparented, which the re-check
+    // detects; a death after arming is covered by the signal itself. The only
+    // residual window is exec-to-first-instruction, and the re-check
+    // terminates the worker immediately after it.
+    configure_parent_death_signal()?;
+    ensure_supervising_parent(parent_pid)?;
+    disable_core_dumps()?;
+    // The open-file limit comes from the supervisor's resource policy and is
+    // applied before the bootstrap secret is read, so an over-limit worker
+    // never reaches the protocol.
+    apply_open_file_limit(max_open_files)?;
+    let secret = citadel::runtime::worker_bootstrap::read_secret_from_fd(bootstrap_fd)
+        .context("runtime worker bootstrap secret unavailable")?;
+    let mut stream =
+        UnixStream::connect(endpoint).context("runtime worker bootstrap connect failed")?;
+    let frame = citadel::runtime::worker_protocol::read_control_frame(&mut stream)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent hello invalid"))?;
+    let (protocol_version, nonce) = match frame {
+        citadel::runtime::worker_protocol::ControlFrame::ParentHello {
+            protocol_version,
+            nonce,
+        } => (protocol_version, nonce),
+        _ => anyhow::bail!("runtime worker expected parent hello"),
+    };
+    if protocol_version != citadel::runtime::worker_protocol::PROTOCOL_VERSION {
+        anyhow::bail!("runtime worker protocol version unsupported");
+    }
+    let proof = citadel::runtime::worker_protocol::challenge_proof(&secret, &nonce);
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerHello {
+            protocol_version,
+            proof: proof.to_vec(),
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker hello write failed"))?;
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerReady {
+            protocol_version,
+            // The protocol-stub worker loads no script yet; a future
+            // script-hosting worker reports its loaded revision here for
+            // revision fencing.
+            script_identity: None,
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
+    // Health is a continuous signal: emit one frame per cadence until the
+    // parent orders shutdown. The read timeout provides the pacing — each
+    // cycle waits up to one cadence for a parent frame before reporting
+    // health again.
+    let cadence = std::time::Duration::from_millis(health_cadence_ms.max(1));
+    stream
+        .set_read_timeout(Some(cadence))
+        .context("runtime worker health pacing setup failed")?;
+    loop {
+        citadel::runtime::worker_protocol::write_control_frame(
+            &mut stream,
+            &citadel::runtime::worker_protocol::ControlFrame::WorkerHealth { protocol_version },
+        )
+        .map_err(|_| anyhow::anyhow!("runtime worker health write failed"))?;
+        match try_read_control_frame(&mut stream)? {
+            Some(citadel::runtime::worker_protocol::ControlFrame::ParentShutdown {
+                protocol_version: shutdown_version,
+            }) if shutdown_version == protocol_version => break,
+            Some(_) => anyhow::bail!("runtime worker expected parent shutdown"),
+            // No parent frame within one cadence: keep reporting health.
+            None => {}
+        }
+    }
+    citadel::runtime::worker_protocol::write_control_frame(
+        &mut stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerStopped { protocol_version },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker stopped acknowledgement write failed"))?;
+    Ok(())
+}
 
 fn main() -> Result<()> {
     // MongoDB's TLS stack may pull aws-lc-rs alongside Citadel's ring-backed
@@ -47,6 +374,24 @@ fn main() -> Result<()> {
                 map.collision.triangles.len()
             );
             Ok(())
+        }
+        #[cfg(any(unix, windows))]
+        Command::RuntimeWorker {
+            bootstrap_endpoint,
+            bootstrap_fd,
+            parent_pid,
+            max_open_files,
+            health_cadence_ms,
+        } => run_runtime_worker(
+            &bootstrap_endpoint,
+            bootstrap_fd,
+            parent_pid,
+            max_open_files,
+            health_cadence_ms,
+        ),
+        #[cfg(not(any(unix, windows)))]
+        Command::RuntimeWorker { .. } => {
+            anyhow::bail!("the runtime-worker subcommand requires a unix or windows host")
         }
         Command::Check => {
             let config = cli::run_check(&cli.global).context("configuration check failed")?;
@@ -137,5 +482,67 @@ fn print_wizard_summary(report: &WizardReport, paths: &WizardPaths) {
     }
     if report.made_changes() {
         let _ = writeln!(out);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn worker_disables_core_dumps_in_child() {
+        if std::env::var_os("CITADEL_CORE_LIMIT_TEST_CHILD").is_some() {
+            super::disable_core_dumps().expect("disable core dumps");
+            let limits = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
+                .expect("read core limits");
+            assert_eq!(limits, (0, 0));
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("tests::worker_disables_core_dumps_in_child")
+            .env("CITADEL_CORE_LIMIT_TEST_CHILD", "1")
+            .status()
+            .expect("run disposable child");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn worker_applies_open_file_limit() {
+        let resource = nix::sys::resource::Resource::RLIMIT_NOFILE;
+        let (soft, hard) = nix::sys::resource::getrlimit(resource).expect("read original limits");
+        super::apply_open_file_limit(32).expect("apply limit");
+        assert_eq!(
+            nix::sys::resource::getrlimit(resource)
+                .expect("read applied limit")
+                .0,
+            32
+        );
+        nix::sys::resource::setrlimit(resource, soft, hard).expect("restore limits");
+    }
+
+    #[test]
+    fn worker_parent_check_accepts_the_live_parent() {
+        let live_parent =
+            u32::try_from(nix::unistd::getppid().as_raw()).expect("parent pid fits u32");
+        super::ensure_supervising_parent(live_parent).expect("live parent is accepted");
+    }
+
+    #[test]
+    fn worker_parent_check_rejects_a_reparented_worker() {
+        // This process's own pid can never be its parent pid, so this models a
+        // supervisor that died before pdeathsig was armed (the worker got
+        // reparented and the recorded supervisor pid no longer matches).
+        assert!(super::ensure_supervising_parent(std::process::id()).is_err());
+    }
+
+    #[test]
+    fn worker_configures_parent_death_signal() {
+        let original = nix::sys::prctl::get_pdeathsig().expect("read original signal");
+        super::configure_parent_death_signal().expect("configure signal");
+        assert_eq!(
+            nix::sys::prctl::get_pdeathsig().expect("read configured signal"),
+            Some(nix::sys::signal::Signal::SIGKILL)
+        );
+        nix::sys::prctl::set_pdeathsig(original).expect("restore original signal");
     }
 }
