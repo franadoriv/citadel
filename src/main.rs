@@ -64,7 +64,12 @@ fn ensure_supervising_parent(supervisor_pid: u32) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32, parent_pid: u32) -> Result<()> {
+fn run_runtime_worker(
+    endpoint: &str,
+    bootstrap_fd: i32,
+    parent_pid: u32,
+    max_open_files: u64,
+) -> Result<()> {
     // Process-group isolation is owned by the supervisor, which places this
     // process in its own group pre-exec (see `SupervisedWorker::spawn`), so
     // group membership cannot depend on worker cooperation.
@@ -79,7 +84,10 @@ fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32, parent_pid: u32) -> Res
     configure_parent_death_signal()?;
     ensure_supervising_parent(parent_pid)?;
     disable_core_dumps()?;
-    apply_open_file_limit(citadel::runtime::worker_supervisor::DEFAULT_WORKER_MAX_OPEN_FILES)?;
+    // The open-file limit comes from the supervisor's resource policy and is
+    // applied before the bootstrap secret is read, so an over-limit worker
+    // never reaches the protocol.
+    apply_open_file_limit(max_open_files)?;
     let secret = citadel::runtime::worker_bootstrap::read_secret_from_fd(bootstrap_fd)
         .context("runtime worker bootstrap secret unavailable")?;
     let mut stream =
@@ -166,7 +174,8 @@ fn main() -> Result<()> {
             bootstrap_endpoint,
             bootstrap_fd,
             parent_pid,
-        } => run_runtime_worker(&bootstrap_endpoint, bootstrap_fd, parent_pid),
+            max_open_files,
+        } => run_runtime_worker(&bootstrap_endpoint, bootstrap_fd, parent_pid, max_open_files),
         #[cfg(not(unix))]
         Command::RuntimeWorker { .. } => {
             anyhow::bail!("the runtime-worker subcommand requires a unix host")

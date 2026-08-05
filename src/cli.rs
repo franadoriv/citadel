@@ -106,6 +106,10 @@ pub enum Command {
         /// before the worker armed its parent-death signal.
         #[arg(long)]
         parent_pid: u32,
+        /// Open-file limit from the supervisor's resource policy, applied
+        /// before the bootstrap secret is read.
+        #[arg(long)]
+        max_open_files: u64,
     },
 }
 
@@ -138,6 +142,8 @@ mod tests {
             "3",
             "--parent-pid",
             "42",
+            "--max-open-files",
+            "64",
         ])
         .expect("internal worker parses with endpoint");
         assert_eq!(
@@ -146,6 +152,7 @@ mod tests {
                 bootstrap_endpoint: "/tmp/citadel.sock".to_string(),
                 bootstrap_fd: 3,
                 parent_pid: 42,
+                max_open_files: 64,
             }
         );
         assert!(Cli::try_parse_from(["citadel", "runtime-worker"]).is_err());
@@ -157,9 +164,25 @@ mod tests {
                 "/tmp/citadel.sock",
                 "--bootstrap-fd",
                 "3",
+                "--max-open-files",
+                "64",
             ])
             .is_err(),
             "the supervising parent pid is mandatory"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+                "--parent-pid",
+                "42",
+            ])
+            .is_err(),
+            "the resource policy is mandatory"
         );
     }
 

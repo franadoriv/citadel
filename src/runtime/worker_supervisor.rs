@@ -64,6 +64,60 @@ impl WorkerResourceLimits {
     }
 }
 
+impl Default for WorkerResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_open_files: DEFAULT_WORKER_MAX_OPEN_FILES,
+        }
+    }
+}
+
+/// PROVISIONAL restart budget: no production data on worker crash cadence
+/// exists yet. Replace once supervised-worker crash/restart rates have been
+/// measured in a real deployment.
+pub const DEFAULT_WORKER_RESTART_LIMIT: u32 = 5;
+
+/// Injectable supervision policy for the external GameScript worker.
+///
+/// This is the single seam the serve lifecycle and tests configure; every
+/// limit the supervisor enforces on a worker process flows through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerSupervisionPolicy {
+    resource_limits: WorkerResourceLimits,
+    restart_limit: u32,
+}
+
+impl WorkerSupervisionPolicy {
+    #[must_use]
+    pub fn with_resource_limits(mut self, resource_limits: WorkerResourceLimits) -> Self {
+        self.resource_limits = resource_limits;
+        self
+    }
+
+    #[must_use]
+    pub fn with_restart_limit(mut self, restart_limit: u32) -> Self {
+        self.restart_limit = restart_limit.max(1);
+        self
+    }
+
+    pub fn resource_limits(&self) -> WorkerResourceLimits {
+        self.resource_limits
+    }
+
+    pub fn restart_limit(&self) -> u32 {
+        self.restart_limit
+    }
+}
+
+impl Default for WorkerSupervisionPolicy {
+    fn default() -> Self {
+        Self {
+            resource_limits: WorkerResourceLimits::default(),
+            restart_limit: DEFAULT_WORKER_RESTART_LIMIT,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryStatus {
     Available,
@@ -134,16 +188,22 @@ impl RestartCircuitBreaker {
 pub struct RestartController {
     executable: PathBuf,
     parent: PathBuf,
+    policy: WorkerSupervisionPolicy,
     breaker: RestartCircuitBreaker,
 }
 
 impl RestartController {
-    pub fn new(executable: PathBuf, parent: PathBuf, restart_limit: u32) -> Self {
+    pub fn new(executable: PathBuf, parent: PathBuf, policy: WorkerSupervisionPolicy) -> Self {
         Self {
             executable,
             parent,
-            breaker: RestartCircuitBreaker::new(restart_limit),
+            policy,
+            breaker: RestartCircuitBreaker::new(policy.restart_limit()),
         }
+    }
+
+    pub fn policy(&self) -> &WorkerSupervisionPolicy {
+        &self.policy
     }
 
     pub fn monitor_health(
@@ -189,7 +249,7 @@ impl RestartController {
         };
         std::thread::sleep(delay);
         let secret = fresh_bootstrap_secret()?;
-        SupervisedWorker::spawn(&self.executable, &self.parent, &secret).map(Some)
+        SupervisedWorker::spawn(&self.executable, &self.parent, &secret, &self.policy).map(Some)
     }
 }
 
@@ -204,7 +264,12 @@ pub struct SupervisedWorker {
 
 #[cfg(unix)]
 impl SupervisedWorker {
-    pub fn spawn(executable: &Path, parent: &Path, secret: &[u8; 32]) -> io::Result<Self> {
+    pub fn spawn(
+        executable: &Path,
+        parent: &Path,
+        secret: &[u8; 32],
+        policy: &WorkerSupervisionPolicy,
+    ) -> io::Result<Self> {
         let endpoint = PrivateUnixEndpoint::create(parent)?;
         let listener = endpoint.bind()?;
         let bootstrap = BootstrapPipe::create()?;
@@ -222,6 +287,11 @@ impl SupervisedWorker {
             // dies before the signal is armed.
             .arg("--parent-pid")
             .arg(std::process::id().to_string())
+            // The supervisor's resource policy travels on the command line
+            // and is applied by the worker before it reads the bootstrap
+            // secret, so an over-limit worker can never reach the protocol.
+            .arg("--max-open-files")
+            .arg(policy.resource_limits().max_open_files().to_string())
             // The worker must land in its own process group before exec so
             // every cleanup path can signal the whole group. Relying on the
             // worker to isolate itself would let a non-cooperating binary
@@ -391,6 +461,10 @@ impl SupervisedWorker {
         result
     }
 
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn has_exited(&mut self) -> io::Result<bool> {
         let exited = self.child.try_wait()?.is_some();
         if exited {
@@ -500,7 +574,13 @@ mod tests {
         .expect("script");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
         let mut worker =
-            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &[8; 32]).expect("spawn");
+            SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[8; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
         let until = std::time::Instant::now() + Duration::from_secs(2);
         while !pid_file.exists() && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
@@ -581,7 +661,11 @@ mod tests {
     #[test]
     fn monitor_health_keeps_unavailable_worker_fail_closed() {
         let mut controller =
-            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+            super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        );
         let mut active = None;
         assert!(
             !controller
@@ -594,9 +678,18 @@ mod tests {
     #[test]
     fn health_failure_removes_active_worker_before_recovery() {
         let mut controller =
-            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+            super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        );
         let mut active = Some(
-            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[3; 32])
+            SupervisedWorker::spawn(
+                Path::new("/bin/true"),
+                &std::env::temp_dir(),
+                &[3; 32],
+                &WorkerSupervisionPolicy::default(),
+            )
                 .expect("spawn"),
         );
         assert!(
@@ -610,7 +703,11 @@ mod tests {
     #[test]
     fn open_breaker_leaves_active_worker_unavailable() {
         let mut controller =
-            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+            super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        );
         let mut active = None;
         assert!(!controller.recover_if_exited(&mut active).expect("recover"));
         assert!(active.is_none());
@@ -619,9 +716,18 @@ mod tests {
     #[test]
     fn controller_replaces_an_exited_active_worker() {
         let mut controller =
-            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 2);
+            super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(2),
+        );
         let mut active = Some(
-            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[4; 32])
+            SupervisedWorker::spawn(
+                Path::new("/bin/true"),
+                &std::env::temp_dir(),
+                &[4; 32],
+                &WorkerSupervisionPolicy::default(),
+            )
                 .expect("spawn"),
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -632,7 +738,11 @@ mod tests {
     #[test]
     fn controller_restarts_before_breaker_limit() {
         let mut controller =
-            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 2);
+            super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(2),
+        );
         let _worker = controller
             .restart_after_failure()
             .expect("restart")
@@ -642,7 +752,11 @@ mod tests {
     #[test]
     fn controller_refuses_restart_when_breaker_is_open() {
         let mut controller =
-            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+            super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        );
         assert!(
             controller
                 .restart_after_failure()
@@ -662,7 +776,12 @@ mod tests {
     fn crashed_worker_requires_a_permitted_restart_delay() {
         let mut breaker = super::RestartCircuitBreaker::new(1);
         let mut worker =
-            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[9; 32])
+            SupervisedWorker::spawn(
+                Path::new("/bin/true"),
+                &std::env::temp_dir(),
+                &[9; 32],
+                &WorkerSupervisionPolicy::default(),
+            )
                 .expect("spawn");
         std::thread::sleep(Duration::from_millis(10));
         assert!(worker.has_exited().expect("child status"));
@@ -672,7 +791,12 @@ mod tests {
     #[test]
     fn reports_when_child_has_exited() {
         let mut worker =
-            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[7; 32])
+            SupervisedWorker::spawn(
+                Path::new("/bin/true"),
+                &std::env::temp_dir(),
+                &[7; 32],
+                &WorkerSupervisionPolicy::default(),
+            )
                 .expect("spawn");
         std::thread::sleep(Duration::from_millis(10));
         assert!(worker.has_exited().expect("child status"));
@@ -733,7 +857,13 @@ mod tests {
         let nonce = vec![6; 32];
         let client_nonce = nonce.clone();
         let mut worker =
-            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &secret).expect("spawn");
+            SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &secret,
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
         let endpoint = worker._endpoint.path().to_path_buf();
         let client = thread::spawn(move || {
             let mut stream = UnixStream::connect(endpoint).expect("connect");
@@ -770,7 +900,13 @@ mod tests {
         fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").expect("script");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
         let mut worker =
-            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &[4; 32]).expect("spawn");
+            SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[4; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
         let endpoint = worker._endpoint.path().to_path_buf();
         let client = thread::spawn(move || {
             let mut stream = UnixStream::connect(endpoint).expect("connect");
@@ -798,7 +934,13 @@ mod tests {
         fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").expect("script");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
         let mut worker =
-            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &[3; 32]).expect("spawn");
+            SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[3; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
         let endpoint = worker._endpoint.path().to_path_buf();
         let client = thread::spawn(move || {
             let mut stream = UnixStream::connect(endpoint).expect("connect");
@@ -825,7 +967,13 @@ mod tests {
     fn bootstrap_acceptance_times_out_fail_closed() {
         let parent = std::env::temp_dir();
         let mut worker =
-            SupervisedWorker::spawn(Path::new("/bin/true"), &parent, &[7; 32]).expect("spawn");
+            SupervisedWorker::spawn(
+            Path::new("/bin/true"),
+            &parent,
+            &[7; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
         let error = worker
             .accept_with_deadline(Duration::from_millis(10))
             .expect_err("must timeout");
