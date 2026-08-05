@@ -5349,6 +5349,53 @@ impl Gateway {
         &self.rooms
     }
 
+    /// Close one authoritative match server-side.
+    ///
+    /// Every member receives a reliable `KIND_MATCH_CLOSED` — a server-error
+    /// close carrying a requeue hint — and the room is pruned from the
+    /// registry. The requeue model is client-prompted: the hinted client
+    /// re-submits its own matchmaker ticket; the server retains no ticket on
+    /// the member's behalf, so nothing can resume the dead match. Returns the
+    /// number of notifications delivered (0 when no such room exists).
+    pub fn close_match(&self, room_id: RoomId) -> usize {
+        let Some(members) = self.rooms.close(room_id) else {
+            return 0;
+        };
+        tracing::warn!(
+            room_id,
+            members = members.len(),
+            "match closed server-side; members returned to matchmaking"
+        );
+        let body = citadel_wire::room::MatchClosed {
+            room_id,
+            reason: citadel_wire::room::MATCH_CLOSE_REASON_SERVER_ERROR,
+            requeue_hint: true,
+        }
+        .encode();
+        let mut sent = 0;
+        for member in members {
+            if self.send_reliable(member, citadel_wire::protocol::KIND_MATCH_CLOSED, body.clone())
+            {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    /// Close every live match via [`Self::close_match`].
+    ///
+    /// The worker-death flow: when the supervised GameScript worker crashes,
+    /// every dependent match is closed the same match-local way — members
+    /// informed and returned to matchmaking, rooms pruned — before the
+    /// replacement worker (which never resumes old matches) starts serving.
+    pub fn close_all_matches(&self) -> usize {
+        self.rooms
+            .snapshot()
+            .into_iter()
+            .map(|room| self.close_match(room.id))
+            .sum()
+    }
+
     /// Route a room frame (kinds 21-25).
     ///
     /// Phase A1: `ROOM_CREATE` interprets its params as the desired map name (Phase
@@ -6423,6 +6470,87 @@ mod transform_tests {
         );
         assert_eq!(sent, 0, "no such room -> nothing sent");
         assert_eq!(gw.rooms().room_of(a), None);
+    }
+
+    #[tokio::test]
+    async fn server_error_match_close_notifies_members_and_prunes_room() {
+        use citadel_wire::protocol::KIND_MATCH_CLOSED;
+        use citadel_wire::room::{
+            MATCH_CLOSE_REASON_SERVER_ERROR, MatchClosed, RoomCreate, RoomJoin, RoomJoined,
+        };
+        let gw = Gateway::new();
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"M".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
+            .unwrap()
+            .room_id;
+        let (b, mut rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+        );
+        let _ = rb.recv().await; // B's ROOM_JOINED
+
+        // The match fails server-side: both members are informed with a
+        // server-error close carrying the client-prompted requeue hint, and
+        // the room is pruned.
+        assert_eq!(gw.close_match(room_id), 2);
+        for receiver in [&mut ra, &mut rb] {
+            let outbound = receiver.recv().await.expect("MATCH_CLOSED delivered");
+            assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
+            let closed = MatchClosed::decode(&outbound.envelope.body).unwrap();
+            assert_eq!(closed.room_id, room_id);
+            assert_eq!(closed.reason, MATCH_CLOSE_REASON_SERVER_ERROR);
+            assert!(closed.requeue_hint, "members are returned to matchmaking");
+        }
+        assert_eq!(gw.rooms().room_count(), 0, "the room is pruned");
+        assert_eq!(gw.rooms().room_of(a), None);
+        assert_eq!(gw.rooms().room_of(b), None);
+        // Closing an already-closed match delivers nothing.
+        assert_eq!(gw.close_match(room_id), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_death_closes_all_dependent_matches() {
+        use citadel_wire::protocol::KIND_MATCH_CLOSED;
+        use citadel_wire::room::{MatchClosed, RoomCreate, RoomJoined};
+        let gw = Gateway::new();
+        // Two independent live matches, one member each. Distinct create
+        // params: same-named creates land in one shared room by design.
+        let mut members = Vec::new();
+        for name in [b"M1".to_vec(), b"M2".to_vec()] {
+            let (p, mut rp) = register(&gw);
+            gw.handle_inbound(
+                p,
+                &Envelope::new(KIND_ROOM_CREATE, RoomCreate { params: name }.encode()),
+            );
+            let room_id = RoomJoined::decode(&rp.recv().await.unwrap().envelope.body)
+                .unwrap()
+                .room_id;
+            members.push((room_id, rp));
+        }
+        assert_eq!(gw.rooms().room_count(), 2);
+
+        // The worker died: every dependent match closes the same way.
+        assert_eq!(gw.close_all_matches(), 2);
+        for (room_id, receiver) in &mut members {
+            let outbound = receiver.recv().await.expect("MATCH_CLOSED delivered");
+            assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
+            assert_eq!(
+                MatchClosed::decode(&outbound.envelope.body).unwrap().room_id,
+                *room_id
+            );
+        }
+        assert_eq!(gw.rooms().room_count(), 0, "all rooms are pruned");
     }
 
     #[tokio::test]
