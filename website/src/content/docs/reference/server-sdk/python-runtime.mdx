@@ -202,6 +202,17 @@ hosting. Write handlers that return quickly and never busy-wait for game
 state.
 :::
 
+:::note[Per-match isolation is soft on Python]
+Under the external-worker adapter each match runs the script in its **own
+module namespace**, so module globals (counters, state tables, handler
+registrations) are match-local. CPython still allows only one interpreter per
+worker process, so this isolation is *soft*: `sys`, imported third-party
+modules, and anything a script mutates on a shared module are visible across
+matches, and an interpreter-level failure costs every match in the worker.
+Keep per-match state in module globals and avoid mutating shared modules. Lua
+and JavaScript matches get fully separate engine states instead.
+:::
+
 ## Enable Python
 
 ```toml

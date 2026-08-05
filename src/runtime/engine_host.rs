@@ -9,8 +9,9 @@
 //!   match globals can never leak between matches.
 //! - **JS** (`runtime-js`): a fresh rquickjs `Runtime` + `Context` per match
 //!   (a per-match `JsRuntime`).
-//! - **Python** (`runtime-python`): a per-match namespace on the single
-//!   interpreter — documented soft isolation (not yet implemented here).
+//! - **Python** (`runtime-python`): a per-match module namespace on the
+//!   single interpreter — documented soft isolation (see
+//!   [`PythonMatchEngine`]).
 //!
 //! Scheduling is fair round-robin with a one-budget-quantum rule: each
 //! scheduling round gives every live match exactly one bounded invocation
@@ -571,6 +572,52 @@ impl MatchEngine for JsMatchEngine {
     }
 }
 
+/// Python engine: one namespace per match on the single interpreter.
+///
+/// CPython allows exactly one interpreter per process, so per-match isolation
+/// is **soft** by construction: every match evaluates the deployment's script
+/// into its own freshly created module pair (a per-match main module and a
+/// per-match `citadel` host module, see `build_python`'s unique module
+/// naming), so script globals and handler tables are match-local. What
+/// remains shared is the interpreter itself — `sys`, imported third-party
+/// modules, and anything a script mutates on a shared module leaks across
+/// matches, and an interpreter-level wedge is engine death (the worker
+/// process is replaced). This is the documented trade-off of the Python
+/// engine; Lua and JS get hard per-match states instead.
+#[cfg(feature = "runtime-python")]
+pub struct PythonMatchEngine {
+    source: String,
+    deadline_ms: u64,
+}
+
+#[cfg(feature = "runtime-python")]
+impl PythonMatchEngine {
+    #[must_use]
+    pub fn new(source: impl Into<String>, deadline_ms: u64) -> Self {
+        Self {
+            source: source.into(),
+            deadline_ms,
+        }
+    }
+}
+
+#[cfg(feature = "runtime-python")]
+impl MatchEngine for PythonMatchEngine {
+    fn engine(&self) -> &'static str {
+        "python"
+    }
+
+    fn open_match(&mut self, match_id: u64) -> Result<Box<dyn MatchContext>, MatchFault> {
+        let runtime = crate::runtime::PythonRuntime::from_source(
+            &self.source,
+            format!("match-{match_id}/main.py"),
+            self.deadline_ms,
+        )
+        .map_err(|_| MatchFault::Wedged)?;
+        Ok(Box::new(RuntimeMatchContext { runtime }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -986,6 +1033,46 @@ mod tests {
             sent_bodies(&outputs, 2),
             vec![b"1".to_vec()],
             "match B starts from a fresh rquickjs runtime"
+        );
+    }
+
+    #[cfg(feature = "runtime-python")]
+    #[test]
+    fn two_matches_do_not_share_globals_python() {
+        // Soft isolation on the single interpreter: each match's script runs
+        // in its own module namespace, so the per-match counter global must
+        // not leak between matches even though the interpreter is shared.
+        const PYTHON_COUNTER_SCRIPT: &str = r#"
+import citadel
+
+count = 0
+
+@citadel.on_message(1)
+def counter(ctx, body):
+    global count
+    count += 1
+    citadel.send(ctx.sender, 99, str(count))
+"#;
+        let engine = PythonMatchEngine::new(PYTHON_COUNTER_SCRIPT, 100);
+        let mut host = EngineHost::new(Box::new(engine), MatchSchedulerPolicy::default());
+        host.open_match(1).expect("open A");
+        host.open_match(2).expect("open B");
+        host.enqueue_event(1, invocation(1));
+        host.run_round(Duration::from_millis(16));
+        host.enqueue_event(1, invocation(1));
+        host.run_round(Duration::from_millis(16));
+        host.enqueue_event(2, invocation(1));
+        host.run_round(Duration::from_millis(16));
+        let outputs = host.drain_outputs();
+        assert_eq!(
+            sent_bodies(&outputs, 1),
+            vec![b"1".to_vec(), b"2".to_vec()],
+            "match A counts its own events"
+        );
+        assert_eq!(
+            sent_bodies(&outputs, 2),
+            vec![b"1".to_vec()],
+            "match B starts from a fresh module namespace"
         );
     }
 
