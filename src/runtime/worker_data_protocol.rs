@@ -510,7 +510,10 @@ mod tests {
 
         // The worker restarted: the gateway fences to a new generation.
         rx.advance_epoch(2);
-        assert!(rx.open_match_ids().is_empty(), "no match survives a restart");
+        assert!(
+            rx.open_match_ids().is_empty(),
+            "no match survives a restart"
+        );
         // A replayed old-epoch frame is dropped and counted.
         assert_eq!(rx.accept(&event(1, 1, 2)), Err(RxRejection::StaleEpoch));
         // Even a current-epoch frame fails until MatchOpen re-registers it.

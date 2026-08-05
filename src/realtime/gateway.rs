@@ -5374,8 +5374,11 @@ impl Gateway {
         .encode();
         let mut sent = 0;
         for member in members {
-            if self.send_reliable(member, citadel_wire::protocol::KIND_MATCH_CLOSED, body.clone())
-            {
+            if self.send_reliable(
+                member,
+                citadel_wire::protocol::KIND_MATCH_CLOSED,
+                body.clone(),
+            ) {
                 sent += 1;
             }
         }
@@ -6546,7 +6549,9 @@ mod transform_tests {
             let outbound = receiver.recv().await.expect("MATCH_CLOSED delivered");
             assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
             assert_eq!(
-                MatchClosed::decode(&outbound.envelope.body).unwrap().room_id,
+                MatchClosed::decode(&outbound.envelope.body)
+                    .unwrap()
+                    .room_id,
                 *room_id
             );
         }

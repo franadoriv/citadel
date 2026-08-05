@@ -145,8 +145,10 @@ pub struct MatchInvocation {
 /// A per-match execution context produced by the deployment's one engine.
 pub trait MatchContext: Send {
     /// Run one queued event through the match's context (one quantum).
-    fn handle_event(&mut self, invocation: &MatchInvocation)
-    -> Result<Vec<OutboundCommand>, MatchFault>;
+    fn handle_event(
+        &mut self,
+        invocation: &MatchInvocation,
+    ) -> Result<Vec<OutboundCommand>, MatchFault>;
 
     /// Advance the match's game loop by `dt` (one quantum).
     fn tick(&mut self, dt: Duration) -> Result<Vec<OutboundCommand>, MatchFault>;
@@ -401,18 +403,15 @@ impl EngineHost {
         std::mem::take(&mut self.outputs)
     }
 
-    fn settle_quantum(
-        &mut self,
-        match_id: u64,
-        result: Result<Vec<OutboundCommand>, MatchFault>,
-    ) {
+    fn settle_quantum(&mut self, match_id: u64, result: Result<Vec<OutboundCommand>, MatchFault>) {
         match result {
             Ok(commands) => {
                 if let Some(slot) = self.matches.get_mut(&match_id) {
                     slot.consecutive_overruns = 0;
                 }
                 if !commands.is_empty() {
-                    self.outputs.push(HostOutput::Commands { match_id, commands });
+                    self.outputs
+                        .push(HostOutput::Commands { match_id, commands });
                 }
             }
             Err(MatchFault::Overrun) => {
@@ -683,7 +682,10 @@ mod tests {
         host.open_match(1).expect("open A");
         host.open_match(2).expect("open B");
         for _ in 0..40 {
-            assert_eq!(host.enqueue_event(1, invocation(1)), EnqueueOutcome::Accepted);
+            assert_eq!(
+                host.enqueue_event(1, invocation(1)),
+                EnqueueOutcome::Accepted
+            );
         }
         const ROUNDS: u64 = 10;
         for _ in 0..ROUNDS {
@@ -741,8 +743,14 @@ mod tests {
         );
         host.open_match(1).expect("open A");
         host.open_match(2).expect("open B");
-        assert_eq!(host.enqueue_event(1, invocation(1)), EnqueueOutcome::Accepted);
-        assert_eq!(host.enqueue_event(1, invocation(1)), EnqueueOutcome::Accepted);
+        assert_eq!(
+            host.enqueue_event(1, invocation(1)),
+            EnqueueOutcome::Accepted
+        );
+        assert_eq!(
+            host.enqueue_event(1, invocation(1)),
+            EnqueueOutcome::Accepted
+        );
         // The third event overflows the bounded mailbox: dropped, counted,
         // and the match fails closed without touching its neighbor.
         assert_eq!(
@@ -843,8 +851,12 @@ mod tests {
             EnqueueOutcome::UnknownMatch
         );
         assert_eq!(host.counters().unknown_match_events, 1);
-        host.open_match(1).expect("MatchOpen re-registers the match");
-        assert_eq!(host.enqueue_event(1, invocation(1)), EnqueueOutcome::Accepted);
+        host.open_match(1)
+            .expect("MatchOpen re-registers the match");
+        assert_eq!(
+            host.enqueue_event(1, invocation(1)),
+            EnqueueOutcome::Accepted
+        );
     }
 
     #[test]

@@ -784,9 +784,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         struct CloseMatchesOnGenerationEnd {
             gateway: Arc<crate::realtime::Gateway>,
         }
-        impl crate::runtime::worker_supervisor::WorkerGenerationObserver
-            for CloseMatchesOnGenerationEnd
-        {
+        impl crate::runtime::worker_supervisor::WorkerGenerationObserver for CloseMatchesOnGenerationEnd {
             fn worker_generation_ended(&self) {
                 let notified = self.gateway.close_all_matches();
                 tracing::warn!(
@@ -801,9 +799,11 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
                 std::env::temp_dir(),
                 crate::runtime::worker_supervisor::WorkerSupervisionPolicy::default(),
             )
-            .with_generation_observer(std::sync::Arc::new(CloseMatchesOnGenerationEnd {
-                gateway: Arc::clone(&gateway),
-            })),
+            .with_generation_observer(std::sync::Arc::new(
+                CloseMatchesOnGenerationEnd {
+                    gateway: Arc::clone(&gateway),
+                },
+            )),
         );
     }
 

@@ -1709,7 +1709,10 @@ mod tests {
             logs.contains("first boot failed"),
             "the first-boot failure must reach live tracing output: {logs:?}"
         );
-        assert!(logs.contains("ERROR"), "failure logs at error level: {logs:?}");
+        assert!(
+            logs.contains("ERROR"),
+            "failure logs at error level: {logs:?}"
+        );
     }
 
     #[test]
