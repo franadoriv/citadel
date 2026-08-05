@@ -830,10 +830,10 @@ pub struct RuntimeConfig {
     /// Explicit runtime language. `None` means autodetect from `scripts_dir`.
     pub language: Option<RuntimeLanguage>,
     /// Runtime hosting adapter. `embedded` executes game scripts in-process.
-    /// `external-worker` (unix only) spawns and supervises the runtime worker
-    /// process from the serve lifecycle but does not execute game scripts
-    /// yet; a present script entrypoint is rejected under it. `wasm` is not
-    /// implemented.
+    /// `external-worker` (unix and windows) spawns and supervises the runtime
+    /// worker process from the serve lifecycle but does not execute game
+    /// scripts yet; a present script entrypoint is rejected under it. `wasm`
+    /// is not implemented.
     pub adapter: RuntimeAdapter,
     /// Runtime trust tier. Only `trusted` is implemented today.
     pub tier: RuntimeTier,
@@ -2136,15 +2136,15 @@ impl RuntimeConfig {
         match self.adapter {
             RuntimeAdapter::Embedded => {}
             // The serve lifecycle spawns and supervises the worker process on
-            // unix. Script execution inside the worker is not implemented yet;
-            // `resolve_selection` rejects a script entrypoint under this
-            // adapter so scripts are never silently ignored.
-            #[cfg(unix)]
+            // unix and windows. Script execution inside the worker is not
+            // implemented yet; `resolve_selection` rejects a script entrypoint
+            // under this adapter so scripts are never silently ignored.
+            #[cfg(any(unix, windows))]
             RuntimeAdapter::ExternalWorker => {}
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             RuntimeAdapter::ExternalWorker => {
                 return Err(AppError::config(
-                    "runtime.adapter 'external-worker' requires a unix host; use 'embedded'",
+                    "runtime.adapter 'external-worker' requires a unix or windows host; use 'embedded'",
                 ));
             }
             RuntimeAdapter::Wasm => {
@@ -2181,14 +2181,14 @@ impl RuntimeConfig {
         // serve lifecycle but does not execute game scripts yet. A present
         // entrypoint is a hard error so the operator's script is never
         // silently ignored.
-        if self.adapter == RuntimeAdapter::ExternalWorker {
-            if let Some(selection) = &selection {
-                return Err(AppError::config(format!(
-                    "runtime.adapter 'external-worker' does not execute game scripts yet; \
-                     use 'embedded' to run {}",
-                    selection.entrypoint.display()
-                )));
-            }
+        if self.adapter == RuntimeAdapter::ExternalWorker
+            && let Some(selection) = &selection
+        {
+            return Err(AppError::config(format!(
+                "runtime.adapter 'external-worker' does not execute game scripts yet; \
+                 use 'embedded' to run {}",
+                selection.entrypoint.display()
+            )));
         }
         Ok(selection)
     }
@@ -2815,9 +2815,9 @@ mod tests {
         assert!(err.message().contains("runtime.tier"));
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
-    fn external_worker_adapter_requires_a_unix_host() {
+    fn external_worker_adapter_requires_a_supported_host() {
         let config = Config {
             runtime: RuntimeConfig {
                 adapter: RuntimeAdapter::ExternalWorker,
@@ -2827,14 +2827,14 @@ mod tests {
         };
         let err = config
             .validate()
-            .expect_err("external worker is unix-only");
+            .expect_err("external worker needs a unix or windows host");
         assert_eq!(err.category(), crate::error::ErrorCategory::Config);
-        assert!(err.message().contains("unix"));
+        assert!(err.message().contains("unix or windows"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn external_worker_adapter_is_accepted_on_unix_without_scripts() {
+    fn external_worker_adapter_is_accepted_without_scripts() {
         let dir = unique_temp_dir("runtime-external-worker-empty");
         std::fs::create_dir_all(&dir).expect("temp dir");
         let config = Config {
@@ -2847,7 +2847,7 @@ mod tests {
         };
         config
             .validate()
-            .expect("external worker validates on unix");
+            .expect("external worker validates on a supported host");
         assert_eq!(
             config
                 .runtime
@@ -2859,7 +2859,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn external_worker_adapter_rejects_a_script_entrypoint() {
         let dir = unique_temp_dir("runtime-external-worker-script");

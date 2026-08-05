@@ -1,10 +1,11 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::{path::Path, time::Duration};
 
+#[cfg(unix)]
+use citadel::runtime::worker_supervisor::WorkerResourceLimits;
 use citadel::runtime::worker_supervisor::{
-    RestartController, SupervisedWorker, WorkerLifecycleService, WorkerResourceLimits,
-    WorkerSupervisionPolicy,
+    RestartController, SupervisedWorker, WorkerLifecycleService, WorkerSupervisionPolicy,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -181,6 +182,11 @@ fn worker_reports_health_periodically_until_shutdown() {
         .expect("worker must acknowledge orderly shutdown");
 }
 
+// Unix-only: the assertion reads `/proc/<pid>/limits`, and the open-file
+// limit itself has no Windows kernel equivalent — the Windows worker
+// surfaces it as unenforceable instead of applying it (job-object
+// containment covers lifecycle, not per-resource limits).
+#[cfg(unix)]
 #[test]
 fn worker_process_applies_supervised_resource_limits() {
     let executable = Path::new(env!("CARGO_BIN_EXE_citadel"));

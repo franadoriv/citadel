@@ -756,12 +756,13 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     maybe_spawn_reload(&mut supervisor, runtime.as_ref(), &app.config().runtime);
 
     // Supervise the external GameScript worker process when the operator
-    // opted into the external-worker adapter (unix only; config validation
-    // rejects it elsewhere). Script execution does not route through the
-    // worker yet — a present entrypoint is rejected by `resolve_selection` —
-    // but the worker's lifecycle (boot, periodic health, restart policy,
-    // shutdown) is owned by the same supervisor as every other service.
-    #[cfg(unix)]
+    // opted into the external-worker adapter (unix and windows; config
+    // validation rejects it elsewhere). Script execution does not route
+    // through the worker yet — a present entrypoint is rejected by
+    // `resolve_selection` — but the worker's lifecycle (boot, periodic
+    // health, restart policy, shutdown) is owned by the same supervisor as
+    // every other service.
+    #[cfg(any(unix, windows))]
     if app.config().runtime.enabled
         && app.config().runtime.adapter == crate::config::RuntimeAdapter::ExternalWorker
     {
