@@ -5540,6 +5540,18 @@ impl Gateway {
         let Some((room_id, remaining)) = self.rooms.leave(sender) else {
             return 0;
         };
+        // A leave that empties the room prunes it from the registry. Let a
+        // process-hosting runtime adapter release the match's execution
+        // context, exactly like [`Self::close_match`] does (embedded adapters
+        // no-op); without this, an exodus-abandoned match ticks until worker
+        // restart. Room ids are never reused, so a pruned id observed here
+        // cannot belong to a later room.
+        if remaining.is_empty()
+            && self.rooms.label(room_id).is_none()
+            && let Some(runtime) = &self.runtime
+        {
+            runtime.on_match_closed(room_id);
+        }
         let body = citadel_wire::room::RoomLeave { room_id }.encode();
         let mut sent = 0;
         for peer in remaining {
@@ -6556,6 +6568,141 @@ mod transform_tests {
         assert_eq!(gw.rooms().room_of(b), None);
         // Closing an already-closed match delivers nothing.
         assert_eq!(gw.close_match(room_id), 0);
+    }
+
+    /// Records every match-closure notification the gateway sends its runtime.
+    /// Every other surface is inert, mirroring [`Runtime`]'s defaults.
+    #[derive(Default)]
+    struct ClosureProbeRuntime {
+        closed: Mutex<Vec<u64>>,
+    }
+
+    impl Runtime for ClosureProbeRuntime {
+        fn dispatch(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _kind: u16,
+            _body: &[u8],
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn dispatch_lifecycle(
+            &self,
+            _hook: LifecycleHook,
+            _sender: u64,
+            _user_id: Option<&str>,
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn tick(
+            &self,
+            _dt: std::time::Duration,
+            _budget: std::time::Duration,
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn on_match_closed(&self, room_id: u64) {
+            self.closed.lock().expect("closed lock").push(room_id);
+        }
+
+        fn call_rpc(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _method: &str,
+            _body: &[u8],
+        ) -> RpcOutcome {
+            RpcOutcome::Err("no rpc handlers".to_owned())
+        }
+
+        fn call_room_create(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _params: &[u8],
+        ) -> Option<crate::runtime::RoomSpec> {
+            None
+        }
+
+        fn call_room_join(&self, _sender: u64, _user_id: Option<&str>, _room_id: u64) -> bool {
+            true
+        }
+
+        fn has_tick_handler(&self) -> bool {
+            false
+        }
+
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_millis(50)
+        }
+
+        fn introspect(&self) -> crate::runtime::RuntimeIntrospection {
+            crate::runtime::RuntimeIntrospection {
+                source: "closure-probe".to_owned(),
+                reloadable: false,
+                deadline_ms: 50,
+                rpcs: Vec::new(),
+                message_kinds: Vec::new(),
+                hooks: Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn member_exodus_notifies_runtime_of_match_closure() {
+        use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined, RoomLeave};
+
+        let runtime = Arc::new(ClosureProbeRuntime::default());
+        let gw = Gateway::with_metrics_and_runtime(
+            Arc::new(NodeMetrics::new()),
+            Some(Arc::clone(&runtime) as Arc<dyn Runtime>),
+        );
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"M".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
+            .unwrap()
+            .room_id;
+        let (b, _rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+        );
+
+        // A leaves explicitly: B remains, so the match is still live and the
+        // runtime must keep its execution context.
+        gw.handle_inbound(
+            a,
+            &Envelope::new(KIND_ROOM_LEAVE, RoomLeave { room_id }.encode()),
+        );
+        assert!(
+            runtime.closed.lock().expect("closed lock").is_empty(),
+            "a leave that does not empty the room is not a match closure"
+        );
+
+        // B disconnects: the room empties and is pruned. The runtime must be
+        // told to release the match's execution context, exactly like a
+        // server-side close — otherwise a process-hosting adapter leaks the
+        // worker-side context (thread + engine state) until worker restart.
+        gw.unregister_session(b);
+        assert_eq!(gw.rooms().room_count(), 0, "the emptied room is pruned");
+        assert_eq!(
+            runtime.closed.lock().expect("closed lock").as_slice(),
+            &[room_id],
+            "emptying the room must notify the runtime exactly once"
+        );
     }
 
     #[tokio::test]
