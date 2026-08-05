@@ -999,6 +999,10 @@ mod postgres {
         .expect("connect + migrate against the test Postgres")
     }
 
+    /// One gated test per backend, like the sibling wallet/friends/groups
+    /// suites: the gated runs share one external database, so scenario and
+    /// concurrency coverage must execute inside a single `#[tokio::test]`
+    /// rather than racing each other under the default parallel harness.
     #[tokio::test]
     async fn postgres_backend_satisfies_the_contract() {
         let Some(url) = test_database_url() else {
@@ -1017,18 +1021,6 @@ mod postgres {
             eprintln!("postgres scenario: {name}");
             run(repo.as_ref()).await;
         }
-    }
-
-    #[tokio::test]
-    async fn postgres_concurrent_contracts_hold() {
-        let Some(url) = test_database_url() else {
-            eprintln!(
-                "skipping Postgres GameScript concurrency contract: set DATABASE_URL or \
-                 CITADEL_TEST_DATABASE_URL to run it"
-            );
-            return;
-        };
-        let db = connect(url).await;
         db.reset_storage_for_tests().await.expect("reset");
         concurrent_identical_submissions_converge(db.gamescript_repository()).await;
         db.reset_storage_for_tests().await.expect("reset");
