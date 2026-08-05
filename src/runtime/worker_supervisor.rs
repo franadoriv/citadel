@@ -507,7 +507,9 @@ impl RestartController {
             bridge
                 .runtime
                 .install_generation(script.epoch, connection.sender);
-            bridge.runtime.spawn_rx_pump(script.epoch, connection.frames);
+            bridge
+                .runtime
+                .spawn_rx_pump(script.epoch, connection.frames);
         }
         Ok(worker)
     }
@@ -835,9 +837,8 @@ impl SupervisedWorker {
                 "worker was not spawned with a script data plane",
             ));
         };
-        let result = super::worker_data_plane::establish_unix_data_plane(
-            &listener, secret, deadline,
-        );
+        let result =
+            super::worker_data_plane::establish_unix_data_plane(&listener, secret, deadline);
         // Keep the endpoint directory alive for the connection's lifetime by
         // storing it back; the listener itself is no longer needed.
         self.data_endpoint = Some((endpoint, listener));

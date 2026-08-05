@@ -25,9 +25,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::external_worker::{FrameSendError, FrameSender};
-use super::worker_data_protocol::{
-    DataFrame, read_data_frame_async, write_data_frame_async,
-};
+use super::worker_data_protocol::{DataFrame, read_data_frame_async, write_data_frame_async};
 use super::worker_protocol::{
     ControlFrame, PROTOCOL_VERSION, read_control_frame_async, verify_worker_hello,
     write_control_frame_async,
@@ -122,7 +120,10 @@ async fn pump_frames<S>(
     };
     let writer = async {
         while let Some(frame) = outbound.recv().await {
-            if write_data_frame_async(&mut write_half, &frame).await.is_err() {
+            if write_data_frame_async(&mut write_half, &frame)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -217,7 +218,8 @@ impl WindowsDataPlane {
         let name = endpoint.name().to_string();
         let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<io::Result<()>>(1);
         let (pid_tx, pid_rx) = std::sync::mpsc::sync_channel::<u32>(1);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<io::Result<DataPlaneConnection>>(1);
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::sync_channel::<io::Result<DataPlaneConnection>>(1);
         std::thread::Builder::new()
             .name("citadel-worker-data-pump".to_owned())
             .spawn(move || {

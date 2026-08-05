@@ -813,9 +813,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         }));
         if let Some(external) = &external_runtime {
             service = service.with_data_plane(
-                crate::runtime::worker_supervisor::WorkerDataPlaneBridge::new(Arc::clone(
-                    external,
-                )),
+                crate::runtime::worker_supervisor::WorkerDataPlaneBridge::new(Arc::clone(external)),
             );
         }
         supervisor.spawn(service);
@@ -1151,14 +1149,16 @@ fn build_external_runtime(
         .tick_period()
         .map(|period| u64::try_from(period.as_millis()).unwrap_or(u64::MAX).max(1))
         .unwrap_or(crate::runtime::external_worker::DEFAULT_MATCH_ROUND_CADENCE_MS);
-    let external = Arc::new(crate::runtime::external_worker::ExternalWorkerRuntime::load(
-        crate::runtime::external_worker::WorkerScriptSpec {
-            language: selection.language,
-            entrypoint: selection.entrypoint.clone(),
-            deadline_ms: rc.deadline_ms,
-            tick_ms,
-        },
-    )?);
+    let external = Arc::new(
+        crate::runtime::external_worker::ExternalWorkerRuntime::load(
+            crate::runtime::external_worker::WorkerScriptSpec {
+                language: selection.language,
+                entrypoint: selection.entrypoint.clone(),
+                deadline_ms: rc.deadline_ms,
+                tick_ms,
+            },
+        )?,
+    );
     tracing::info!(
         entrypoint = %selection.entrypoint.display(),
         language = selection.language.as_str(),

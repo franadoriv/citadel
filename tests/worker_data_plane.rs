@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use citadel::config::RuntimeLanguage;
-use citadel::runtime::{OutboundCommand, Runtime};
 use citadel::runtime::external_worker::{
     ExternalWorkerRuntime, MatchCommandSink, WorkerScriptSpec,
 };
@@ -18,6 +17,7 @@ use citadel::runtime::worker_data_protocol::MatchCloseReason;
 use citadel::runtime::worker_supervisor::{
     RestartController, SupervisedWorker, WorkerDataPlaneBridge, WorkerSupervisionPolicy,
 };
+use citadel::runtime::{OutboundCommand, Runtime};
 
 mod common;
 
@@ -219,7 +219,10 @@ fn non_yielding_lua_match_closes_only_itself_over_live_ipc() {
         "match 2 must keep being served; got {:?}",
         harness.sink.sent_bodies(2),
     );
-    assert_eq!(harness.sink.sent_bodies(2), vec![b"1".to_vec(), b"2".to_vec()]);
+    assert_eq!(
+        harness.sink.sent_bodies(2),
+        vec![b"1".to_vec(), b"2".to_vec()]
+    );
     // The worker itself stayed healthy: one bad match is match-local.
     worker
         .health_check(Duration::from_secs(5))
@@ -247,7 +250,11 @@ fn worker_crash_replacement_never_resumes_matches() {
     // Kill the real process out from under the supervisor and recover: the
     // replacement completes a fresh authenticated handshake (fresh secret)
     // and a fresh data plane (fresh epoch).
-    active.as_mut().expect("active worker").kill().expect("kill");
+    active
+        .as_mut()
+        .expect("active worker")
+        .kill()
+        .expect("kill");
     let mut replaced = false;
     for _ in 0..5 {
         let available = harness
@@ -296,7 +303,9 @@ async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
     use citadel::transport::codec::Envelope;
     use citadel::transport::websocket::WebSocketServer;
     use citadel_wire::protocol::{KIND_MATCH_CLOSED, KIND_ROOM_CREATE, KIND_ROOM_JOINED};
-    use citadel_wire::room::{MATCH_CLOSE_REASON_SERVER_ERROR, MatchClosed, RoomCreate, RoomJoined};
+    use citadel_wire::room::{
+        MATCH_CLOSE_REASON_SERVER_ERROR, MatchClosed, RoomCreate, RoomJoined,
+    };
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
 

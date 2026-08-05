@@ -173,32 +173,32 @@ fn load_script_host(args: &ScriptArgs) -> Result<ScriptHost> {
         )
     })?;
     let identity = citadel::runtime::external_worker::script_identity(source.as_bytes());
-    let mut engine: Box<dyn citadel::runtime::engine_host::MatchEngine> =
-        match args.engine.as_str() {
-            "lua" => Box::new(citadel::runtime::engine_host::LuaMatchEngine::new(
-                source,
-                args.script_deadline_ms,
-            )),
-            #[cfg(feature = "runtime-js")]
-            "js" => Box::new(citadel::runtime::engine_host::JsMatchEngine::new(
-                source,
-                args.script_deadline_ms,
-            )),
-            #[cfg(not(feature = "runtime-js"))]
-            "js" => anyhow::bail!(
-                "runtime worker was built without the 'runtime-js' feature and cannot host js"
-            ),
-            #[cfg(feature = "runtime-python")]
-            "python" => Box::new(citadel::runtime::engine_host::PythonMatchEngine::new(
-                source,
-                args.script_deadline_ms,
-            )),
-            #[cfg(not(feature = "runtime-python"))]
-            "python" => anyhow::bail!(
-                "runtime worker was built without the 'runtime-python' feature and cannot host python"
-            ),
-            other => anyhow::bail!("runtime worker does not know the engine '{other}'"),
-        };
+    let mut engine: Box<dyn citadel::runtime::engine_host::MatchEngine> = match args.engine.as_str()
+    {
+        "lua" => Box::new(citadel::runtime::engine_host::LuaMatchEngine::new(
+            source,
+            args.script_deadline_ms,
+        )),
+        #[cfg(feature = "runtime-js")]
+        "js" => Box::new(citadel::runtime::engine_host::JsMatchEngine::new(
+            source,
+            args.script_deadline_ms,
+        )),
+        #[cfg(not(feature = "runtime-js"))]
+        "js" => anyhow::bail!(
+            "runtime worker was built without the 'runtime-js' feature and cannot host js"
+        ),
+        #[cfg(feature = "runtime-python")]
+        "python" => Box::new(citadel::runtime::engine_host::PythonMatchEngine::new(
+            source,
+            args.script_deadline_ms,
+        )),
+        #[cfg(not(feature = "runtime-python"))]
+        "python" => anyhow::bail!(
+            "runtime worker was built without the 'runtime-python' feature and cannot host python"
+        ),
+        other => anyhow::bail!("runtime worker does not know the engine '{other}'"),
+    };
     engine
         .open_match(u64::MAX)
         .map_err(|fault| anyhow::anyhow!("runtime worker script failed to load: {fault:?}"))?;
@@ -302,7 +302,13 @@ where
         .name("citadel-worker-engine".to_owned())
         .spawn(move || {
             citadel::runtime::worker_engine::run_worker_data_plane(
-                reader, writer, engine_loop, tick, heartbeat, &stop, &healthy,
+                reader,
+                writer,
+                engine_loop,
+                tick,
+                heartbeat,
+                &stop,
+                &healthy,
             );
         })
         .expect("spawn worker engine thread")
@@ -417,10 +423,7 @@ fn run_runtime_worker(
     // Load and validate the hosted script (if any) before reporting
     // readiness, so a broken script fails the bootstrap instead of being
     // discovered match by match.
-    let script_host = script
-        .as_ref()
-        .map(load_script_host)
-        .transpose()?;
+    let script_host = script.as_ref().map(load_script_host).transpose()?;
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
         &citadel::runtime::worker_protocol::ControlFrame::WorkerReady {
@@ -565,10 +568,7 @@ fn run_runtime_worker(
     // Load and validate the hosted script (if any) before reporting
     // readiness, so a broken script fails the bootstrap instead of being
     // discovered match by match.
-    let script_host = script
-        .as_ref()
-        .map(load_script_host)
-        .transpose()?;
+    let script_host = script.as_ref().map(load_script_host).transpose()?;
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
         &citadel::runtime::worker_protocol::ControlFrame::WorkerReady {

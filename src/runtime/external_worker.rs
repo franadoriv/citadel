@@ -320,12 +320,7 @@ impl ExternalWorkerRuntime {
 
     /// Validate and apply one worker→gateway frame (pump body; separated for
     /// deterministic tests).
-    pub fn handle_worker_frame(
-        &self,
-        epoch: u64,
-        rx: &Arc<Mutex<DataPlaneRx>>,
-        frame: DataFrame,
-    ) {
+    pub fn handle_worker_frame(&self, epoch: u64, rx: &Arc<Mutex<DataPlaneRx>>, frame: DataFrame) {
         // Generation fence first: a pump outliving its generation applies
         // nothing, however valid its frames look for their own epoch.
         if !self.is_active_epoch(epoch) {
@@ -707,7 +702,8 @@ mod tests {
         }
 
         pub fn create(label: &str) -> TempDirGuard {
-            let path = std::env::temp_dir().join(format!("citadel-{label}-{}", uuid::Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("citadel-{label}-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).expect("temp dir");
             TempDirGuard { path }
         }

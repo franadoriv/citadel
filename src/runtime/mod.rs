@@ -59,9 +59,9 @@ pub mod shared_cache;
 pub(crate) mod static_data;
 #[cfg(unix)]
 pub mod worker_bootstrap;
-pub mod worker_data_protocol;
 #[cfg(any(unix, windows))]
 pub mod worker_data_plane;
+pub mod worker_data_protocol;
 pub mod worker_engine;
 #[cfg(any(unix, windows))]
 pub mod worker_ipc;

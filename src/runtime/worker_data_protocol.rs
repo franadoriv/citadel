@@ -332,7 +332,9 @@ impl From<WirePhysicsOptions> for crate::runtime::PhysicsOptions {
                     WireShape::Capsule { radius, height } => {
                         citadel_physics::Shape::Capsule { radius, height }
                     }
-                    WireShape::Aabb { half_extents } => citadel_physics::Shape::Aabb { half_extents },
+                    WireShape::Aabb { half_extents } => {
+                        citadel_physics::Shape::Aabb { half_extents }
+                    }
                 },
                 gravity: opts.gravity,
                 buoyancy: opts.buoyancy,

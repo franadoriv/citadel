@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::engine_host::{EngineHost, HostOpenError, HostOutput, MatchEngine, MatchInvocation};
 use super::engine_host::MatchSchedulerPolicy;
+use super::engine_host::{EngineHost, HostOpenError, HostOutput, MatchEngine, MatchInvocation};
 use super::worker_data_protocol::{
     DATA_PROTOCOL_VERSION, DataFrame, DataPlaneRx, EngineReport, FrameHeader, MatchCloseReason,
     RxCounters, WORKER_SCOPE_MATCH_ID, encode_commands,
@@ -625,7 +625,11 @@ mod tests {
         assert!(frames.iter().any(|frame| matches!(
             frame,
             DataFrame::MatchClosed {
-                header: FrameHeader { match_id: 1, epoch: 5, .. },
+                header: FrameHeader {
+                    match_id: 1,
+                    epoch: 5,
+                    ..
+                },
                 reason: MatchCloseReason::ServerError,
                 ..
             }
