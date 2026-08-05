@@ -54,6 +54,10 @@ pub fn fresh_bootstrap_nonce() -> io::Result<[u8; 32]> {
     Ok(nonce)
 }
 
+/// PROVISIONAL descriptor budget: no measurement of a script-hosting worker's
+/// real open-file footprint (script + module files, sockets, engine
+/// internals) exists yet. Replace once descriptor usage of a worker running
+/// representative game scripts has been profiled.
 pub const DEFAULT_WORKER_MAX_OPEN_FILES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +111,14 @@ pub const DEFAULT_WORKER_LIVENESS_DEADLINE: Duration = Duration::from_secs(5);
 /// worker's stop acknowledgement before the process group is killed anyway.
 pub const DEFAULT_WORKER_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
+/// PROVISIONAL re-arm streak: how many consecutive healthy cycles prove a
+/// recovery before the restart circuit breaker clears its failure count. One
+/// healthy cycle is not proof — a crash-looping worker can squeeze a health
+/// frame in between crashes and would otherwise reset the breaker forever.
+/// Replace once restart-storm telemetry shows the healthy-streak length that
+/// separates real recoveries from flapping workers.
+pub const DEFAULT_WORKER_BREAKER_REARM_CYCLES: u32 = 3;
+
 /// Injectable supervision policy for the external GameScript worker.
 ///
 /// This is the single seam the serve lifecycle and tests configure; every
@@ -117,6 +129,7 @@ pub const DEFAULT_WORKER_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 pub struct WorkerSupervisionPolicy {
     resource_limits: WorkerResourceLimits,
     restart_limit: u32,
+    breaker_rearm_healthy_cycles: u32,
     bootstrap_deadline: Duration,
     health_cadence: Duration,
     liveness_deadline: Duration,
@@ -133,6 +146,12 @@ impl WorkerSupervisionPolicy {
     #[must_use]
     pub fn with_restart_limit(mut self, restart_limit: u32) -> Self {
         self.restart_limit = restart_limit.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_breaker_rearm_healthy_cycles(mut self, breaker_rearm_healthy_cycles: u32) -> Self {
+        self.breaker_rearm_healthy_cycles = breaker_rearm_healthy_cycles.max(1);
         self
     }
 
@@ -168,6 +187,10 @@ impl WorkerSupervisionPolicy {
         self.restart_limit
     }
 
+    pub fn breaker_rearm_healthy_cycles(&self) -> u32 {
+        self.breaker_rearm_healthy_cycles
+    }
+
     pub fn bootstrap_deadline(&self) -> Duration {
         self.bootstrap_deadline
     }
@@ -190,6 +213,7 @@ impl Default for WorkerSupervisionPolicy {
         Self {
             resource_limits: WorkerResourceLimits::default(),
             restart_limit: DEFAULT_WORKER_RESTART_LIMIT,
+            breaker_rearm_healthy_cycles: DEFAULT_WORKER_BREAKER_REARM_CYCLES,
             bootstrap_deadline: DEFAULT_WORKER_BOOTSTRAP_DEADLINE,
             health_cadence: DEFAULT_WORKER_HEALTH_CADENCE,
             liveness_deadline: DEFAULT_WORKER_LIVENESS_DEADLINE,
@@ -215,17 +239,30 @@ pub struct RecoverySnapshot {
 pub struct RestartCircuitBreaker {
     limit: u32,
     failures: u32,
+    /// Consecutive healthy cycles required before the failure count clears.
+    rearm_after: u32,
+    healthy_streak: u32,
 }
 
 impl RestartCircuitBreaker {
     pub fn new(limit: u32) -> Self {
+        Self::with_rearm(limit, DEFAULT_WORKER_BREAKER_REARM_CYCLES)
+    }
+
+    /// A breaker that re-arms only after `rearm_after` consecutive healthy
+    /// cycles, so a crash-looping worker's intermittent health frames cannot
+    /// keep resetting the failure count.
+    pub fn with_rearm(limit: u32, rearm_after: u32) -> Self {
         Self {
             limit: limit.max(1),
             failures: 0,
+            rearm_after: rearm_after.max(1),
+            healthy_streak: 0,
         }
     }
 
     pub fn record_failure(&mut self) -> bool {
+        self.healthy_streak = 0;
         self.failures = self.failures.saturating_add(1);
         !self.is_open()
     }
@@ -240,7 +277,10 @@ impl RestartCircuitBreaker {
     }
 
     pub fn record_healthy(&mut self) {
-        self.failures = 0;
+        self.healthy_streak = self.healthy_streak.saturating_add(1);
+        if self.healthy_streak >= self.rearm_after {
+            self.failures = 0;
+        }
     }
 
     pub fn snapshot(&self) -> RecoverySnapshot {
@@ -278,7 +318,10 @@ impl RestartController {
             executable,
             parent,
             policy,
-            breaker: RestartCircuitBreaker::new(policy.restart_limit()),
+            breaker: RestartCircuitBreaker::with_rearm(
+                policy.restart_limit(),
+                policy.breaker_rearm_healthy_cycles(),
+            ),
         }
     }
 
@@ -386,16 +429,26 @@ pub fn run_supervision_loop(
             "worker health cadence must stay below the liveness deadline",
         ));
     }
-    let mut active = Some(controller.start()?);
+    // First-boot and breaker-open failures are surfaced in live logs here,
+    // at the moment they happen — not only through the error the serve
+    // lifecycle joins at shutdown.
+    let mut active = match controller.start() {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "external runtime worker first boot failed; supervision halted"
+            );
+            return Err(error);
+        }
+    };
     while !stop.load(Ordering::SeqCst) {
         match controller.monitor_health(&mut active, policy.liveness_deadline()) {
             Ok(true) => {
                 healthy_cycles.fetch_add(1, Ordering::SeqCst);
             }
             Ok(false) => {
-                return Err(io::Error::other(
-                    "worker restart circuit breaker is open; supervision halted",
-                ));
+                return Err(breaker_open_halt());
             }
             Err(error) => {
                 // A restart attempt failed to boot or authenticate. The
@@ -413,6 +466,15 @@ pub fn run_supervision_loop(
         tracing::warn!(error = %error, "external runtime worker shutdown was not acknowledged");
     }
     Ok(())
+}
+
+/// Report the breaker-open supervision halt in live logs and build its error.
+///
+/// One shared path for the halt so the live-log surface and the returned
+/// error can never drift apart.
+fn breaker_open_halt() -> io::Error {
+    tracing::error!("external runtime worker restart circuit breaker is open; supervision halted");
+    io::Error::other("worker restart circuit breaker is open; supervision halted")
 }
 
 /// Serve-lifecycle service owning the external GameScript worker.
@@ -1491,14 +1553,124 @@ mod tests {
 
     #[test]
     fn circuit_breaker_opens_at_restart_limit() {
-        let mut breaker = super::RestartCircuitBreaker::new(3);
+        let mut breaker = super::RestartCircuitBreaker::with_rearm(3, 2);
         assert!(breaker.record_failure());
         assert!(breaker.record_failure());
         assert!(!breaker.record_failure());
         assert!(breaker.is_open());
+        // One healthy cycle is not proof of recovery: the breaker re-arms
+        // only after the configured healthy streak.
+        breaker.record_healthy();
+        assert!(breaker.is_open());
         breaker.record_healthy();
         assert!(!breaker.is_open());
         assert!(breaker.record_failure());
+    }
+
+    #[test]
+    fn breaker_requires_n_healthy_cycles_before_rearming() {
+        // A crash-loop that squeezes in a single healthy cycle between
+        // failures must not keep resetting the failure count, otherwise the
+        // breaker can never trip on a flapping worker.
+        let mut breaker = super::RestartCircuitBreaker::with_rearm(3, 2);
+        assert!(breaker.record_failure());
+        breaker.record_healthy();
+        assert_eq!(
+            breaker.snapshot().consecutive_failures,
+            1,
+            "a lone healthy cycle must not re-arm the breaker"
+        );
+        assert!(breaker.record_failure());
+        breaker.record_healthy();
+        assert_eq!(
+            breaker.snapshot().consecutive_failures,
+            2,
+            "intermittent health in a crash-loop keeps charging the breaker"
+        );
+        // A genuine recovery — N consecutive healthy cycles — re-arms.
+        breaker.record_healthy();
+        assert_eq!(breaker.snapshot().consecutive_failures, 0);
+
+        // The default construction sources the PROVISIONAL re-arm streak.
+        let defaulted = super::RestartCircuitBreaker::new(3);
+        assert_eq!(
+            super::WorkerSupervisionPolicy::default().breaker_rearm_healthy_cycles(),
+            super::DEFAULT_WORKER_BREAKER_REARM_CYCLES
+        );
+        drop(defaulted);
+    }
+
+    /// Capture everything the closure emits through `tracing` on this thread.
+    fn captured_tracing(run: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).write(data)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Buffer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn first_boot_failure_surfaces_in_live_tracing() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        // An unresolvable worker executable fails the first boot. The failure
+        // must appear in live logs at error level immediately — not only in
+        // the error joined at shutdown.
+        let mut controller = super::RestartController::new(
+            PathBuf::from("citadel-no-such-worker-executable"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        );
+        let logs = captured_tracing(|| {
+            let result = super::run_supervision_loop(
+                &mut controller,
+                &AtomicBool::new(false),
+                &AtomicU64::new(0),
+            );
+            assert!(result.is_err(), "an unbootable first boot must fail");
+        });
+        assert!(
+            logs.contains("first boot failed"),
+            "the first-boot failure must reach live tracing output: {logs:?}"
+        );
+        assert!(logs.contains("ERROR"), "failure logs at error level: {logs:?}");
+    }
+
+    #[test]
+    fn open_breaker_halt_surfaces_in_live_tracing() {
+        // The breaker-open halt goes through one shared reporting path; the
+        // supervision loop calls it when `monitor_health` refuses a restart.
+        let logs = captured_tracing(|| {
+            let error = super::breaker_open_halt();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+        });
+        assert!(
+            logs.contains("circuit breaker is open"),
+            "the breaker-open halt must reach live tracing output: {logs:?}"
+        );
+        assert!(logs.contains("ERROR"), "halts log at error level: {logs:?}");
     }
 
     #[test]
