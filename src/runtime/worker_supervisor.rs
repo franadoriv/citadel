@@ -7,7 +7,7 @@ use std::{
         fd::OwnedFd,
         unix::net::{UnixListener, UnixStream},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command},
     time::Duration,
 };
@@ -72,6 +72,68 @@ impl RestartCircuitBreaker {
 
     pub fn is_open(&self) -> bool {
         self.failures >= self.limit
+    }
+}
+
+pub struct RestartController {
+    executable: PathBuf,
+    parent: PathBuf,
+    breaker: RestartCircuitBreaker,
+}
+
+impl RestartController {
+    pub fn new(executable: PathBuf, parent: PathBuf, restart_limit: u32) -> Self {
+        Self {
+            executable,
+            parent,
+            breaker: RestartCircuitBreaker::new(restart_limit),
+        }
+    }
+
+    pub fn monitor_health(
+        &mut self,
+        active: &mut Option<SupervisedWorker>,
+        deadline: Duration,
+    ) -> io::Result<bool> {
+        let Some(worker) = active.as_mut() else {
+            return self.recover_if_exited(active);
+        };
+        if worker.health_check(deadline).is_ok() {
+            self.breaker.record_healthy();
+            Ok(true)
+        } else {
+            self.recover_after_health_failure(active)
+        }
+    }
+
+    pub fn recover_after_health_failure(
+        &mut self,
+        active: &mut Option<SupervisedWorker>,
+    ) -> io::Result<bool> {
+        let _ = active.take();
+        *active = self.restart_after_failure()?;
+        Ok(active.is_some())
+    }
+
+    pub fn recover_if_exited(&mut self, active: &mut Option<SupervisedWorker>) -> io::Result<bool> {
+        let exited = match active.as_mut() {
+            Some(worker) => worker.has_exited()?,
+            None => true,
+        };
+        if !exited {
+            return Ok(false);
+        }
+        *active = self.restart_after_failure()?;
+        Ok(active.is_some())
+    }
+
+    pub fn restart_after_failure(&mut self) -> io::Result<Option<SupervisedWorker>> {
+        let Some(delay) = self.breaker.next_restart_delay() else {
+            return Ok(None);
+        };
+        std::thread::sleep(delay);
+        let secret = fresh_bootstrap_secret()?;
+        SupervisedWorker::spawn(&self.executable, &self.parent, &secret).map(Some)
     }
 }
 
@@ -274,6 +336,79 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn monitor_health_keeps_unavailable_worker_fail_closed() {
+        let mut controller =
+            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+        let mut active = None;
+        assert!(
+            !controller
+                .monitor_health(&mut active, Duration::from_millis(1))
+                .expect("monitor")
+        );
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn health_failure_removes_active_worker_before_recovery() {
+        let mut controller =
+            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+        let mut active = Some(
+            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[3; 32])
+                .expect("spawn"),
+        );
+        assert!(
+            !controller
+                .recover_after_health_failure(&mut active)
+                .expect("recover")
+        );
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn open_breaker_leaves_active_worker_unavailable() {
+        let mut controller =
+            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+        let mut active = None;
+        assert!(!controller.recover_if_exited(&mut active).expect("recover"));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn controller_replaces_an_exited_active_worker() {
+        let mut controller =
+            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 2);
+        let mut active = Some(
+            SupervisedWorker::spawn(Path::new("/bin/true"), &std::env::temp_dir(), &[4; 32])
+                .expect("spawn"),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(controller.recover_if_exited(&mut active).expect("recover"));
+        assert!(active.is_some());
+    }
+
+    #[test]
+    fn controller_restarts_before_breaker_limit() {
+        let mut controller =
+            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 2);
+        let _worker = controller
+            .restart_after_failure()
+            .expect("restart")
+            .expect("permitted restart");
+    }
+
+    #[test]
+    fn controller_refuses_restart_when_breaker_is_open() {
+        let mut controller =
+            super::RestartController::new(PathBuf::from("/bin/true"), std::env::temp_dir(), 1);
+        assert!(
+            controller
+                .restart_after_failure()
+                .expect("decision")
+                .is_none()
+        );
+    }
+
     #[test]
     fn restart_secrets_are_fresh_32_byte_values() {
         let first = super::fresh_bootstrap_secret().expect("first secret");
