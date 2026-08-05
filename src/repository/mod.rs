@@ -21,6 +21,7 @@
 pub mod backend;
 pub mod chat;
 pub mod friends;
+pub mod gamescript;
 pub mod groups;
 pub mod identity;
 pub mod leaderboards;
@@ -43,6 +44,14 @@ pub use chat::{
 };
 pub use friends::{
     AddPlan, FriendRow, FriendState, FriendsRepository, InMemoryFriendsRepository, plan_add,
+};
+pub use gamescript::{
+    CreateGameScriptDraftRequest, GameScriptActivation, GameScriptAuditContext,
+    GameScriptAuditRecord, GameScriptDiagnostic, GameScriptDiagnosticSeverity, GameScriptDraft,
+    GameScriptLimits, GameScriptOutboxKind, GameScriptOutboxRecord, GameScriptRepository,
+    GameScriptRevision, GameScriptSubmission, InMemoryGameScriptRepository,
+    PROVISIONAL_MAX_GAMESCRIPT_SOURCE_BYTES, UpdateGameScriptDraftRequest,
+    gamescript_revision_content_hash, redact_gamescript_audit_details,
 };
 pub use groups::{
     CreateGroupRequest, Group, GroupFilter, GroupId, GroupRole, GroupsPage, GroupsRepository,
