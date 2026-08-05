@@ -404,6 +404,91 @@ pub fn run_supervision_loop(
     Ok(())
 }
 
+/// Serve-lifecycle service owning the external GameScript worker.
+///
+/// Spawned by the transport supervisor when `runtime.adapter` is
+/// `external-worker`: it boots the worker on server startup, keeps it healthy
+/// through [`run_supervision_loop`] (periodic liveness, restart policy,
+/// circuit breaker), and shuts it down together with the server.
+#[cfg(unix)]
+pub struct WorkerLifecycleService {
+    executable: PathBuf,
+    socket_parent: PathBuf,
+    policy: WorkerSupervisionPolicy,
+    healthy_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(unix)]
+impl WorkerLifecycleService {
+    #[must_use]
+    pub fn new(executable: PathBuf, socket_parent: PathBuf, policy: WorkerSupervisionPolicy) -> Self {
+        Self {
+            executable,
+            socket_parent,
+            policy,
+            healthy_cycles: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Monotone count of successful health cycles — an observability probe
+    /// for tests and diagnostics.
+    #[must_use]
+    pub fn healthy_cycles(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.healthy_cycles)
+    }
+}
+
+#[cfg(unix)]
+impl crate::lifecycle::AsyncService for WorkerLifecycleService {
+    fn name(&self) -> &str {
+        "runtime-external-worker"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        cancel: crate::lifecycle::CancellationToken,
+    ) -> crate::error::AppResult<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        // The supervision loop is synchronous blocking I/O; it runs on the
+        // blocking pool and observes cancellation through a shared stop flag
+        // (latency bounded by one liveness deadline plus any active restart
+        // backoff, see `run_supervision_loop`).
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let watch = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            watch.cancelled().await;
+            stop_flag.store(true, Ordering::SeqCst);
+        });
+        let executable = self.executable;
+        let socket_parent = self.socket_parent;
+        let policy = self.policy;
+        let healthy_cycles = Arc::clone(&self.healthy_cycles);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut controller = RestartController::new(executable, socket_parent, policy);
+            run_supervision_loop(&mut controller, &stop, &healthy_cycles)
+        })
+        .await;
+        watcher.abort();
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(crate::error::AppError::new(
+                crate::error::ErrorCategory::Runtime,
+                "external runtime worker supervision failed",
+            )
+            .with_detail(error.to_string())),
+            Err(join_error) => Err(crate::error::AppError::internal(
+                "external runtime worker supervision task failed",
+            )
+            .with_detail(join_error.to_string())),
+        }
+    }
+}
+
 pub struct SupervisedWorker {
     _endpoint: PrivateUnixEndpoint,
     _listener: UnixListener,

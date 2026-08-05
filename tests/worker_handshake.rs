@@ -3,8 +3,40 @@
 use std::{path::Path, time::Duration};
 
 use citadel::runtime::worker_supervisor::{
-    RestartController, SupervisedWorker, WorkerResourceLimits, WorkerSupervisionPolicy,
+    RestartController, SupervisedWorker, WorkerLifecycleService, WorkerResourceLimits,
+    WorkerSupervisionPolicy,
 };
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_lifecycle_supervises_and_stops_the_external_worker() {
+    use std::sync::atomic::Ordering;
+
+    // The same service the transport supervisor spawns for
+    // `runtime.adapter = "external-worker"`, driven through the real
+    // Supervisor lifecycle: boot, periodic health, cancel, orderly stop.
+    let service = WorkerLifecycleService::new(
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_citadel")),
+        std::env::temp_dir(),
+        WorkerSupervisionPolicy::default()
+            .with_health_cadence(Duration::from_millis(50))
+            .with_liveness_deadline(Duration::from_secs(2)),
+    );
+    let healthy_cycles = service.healthy_cycles();
+    let mut supervisor = citadel::lifecycle::Supervisor::new();
+    supervisor.spawn(service);
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while healthy_cycles.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        healthy_cycles.load(Ordering::SeqCst) >= 3,
+        "the supervised worker must complete periodic health cycles from the serve lifecycle"
+    );
+    supervisor
+        .shutdown()
+        .await
+        .expect("the worker service must stop cleanly with the server");
+}
 
 #[test]
 fn restarted_worker_completes_a_fresh_authenticated_handshake() {
