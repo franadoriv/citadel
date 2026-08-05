@@ -1893,12 +1893,11 @@ mod tests {
         assert_eq!(breaker.snapshot().consecutive_failures, 0);
 
         // The default construction sources the PROVISIONAL re-arm streak.
-        let defaulted = super::RestartCircuitBreaker::new(3);
+        let _defaulted = super::RestartCircuitBreaker::new(3);
         assert_eq!(
             super::WorkerSupervisionPolicy::default().breaker_rearm_healthy_cycles(),
             super::DEFAULT_WORKER_BREAKER_REARM_CYCLES
         );
-        drop(defaulted);
     }
 
     /// Capture everything the closure emits through `tracing` on this thread.

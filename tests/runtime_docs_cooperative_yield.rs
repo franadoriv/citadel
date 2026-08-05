@@ -31,7 +31,7 @@ fn cooperative_yield_warning_is_present_for_all_three_engines() {
     for page in ["lua-runtime.md", "js-runtime.mdx", "python-runtime.mdx"] {
         let path = runtime_docs_dir().join(page);
         let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            .unwrap_or_else(|error| unreachable!("read {}: {error}", path.display()));
         // Markdown hard-wraps prose; compare against whitespace-normalized
         // text so a re-wrap cannot break the gate.
         let content = raw.split_whitespace().collect::<Vec<_>>().join(" ");
