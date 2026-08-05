@@ -62,6 +62,14 @@ pub const DEFAULT_MATCH_OVERRUN_LIMIT: u32 = 3;
 /// been measured against a real worker's thread budget.
 pub const DEFAULT_QUARANTINED_THREAD_LIMIT: u32 = 2;
 
+/// PROVISIONAL quarantine grace: how much longer than a context's own
+/// engine-enforced quantum bound the host waits for the quantum's result
+/// before writing the executor thread off as wedged. Must absorb engine
+/// deadline-detection jitter but nothing more — a quantum this late means
+/// the engine's in-thread abort machinery never got control back. Replace
+/// once deadline-overshoot distributions of real engines have been measured.
+pub const DEFAULT_QUARANTINE_GRACE: Duration = Duration::from_millis(250);
+
 /// Injectable per-match scheduling/watchdog policy.
 ///
 /// Mirrors the `WorkerSupervisionPolicy` seam: the worker loop and tests
@@ -71,6 +79,7 @@ pub struct MatchSchedulerPolicy {
     mailbox_capacity: usize,
     overrun_limit: u32,
     quarantined_thread_limit: u32,
+    quarantine_grace: Duration,
 }
 
 impl MatchSchedulerPolicy {
@@ -92,6 +101,12 @@ impl MatchSchedulerPolicy {
         self
     }
 
+    #[must_use]
+    pub fn with_quarantine_grace(mut self, quarantine_grace: Duration) -> Self {
+        self.quarantine_grace = quarantine_grace;
+        self
+    }
+
     pub fn mailbox_capacity(&self) -> usize {
         self.mailbox_capacity
     }
@@ -103,6 +118,10 @@ impl MatchSchedulerPolicy {
     pub fn quarantined_thread_limit(&self) -> u32 {
         self.quarantined_thread_limit
     }
+
+    pub fn quarantine_grace(&self) -> Duration {
+        self.quarantine_grace
+    }
 }
 
 impl Default for MatchSchedulerPolicy {
@@ -111,6 +130,7 @@ impl Default for MatchSchedulerPolicy {
             mailbox_capacity: DEFAULT_MATCH_MAILBOX_CAPACITY,
             overrun_limit: DEFAULT_MATCH_OVERRUN_LIMIT,
             quarantined_thread_limit: DEFAULT_QUARANTINED_THREAD_LIMIT,
+            quarantine_grace: DEFAULT_QUARANTINE_GRACE,
         }
     }
 }
@@ -153,6 +173,16 @@ pub trait MatchContext: Send {
 
     /// Advance the match's game loop by `dt` (one quantum).
     fn tick(&mut self, dt: Duration) -> Result<Vec<OutboundCommand>, MatchFault>;
+
+    /// The engine-enforced upper bound of one quantum (the per-invocation
+    /// deadline). The host's quarantine timeout is this bound plus the
+    /// policy grace: a quantum still running past it means the engine's
+    /// in-thread abort machinery never got control back. The default reuses
+    /// the platform's per-invocation deadline default; engine-backed
+    /// contexts report their configured budget.
+    fn quantum_bound(&self) -> Duration {
+        Duration::from_millis(crate::runtime::DEFAULT_DEADLINE_MS)
+    }
 }
 
 /// The deployment's single engine: a factory for per-match contexts.
@@ -220,8 +250,87 @@ pub struct HostCounters {
     pub quarantined_threads: u32,
 }
 
+/// One quantum submitted to a match's executor thread.
+enum ExecutorRequest {
+    Event(MatchInvocation),
+    Tick(Duration),
+}
+
+/// A match's dedicated executor thread.
+///
+/// Every quantum runs on this thread, never on the host's scheduler thread,
+/// so a context wedged inside a non-reclaimable native call parks *its own*
+/// executor: the host times the quantum out (`quantum_bound` + policy grace),
+/// marks the executor wedged, and abandons the thread — parked for the rest
+/// of the worker process's life, which is exactly what the quarantine budget
+/// (`K`) accounts for. Neighbor matches run on their own executors and a
+/// freshly opened match gets a fresh executor, so a replacement takes over
+/// transparently.
+struct MatchExecutor {
+    request_tx: std::sync::mpsc::SyncSender<ExecutorRequest>,
+    result_rx: std::sync::mpsc::Receiver<Result<Vec<OutboundCommand>, MatchFault>>,
+    quantum_bound: Duration,
+    wedged: bool,
+}
+
+impl MatchExecutor {
+    fn spawn(match_id: u64, context: Box<dyn MatchContext>) -> Self {
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<ExecutorRequest>(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let quantum_bound = context.quantum_bound();
+        // The thread is deliberately detached: a healthy executor exits when
+        // its request channel closes (the match closed), a wedged one is
+        // written off and ends with the process.
+        let _ = std::thread::Builder::new()
+            .name(format!("citadel-match-{match_id}"))
+            .spawn(move || {
+                let mut context = context;
+                while let Ok(request) = request_rx.recv() {
+                    let result = match request {
+                        ExecutorRequest::Event(invocation) => context.handle_event(&invocation),
+                        ExecutorRequest::Tick(dt) => context.tick(dt),
+                    };
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        Self {
+            request_tx,
+            result_rx,
+            quantum_bound,
+            wedged: false,
+        }
+    }
+
+    /// Run one quantum, bounded by the context's own quantum bound plus the
+    /// policy grace. A timeout writes the executor off as wedged; so does a
+    /// dead executor thread (a panic that escaped the engine's isolation is
+    /// treated the same as a wedge: the context is unusable).
+    fn run(
+        &mut self,
+        request: ExecutorRequest,
+        grace: Duration,
+    ) -> Result<Vec<OutboundCommand>, MatchFault> {
+        if self.wedged || self.request_tx.try_send(request).is_err() {
+            self.wedged = true;
+            return Err(MatchFault::Wedged);
+        }
+        match self
+            .result_rx
+            .recv_timeout(self.quantum_bound.saturating_add(grace))
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.wedged = true;
+                Err(MatchFault::Wedged)
+            }
+        }
+    }
+}
+
 struct MatchSlot {
-    context: Box<dyn MatchContext>,
+    executor: MatchExecutor,
     mailbox: VecDeque<MatchInvocation>,
     consecutive_overruns: u32,
 }
@@ -316,7 +425,7 @@ impl EngineHost {
                 self.matches.insert(
                     match_id,
                     MatchSlot {
-                        context,
+                        executor: MatchExecutor::spawn(match_id, context),
                         mailbox: VecDeque::with_capacity(self.policy.mailbox_capacity()),
                         consecutive_overruns: 0,
                     },
@@ -366,16 +475,20 @@ impl EngineHost {
             return;
         }
         let round: Vec<u64> = self.order.iter().copied().collect();
+        let grace = self.policy.quarantine_grace();
         for match_id in round {
             // One quantum per match per round: one queued event, or one tick
-            // when the mailbox is empty — never both.
+            // when the mailbox is empty — never both. The quantum runs on
+            // the match's dedicated executor thread, bounded by the
+            // context's own quantum bound plus the quarantine grace.
             let Some(slot) = self.matches.get_mut(&match_id) else {
                 continue;
             };
-            let result = match slot.mailbox.pop_front() {
-                Some(invocation) => slot.context.handle_event(&invocation),
-                None => slot.context.tick(dt),
+            let request = match slot.mailbox.pop_front() {
+                Some(invocation) => ExecutorRequest::Event(invocation),
+                None => ExecutorRequest::Tick(dt),
             };
+            let result = slot.executor.run(request, grace);
             self.settle_quantum(match_id, result);
             if self.engine_dead {
                 break;
@@ -497,6 +610,10 @@ impl<R: Runtime> MatchContext for RuntimeMatchContext<R> {
             return Err(MatchFault::Overrun);
         }
         Ok(commands)
+    }
+
+    fn quantum_bound(&self) -> Duration {
+        self.runtime.budget()
     }
 }
 
@@ -864,6 +981,109 @@ mod tests {
             !host.is_healthy(),
             "after K quarantines the worker must self-report unhealthy"
         );
+    }
+
+    /// A context wedged inside a genuinely blocking native call: it does not
+    /// cooperate, does not observe deadlines, and holds its thread for far
+    /// longer than any quantum bound.
+    struct BlockingContext {
+        ticks: Arc<MatchStats>,
+    }
+
+    impl MatchContext for BlockingContext {
+        fn handle_event(
+            &mut self,
+            _invocation: &MatchInvocation,
+        ) -> Result<Vec<OutboundCommand>, MatchFault> {
+            // Long enough that an implementation executing quanta inline
+            // would visibly stall the scheduler; short enough that a buggy
+            // build fails instead of hanging the suite.
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        }
+
+        fn tick(&mut self, _dt: Duration) -> Result<Vec<OutboundCommand>, MatchFault> {
+            self.ticks.ticks.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        fn quantum_bound(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+    }
+
+    struct BlockingEngine {
+        wedge_matches: Vec<u64>,
+        stats: HashMap<u64, Arc<MatchStats>>,
+    }
+
+    impl MatchEngine for BlockingEngine {
+        fn engine(&self) -> &'static str {
+            "fake"
+        }
+
+        fn open_match(&mut self, match_id: u64) -> Result<Box<dyn MatchContext>, MatchFault> {
+            let stats = Arc::clone(&self.stats[&match_id]);
+            if self.wedge_matches.contains(&match_id) {
+                Ok(Box::new(BlockingContext { ticks: stats }))
+            } else {
+                Ok(Box::new(FakeContext {
+                    behavior: Behavior::Counts,
+                    stats,
+                }))
+            }
+        }
+    }
+
+    #[test]
+    fn wedged_native_call_parks_the_executor_and_quarantines_the_match() {
+        // Match A wedges inside a blocking call its engine cannot abort.
+        // The host must not execute that call on its own thread: the match's
+        // dedicated executor parks with it, the host times the quantum out
+        // (bound + grace), closes only A as quarantined, and keeps serving B.
+        let stats: HashMap<u64, Arc<MatchStats>> = [1, 2, 3]
+            .into_iter()
+            .map(|id| (id, Arc::new(MatchStats::default())))
+            .collect();
+        let b = Arc::clone(&stats[&2]);
+        let engine = BlockingEngine {
+            wedge_matches: vec![1, 3],
+            stats,
+        };
+        let mut host = EngineHost::new(
+            Box::new(engine),
+            MatchSchedulerPolicy::default()
+                .with_quarantine_grace(Duration::from_millis(50))
+                .with_quarantined_thread_limit(2),
+        );
+        host.open_match(1).expect("open A");
+        host.open_match(2).expect("open B");
+        host.enqueue_event(1, invocation(1));
+        let started = std::time::Instant::now();
+        host.run_round(Duration::from_millis(16));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a wedged quantum must be timed out, not executed inline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(host.counters().quarantined_threads, 1);
+        assert_eq!(host.live_match_ids(), vec![2], "only A may be closed");
+        assert!(host.drain_outputs().contains(&HostOutput::Closed {
+            match_id: 1,
+            reason: MatchCloseReason::Quarantined,
+        }));
+        assert!(host.is_healthy(), "one quarantine stays under K=2");
+        // The neighbor keeps ticking on its own executor after the wedge.
+        host.run_round(Duration::from_millis(16));
+        assert!(b.ticks.load(Ordering::SeqCst) >= 2, "B keeps ticking");
+
+        // A second wedged match exhausts the quarantine budget (K=2): the
+        // worker self-reports unhealthy so the supervisor replaces it.
+        host.open_match(3).expect("open C");
+        host.enqueue_event(3, invocation(1));
+        host.run_round(Duration::from_millis(16));
+        assert_eq!(host.counters().quarantined_threads, 2);
+        assert!(!host.is_healthy(), "after K quarantines the worker retires");
     }
 
     #[test]
