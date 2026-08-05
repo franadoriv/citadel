@@ -59,6 +59,7 @@ pub(crate) mod static_data;
 #[cfg(unix)]
 pub mod worker_bootstrap;
 pub mod worker_data_protocol;
+pub mod worker_engine;
 #[cfg(any(unix, windows))]
 pub mod worker_ipc;
 pub mod worker_protocol;

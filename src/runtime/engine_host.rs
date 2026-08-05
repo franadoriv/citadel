@@ -391,6 +391,18 @@ impl EngineHost {
         }
     }
 
+    /// Remove `match_id` without emitting a closure output.
+    ///
+    /// The gateway-initiated close path: the gateway already closed the match
+    /// on its side (members informed, room pruned), so the worker only frees
+    /// the execution context; echoing a closure back would target a match the
+    /// gateway no longer knows.
+    pub fn evict_match(&mut self, match_id: u64) {
+        if self.matches.remove(&match_id).is_some() {
+            self.order.retain(|&id| id != match_id);
+        }
+    }
+
     /// Orderly shutdown: close every match with [`MatchCloseReason::Shutdown`].
     pub fn shutdown(&mut self) {
         for match_id in self.live_match_ids() {
