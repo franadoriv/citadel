@@ -112,6 +112,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
 # SHA-256 of the dev cert for the browser `serverCertificateHashes` flow.
 sha2 = "0.10"
+# Manifest signatures keep embedded payload metadata authentic before any cache write.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 # CSPRNG for unguessable session tokens. `getrandom` pulls OS entropy
 # with no extra transitive weight (already in the tree); `base64` encodes the
 # random bytes into an opaque URL-safe token string.
