@@ -103,6 +103,9 @@ pub struct LuaReloadService {
     path: PathBuf,
     /// Poll interval between change checks.
     interval: Duration,
+    /// GameScript readiness source fed by reload outcomes
+    /// (`runtime.require_script` deployments). `None` on ungated nodes.
+    readiness: Option<crate::runtime::InProcessRuntimeSource>,
 }
 
 impl LuaReloadService {
@@ -113,7 +116,17 @@ impl LuaReloadService {
             runtime,
             path,
             interval,
+            readiness: None,
         }
+    }
+
+    /// Publish reload outcomes into the GameScript readiness authority: a
+    /// successful reload adopts the new content identity and bumps the gate
+    /// generation; a rejected reload keeps the serving script `Ready`.
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: crate::runtime::InProcessRuntimeSource) -> Self {
+        self.readiness = Some(readiness);
+        self
     }
 }
 
@@ -157,7 +170,15 @@ impl AsyncService for LuaReloadService {
                     // off the async workers. `reload` is failure-safe internally;
                     // a panic here becomes a JoinError, logged, loop continues.
                     match tokio::task::spawn_blocking(move || runtime.reload()).await {
-                        Ok(_outcome) => {}
+                        Ok(outcome) => {
+                            if let Some(readiness) = &self.readiness {
+                                readiness.record_reload(
+                                    outcome,
+                                    &self.path,
+                                    crate::time::Clock::now(&crate::time::SystemClock),
+                                );
+                            }
+                        }
                         Err(join_err) => {
                             tracing::error!(
                                 error = %join_err,

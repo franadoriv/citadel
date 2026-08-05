@@ -3176,7 +3176,9 @@ fields = ["region"]
 
         let mut gated = Config::default();
         gated.runtime.require_script = true;
-        gated.validate().expect("require_script with enabled runtime");
+        gated
+            .validate()
+            .expect("require_script with enabled runtime");
 
         // A gate that can never open is a config error, not a stance.
         let mut contradictory = Config::default();

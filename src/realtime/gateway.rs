@@ -39,7 +39,7 @@ use crate::matchmaker_transport::{
     PartyControlCommand, PartyControlOperation, PartyControlReply, PartyQueueAdmission,
     TlsMatchmakerHandoffRouter,
 };
-use crate::observability::NodeMetrics;
+use crate::observability::{NodeMetrics, ScriptGateSurface};
 use crate::party::{PartyId, PartyRegistry, PartySnapshot};
 use crate::party_presence::{
     LocalPartyPresence, PartyPresenceCommand, PartyPresenceDelivery,
@@ -54,10 +54,11 @@ use crate::realtime::registry::{
     CloseDisposition, LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen,
     SessionHandle, SessionRegistry,
 };
-use crate::realtime::rooms::{RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
+use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
-    LifecycleHook, OutboundCommand, RealtimeAfterOutcome, RealtimeInterception, RpcOutcome, Runtime,
+    GameScriptReadiness, LifecycleHook, OutboundCommand, RealtimeAfterOutcome,
+    RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
 };
 use crate::services::party_directory::{
     PartyOwnerResolution, PartyQueueFreeze, StoragePartyDirectory,
@@ -2306,6 +2307,12 @@ pub struct Gateway {
     /// Owner binding and short-lived handoffs for formed tickets. Tokens are
     /// redacted from `Debug` through [`JoinToken`].
     handoffs: Mutex<MatchmakerHandoffs>,
+    /// The GameScript readiness gate. Present only when
+    /// `runtime.require_script` is enabled; every match surface then fails
+    /// closed unless one atomic snapshot is `Ready`, and rooms are born bound
+    /// to that snapshot's `(revision, generation)`. `None` preserves ungated
+    /// behavior byte for byte.
+    script_readiness: Option<Arc<GameScriptReadiness>>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -2327,6 +2334,7 @@ impl std::fmt::Debug for Gateway {
             .field("durable_parties", &self.durable_parties.is_some())
             .field("live_matchmaker", &self.live_matchmaker.is_some())
             .field("handoffs", &"[redacted]")
+            .field("script_readiness", &self.script_readiness.is_some())
             .finish()
     }
 }
@@ -2440,13 +2448,21 @@ impl Gateway {
     }
 
     /// Allocate an empty, closed room for a durably formed live cohort.
-    pub(crate) fn live_matchmaker_create_room(&self, participants: usize) -> RoomId {
-        self.rooms.create(RoomLabel {
-            map: "default".to_owned(),
-            mode: "matchmaker".to_owned(),
-            max_players: u16::try_from(participants).unwrap_or(u16::MAX),
-            open: false,
-        })
+    ///
+    /// Fails closed (no room is born) when the GameScript readiness gate is
+    /// attached and not `Ready`; a created room is bound to the gating
+    /// snapshot's `(revision, generation)`.
+    pub(crate) fn live_matchmaker_create_room(&self, participants: usize) -> Result<RoomId, ()> {
+        let binding = self.script_gate(ScriptGateSurface::LiveForm)?;
+        Ok(self.rooms.create_bound(
+            RoomLabel {
+                map: "default".to_owned(),
+                mode: "matchmaker".to_owned(),
+                max_players: u16::try_from(participants).unwrap_or(u16::MAX),
+                open: false,
+            },
+            binding,
+        ))
     }
 
     /// Persisted live handoffs are notified only through the recipient's local
@@ -2468,13 +2484,42 @@ impl Gateway {
     }
 
     /// Complete trusted admission into a match owned by this same node.
+    ///
+    /// Fails closed under the readiness gate: a non-Ready snapshot (or a room
+    /// bound to a superseded load) refuses the admission and replies the one
+    /// stable client-safe message. The live worker's generic failure reply
+    /// for the same request id is then redundant and ignored by correlation.
     pub(crate) fn live_matchmaker_finish_local_accept(
         &self,
         sender: ParticipantId,
         request_id: u64,
         room_id: RoomId,
     ) -> Result<(), ()> {
-        let label = self.rooms.admit_match(sender, room_id).map_err(|_| ())?;
+        let Ok(binding) = self.script_gate(ScriptGateSurface::LiveAcceptLocal) else {
+            let _ = self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+            );
+            return Err(());
+        };
+        let label = match self
+            .rooms
+            .admit_match_bound(sender, room_id, binding.as_ref())
+        {
+            Ok(label) => label,
+            Err(JoinError::StaleScript) => {
+                let _ = self.reply_rpc(
+                    sender,
+                    request_id,
+                    protocol::RPC_STATUS_ERROR,
+                    SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+                );
+                return Err(());
+            }
+            Err(_) => return Err(()),
+        };
         let body = serde_json::json!({ "accepted": true, "match_id": room_id }).to_string();
         let _ = self.reply_rpc(sender, request_id, protocol::RPC_STATUS_OK, body.as_bytes());
         let _ = self.reply_joined(sender, room_id, label);
@@ -2484,12 +2529,28 @@ impl Gateway {
     /// Complete a trusted admission that was validated on a remote match node.
     /// The session node never inserts its local participant id into the remote
     /// room; the remote node already recorded a `RemoteRoomMember`.
+    ///
+    /// Fails closed under the readiness gate with the stable client-safe
+    /// reply: this session node must not confirm membership in a match it
+    /// could not itself have started.
     pub(crate) fn live_matchmaker_finish_remote_accept(
         &self,
         sender: ParticipantId,
         request_id: u64,
         room_id: RoomId,
     ) -> Result<(), ()> {
+        if self
+            .script_gate(ScriptGateSurface::LiveAcceptRemote)
+            .is_err()
+        {
+            let _ = self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+            );
+            return Err(());
+        }
         let label = RoomLabel {
             map: "default".to_owned(),
             mode: "matchmaker".to_owned(),
@@ -2504,19 +2565,24 @@ impl Gateway {
 
     /// Admit a member whose socket belongs to another session node after the
     /// durable formation/admission claim has succeeded.
+    ///
+    /// Fails closed under the readiness gate on this owner node, including
+    /// for a room bound to a superseded load.
     pub(crate) fn live_matchmaker_admit_remote(
         &self,
         requester_node: NodeId,
         user_id: String,
         room_id: RoomId,
     ) -> Result<(), ()> {
+        let binding = self.script_gate(ScriptGateSurface::LiveAdmitRemote)?;
         self.rooms
-            .admit_remote_match(
+            .admit_remote_match_bound(
                 RemoteRoomMember {
                     node_id: requester_node,
                     user_id,
                 },
                 room_id,
+                binding.as_ref(),
             )
             .map(|_| ())
             .map_err(|_| ())
@@ -2582,7 +2648,23 @@ impl Gateway {
             cluster_matchmaker: None,
             live_matchmaker: None,
             handoffs: Mutex::new(MatchmakerHandoffs::default()),
+            script_readiness: None,
         }
+    }
+
+    /// Attach the GameScript readiness gate (builder style, before the
+    /// gateway is shared). Wired only when `runtime.require_script` is
+    /// enabled; see the field docs for the fail-closed contract.
+    #[must_use]
+    pub fn with_script_readiness(mut self, readiness: Arc<GameScriptReadiness>) -> Self {
+        self.script_readiness = Some(readiness);
+        self
+    }
+
+    /// The attached readiness gate, when this node requires a script.
+    #[must_use]
+    pub fn script_readiness(&self) -> Option<&Arc<GameScriptReadiness>> {
+        self.script_readiness.as_ref()
     }
 
     /// Attach the persisted domain-feature services, consuming and returning
@@ -4448,6 +4530,20 @@ impl Gateway {
         let now = SystemClock.now();
         match method {
             "matchmaker.add" => {
+                // Readiness gate: a ticket that can only ever form a match a
+                // ready script must exist for is refused up front rather than
+                // parked in a queue that cannot activate.
+                if self
+                    .script_gate(ScriptGateSurface::MatchmakerQueue)
+                    .is_err()
+                {
+                    return self.reply_rpc(
+                        sender,
+                        request_id,
+                        protocol::RPC_STATUS_ERROR,
+                        SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+                    );
+                }
                 let mut request: TicketRequest = match serde_json::from_slice(payload) {
                     Ok(request) => request,
                     Err(_) => {
@@ -4777,6 +4873,12 @@ impl Gateway {
     /// handoff; only `matchmaker.accept` performs trusted admission.
     fn activate_formed_matches(&self, now: crate::time::TimestampMillis) -> usize {
         self.prune_expired_handoffs(now);
+        // Readiness gate: while not Ready, queued tickets are held unevaluated
+        // (never consumed) and no match room is born on this tick.
+        let binding = match self.script_gate(ScriptGateSurface::MatchmakerActivate) {
+            Ok(binding) => binding,
+            Err(()) => return 0,
+        };
         let expires_at = now
             .checked_add(crate::time::DurationMillis::from_millis(
                 MATCHMAKER_HANDOFF_TTL_MS,
@@ -4797,12 +4899,15 @@ impl Gateway {
                 continue;
             }
             let cap = u16::try_from(formed.participants.len()).unwrap_or(u16::MAX);
-            let room_id = self.rooms.create(RoomLabel {
-                map: "default".to_owned(),
-                mode: "matchmaker".to_owned(),
-                max_players: cap,
-                open: false,
-            });
+            let room_id = self.rooms.create_bound(
+                RoomLabel {
+                    map: "default".to_owned(),
+                    mode: "matchmaker".to_owned(),
+                    max_players: cap,
+                    open: false,
+                },
+                binding.clone(),
+            );
             let mut deliveries = Vec::new();
             let mut complete = true;
             for (ticket, members) in formed.tickets.iter().zip(&formed.ticket_members) {
@@ -4974,6 +5079,19 @@ impl Gateway {
         now: crate::time::TimestampMillis,
     ) -> usize {
         self.prune_expired_handoffs(now);
+        // Readiness gate: trusted admission is refused (stable client-safe
+        // message) while not Ready and for rooms bound to a superseded load.
+        let binding = match self.script_gate(ScriptGateSurface::MatchmakerAccept) {
+            Ok(binding) => binding,
+            Err(()) => {
+                return self.reply_rpc(
+                    sender,
+                    request_id,
+                    protocol::RPC_STATUS_ERROR,
+                    SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+                );
+            }
+        };
         let Some(handoff) = self.handoff_for(ticket, user_id, now) else {
             return self.reply_rpc(
                 sender,
@@ -4990,7 +5108,10 @@ impl Gateway {
                 b"invalid match join token",
             );
         }
-        match self.rooms.admit_match(sender, handoff.room_id) {
+        match self
+            .rooms
+            .admit_match_bound(sender, handoff.room_id, binding.as_ref())
+        {
             Ok(label) => {
                 if let Ok(mut handoffs) = self.handoffs.lock() {
                     let remove_ticket = if let Some(pending) = handoffs.pending.get_mut(ticket) {
@@ -5010,6 +5131,12 @@ impl Gateway {
                 self.reply_rpc(sender, request_id, protocol::RPC_STATUS_OK, body.as_bytes())
                     + self.reply_joined(sender, handoff.room_id, label)
             }
+            Err(JoinError::StaleScript) => self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+            ),
             Err(error) => self.reply_rpc(
                 sender,
                 request_id,
@@ -5028,6 +5155,12 @@ impl Gateway {
                 request.requester_node,
             ));
         };
+        // Readiness gate on the match-owner node: the control-plane admission
+        // transport fails closed like every local surface. The requester sees
+        // the same opaque rejection as any other refused admission.
+        let binding = self
+            .script_gate(ScriptGateSurface::ClusterAdmitRemote)
+            .map_err(|()| MatchmakerRouterError::Rejected(cluster.node_id.clone()))?;
         let now = SystemClock.now();
         let handoff = self
             .handoff_for(&request.ticket_id, &request.user_id, now)
@@ -5043,12 +5176,13 @@ impl Gateway {
             .claim_admission(&request.ticket_id, &request.user_id, &cluster.lease, now)
             .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
         self.rooms
-            .admit_remote_match(
+            .admit_remote_match_bound(
                 RemoteRoomMember {
                     node_id: request.requester_node,
                     user_id: request.user_id,
                 },
                 handoff.room_id,
+                binding.as_ref(),
             )
             .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
         Ok(handoff.room_id)
@@ -5349,6 +5483,42 @@ impl Gateway {
         &self.rooms
     }
 
+    /// Consult the GameScript readiness gate for one enforcement `surface`.
+    ///
+    /// `Ok(None)` when no gate is attached (`require_script` off — ungated
+    /// behavior, unchanged). `Ok(Some(binding))` when ONE atomic Ready
+    /// snapshot admitted the caller; a match born from this call must carry
+    /// exactly that binding. `Err(())` fails closed after counting the
+    /// rejection for `surface`; the caller owes the client the stable
+    /// [`SCRIPT_UNAVAILABLE_MESSAGE`] wherever a reply channel exists.
+    fn script_gate(&self, surface: ScriptGateSurface) -> Result<Option<ScriptBinding>, ()> {
+        let Some(readiness) = &self.script_readiness else {
+            return Ok(None);
+        };
+        match readiness.gate() {
+            Ok(binding) => Ok(Some(binding)),
+            Err(_) => {
+                self.metrics.record_script_gate_rejection(surface);
+                tracing::debug!(
+                    surface = surface.code(),
+                    "script readiness gate refused a match surface"
+                );
+                Err(())
+            }
+        }
+    }
+
+    /// Send the stable, client-safe policy rejection for a refused room frame
+    /// (`KIND_ROOM_REJECT`). Returns frames delivered.
+    fn reply_room_reject(&self, sender: ParticipantId, request_kind: u16) -> usize {
+        let body = citadel_wire::room::RoomReject {
+            request_kind,
+            reason: SCRIPT_UNAVAILABLE_MESSAGE.to_owned(),
+        }
+        .encode();
+        usize::from(self.send_reliable(sender, citadel_wire::protocol::KIND_ROOM_REJECT, body))
+    }
+
     /// Route a room frame (kinds 21-25).
     ///
     /// Phase A1: `ROOM_CREATE` interprets its params as the desired map name (Phase
@@ -5363,6 +5533,12 @@ impl Gateway {
                     tracing::debug!(%sender, "gateway dropped a malformed ROOM_CREATE");
                     return 0;
                 };
+                // Readiness gate: a room may only be born (or re-joined by
+                // name) from one Ready snapshot; refusals are visible.
+                let binding = match self.script_gate(ScriptGateSurface::RoomCreate) {
+                    Ok(binding) => binding,
+                    Err(()) => return self.reply_room_reject(sender, KIND_ROOM_CREATE),
+                };
                 // The params are the room's matchmaking NAME: everyone asking for the
                 // same name lands in the same room (first creates, rest join). The map
                 // is decided by on_room_create when the room is first created.
@@ -5375,7 +5551,7 @@ impl Gateway {
                     }
                 };
                 let params = create.params.clone();
-                match self.rooms.join_or_create(sender, &name, || {
+                match self.rooms.join_or_create_bound(sender, &name, binding, || {
                     self.room_label_for_create(sender, &params)
                 }) {
                     Ok((room_id, label)) => {
@@ -5387,6 +5563,10 @@ impl Gateway {
                             "room: join-or-create"
                         );
                         self.reply_joined(sender, room_id, label)
+                    }
+                    Err(JoinError::StaleScript) => {
+                        // Policy refusal (superseded named room): visible.
+                        self.reply_room_reject(sender, KIND_ROOM_CREATE)
                     }
                     Err(reason) => {
                         tracing::debug!(
@@ -5403,6 +5583,12 @@ impl Gateway {
                 let Ok(join) = RoomJoin::decode(&env.body) else {
                     return 0;
                 };
+                // Readiness gate first: no admission surface is reachable
+                // without a Ready script, script hooks included.
+                let binding = match self.script_gate(ScriptGateSurface::RoomJoin) {
+                    Ok(binding) => binding,
+                    Err(()) => return self.reply_room_reject(sender, KIND_ROOM_JOIN),
+                };
                 // Lua admission gate (`on_room_join`); admits by default.
                 if let Some(runtime) = &self.runtime {
                     let user_id = self.registry.user_id_of(sender);
@@ -5415,7 +5601,7 @@ impl Gateway {
                         return 0;
                     }
                 }
-                self.join_and_reply(sender, join.room_id)
+                self.join_and_reply(sender, join.room_id, binding)
             }
             KIND_ROOM_LEAVE => {
                 if RoomLeave::decode(&env.body).is_err() {
@@ -5439,10 +5625,19 @@ impl Gateway {
     }
 
     /// Join `sender` to `room_id` and reply with `ROOM_JOINED` (carrying the label's
-    /// map/mode) on success. Returns frames sent (0 on rejection).
-    fn join_and_reply(&self, sender: ParticipantId, room_id: RoomId) -> usize {
-        match self.rooms.join(sender, room_id) {
+    /// map/mode) on success. `binding` is the gating snapshot's identity on a
+    /// gated node (`None` when ungated): a room bound to a superseded load
+    /// refuses the join with a visible policy reject. Returns frames sent
+    /// (0 on a silent legacy rejection).
+    fn join_and_reply(
+        &self,
+        sender: ParticipantId,
+        room_id: RoomId,
+        binding: Option<ScriptBinding>,
+    ) -> usize {
+        match self.rooms.join_bound(sender, room_id, binding.as_ref()) {
             Ok(label) => self.reply_joined(sender, room_id, label),
+            Err(JoinError::StaleScript) => self.reply_room_reject(sender, KIND_ROOM_JOIN),
             Err(reason) => {
                 tracing::debug!(
                     participant = sender.get(),
@@ -9453,5 +9648,650 @@ mod domain_rpc_tests {
         assert_eq!(metrics.party_owner_failover_total, 1);
         assert_eq!(metrics.party_resync_total, 1);
         assert_eq!(metrics.party_owner_stale_reject_total, 1);
+    }
+}
+
+/// The GameScript readiness-gate acceptance suite: with a snapshot that is not
+/// `Ready`, nothing lists, creates, or admits on any enforcement surface; every
+/// rejection carries the one stable client-safe message; matches are born bound
+/// to the gating snapshot's `(revision, generation)`; and `require_script = false`
+/// (no gate attached) behavior is unchanged.
+#[cfg(test)]
+mod script_gate_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::matchmaker_cluster::{MatchmakerHandoffRouter, QueueShardId};
+    use crate::realtime::registry::{ParticipantIdentity, SessionHandle};
+    use crate::runtime::GameScriptReadiness;
+    use crate::session::SessionId;
+    use crate::storage::UserId;
+    use crate::transport::TransportKind;
+    use citadel_wire::protocol::KIND_ROOM_REJECT;
+    use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined, RoomReject};
+    use tokio::sync::mpsc;
+
+    fn now() -> TimestampMillis {
+        SystemClock.now()
+    }
+
+    /// A fresh readiness authority in its boot (`NoScript`, not-ready) state.
+    fn boot_readiness() -> Arc<GameScriptReadiness> {
+        Arc::new(GameScriptReadiness::new(now()))
+    }
+
+    /// A gateway with the readiness gate attached (the `require_script` shape).
+    fn gated_gateway(readiness: &Arc<GameScriptReadiness>) -> Gateway {
+        Gateway::with_metrics(Arc::new(NodeMetrics::new()))
+            .with_script_readiness(Arc::clone(readiness))
+    }
+
+    fn register(gw: &Gateway, user: Option<&str>) -> (ParticipantId, mpsc::Receiver<Outbound>) {
+        let id = gw.next_participant_id();
+        let (tx, rx) = mpsc::channel(16);
+        let identity = user.map(|user| ParticipantIdentity {
+            user_id: UserId::new(user).expect("user id"),
+            session_id: SessionId::new(format!("session-{user}")).expect("session id"),
+            expires_at: TimestampMillis::from_unix_millis(9_999_999_999),
+        });
+        gw.registry().register(SessionHandle {
+            id,
+            kind: TransportKind::WebSocket,
+            outbound: tx,
+            identity,
+        });
+        (id, rx)
+    }
+
+    fn rpc(request_id: u64, method: &str, body: serde_json::Value) -> Envelope {
+        let payload = body.to_string().into_bytes();
+        Envelope::new(
+            KIND_RPC_REQUEST,
+            protocol::encode_rpc_request(request_id, method, &payload),
+        )
+    }
+
+    async fn recv_rpc(rx: &mut mpsc::Receiver<Outbound>) -> (u8, Vec<u8>) {
+        let out = rx.recv().await.expect("rpc response delivered");
+        assert_eq!(out.envelope.kind, KIND_RPC_RESPONSE);
+        let resp = protocol::decode_rpc_response(&out.envelope.body).expect("decodes");
+        (resp.status, resp.payload.to_vec())
+    }
+
+    fn json(payload: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(payload).expect("json body")
+    }
+
+    fn room_create(name: &[u8]) -> Envelope {
+        Envelope::new(
+            KIND_ROOM_CREATE,
+            RoomCreate {
+                params: name.to_vec(),
+            }
+            .encode(),
+        )
+    }
+
+    fn room_join(room_id: RoomId) -> Envelope {
+        Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode())
+    }
+
+    /// Assert the next frame is the stable, client-safe policy rejection.
+    async fn expect_room_reject(rx: &mut mpsc::Receiver<Outbound>, request_kind: u16) {
+        let out = rx.recv().await.expect("reject reply delivered");
+        assert_eq!(out.envelope.kind, KIND_ROOM_REJECT, "policy reject frame");
+        let reject = RoomReject::decode(&out.envelope.body).expect("decodes");
+        assert_eq!(reject.request_kind, request_kind);
+        assert_eq!(reject.reason, SCRIPT_UNAVAILABLE_MESSAGE);
+    }
+
+    // ---- Surface 1: KIND_ROOM_CREATE ------------------------------------
+
+    #[tokio::test]
+    async fn gate_01_room_create_refuses_with_visible_stable_reject() {
+        let readiness = boot_readiness();
+        let gw = gated_gateway(&readiness);
+        let (a, mut ra) = register(&gw, Some("alice"));
+        let sent = gw.handle_inbound(a, &room_create(b"lobby"));
+        assert_eq!(sent, 1, "the rejection is visible, not a silent drop");
+        expect_room_reject(&mut ra, KIND_ROOM_CREATE).await;
+        assert_eq!(gw.rooms().room_count(), 0, "no placeholder room is born");
+        assert_eq!(
+            gw.metrics.snapshot().script_gate_rejections.room_create,
+            1,
+            "the surface counted its rejection"
+        );
+    }
+
+    // ---- Surface 2: KIND_ROOM_JOIN --------------------------------------
+
+    #[tokio::test]
+    async fn gate_02_room_join_refuses_when_not_ready() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:v1", now());
+        let gw = gated_gateway(&readiness);
+        let (a, mut ra) = register(&gw, Some("alice"));
+        gw.handle_inbound(a, &room_create(b"lobby"));
+        let joined = RoomJoined::decode(&ra.recv().await.expect("joined").envelope.body)
+            .expect("room joined");
+
+        readiness.record_degraded(now());
+        let (b, mut rb) = register(&gw, Some("bob"));
+        let sent = gw.handle_inbound(b, &room_join(joined.room_id));
+        assert_eq!(sent, 1);
+        expect_room_reject(&mut rb, KIND_ROOM_JOIN).await;
+        assert_eq!(
+            gw.rooms().members(joined.room_id),
+            vec![a],
+            "nobody was admitted while degraded"
+        );
+        assert_eq!(gw.metrics.snapshot().script_gate_rejections.room_join, 1);
+    }
+
+    // ---- Surface 3: matchmaker.add (queueing) ---------------------------
+
+    #[tokio::test]
+    async fn gate_03_matchmaker_add_refuses_with_the_stable_error() {
+        let readiness = boot_readiness();
+        let gw = gated_gateway(&readiness);
+        let (alice, mut ra) = register(&gw, Some("alice"));
+        gw.handle_inbound(
+            alice,
+            &rpc(
+                1,
+                "matchmaker.add",
+                serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 }),
+            ),
+        );
+        let (status, body) = recv_rpc(&mut ra).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(String::from_utf8_lossy(&body), SCRIPT_UNAVAILABLE_MESSAGE);
+        assert_eq!(gw.matchmaker_stats().queued_tickets, 0, "nothing queued");
+        assert_eq!(
+            gw.metrics
+                .snapshot()
+                .script_gate_rejections
+                .matchmaker_queue,
+            1
+        );
+    }
+
+    // ---- Surface 4: local matchmaker activation (matchmaker_tick) -------
+
+    #[tokio::test]
+    async fn gate_04_activation_holds_queued_tickets_until_ready() {
+        let readiness = boot_readiness();
+        let gw = gated_gateway(&readiness);
+        let (alice, mut ra) = register(&gw, Some("alice"));
+        let (bob, mut rb) = register(&gw, Some("bob"));
+        // Tickets queued out-of-band (as if queued before readiness was lost):
+        // the activation surface must still fail closed on its own.
+        let request: TicketRequest = serde_json::from_value(
+            serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 }),
+        )
+        .expect("request");
+        let t = now();
+        for (participant, user) in [(alice, "alice"), (bob, "bob")] {
+            let ticket = gw
+                .matchmaker
+                .add_party(participant, vec![participant], request.clone(), t)
+                .expect("queued");
+            gw.remember_ticket_owners(
+                ticket,
+                vec![QueuedTicketOwner {
+                    user_id: user.to_owned(),
+                    participant,
+                }],
+            );
+        }
+
+        assert_eq!(gw.matchmaker_tick(), 0, "no handoffs while not ready");
+        assert_eq!(gw.rooms().room_count(), 0, "no match room is born");
+        assert!(ra.try_recv().is_err(), "alice got no MATCHMAKER_MATCHED");
+        assert!(rb.try_recv().is_err(), "bob got no MATCHMAKER_MATCHED");
+        assert_eq!(gw.matchmaker_stats().queued_tickets, 2, "tickets held");
+        assert!(
+            gw.metrics
+                .snapshot()
+                .script_gate_rejections
+                .matchmaker_activate
+                >= 1
+        );
+
+        // Boot-not-ready then Ready: the held cohort forms once a script loads.
+        readiness.record_loaded("sha256:v1", now());
+        assert_eq!(gw.matchmaker_tick(), 2, "both members receive handoffs");
+        assert_eq!(gw.rooms().room_count(), 1);
+        let room = &gw.rooms().snapshot()[0];
+        assert_eq!(
+            room.script_binding,
+            Some(ScriptBinding {
+                revision_id: "sha256:v1".to_owned(),
+                generation: 1,
+            }),
+            "the match is born bound to the gating snapshot"
+        );
+    }
+
+    // ---- Surface 5: matchmaker.accept -----------------------------------
+
+    #[tokio::test]
+    async fn gate_05_accept_refuses_when_not_ready_and_when_stale() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:v1", now());
+        let gw = gated_gateway(&readiness);
+        let (alice, mut ra) = register(&gw, Some("alice"));
+        let (bob, mut rb) = register(&gw, Some("bob"));
+        let request = serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 });
+        gw.handle_inbound(alice, &rpc(1, "matchmaker.add", request.clone()));
+        let (status, body) = recv_rpc(&mut ra).await;
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        let ticket = json(&body)["ticket_id"]
+            .as_str()
+            .expect("ticket")
+            .to_owned();
+        gw.handle_inbound(bob, &rpc(2, "matchmaker.add", request));
+        let _ = recv_rpc(&mut rb).await;
+        let handoff = json(&ra.recv().await.expect("matched").envelope.body);
+        let _ = rb.recv().await.expect("bob matched");
+        let accept = |request_id: u64| {
+            rpc(
+                request_id,
+                "matchmaker.accept",
+                serde_json::json!({
+                    "ticket_id": ticket,
+                    "join_token": handoff["join_token"],
+                }),
+            )
+        };
+
+        // Not ready: trusted admission is refused with the stable message.
+        readiness.record_degraded(now());
+        gw.handle_inbound(alice, &accept(3));
+        let (status, body) = recv_rpc(&mut ra).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(String::from_utf8_lossy(&body), SCRIPT_UNAVAILABLE_MESSAGE);
+        assert!(
+            gw.rooms().snapshot()[0].members.is_empty(),
+            "no admission while degraded"
+        );
+        assert_eq!(
+            gw.metrics
+                .snapshot()
+                .script_gate_rejections
+                .matchmaker_accept,
+            1
+        );
+
+        // Recovered under a NEW load: the room's bound revision is superseded,
+        // so admission into the stale match is refused with the same message.
+        readiness.record_loaded("sha256:v2", now());
+        gw.handle_inbound(alice, &accept(4));
+        let (status, body) = recv_rpc(&mut ra).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(String::from_utf8_lossy(&body), SCRIPT_UNAVAILABLE_MESSAGE);
+        assert!(gw.rooms().snapshot()[0].members.is_empty());
+    }
+
+    // ---- Surface 6: live matchmaker formation (room birth) --------------
+
+    #[tokio::test]
+    async fn gate_06_live_form_refuses_room_birth() {
+        let readiness = boot_readiness();
+        let gw = gated_gateway(&readiness);
+        assert_eq!(gw.live_matchmaker_create_room(2), Err(()));
+        assert_eq!(gw.rooms().room_count(), 0, "no room is born while closed");
+        assert_eq!(gw.metrics.snapshot().script_gate_rejections.live_form, 1);
+
+        readiness.record_loaded("sha256:v1", now());
+        let room = gw.live_matchmaker_create_room(2).expect("ready opens");
+        assert_eq!(
+            gw.rooms().binding(room),
+            Some(ScriptBinding {
+                revision_id: "sha256:v1".to_owned(),
+                generation: 1,
+            })
+        );
+    }
+
+    // ---- Surface 7: live acceptance into a locally owned match ----------
+
+    #[tokio::test]
+    async fn gate_07_live_accept_local_refuses() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:v1", now());
+        let gw = gated_gateway(&readiness);
+        let room = gw.live_matchmaker_create_room(2).expect("room");
+        let (alice, mut ra) = register(&gw, Some("alice"));
+
+        readiness.record_degraded(now());
+        assert_eq!(
+            gw.live_matchmaker_finish_local_accept(alice, 7, room),
+            Err(())
+        );
+        let (status, body) = recv_rpc(&mut ra).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(String::from_utf8_lossy(&body), SCRIPT_UNAVAILABLE_MESSAGE);
+        assert!(ra.try_recv().is_err(), "no ROOM_JOINED follows a refusal");
+        assert!(gw.rooms().members(room).is_empty());
+        assert_eq!(
+            gw.metrics
+                .snapshot()
+                .script_gate_rejections
+                .live_accept_local,
+            1
+        );
+    }
+
+    // ---- Surface 8: live acceptance completion for a remote match -------
+
+    #[tokio::test]
+    async fn gate_08_live_accept_remote_refuses() {
+        let readiness = boot_readiness();
+        let gw = gated_gateway(&readiness);
+        let (alice, mut ra) = register(&gw, Some("alice"));
+        assert_eq!(
+            gw.live_matchmaker_finish_remote_accept(alice, 8, 42),
+            Err(())
+        );
+        let (status, body) = recv_rpc(&mut ra).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(String::from_utf8_lossy(&body), SCRIPT_UNAVAILABLE_MESSAGE);
+        assert!(
+            ra.try_recv().is_err(),
+            "no accepted/ROOM_JOINED frames while closed"
+        );
+        assert_eq!(
+            gw.metrics
+                .snapshot()
+                .script_gate_rejections
+                .live_accept_remote,
+            1
+        );
+    }
+
+    // ---- Surface 9: live fenced remote admission on the owner node ------
+
+    #[tokio::test]
+    async fn gate_09_live_admit_remote_refuses_on_owner() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:v1", now());
+        let gw = gated_gateway(&readiness);
+        let room = gw.live_matchmaker_create_room(2).expect("room");
+        let node_b = NodeId::new("node-b").expect("node id");
+
+        readiness.record_degraded(now());
+        assert_eq!(
+            gw.live_matchmaker_admit_remote(node_b.clone(), "bob".to_owned(), room),
+            Err(())
+        );
+        assert_eq!(gw.rooms().snapshot()[0].remote_member_count, 0);
+        assert_eq!(
+            gw.metrics
+                .snapshot()
+                .script_gate_rejections
+                .live_admit_remote,
+            1
+        );
+
+        // A recovery under a NEW load supersedes the room: still refused.
+        readiness.record_loaded("sha256:v2", now());
+        assert_eq!(
+            gw.live_matchmaker_admit_remote(node_b, "bob".to_owned(), room),
+            Err(())
+        );
+        assert_eq!(gw.rooms().snapshot()[0].remote_member_count, 0);
+    }
+
+    // ---- Surface 10 (charter test 17): cluster NodeCommand::AdmitRemote -
+
+    #[tokio::test]
+    async fn gate_17_cluster_admit_remote_refuses_on_owner_node() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:v1", now());
+        let node_a = NodeId::new("node-a").expect("node a");
+        let node_b = NodeId::new("node-b").expect("node b");
+        let authority = Arc::new(InMemoryMatchmakerCluster::new());
+        let router = Arc::new(InMemoryMatchmakerHandoffRouter::new());
+        let lease = MatchmakerShardLease {
+            shard: QueueShardId::new(0),
+            owner_node: node_a.clone(),
+            generation: OwnershipGeneration::new(1),
+            expires_at: now()
+                .checked_add(DurationMillis::from_millis(60_000))
+                .expect("lease expiry"),
+        };
+        authority.acquire_shard(lease.clone()).expect("shard owned");
+        let gw = Arc::new(gated_gateway(&readiness).with_matchmaker_cluster(
+            node_a.clone(),
+            lease.clone(),
+            Arc::clone(&authority),
+            Arc::clone(&router),
+        ));
+        gw.register_matchmaker_cluster_endpoint();
+
+        // Form a cohort while Ready so real owner-bound handoffs exist.
+        let (alice, mut ra) = register(&gw, Some("alice"));
+        let (bob, mut rb) = register(&gw, Some("bob"));
+        let request = serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 });
+        gw.handle_inbound(alice, &rpc(1, "matchmaker.add", request.clone()));
+        let _ = recv_rpc(&mut ra).await;
+        gw.handle_inbound(bob, &rpc(2, "matchmaker.add", request));
+        let _ = recv_rpc(&mut rb).await;
+        let alice_handoff = json(&ra.recv().await.expect("matched").envelope.body);
+        let bob_handoff = json(&rb.recv().await.expect("matched").envelope.body);
+        let admission = |handoff: &serde_json::Value, user: &str| RemoteMatchmakerAdmission {
+            ticket_id: TicketId::parse(handoff["ticket_id"].as_str().expect("ticket"))
+                .expect("ticket id"),
+            user_id: user.to_owned(),
+            requester_node: node_b.clone(),
+            join_token: handoff["join_token"].as_str().expect("token").to_owned(),
+            formation_lease: lease.clone(),
+        };
+
+        // Control probe: while Ready the owner node admits the remote member.
+        let match_id = router
+            .admit_remote(&node_a, admission(&alice_handoff, "alice"))
+            .expect("ready owner admits");
+        assert_eq!(gw.rooms().snapshot()[0].remote_member_count, 1);
+
+        // Owner loses script readiness: the same control-plane path refuses.
+        readiness.record_degraded(now());
+        assert!(
+            router
+                .admit_remote(&node_a, admission(&bob_handoff, "bob"))
+                .is_err(),
+            "owner node fails closed on NodeCommand::AdmitRemote"
+        );
+        let rooms = gw.rooms().snapshot();
+        let room = rooms.iter().find(|room| room.id == match_id).expect("room");
+        assert_eq!(room.remote_member_count, 1, "no admission while degraded");
+        assert_eq!(
+            gw.metrics
+                .snapshot()
+                .script_gate_rejections
+                .cluster_admit_remote,
+            1
+        );
+    }
+
+    // ---- require_script = false: byte-identical relay behavior ----------
+
+    #[tokio::test]
+    async fn gate_11_ungated_gateway_behavior_is_unchanged() {
+        // No readiness attached (require_script = false): rooms create/join
+        // exactly as before, no reject frames, no bindings.
+        let gw = Gateway::new();
+        let (a, mut ra) = register(&gw, None);
+        let sent = gw.handle_inbound(a, &room_create(b"lobby"));
+        assert_eq!(sent, 1, "exactly the ROOM_JOINED reply");
+        let joined = ra.recv().await.expect("joined");
+        assert_eq!(joined.envelope.kind, KIND_ROOM_JOINED);
+        let room_id = RoomJoined::decode(&joined.envelope.body)
+            .expect("decodes")
+            .room_id;
+        let (b, mut rb) = register(&gw, None);
+        gw.handle_inbound(b, &room_join(room_id));
+        assert_eq!(
+            rb.recv().await.expect("joined").envelope.kind,
+            KIND_ROOM_JOINED
+        );
+        assert_eq!(gw.rooms().binding(room_id), None, "no binding when ungated");
+        let metrics = gw.metrics.snapshot();
+        assert_eq!(
+            metrics.script_gate_rejections,
+            crate::observability::ScriptGateRejectionsSnapshot::default(),
+            "no surface ever counted a rejection"
+        );
+    }
+
+    // ---- Degraded: existing matches held, new ones gated ----------------
+
+    #[tokio::test]
+    async fn gate_12_degraded_holds_existing_matches_but_gates_new_ones() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:v1", now());
+        let gw = gated_gateway(&readiness);
+        let (a, mut ra) = register(&gw, Some("alice"));
+        let (b, mut rb) = register(&gw, Some("bob"));
+        gw.handle_inbound(a, &room_create(b"lobby"));
+        let room_id = RoomJoined::decode(&ra.recv().await.expect("joined").envelope.body)
+            .expect("decodes")
+            .room_id;
+        gw.handle_inbound(b, &room_join(room_id));
+        let _ = rb.recv().await.expect("bob joined");
+
+        readiness.record_degraded(now());
+        // Held: the existing match keeps its members and is not torn down.
+        let mut members = gw.rooms().members(room_id);
+        members.sort_unstable();
+        assert_eq!(members, vec![a, b]);
+        assert_eq!(gw.rooms().room_count(), 1);
+        // Gated: no new creation and no new admission while degraded.
+        let (c, mut rc) = register(&gw, Some("carol"));
+        gw.handle_inbound(c, &room_create(b"lobby2"));
+        expect_room_reject(&mut rc, KIND_ROOM_CREATE).await;
+        gw.handle_inbound(c, &room_join(room_id));
+        expect_room_reject(&mut rc, KIND_ROOM_JOIN).await;
+        let mut members = gw.rooms().members(room_id);
+        members.sort_unstable();
+        assert_eq!(members, vec![a, b]);
+        assert_eq!(gw.rooms().room_count(), 1);
+    }
+
+    // ---- Stale-revision rooms refuse admission --------------------------
+
+    #[tokio::test]
+    async fn gate_13_room_join_into_a_superseded_room_is_refused() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:v1", now());
+        let gw = gated_gateway(&readiness);
+        let (a, mut ra) = register(&gw, Some("alice"));
+        gw.handle_inbound(a, &room_create(b"lobby"));
+        let room_id = RoomJoined::decode(&ra.recv().await.expect("joined").envelope.body)
+            .expect("decodes")
+            .room_id;
+
+        // A hot reload loads a new revision: the old room is superseded.
+        readiness.record_loaded("sha256:v2", now());
+        let (b, mut rb) = register(&gw, Some("bob"));
+        gw.handle_inbound(b, &room_join(room_id));
+        expect_room_reject(&mut rb, KIND_ROOM_JOIN).await;
+        assert_eq!(gw.rooms().members(room_id), vec![a]);
+
+        // Same name lands in the OLD named room's slot: refused too (a gated
+        // node never quietly re-admits into a stale named room).
+        gw.handle_inbound(b, &room_create(b"lobby"));
+        expect_room_reject(&mut rb, KIND_ROOM_CREATE).await;
+
+        // A fresh name creates a fresh room bound to the new revision.
+        gw.handle_inbound(b, &room_create(b"lobby-v2"));
+        let fresh = RoomJoined::decode(&rb.recv().await.expect("joined").envelope.body)
+            .expect("decodes")
+            .room_id;
+        assert_eq!(
+            gw.rooms().binding(fresh),
+            Some(ScriptBinding {
+                revision_id: "sha256:v2".to_owned(),
+                generation: 2,
+            })
+        );
+    }
+
+    // ---- Boot not-ready, then Ready after a successful load -------------
+
+    #[tokio::test]
+    async fn gate_14_boot_not_ready_then_ready_after_load() {
+        let readiness = boot_readiness();
+        let gw = gated_gateway(&readiness);
+        let (a, mut ra) = register(&gw, Some("alice"));
+        gw.handle_inbound(a, &room_create(b"lobby"));
+        expect_room_reject(&mut ra, KIND_ROOM_CREATE).await;
+        assert_eq!(gw.rooms().room_count(), 0);
+
+        // A later valid load (hot reload / revision deploy) opens the gate.
+        readiness.record_loaded("sha256:v1", now());
+        gw.handle_inbound(a, &room_create(b"lobby"));
+        let joined = ra.recv().await.expect("joined");
+        assert_eq!(joined.envelope.kind, KIND_ROOM_JOINED);
+        assert_eq!(gw.rooms().room_count(), 1);
+    }
+
+    // ---- The standing invariant (charter test 18) ------------------------
+
+    #[tokio::test]
+    async fn gate_18_no_match_ever_starts_without_a_ready_script() {
+        let readiness = boot_readiness();
+        let gw = gated_gateway(&readiness);
+        let (a, mut ra) = register(&gw, Some("alice"));
+        let (b, mut rb) = register(&gw, Some("bob"));
+
+        // Every creation surface, in every non-ready state.
+        let t = now();
+        let request: TicketRequest = serde_json::from_value(
+            serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 }),
+        )
+        .expect("request");
+        let closed_states: [&dyn Fn(&GameScriptReadiness); 5] = [
+            &|r| r.record_no_script(t),
+            &|r| r.record_validating(t),
+            &|r| r.record_activating(t),
+            &|r| r.record_degraded(t),
+            &|r| r.record_unavailable(t),
+        ];
+        for close in closed_states {
+            close(&readiness);
+            // Surface: client room create.
+            gw.handle_inbound(a, &room_create(b"never"));
+            expect_room_reject(&mut ra, KIND_ROOM_CREATE).await;
+            // Surface: matchmaker queue.
+            gw.handle_inbound(
+                b,
+                &rpc(
+                    1,
+                    "matchmaker.add",
+                    serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 }),
+                ),
+            );
+            let (status, _) = recv_rpc(&mut rb).await;
+            assert_eq!(status, protocol::RPC_STATUS_ERROR);
+            // Surface: local activation over externally queued tickets.
+            let ticket = gw
+                .matchmaker
+                .add_party(a, vec![a], request.clone(), t)
+                .expect("queued");
+            assert_eq!(gw.matchmaker_tick(), 0);
+            assert!(
+                gw.matchmaker.cancel(a, &ticket, t),
+                "ticket held, not consumed"
+            );
+            // Surface: live formation.
+            assert_eq!(gw.live_matchmaker_create_room(2), Err(()));
+            assert_eq!(
+                gw.rooms().room_count(),
+                0,
+                "invariant: no match exists without a ready script"
+            );
+        }
     }
 }

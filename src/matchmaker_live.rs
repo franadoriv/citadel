@@ -683,21 +683,33 @@ async fn form_matches(
         ));
     };
     for formed in inner.index.preview(now) {
-        inner
+        // Fail closed before any durable claim: a shard owner whose
+        // GameScript is not ready must not give birth to a match room, and a
+        // previewed cohort must stay queued (able to form once the script
+        // recovers) rather than be consumed by a doomed formation.
+        let room_id = gateway
+            .live_matchmaker_create_room(formed.participants.len())
+            .map_err(|()| MatchmakerRouterError::Unavailable(inner.config.node_id.clone()))?;
+        if let Err(_error) = inner
             .config
             .directory
             .claim_formations(&formed.tickets, lease, now)
             .await
-            .map_err(|_| MatchmakerRouterError::Rejected(inner.config.node_id.clone()))?;
-        if !inner
-            .index
-            .commit_formations(std::slice::from_ref(&formed), now)
         {
+            let _ = gateway.rooms().discard_empty(room_id);
             return Err(MatchmakerRouterError::Rejected(
                 inner.config.node_id.clone(),
             ));
         }
-        let room_id = gateway.live_matchmaker_create_room(formed.participants.len());
+        if !inner
+            .index
+            .commit_formations(std::slice::from_ref(&formed), now)
+        {
+            let _ = gateway.rooms().discard_empty(room_id);
+            return Err(MatchmakerRouterError::Rejected(
+                inner.config.node_id.clone(),
+            ));
+        }
         let expires_at = now
             .checked_add(inner.config.handoff_ttl)
             .map_err(|_| MatchmakerRouterError::Unavailable(inner.config.node_id.clone()))?;

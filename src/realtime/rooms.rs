@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::realtime::registry::ParticipantId;
+use crate::runtime::ScriptBinding;
 use crate::session::NodeId;
 
 /// Server-assigned room identifier (monotonic, starts at 1; `0` is never a room).
@@ -61,6 +62,9 @@ pub struct RoomSnapshot {
     /// Members proxied by another node. Their local participant ids are not
     /// meaningful on this node, so the console exposes only the count.
     pub remote_member_count: usize,
+    /// The GameScript `(revision, generation)` this room was born bound to.
+    /// `None` on ungated nodes (`runtime.require_script` off).
+    pub script_binding: Option<ScriptBinding>,
 }
 
 /// Globally scoped identity for a member proxied by another node.
@@ -79,6 +83,10 @@ pub enum JoinError {
     Full,
     /// The room's label has `open = false`.
     Closed,
+    /// The room is bound to a GameScript revision that is no longer the
+    /// loaded one (or carries no binding on a gated node). Admission into a
+    /// superseded match fails closed.
+    StaleScript,
 }
 
 #[derive(Debug)]
@@ -90,6 +98,9 @@ struct Room {
     /// name from the `names` index when the room is pruned). `None` for id-only
     /// rooms created via [`RoomRegistry::create`].
     name: Option<String>,
+    /// The GameScript `(revision, generation)` captured from the readiness
+    /// snapshot that admitted this room's creation. `None` on ungated nodes.
+    binding: Option<ScriptBinding>,
 }
 
 #[derive(Debug)]
@@ -128,6 +139,13 @@ impl RoomRegistry {
 
     /// Create a new, empty room with `label`; returns its id. Does not add members.
     pub fn create(&self, label: RoomLabel) -> RoomId {
+        self.create_bound(label, None)
+    }
+
+    /// Create a new, empty room born bound to `binding` (the readiness
+    /// snapshot that admitted its creation). `None` preserves the ungated
+    /// behavior.
+    pub fn create_bound(&self, label: RoomLabel, binding: Option<ScriptBinding>) -> RoomId {
         let mut g = self.lock();
         let id = g.next_id;
         g.next_id += 1;
@@ -138,6 +156,7 @@ impl RoomRegistry {
                 members: HashSet::new(),
                 remote_members: HashSet::new(),
                 name: None,
+                binding,
             },
         );
         id
@@ -156,9 +175,23 @@ impl RoomRegistry {
         name: &str,
         make_label: impl FnOnce() -> RoomLabel,
     ) -> Result<(RoomId, RoomLabel), JoinError> {
+        self.join_or_create_bound(participant, name, None, make_label)
+    }
+
+    /// [`Self::join_or_create`] under the readiness gate: a newly created room
+    /// is born bound to `binding`, and joining an existing named room
+    /// requires its binding to match (see [`Self::join_bound`]). `None`
+    /// preserves the ungated behavior.
+    pub fn join_or_create_bound(
+        &self,
+        participant: ParticipantId,
+        name: &str,
+        binding: Option<ScriptBinding>,
+        make_label: impl FnOnce() -> RoomLabel,
+    ) -> Result<(RoomId, RoomLabel), JoinError> {
         let mut g = self.lock();
         if let Some(&existing) = g.names.get(name) {
-            return Self::join_locked(&mut g, participant, existing, false);
+            return Self::join_locked(&mut g, participant, existing, false, binding.as_ref());
         }
         // Create the named room, then join the creator into it.
         let id = g.next_id;
@@ -170,10 +203,11 @@ impl RoomRegistry {
                 members: HashSet::new(),
                 remote_members: HashSet::new(),
                 name: Some(name.to_owned()),
+                binding: binding.clone(),
             },
         );
         g.names.insert(name.to_owned(), id);
-        Self::join_locked(&mut g, participant, id, false)
+        Self::join_locked(&mut g, participant, id, false, binding.as_ref())
     }
 
     /// Add `participant` to `room_id`, first removing it from any prior room (MVP:
@@ -184,34 +218,53 @@ impl RoomRegistry {
         participant: ParticipantId,
         room_id: RoomId,
     ) -> Result<RoomLabel, JoinError> {
-        let mut g = self.lock();
-        Self::join_locked(&mut g, participant, room_id, false).map(|(_, label)| label)
+        self.join_bound(participant, room_id, None)
     }
 
-    /// Admit a participant selected by the trusted matchmaker into a closed
-    /// match room. This is deliberately separate from [`Self::join`]: a raw
-    /// `ROOM_JOIN` frame cannot bypass a room's `open = false` policy.
-    pub(crate) fn admit_match(
+    /// [`Self::join`] under the readiness gate: with `expected` set, the room
+    /// must be bound to exactly that `(revision, generation)` or the join is
+    /// refused as [`JoinError::StaleScript`]. `None` preserves the ungated
+    /// behavior.
+    pub fn join_bound(
         &self,
         participant: ParticipantId,
         room_id: RoomId,
+        expected: Option<&ScriptBinding>,
     ) -> Result<RoomLabel, JoinError> {
         let mut g = self.lock();
-        Self::join_locked(&mut g, participant, room_id, true).map(|(_, label)| label)
+        Self::join_locked(&mut g, participant, room_id, false, expected).map(|(_, label)| label)
+    }
+
+    /// Admit a participant selected by the trusted matchmaker into a closed
+    /// match room. This is deliberately separate from [`Self::join_bound`]: a
+    /// raw `ROOM_JOIN` frame cannot bypass a room's `open = false` policy.
+    /// See [`Self::join_bound`] for the `expected` binding contract
+    /// (`None` = ungated node).
+    pub(crate) fn admit_match_bound(
+        &self,
+        participant: ParticipantId,
+        room_id: RoomId,
+        expected: Option<&ScriptBinding>,
+    ) -> Result<RoomLabel, JoinError> {
+        let mut g = self.lock();
+        Self::join_locked(&mut g, participant, room_id, true, expected).map(|(_, label)| label)
     }
 
     /// Join logic operating on an already-locked `Inner` (shared by [`Self::join`]
-    /// and [`Self::join_or_create`]). Validates open/cap first so a failed join never
-    /// disturbs current state, moves the participant out of any prior room (pruning
-    /// an emptied one), then inserts and returns `(room_id, label)`.
+    /// and [`Self::join_or_create`]). Validates the script binding and open/cap
+    /// first so a failed join never disturbs current state, moves the participant
+    /// out of any prior room (pruning an emptied one), then inserts and returns
+    /// `(room_id, label)`.
     fn join_locked(
         g: &mut Inner,
         participant: ParticipantId,
         room_id: RoomId,
         bypass_closed: bool,
+        expected: Option<&ScriptBinding>,
     ) -> Result<(RoomId, RoomLabel), JoinError> {
         {
             let room = g.rooms.get(&room_id).ok_or(JoinError::NoSuchRoom)?;
+            Self::check_binding(room, expected)?;
             if !bypass_closed && !room.label.open {
                 return Err(JoinError::Closed);
             }
@@ -244,14 +297,18 @@ impl RoomRegistry {
     /// Admit a member whose transport is owned by another node. This trusted
     /// boundary preserves room capacity and one-room membership without treating
     /// the remote node's local participant id as globally unique.
-    pub(crate) fn admit_remote_match(
+    /// See [`Self::join_bound`] for the `expected` binding contract
+    /// (`None` = ungated node).
+    pub(crate) fn admit_remote_match_bound(
         &self,
         member: RemoteRoomMember,
         room_id: RoomId,
+        expected: Option<&ScriptBinding>,
     ) -> Result<RoomLabel, JoinError> {
         let mut g = self.lock();
         {
             let room = g.rooms.get(&room_id).ok_or(JoinError::NoSuchRoom)?;
+            Self::check_binding(room, expected)?;
             let already_here = room.remote_members.contains(&member);
             if room.label.max_players != 0
                 && !already_here
@@ -310,6 +367,31 @@ impl RoomRegistry {
         self.lock().rooms.get(&room_id).map(|r| r.label.clone())
     }
 
+    /// The script binding a room was born with, if the room exists and was
+    /// created under the readiness gate.
+    #[must_use]
+    pub fn binding(&self, room_id: RoomId) -> Option<ScriptBinding> {
+        self.lock()
+            .rooms
+            .get(&room_id)
+            .and_then(|r| r.binding.clone())
+    }
+
+    /// Fail-closed script-binding check shared by every admission path.
+    ///
+    /// With `expected` set (a gated node's current Ready snapshot), the room
+    /// must carry exactly that binding: a room from a superseded load — or a
+    /// room that somehow has no binding at all on a gated node — refuses
+    /// admission as [`JoinError::StaleScript`]. `expected = None` (ungated
+    /// node) checks nothing.
+    fn check_binding(room: &Room, expected: Option<&ScriptBinding>) -> Result<(), JoinError> {
+        match expected {
+            None => Ok(()),
+            Some(expected) if room.binding.as_ref() == Some(expected) => Ok(()),
+            Some(_) => Err(JoinError::StaleScript),
+        }
+    }
+
     /// Number of live rooms (tests/metrics).
     #[must_use]
     pub fn room_count(&self) -> usize {
@@ -336,6 +418,7 @@ impl RoomRegistry {
                     label: room.label.clone(),
                     members,
                     remote_member_count: room.remote_members.len(),
+                    script_binding: room.binding.clone(),
                 }
             })
             .collect();
@@ -498,7 +581,7 @@ mod tests {
             open: false,
         });
         assert_eq!(r.join(pid(3), closed), Err(JoinError::Closed));
-        assert!(r.admit_match(pid(3), closed).is_ok());
+        assert!(r.admit_match_bound(pid(3), closed, None).is_ok());
         assert_eq!(r.room_of(pid(3)), Some(closed));
     }
 
@@ -515,9 +598,12 @@ mod tests {
             node_id: NodeId::new("node-b").expect("node id"),
             user_id: "bob".to_owned(),
         };
-        assert!(r.admit_remote_match(remote, room).is_ok());
-        assert!(r.admit_match(pid(1), room).is_ok());
-        assert_eq!(r.admit_match(pid(2), room), Err(JoinError::Full));
+        assert!(r.admit_remote_match_bound(remote, room, None).is_ok());
+        assert!(r.admit_match_bound(pid(1), room, None).is_ok());
+        assert_eq!(
+            r.admit_match_bound(pid(2), room, None),
+            Err(JoinError::Full)
+        );
         let snapshot = r.snapshot();
         assert_eq!(snapshot[0].members, vec![pid(1)]);
         assert_eq!(snapshot[0].remote_member_count, 1);
@@ -557,6 +643,87 @@ mod tests {
         let other = snapshot.iter().find(|s| s.id == solo).unwrap();
         assert_eq!(other.name, None);
         assert_eq!(other.members, vec![pid(3)]);
+    }
+
+    fn binding(revision: &str, generation: u64) -> ScriptBinding {
+        ScriptBinding {
+            revision_id: revision.to_owned(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn rooms_are_born_bound_and_report_their_binding() {
+        let r = RoomRegistry::new();
+        let bound = r.create_bound(RoomLabel::with_map("M"), Some(binding("sha256:v1", 1)));
+        assert_eq!(r.binding(bound), Some(binding("sha256:v1", 1)));
+        let (named, _) = r
+            .join_or_create_bound(pid(1), "lobby", Some(binding("sha256:v1", 1)), || {
+                RoomLabel::with_map("M")
+            })
+            .expect("bound create joins");
+        assert_eq!(r.binding(named), Some(binding("sha256:v1", 1)));
+        let snapshot = r.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .all(|room| room.script_binding == Some(binding("sha256:v1", 1))),
+            "snapshots expose the birth binding"
+        );
+        // Ungated rooms carry no binding.
+        let unbound = r.create(RoomLabel::with_map("M"));
+        assert_eq!(r.binding(unbound), None);
+    }
+
+    #[test]
+    fn admission_refuses_a_stale_or_missing_binding() {
+        let r = RoomRegistry::new();
+        let v1 = binding("sha256:v1", 1);
+        let v2 = binding("sha256:v1", 2); // same content, superseded load
+        let room = r.create_bound(
+            RoomLabel {
+                map: "M".into(),
+                mode: "matchmaker".into(),
+                max_players: 0,
+                open: false,
+            },
+            Some(v1.clone()),
+        );
+
+        // The bound revision is still loaded: admission proceeds.
+        assert!(r.admit_match_bound(pid(1), room, Some(&v1)).is_ok());
+        // A newer generation supersedes the room: fail closed.
+        assert_eq!(
+            r.admit_match_bound(pid(2), room, Some(&v2)),
+            Err(JoinError::StaleScript)
+        );
+        assert_eq!(
+            r.join_bound(pid(2), room, Some(&v2)),
+            Err(JoinError::StaleScript)
+        );
+        let remote = RemoteRoomMember {
+            node_id: NodeId::new("node-b").expect("node id"),
+            user_id: "bob".to_owned(),
+        };
+        assert_eq!(
+            r.admit_remote_match_bound(remote.clone(), room, Some(&v2)),
+            Err(JoinError::StaleScript)
+        );
+        assert_eq!(
+            r.admit_remote_match_bound(remote, room, Some(&v1))
+                .map(|_| ()),
+            Ok(())
+        );
+        // A failed stale admission never disturbed membership.
+        assert_eq!(r.members(room), vec![pid(1)]);
+
+        // An unbound room on a gated node is structurally impossible to admit
+        // into: no placeholder matches.
+        let placeholder = r.create(RoomLabel::with_map("M"));
+        assert_eq!(
+            r.join_bound(pid(3), placeholder, Some(&v1)),
+            Err(JoinError::StaleScript)
+        );
     }
 
     #[test]

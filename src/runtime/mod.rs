@@ -50,10 +50,10 @@ pub mod lua;
 pub mod outbound_http;
 #[cfg(feature = "runtime-python")]
 pub mod python;
-pub mod readiness;
 #[cfg(feature = "runtime-python")]
 mod python_bundle;
 pub mod python_payload;
+pub mod readiness;
 pub mod shared_cache;
 pub(crate) mod static_data;
 #[cfg(unix)]
@@ -91,13 +91,6 @@ pub use lua::{
     DEFAULT_DEADLINE_MS, LifecycleHook, LuaRuntime, OutboundCommand, PhysicsOptions, ReloadOutcome,
     RoomSpec, RpcOutcome, RuntimeIntrospection,
 };
-#[cfg(any(unix, windows))]
-pub use readiness::SupervisedWorkerSource;
-pub use readiness::{
-    DEFAULT_DEGRADED_HOLD, GameScriptReadiness, InProcessRuntimeSource, ReadinessSnapshot,
-    ReadinessSource, RecoveryView, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
-    ScriptReadinessState, script_content_identity,
-};
 #[cfg(feature = "runtime-python")]
 pub use python::PythonRuntime;
 #[cfg(feature = "runtime-python")]
@@ -106,6 +99,13 @@ pub use python_bundle::{
 };
 pub use python_payload::{
     PayloadCache, PayloadFile, PayloadManifest, PythonPayloadError, VerifiedPayload,
+};
+#[cfg(any(unix, windows))]
+pub use readiness::SupervisedWorkerSource;
+pub use readiness::{
+    DEFAULT_DEGRADED_HOLD, GameScriptReadiness, InProcessRuntimeSource, ReadinessSnapshot,
+    ReadinessSource, RecoveryView, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding, ScriptReadinessState,
+    script_content_identity,
 };
 pub use shared_cache::{
     RuntimeCachePublisher, RuntimeSharedCache, RuntimeSharedCacheError, RuntimeSharedCacheHandle,

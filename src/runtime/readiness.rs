@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::observability::{NodeMetrics, ScriptGateSurface};
+use crate::observability::NodeMetrics;
 use crate::runtime::ReloadOutcome;
 use crate::time::TimestampMillis;
 
@@ -237,19 +237,14 @@ impl GameScriptReadiness {
     /// The single gate every enforcement surface calls.
     ///
     /// Returns the binding for a match born now, or the stable client-safe
-    /// message when the gate is closed. Metrics record one rejection per
-    /// refused surface call.
-    pub fn gate(&self, surface: ScriptGateSurface) -> Result<ScriptBinding, &'static str> {
-        let binding = self.lock().snapshot.binding();
-        match binding {
-            Some(binding) => Ok(binding),
-            None => {
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_script_gate_rejection(surface);
-                }
-                Err(SCRIPT_UNAVAILABLE_MESSAGE)
-            }
-        }
+    /// message when the gate is closed. Per-surface rejection counters are
+    /// owned by the enforcement points (gateway/console) so a shared metrics
+    /// registry never double-counts one refusal.
+    pub fn gate(&self) -> Result<ScriptBinding, &'static str> {
+        self.lock()
+            .snapshot
+            .binding()
+            .ok_or(SCRIPT_UNAVAILABLE_MESSAGE)
     }
 
     /// A load/validation began (e.g. a revision deploy is being validated).
@@ -469,9 +464,7 @@ impl SupervisedWorkerSource {
                 self.authority.record_loaded(identity, now);
             }
             _ => {
-                tracing::warn!(
-                    "worker ready without a script identity; readiness stays closed"
-                );
+                tracing::warn!("worker ready without a script identity; readiness stays closed");
                 self.authority.record_no_script(now);
             }
         }
@@ -532,15 +525,10 @@ mod tests {
         assert_eq!(snapshot.state, ScriptReadinessState::NoScript);
         assert_eq!(snapshot.generation, 0);
         assert_eq!(snapshot.binding(), None);
-        assert_eq!(
-            readiness.gate(ScriptGateSurface::RoomCreate),
-            Err(SCRIPT_UNAVAILABLE_MESSAGE)
-        );
+        assert_eq!(readiness.gate(), Err(SCRIPT_UNAVAILABLE_MESSAGE));
 
         readiness.record_loaded("sha256:abc", at(5));
-        let binding = readiness
-            .gate(ScriptGateSurface::RoomCreate)
-            .expect("ready gate opens");
+        let binding = readiness.gate().expect("ready gate opens");
         assert_eq!(binding.revision_id, "sha256:abc");
         assert_eq!(binding.generation, 1);
         assert_eq!(readiness.snapshot().state, ScriptReadinessState::Ready);
@@ -572,10 +560,7 @@ mod tests {
         ] {
             readiness.record_loaded("sha256:v1", at(1));
             close(&readiness);
-            assert_eq!(
-                readiness.gate(ScriptGateSurface::MatchmakerAccept),
-                Err(SCRIPT_UNAVAILABLE_MESSAGE)
-            );
+            assert_eq!(readiness.gate(), Err(SCRIPT_UNAVAILABLE_MESSAGE));
             assert_eq!(readiness.snapshot().binding(), None);
         }
     }
@@ -610,37 +595,42 @@ mod tests {
         );
         // Recovery through a fresh load reopens the gate.
         readiness.record_loaded("sha256:v2", at(200));
-        assert!(readiness.gate(ScriptGateSurface::RoomJoin).is_ok());
-        assert!(!readiness.expire_degraded_hold(at(999)), "no longer degraded");
+        assert!(readiness.gate().is_ok());
+        assert!(
+            !readiness.expire_degraded_hold(at(999)),
+            "no longer degraded"
+        );
     }
 
     #[test]
-    fn gate_rejections_and_state_moves_are_metered() {
+    fn state_transitions_move_the_readiness_gauge() {
         let metrics = Arc::new(NodeMetrics::new());
         let readiness = GameScriptReadiness::new(at(0)).with_metrics(Arc::clone(&metrics));
         assert_eq!(
             metrics.snapshot().script_readiness_state,
             ScriptReadinessState::NoScript.gauge_value()
         );
-        let _ = readiness.gate(ScriptGateSurface::RoomCreate);
-        let _ = readiness.gate(ScriptGateSurface::RoomCreate);
-        let _ = readiness.gate(ScriptGateSurface::ConsoleList);
-        let rejections = metrics.snapshot().script_gate_rejections;
-        assert_eq!(rejections.room_create, 2);
-        assert_eq!(rejections.console_list, 1);
-        assert_eq!(rejections.room_join, 0);
-
         readiness.record_loaded("sha256:v1", at(1));
         assert_eq!(
             metrics.snapshot().script_readiness_state,
             ScriptReadinessState::Ready.gauge_value()
         );
-        let before = metrics.snapshot().script_gate_rejections;
-        assert!(readiness.gate(ScriptGateSurface::RoomCreate).is_ok());
+        readiness.record_degraded(at(2));
+        assert_eq!(
+            metrics.snapshot().script_readiness_state,
+            ScriptReadinessState::Degraded.gauge_value()
+        );
+        assert!(readiness.expire_degraded_hold(at(999_999_999)));
+        assert_eq!(
+            metrics.snapshot().script_readiness_state,
+            ScriptReadinessState::Unavailable.gauge_value()
+        );
+        // Rejection counters belong to the enforcement points; consulting a
+        // closed gate here moves no counter.
+        let _ = readiness.gate();
         assert_eq!(
             metrics.snapshot().script_gate_rejections,
-            before,
-            "an open gate never counts a rejection"
+            crate::observability::ScriptGateRejectionsSnapshot::default()
         );
     }
 

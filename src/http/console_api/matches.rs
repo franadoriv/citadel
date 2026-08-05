@@ -200,6 +200,7 @@ mod tests {
             },
             members: Vec::new(),
             remote_member_count: 0,
+            script_binding: None,
         }
     }
 

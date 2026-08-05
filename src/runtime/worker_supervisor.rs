@@ -270,6 +270,9 @@ pub struct RestartController {
     parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     breaker: RestartCircuitBreaker,
+    /// GameScript readiness source fed by boot/health/recovery outcomes.
+    /// `None` on ungated nodes (`runtime.require_script` off).
+    readiness: Option<crate::runtime::SupervisedWorkerSource>,
 }
 
 impl RestartController {
@@ -279,6 +282,25 @@ impl RestartController {
             parent,
             policy,
             breaker: RestartCircuitBreaker::new(policy.restart_limit()),
+            readiness: None,
+        }
+    }
+
+    /// Publish supervision outcomes into the GameScript readiness authority.
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: crate::runtime::SupervisedWorkerSource) -> Self {
+        self.readiness = Some(readiness);
+        self
+    }
+
+    /// Mirror the current breaker posture (and any boot/health verdict) into
+    /// the readiness authority, when one is attached.
+    fn publish_readiness_recovery(&self) {
+        if let Some(readiness) = &self.readiness {
+            readiness.record_recovery(
+                &self.breaker.snapshot(),
+                crate::time::Clock::now(&crate::time::SystemClock),
+            );
         }
     }
 
@@ -302,6 +324,11 @@ impl RestartController {
             self.breaker.record_healthy();
             Ok(true)
         } else {
+            // Readiness: a missed/invalid health frame degrades the gate
+            // before any recovery attempt; new matches stop immediately.
+            if let Some(readiness) = &self.readiness {
+                readiness.record_health_lost(crate::time::Clock::now(&crate::time::SystemClock));
+            }
             self.recover_after_health_failure(active)
         }
     }
@@ -332,13 +359,19 @@ impl RestartController {
 
     pub fn restart_after_failure(&mut self) -> io::Result<Option<SupervisedWorker>> {
         let Some(delay) = self.breaker.next_restart_delay() else {
+            // The restart budget is exhausted: the circuit is open, which the
+            // readiness source escalates to a hard Unavailable.
+            self.publish_readiness_recovery();
             return Ok(None);
         };
+        self.publish_readiness_recovery();
         std::thread::sleep(delay);
         // A restarted worker is indistinguishable from a first boot: it gets
         // a fresh secret and must complete the same authenticated bootstrap,
         // so recovery can never hand back an unauthenticated worker.
-        self.boot().map(Some)
+        let worker = self.boot()?;
+        self.publish_worker_ready(&worker);
+        Ok(Some(worker))
     }
 
     /// Boot the initial worker without charging the restart circuit breaker.
@@ -348,7 +381,19 @@ impl RestartController {
     pub fn start(&mut self) -> io::Result<SupervisedWorker> {
         let worker = self.boot()?;
         self.breaker.record_healthy();
+        self.publish_worker_ready(&worker);
         Ok(worker)
+    }
+
+    /// Report an authenticated, ready worker (and its `script_identity`)
+    /// into the readiness authority, when one is attached.
+    fn publish_worker_ready(&self, worker: &SupervisedWorker) {
+        if let Some(readiness) = &self.readiness {
+            readiness.record_worker_ready(
+                worker.script_identity(),
+                crate::time::Clock::now(&crate::time::SystemClock),
+            );
+        }
     }
 
     fn boot(&mut self) -> io::Result<SupervisedWorker> {
@@ -426,6 +471,7 @@ pub struct WorkerLifecycleService {
     socket_parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     healthy_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    readiness: Option<crate::runtime::SupervisedWorkerSource>,
 }
 
 impl WorkerLifecycleService {
@@ -440,7 +486,16 @@ impl WorkerLifecycleService {
             socket_parent,
             policy,
             healthy_cycles: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readiness: None,
         }
+    }
+
+    /// Publish worker readiness/health/recovery into the GameScript
+    /// readiness authority (`runtime.require_script` deployments).
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: crate::runtime::SupervisedWorkerSource) -> Self {
+        self.readiness = Some(readiness);
+        self
     }
 
     /// Monotone count of successful health cycles — an observability probe
@@ -480,8 +535,12 @@ impl crate::lifecycle::AsyncService for WorkerLifecycleService {
         let socket_parent = self.socket_parent;
         let policy = self.policy;
         let healthy_cycles = Arc::clone(&self.healthy_cycles);
+        let readiness = self.readiness;
         let result = tokio::task::spawn_blocking(move || {
             let mut controller = RestartController::new(executable, socket_parent, policy);
+            if let Some(readiness) = readiness {
+                controller = controller.with_readiness(readiness);
+            }
             run_supervision_loop(&mut controller, &stop, &healthy_cycles)
         })
         .await;
@@ -509,6 +568,8 @@ pub struct SupervisedWorker {
     _bootstrap_reader: OwnedFd,
     child: Child,
     process_group_id: Option<i32>,
+    /// Content identity the worker reported in `WorkerReady` (readiness gate).
+    script_identity: Option<String>,
 }
 
 #[cfg(unix)]
@@ -572,6 +633,7 @@ impl SupervisedWorker {
             _bootstrap_reader: bootstrap_reader,
             child,
             process_group_id,
+            script_identity: None,
         })
     }
 
@@ -631,9 +693,11 @@ impl SupervisedWorker {
                 io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
             })? {
                 ControlFrame::WorkerReady {
-                    protocol_version, ..
+                    protocol_version,
+                    script_identity,
                 } if protocol_version == PROTOCOL_VERSION => {
                     self.stream = Some(stream);
+                    self.script_identity = script_identity;
                     Ok(())
                 }
                 _ => Err(io::Error::new(
@@ -646,6 +710,11 @@ impl SupervisedWorker {
             self.kill_and_reap();
         }
         result
+    }
+
+    /// The `WorkerReady.script_identity` the current worker reported, if any.
+    pub fn script_identity(&self) -> Option<&str> {
+        self.script_identity.as_deref()
     }
 
     pub fn shutdown(&mut self, deadline: Duration) -> io::Result<()> {
@@ -818,6 +887,8 @@ pub struct SupervisedWorker {
     job: citadel_win_proc::JobObject,
     _secret_reader: std::os::windows::io::OwnedHandle,
     child: Child,
+    /// Content identity the worker reported in `WorkerReady` (readiness gate).
+    script_identity: Option<String>,
 }
 
 #[cfg(windows)]
@@ -906,6 +977,7 @@ impl SupervisedWorker {
             job,
             _secret_reader: secret_reader,
             child,
+            script_identity: None,
         })
     }
 
@@ -915,7 +987,10 @@ impl SupervisedWorker {
         nonce: Vec<u8>,
         deadline: Duration,
     ) -> io::Result<()> {
-        let result = (|| -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        let result = (|| -> io::Result<(
+            tokio::net::windows::named_pipe::NamedPipeServer,
+            Option<String>,
+        )> {
             let mut stream = self
                 .server
                 .take()
@@ -965,8 +1040,9 @@ impl SupervisedWorker {
                         io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
                     })? {
                         ControlFrame::WorkerReady {
-                            protocol_version, ..
-                        } if protocol_version == PROTOCOL_VERSION => Ok(()),
+                            protocol_version,
+                            script_identity,
+                        } if protocol_version == PROTOCOL_VERSION => Ok(script_identity),
                         _ => Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "worker readiness frame invalid",
@@ -979,13 +1055,14 @@ impl SupervisedWorker {
                         io::ErrorKind::TimedOut,
                         "worker bootstrap deadline exceeded",
                     )
-                })??;
-                Ok(stream)
+                })?
+                .map(|script_identity| (stream, script_identity))
             })
         })();
         match result {
-            Ok(stream) => {
+            Ok((stream, script_identity)) => {
                 self.stream = Some(stream);
+                self.script_identity = script_identity;
                 Ok(())
             }
             Err(error) => {
@@ -993,6 +1070,11 @@ impl SupervisedWorker {
                 Err(error)
             }
         }
+    }
+
+    /// The `WorkerReady.script_identity` the current worker reported, if any.
+    pub fn script_identity(&self) -> Option<&str> {
+        self.script_identity.as_deref()
     }
 
     pub fn shutdown(&mut self, deadline: Duration) -> io::Result<()> {
