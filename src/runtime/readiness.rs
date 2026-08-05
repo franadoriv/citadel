@@ -360,6 +360,12 @@ pub trait ReadinessSource: Send + Sync {
 /// This is the in-process analogue of the supervised worker's
 /// `WorkerReady.script_identity`. `None` when the file cannot be read — the
 /// caller must treat that as not-ready rather than inventing an identity.
+///
+/// Seam note: once the revision-repository activation pipeline drives
+/// deployment, the domain-scoped
+/// [`gamescript_revision_content_hash`](crate::repository::gamescript::gamescript_revision_content_hash)
+/// of the activated revision becomes the identity source and this
+/// file-hash fallback retires with the local generation counter.
 #[must_use]
 pub fn script_content_identity(entrypoint: &Path) -> Option<String> {
     let bytes = std::fs::read(entrypoint).ok()?;
