@@ -1755,7 +1755,7 @@ mod tests {
                 }
                 // The breaker opened: restarts are refused from here on.
                 Ok(None) => break,
-                Ok(Some(_)) => panic!("an unauthenticatable fixture cannot restart"),
+                Ok(Some(_)) => unreachable!("an unauthenticatable fixture cannot restart"),
             }
         }
         assert!(failed_attempts >= 1, "the storm must charge the breaker");
@@ -1955,7 +1955,7 @@ mod tests {
                 }
                 // The breaker opened: restarts are refused from here on.
                 Ok(None) => break,
-                Ok(Some(_)) => panic!("an unauthenticatable fixture cannot restart"),
+                Ok(Some(_)) => unreachable!("an unauthenticatable fixture cannot restart"),
             }
         }
         assert!(failed_attempts >= 1, "the storm must charge the breaker");

@@ -174,7 +174,7 @@ fn worker_reports_health_periodically_until_shutdown() {
         worker
             .health_check(Duration::from_secs(2))
             .unwrap_or_else(|error| {
-                panic!("worker must keep reporting health (cycle {cycle}): {error}")
+                unreachable!("worker must keep reporting health (cycle {cycle}): {error}")
             });
     }
     worker
