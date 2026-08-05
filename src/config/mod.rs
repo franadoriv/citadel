@@ -827,6 +827,14 @@ pub struct RuntimeSelection {
 pub struct RuntimeConfig {
     /// Whether the embedded script runtime is consulted for inbound messages.
     pub enabled: bool,
+    /// Whether matches require a validated, loaded GameScript. When `true`, the
+    /// node refuses to list, create, or admit players into matches until a
+    /// script is loaded and its execution backend is healthy; a missing
+    /// entrypoint boots the node not-ready instead of silently falling back to
+    /// the built-in relay. `false` (the default) preserves the unzip-and-run
+    /// relay behavior byte for byte. The first-run wizard enables this when it
+    /// scaffolds a scripted project.
+    pub require_script: bool,
     /// Explicit runtime language. `None` means autodetect from `scripts_dir`.
     pub language: Option<RuntimeLanguage>,
     /// Runtime hosting adapter. `embedded` executes game scripts in-process.
@@ -881,6 +889,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            require_script: false,
             language: None,
             adapter: RuntimeAdapter::Embedded,
             tier: RuntimeTier::Trusted,
@@ -1903,6 +1912,13 @@ impl Config {
                 ));
             }
             self.runtime.validate_capabilities()?;
+        }
+        if self.runtime.require_script && !self.runtime.enabled {
+            // A gate that can never open is a misconfiguration, not a stance:
+            // require_script demands a loadable script runtime.
+            return Err(AppError::config(
+                "runtime.require_script requires runtime.enabled = true",
+            ));
         }
         self.storage.index_definitions()?;
         self.storage.deferred.validate()?;
@@ -3149,6 +3165,26 @@ fields = ["region"]
         let mut config = Config::default();
         config.runtime.scripts_dir = "   ".to_string();
         let err = config.validate().expect_err("empty scripts_dir must fail");
+        assert_eq!(err.category(), crate::error::ErrorCategory::Config);
+    }
+
+    #[test]
+    fn require_script_defaults_off_and_demands_an_enabled_runtime() {
+        // Default off: unzip-and-run relay onboarding stays untouched.
+        assert!(!RuntimeConfig::default().require_script);
+        assert!(Config::default().validate().is_ok());
+
+        let mut gated = Config::default();
+        gated.runtime.require_script = true;
+        gated.validate().expect("require_script with enabled runtime");
+
+        // A gate that can never open is a config error, not a stance.
+        let mut contradictory = Config::default();
+        contradictory.runtime.require_script = true;
+        contradictory.runtime.enabled = false;
+        let err = contradictory
+            .validate()
+            .expect_err("require_script with a disabled runtime must fail");
         assert_eq!(err.category(), crate::error::ErrorCategory::Config);
     }
 

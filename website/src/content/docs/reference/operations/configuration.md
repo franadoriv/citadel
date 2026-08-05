@@ -86,6 +86,12 @@ interest_outer = 125
 # (runtime-python builds), then main.js (runtime-js builds). With no entrypoint,
 # the built-in relay runs.
 enabled = true
+# Strict GameScript readiness gate. When true, matches require a validated,
+# loaded script with a healthy execution backend: the node refuses to list,
+# create, or admit players into matches until one is ready, and a missing
+# entrypoint boots the node not-ready instead of silently falling back to the
+# relay. The first-run wizard enables this when it scaffolds a scripted project.
+require_script = false
 # Optional explicit language. Omit for autodetect. Supported values today:
 # "lua"; "python" when compiled with --features runtime-python; "js" or
 # "javascript" when compiled with --features runtime-js.
@@ -487,6 +493,7 @@ selected entrypoint is absent, the node uses the built-in position relay.
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Consult the script for inbound messages; `false` forces the built-in relay. |
+| `require_script` | bool | `false` | Strict GameScript readiness gate. When `true`, no match exists without a validated, loaded script and a healthy execution backend: match listing, match creation, and player admission are all refused with a stable `game script unavailable` error until a script is ready, and every match is born bound to the loaded script revision and generation (admission into a match whose revision is no longer loaded is refused). A missing entrypoint boots the node **not-ready** instead of silently falling back to the relay; the node becomes ready when a valid script loads (for example via `hot_reload` or a later deploy). A present-but-broken script remains a hard startup error. Requires `enabled = true`. The first-run wizard sets this when it scaffolds a scripted project; the default `false` keeps unzip-and-run relay behavior unchanged. |
 | `language` | enum | *(unset / autodetect)* | Optional explicit language. Current accepted values: `"lua"`, `"python"`, `"js"` (`"javascript"` is an alias for JS). Lua is always implemented; Python requires a `runtime-python` build; JavaScript requires a `runtime-js` build. |
 | `adapter` | enum | `"embedded"` | Runtime hosting adapter. `"embedded"` is implemented. `"external-worker"` and `"wasm"` are reserved for later phases and currently fail validation. |
 | `tier` | enum | `"trusted"` | Runtime trust tier. `"trusted"` is implemented. `"hardened"` is reserved for the future WASM/capability-gated tier and currently fails validation. |
