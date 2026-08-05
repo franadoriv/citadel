@@ -721,6 +721,13 @@ const SCHEMA: &[CollectionSpec] = &[
             },
         ],
     },
+    CollectionSpec {
+        // Sequence documents keyed by `_id` ("audit"/"outbox"); no secondary
+        // indexes. Declared so the manifest genuinely covers every projection
+        // the adapter writes.
+        name: GAMESCRIPT_COUNTERS,
+        indexes: &[],
+    },
 ];
 
 /// Public, deterministic description of the foundation schema for operator and
@@ -7989,7 +7996,7 @@ mod tests {
     fn foundation_manifest_covers_every_existing_domain_projection() {
         let plan = MongoSchemaPlan::foundation();
         assert_eq!(plan.version, 6);
-        assert_eq!(plan.collections, 39);
+        assert_eq!(plan.collections, 40);
         assert!(plan.indexes >= 61);
     }
 
