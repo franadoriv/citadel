@@ -85,18 +85,22 @@ pub trait MatchCommandSink: Send + Sync + 'static {
     fn on_match_closed(&self, room_id: u64, reason: MatchCloseReason);
 }
 
+/// The frame was dropped: the connection is saturated or gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSendError;
+
 /// Sender half of one generation's data-plane connection.
 ///
 /// Implemented by the IPC layer (a bounded channel into the pump thread) and
 /// by test fakes. Sending is best-effort fail-closed: an error means the
 /// frame was dropped and the connection should be considered gone.
 pub trait FrameSender: Send + Sync {
-    fn send(&self, frame: DataFrame) -> Result<(), ()>;
+    fn send(&self, frame: DataFrame) -> Result<(), FrameSendError>;
 }
 
 impl FrameSender for std::sync::mpsc::SyncSender<DataFrame> {
-    fn send(&self, frame: DataFrame) -> Result<(), ()> {
-        self.try_send(frame).map_err(|_| ())
+    fn send(&self, frame: DataFrame) -> Result<(), FrameSendError> {
+        self.try_send(frame).map_err(|_| FrameSendError)
     }
 }
 
@@ -235,6 +239,13 @@ impl ExternalWorkerRuntime {
             tx_seqs: HashMap::new(),
             rx: Arc::clone(&rx),
         });
+    }
+
+    /// Drop the active generation unconditionally (the supervisor observed
+    /// the worker's death before booting any replacement).
+    pub fn clear_active_generation(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active = None;
     }
 
     /// Drop the active generation if it still is `epoch` (a late death
@@ -648,7 +659,7 @@ mod tests {
     }
 
     impl FrameSender for CapturingSender {
-        fn send(&self, frame: DataFrame) -> Result<(), ()> {
+        fn send(&self, frame: DataFrame) -> Result<(), FrameSendError> {
             self.0.lock().expect("frames lock").push(frame);
             Ok(())
         }

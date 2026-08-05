@@ -16,6 +16,8 @@ use std::os::{
     },
 };
 
+use super::external_worker::{ExternalWorkerRuntime, WorkerScriptSpec};
+use super::worker_data_plane::DataPlaneConnection;
 use super::worker_protocol::{
     ControlFrame, PROTOCOL_VERSION, is_valid_worker_health, verify_worker_hello,
 };
@@ -317,12 +319,39 @@ pub trait WorkerGenerationObserver: Send + Sync {
     fn worker_generation_ended(&self);
 }
 
+/// Everything the supervisor needs to host a script-serving worker: the spec
+/// travels to the worker on its command line, the runtime adapter receives
+/// each generation's authenticated data-plane connection.
+#[derive(Clone)]
+pub struct WorkerDataPlaneBridge {
+    runtime: std::sync::Arc<ExternalWorkerRuntime>,
+}
+
+impl WorkerDataPlaneBridge {
+    #[must_use]
+    pub fn new(runtime: std::sync::Arc<ExternalWorkerRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    fn spec(&self) -> WorkerScriptSpec {
+        self.runtime.spec().clone()
+    }
+}
+
+/// A script spec pinned to one spawned worker generation.
+#[derive(Debug, Clone)]
+pub struct SpawnedScript {
+    pub spec: WorkerScriptSpec,
+    pub epoch: u64,
+}
+
 pub struct RestartController {
     executable: PathBuf,
     parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     breaker: RestartCircuitBreaker,
     generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
+    data_plane: Option<WorkerDataPlaneBridge>,
 }
 
 impl RestartController {
@@ -336,7 +365,16 @@ impl RestartController {
                 policy.breaker_rearm_healthy_cycles(),
             ),
             generation_observer: None,
+            data_plane: None,
         }
+    }
+
+    /// Host the deployment's script in every worker this controller boots,
+    /// installing each generation's data plane into `runtime`.
+    #[must_use]
+    pub fn with_data_plane(mut self, bridge: WorkerDataPlaneBridge) -> Self {
+        self.data_plane = Some(bridge);
+        self
     }
 
     /// Attach the observer notified whenever a worker generation ends
@@ -351,6 +389,12 @@ impl RestartController {
     }
 
     fn notify_generation_ended(&self) {
+        // Stop feeding the dead generation's connection before the gateway is
+        // told: dispatches between now and the replacement's install drop
+        // fail-closed at the adapter instead of queueing into a dead pump.
+        if let Some(bridge) = &self.data_plane {
+            bridge.runtime.clear_active_generation();
+        }
         if let Some(observer) = &self.generation_observer {
             observer.worker_generation_ended();
         }
@@ -433,10 +477,38 @@ impl RestartController {
 
     fn boot(&mut self) -> io::Result<SupervisedWorker> {
         let secret = fresh_bootstrap_secret()?;
-        let mut worker =
-            SupervisedWorker::spawn(&self.executable, &self.parent, &secret, &self.policy)?;
+        let script = self.data_plane.as_ref().map(|bridge| SpawnedScript {
+            spec: bridge.spec(),
+            // A monotone epoch per boot: every frame of this generation is
+            // fenced to it, so nothing from a previous worker can replay.
+            epoch: bridge.runtime.allocate_epoch(),
+        });
+        let mut worker = SupervisedWorker::spawn_with_script(
+            &self.executable,
+            &self.parent,
+            &secret,
+            &self.policy,
+            script.as_ref(),
+        )?;
         let nonce = fresh_bootstrap_nonce()?;
         worker.authenticate(&secret, nonce.to_vec(), self.policy.bootstrap_deadline())?;
+        if let (Some(bridge), Some(script)) = (&self.data_plane, &script) {
+            // Revision fence: the worker must have loaded exactly the script
+            // revision the adapter pinned; drift between the two reads is a
+            // boot failure, not something to discover match by match.
+            if worker.script_identity() != Some(bridge.runtime.identity()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker loaded a different script revision than the runtime adapter",
+                ));
+            }
+            let connection =
+                worker.establish_data_plane(&secret, self.policy.bootstrap_deadline())?;
+            bridge
+                .runtime
+                .install_generation(script.epoch, connection.sender);
+            bridge.runtime.spawn_rx_pump(script.epoch, connection.frames);
+        }
         Ok(worker)
     }
 }
@@ -526,6 +598,7 @@ pub struct WorkerLifecycleService {
     policy: WorkerSupervisionPolicy,
     healthy_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
     generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
+    data_plane: Option<WorkerDataPlaneBridge>,
 }
 
 impl WorkerLifecycleService {
@@ -541,6 +614,7 @@ impl WorkerLifecycleService {
             policy,
             healthy_cycles: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation_observer: None,
+            data_plane: None,
         }
     }
 
@@ -552,6 +626,14 @@ impl WorkerLifecycleService {
         observer: std::sync::Arc<dyn WorkerGenerationObserver>,
     ) -> Self {
         self.generation_observer = Some(observer);
+        self
+    }
+
+    /// Host the deployment's script in the supervised workers, installing
+    /// each generation's data plane into the external-worker runtime adapter.
+    #[must_use]
+    pub fn with_data_plane(mut self, bridge: WorkerDataPlaneBridge) -> Self {
+        self.data_plane = Some(bridge);
         self
     }
 
@@ -593,10 +675,14 @@ impl crate::lifecycle::AsyncService for WorkerLifecycleService {
         let policy = self.policy;
         let healthy_cycles = Arc::clone(&self.healthy_cycles);
         let generation_observer = self.generation_observer;
+        let data_plane = self.data_plane;
         let result = tokio::task::spawn_blocking(move || {
             let mut controller = RestartController::new(executable, socket_parent, policy);
             if let Some(observer) = generation_observer {
                 controller = controller.with_generation_observer(observer);
+            }
+            if let Some(bridge) = data_plane {
+                controller = controller.with_data_plane(bridge);
             }
             run_supervision_loop(&mut controller, &stop, &healthy_cycles)
         })
@@ -625,6 +711,10 @@ pub struct SupervisedWorker {
     _bootstrap_reader: OwnedFd,
     child: Child,
     process_group_id: Option<i32>,
+    /// Private data-plane endpoint, present when this worker hosts a script.
+    data_endpoint: Option<(PrivateUnixEndpoint, UnixListener)>,
+    /// Script revision the worker reported in its readiness frame.
+    script_identity: Option<String>,
 }
 
 #[cfg(unix)]
@@ -635,13 +725,33 @@ impl SupervisedWorker {
         secret: &[u8; 32],
         policy: &WorkerSupervisionPolicy,
     ) -> io::Result<Self> {
+        Self::spawn_with_script(executable, parent, secret, policy, None)
+    }
+
+    pub fn spawn_with_script(
+        executable: &Path,
+        parent: &Path,
+        secret: &[u8; 32],
+        policy: &WorkerSupervisionPolicy,
+        script: Option<&SpawnedScript>,
+    ) -> io::Result<Self> {
         let endpoint = PrivateUnixEndpoint::create(parent)?;
         let listener = endpoint.bind()?;
+        // The data plane gets its own private endpoint so supervision frames
+        // (64 KiB cap) and match frames (1 MiB cap) never share a stream.
+        let data_endpoint = script
+            .map(|_| -> io::Result<_> {
+                let endpoint = PrivateUnixEndpoint::create(parent)?;
+                let listener = endpoint.bind()?;
+                Ok((endpoint, listener))
+            })
+            .transpose()?;
         let bootstrap = BootstrapPipe::create()?;
         bootstrap.make_reader_inheritable()?;
         let bootstrap_fd = bootstrap.reader_fd();
         let (bootstrap_reader, bootstrap_writer) = bootstrap.into_reader_and_writer();
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("runtime-worker")
             .arg("--bootstrap-endpoint")
             .arg(endpoint.path())
@@ -660,7 +770,23 @@ impl SupervisedWorker {
             // How often the worker emits a health frame after readiness; the
             // supervisor's liveness deadline is calibrated against it.
             .arg("--health-cadence-ms")
-            .arg(policy.health_cadence().as_millis().to_string())
+            .arg(policy.health_cadence().as_millis().to_string());
+        if let (Some(script), Some((data, _))) = (script, &data_endpoint) {
+            command
+                .arg("--engine")
+                .arg(script.spec.language.as_str())
+                .arg("--entrypoint")
+                .arg(&script.spec.entrypoint)
+                .arg("--script-deadline-ms")
+                .arg(script.spec.deadline_ms.to_string())
+                .arg("--tick-ms")
+                .arg(script.spec.tick_ms.to_string())
+                .arg("--data-endpoint")
+                .arg(data.path())
+                .arg("--data-epoch")
+                .arg(script.epoch.to_string());
+        }
+        let mut child = command
             // The worker must land in its own process group before exec so
             // every cleanup path can signal the whole group. Relying on the
             // worker to isolate itself would let a non-cooperating binary
@@ -688,7 +814,43 @@ impl SupervisedWorker {
             _bootstrap_reader: bootstrap_reader,
             child,
             process_group_id,
+            data_endpoint,
+            script_identity: None,
         })
+    }
+
+    /// Accept and authenticate this generation's data-plane connection.
+    ///
+    /// Must run after [`Self::authenticate`]; the same generation secret
+    /// backs both handshakes. Consumes the endpoint: a generation gets
+    /// exactly one data connection.
+    pub fn establish_data_plane(
+        &mut self,
+        secret: &[u8; 32],
+        deadline: Duration,
+    ) -> io::Result<DataPlaneConnection> {
+        let Some((endpoint, listener)) = self.data_endpoint.take() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "worker was not spawned with a script data plane",
+            ));
+        };
+        let result = super::worker_data_plane::establish_unix_data_plane(
+            &listener, secret, deadline,
+        );
+        // Keep the endpoint directory alive for the connection's lifetime by
+        // storing it back; the listener itself is no longer needed.
+        self.data_endpoint = Some((endpoint, listener));
+        if result.is_err() {
+            self.kill_and_reap();
+        }
+        result
+    }
+
+    /// The script revision the worker reported at readiness, if any.
+    #[must_use]
+    pub fn script_identity(&self) -> Option<&str> {
+        self.script_identity.as_deref()
     }
 
     pub fn accept_with_deadline(&self, deadline: Duration) -> io::Result<UnixStream> {
@@ -747,8 +909,10 @@ impl SupervisedWorker {
                 io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
             })? {
                 ControlFrame::WorkerReady {
-                    protocol_version, ..
+                    protocol_version,
+                    script_identity,
                 } if protocol_version == PROTOCOL_VERSION => {
+                    self.script_identity = script_identity;
                     self.stream = Some(stream);
                     Ok(())
                 }
@@ -934,6 +1098,11 @@ pub struct SupervisedWorker {
     job: citadel_win_proc::JobObject,
     _secret_reader: std::os::windows::io::OwnedHandle,
     child: Child,
+    /// Data-plane pump, present when this worker hosts a script. Its thread
+    /// owns the pipe server (bound before the child spawned).
+    data_plane: Option<super::worker_data_plane::WindowsDataPlane>,
+    /// Script revision the worker reported in its readiness frame.
+    script_identity: Option<String>,
 }
 
 #[cfg(windows)]
@@ -948,6 +1117,16 @@ impl SupervisedWorker {
         secret: &[u8; 32],
         policy: &WorkerSupervisionPolicy,
     ) -> io::Result<Self> {
+        Self::spawn_with_script(executable, _parent, secret, policy, None)
+    }
+
+    pub fn spawn_with_script(
+        executable: &Path,
+        _parent: &Path,
+        secret: &[u8; 32],
+        policy: &WorkerSupervisionPolicy,
+        script: Option<&SpawnedScript>,
+    ) -> io::Result<Self> {
         let endpoint = PrivateNamedPipeEndpoint::create()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -960,6 +1139,17 @@ impl SupervisedWorker {
             let _context = runtime.enter();
             endpoint.bind()?
         };
+        // The data plane binds on its own pump thread before the child exists
+        // for the same reason (the tokio pipe server is tied to the runtime
+        // that created it, and the pump outlives this call).
+        let data_plane = script
+            .map(|_| {
+                super::worker_data_plane::WindowsDataPlane::start(
+                    *secret,
+                    policy.bootstrap_deadline(),
+                )
+            })
+            .transpose()?;
         // Kill-on-close is armed before the child exists: once assignment
         // below succeeds, even an abrupt supervisor death tears the worker
         // tree down with the closing job handle (the PDEATHSIG analog).
@@ -971,7 +1161,8 @@ impl SupervisedWorker {
             io::Error::other("worker bootstrap handle value exceeds the command-line range")
         })?;
         let (secret_reader, secret_writer) = secret_pipe.into_reader_and_writer();
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("runtime-worker")
             .arg("--bootstrap-endpoint")
             .arg(endpoint.name())
@@ -993,8 +1184,27 @@ impl SupervisedWorker {
             // How often the worker emits a health frame after readiness; the
             // supervisor's liveness deadline is calibrated against it.
             .arg("--health-cadence-ms")
-            .arg(policy.health_cadence().as_millis().to_string())
-            .spawn()?;
+            .arg(policy.health_cadence().as_millis().to_string());
+        if let (Some(script), Some(data)) = (script, &data_plane) {
+            command
+                .arg("--engine")
+                .arg(script.spec.language.as_str())
+                .arg("--entrypoint")
+                .arg(&script.spec.entrypoint)
+                .arg("--script-deadline-ms")
+                .arg(script.spec.deadline_ms.to_string())
+                .arg("--tick-ms")
+                .arg(script.spec.tick_ms.to_string())
+                .arg("--data-endpoint")
+                .arg(&data.endpoint)
+                .arg("--data-epoch")
+                .arg(script.epoch.to_string());
+        }
+        let mut child = command.spawn()?;
+        // Only the spawned child may complete the data-plane connection.
+        if let Some(data) = &data_plane {
+            data.set_child_pid(child.id());
+        }
         // Containment before secrets: the child blocks reading the bootstrap
         // secret, and the secret is only written after job assignment
         // succeeds, so a worker that reached the protocol is provably inside
@@ -1022,7 +1232,37 @@ impl SupervisedWorker {
             job,
             _secret_reader: secret_reader,
             child,
+            data_plane,
+            script_identity: None,
         })
+    }
+
+    /// Wait for this generation's authenticated data-plane connection.
+    ///
+    /// Must run after [`Self::authenticate`]; the pump thread performs the
+    /// accept, peer-pid validation, and challenge-proof handshake itself.
+    pub fn establish_data_plane(
+        &mut self,
+        _secret: &[u8; 32],
+        deadline: Duration,
+    ) -> io::Result<DataPlaneConnection> {
+        let Some(data_plane) = self.data_plane.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "worker was not spawned with a script data plane",
+            ));
+        };
+        let result = data_plane.establish(deadline);
+        if result.is_err() {
+            self.kill_and_reap();
+        }
+        result
+    }
+
+    /// The script revision the worker reported at readiness, if any.
+    #[must_use]
+    pub fn script_identity(&self) -> Option<&str> {
+        self.script_identity.as_deref()
     }
 
     pub fn authenticate(
@@ -1031,7 +1271,11 @@ impl SupervisedWorker {
         nonce: Vec<u8>,
         deadline: Duration,
     ) -> io::Result<()> {
-        let result = (|| -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        type Authenticated = (
+            tokio::net::windows::named_pipe::NamedPipeServer,
+            Option<String>,
+        );
+        let result = (|| -> io::Result<Authenticated> {
             let mut stream = self
                 .server
                 .take()
@@ -1056,7 +1300,7 @@ impl SupervisedWorker {
                         "worker bootstrap peer mismatch",
                     ));
                 }
-                tokio::time::timeout(deadline, async {
+                let script_identity = tokio::time::timeout(deadline, async {
                     write_control_frame_async(
                         &mut stream,
                         &ControlFrame::ParentHello {
@@ -1081,8 +1325,9 @@ impl SupervisedWorker {
                         io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
                     })? {
                         ControlFrame::WorkerReady {
-                            protocol_version, ..
-                        } if protocol_version == PROTOCOL_VERSION => Ok(()),
+                            protocol_version,
+                            script_identity,
+                        } if protocol_version == PROTOCOL_VERSION => Ok(script_identity),
                         _ => Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "worker readiness frame invalid",
@@ -1096,12 +1341,13 @@ impl SupervisedWorker {
                         "worker bootstrap deadline exceeded",
                     )
                 })??;
-                Ok(stream)
+                Ok((stream, script_identity))
             })
         })();
         match result {
-            Ok(stream) => {
+            Ok((stream, script_identity)) => {
                 self.stream = Some(stream);
+                self.script_identity = script_identity;
                 Ok(())
             }
             Err(error) => {

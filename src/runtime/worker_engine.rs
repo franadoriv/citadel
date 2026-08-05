@@ -269,6 +269,128 @@ impl EngineLoop {
     }
 }
 
+/// Source of inbound data-plane frames for [`run_worker_data_plane`].
+///
+/// A seam instead of `std::io::Read` because the platforms differ in how a
+/// read may block: on unix a socket read can block freely, but a Windows
+/// synchronous pipe handle serializes a blocked `ReadFile` with `WriteFile`
+/// on the same file object, so the Windows source must peek before
+/// committing to a read (the same discipline the control plane uses).
+pub trait FrameSource: Send + 'static {
+    /// Block until the next frame arrives; an error ends the stream.
+    fn read_frame(&mut self) -> Result<DataFrame, ()>;
+}
+
+/// Drive one worker generation's data plane over a connected byte stream.
+///
+/// Owns the whole worker-side IO shape so the binary stays thin: a reader
+/// thread turns the stream into frames (whole-frame reads never
+/// desynchronize mid-frame the way timeout reads could), the loop body runs
+/// scheduler rounds at `tick` cadence with real elapsed `dt`, emits
+/// heartbeats at `heartbeat` cadence, and writes every produced frame back.
+/// Returns on orderly stop (`stop` observed), on a broken connection, or
+/// once the host self-reports unhealthy — in every case after clearing
+/// `healthy` when the engine can no longer serve, so the health loop stops
+/// reassuring the supervisor and the process is replaced.
+pub fn run_worker_data_plane<S, W>(
+    source: S,
+    mut writer: W,
+    mut engine_loop: EngineLoop,
+    tick: Duration,
+    heartbeat: Duration,
+    stop: &std::sync::atomic::AtomicBool,
+    healthy: &std::sync::atomic::AtomicBool,
+) where
+    S: FrameSource,
+    W: std::io::Write,
+{
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DataFrame>(
+        super::engine_host::DEFAULT_MATCH_MAILBOX_CAPACITY,
+    );
+    // The reader thread applies backpressure to the transport when the frame
+    // channel is full (`send` blocks) and exits on stream EOF or error. It is
+    // deliberately detached: on shutdown it sits in a blocking read that ends
+    // with the process.
+    let _ = std::thread::Builder::new()
+        .name("citadel-worker-data-rx".to_owned())
+        .spawn(move || {
+            let mut source = source;
+            while let Ok(frame) = source.read_frame() {
+                if frame_tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+    let tick = tick.max(Duration::from_millis(1));
+    let heartbeat = heartbeat.max(Duration::from_millis(1));
+    let mut last_round = Instant::now();
+    let mut next_round = last_round + tick;
+    let mut next_heartbeat = last_round + heartbeat;
+    let write_frames = |frames: Vec<DataFrame>, writer: &mut W| -> bool {
+        for frame in frames {
+            if super::worker_data_protocol::write_data_frame(writer, &frame).is_err() {
+                return false;
+            }
+        }
+        true
+    };
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            // Orderly shutdown: close every match so the gateway can inform
+            // the members before the process exits.
+            let frames = engine_loop.shutdown();
+            let _ = write_frames(frames, &mut writer);
+            return;
+        }
+        let now = Instant::now();
+        let timeout = next_round.saturating_duration_since(now);
+        match frame_rx.recv_timeout(timeout) {
+            Ok(frame) => {
+                let frames = engine_loop.handle_frame(frame);
+                if !write_frames(frames, &mut writer) {
+                    healthy.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The data connection is gone; without it no match can be
+                // served, so the worker reports unhealthy and is replaced.
+                healthy.store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+        let now = Instant::now();
+        if now >= next_round {
+            let frames = engine_loop.run_round(now.duration_since(last_round));
+            last_round = now;
+            next_round = now + tick;
+            if !write_frames(frames, &mut writer) {
+                healthy.store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+        if now >= next_heartbeat {
+            next_heartbeat = now + heartbeat;
+            let frame = engine_loop.heartbeat();
+            if !write_frames(vec![frame], &mut writer) {
+                healthy.store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+        if !engine_loop.is_healthy() {
+            // Layered watchdog top level: quarantine budget exhausted or the
+            // engine died. Stop reassuring the supervisor so the whole
+            // process is replaced (a replacement never resumes old matches).
+            healthy.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::engine_host::{MatchContext, MatchFault};
@@ -406,7 +528,7 @@ mod tests {
             commands,
         } = &frames[0]
         else {
-            panic!("expected a command frame: {frames:?}");
+            unreachable!("expected a command frame: {frames:?}");
         };
         assert_eq!(*protocol_version, DATA_PROTOCOL_VERSION);
         // The worker's outbound stream is fenced to its generation and
@@ -627,7 +749,7 @@ mod tests {
             ..
         } = &first
         else {
-            panic!("expected a heartbeat: {first:?}");
+            unreachable!("expected a heartbeat: {first:?}");
         };
         assert_eq!(
             *header,

@@ -101,6 +101,213 @@ fn try_read_control_frame(
         .map_err(|_| anyhow::anyhow!("runtime worker parent frame invalid"))
 }
 
+/// Script-hosting arguments of a data-plane worker, collected all-or-nothing
+/// from the CLI (clap already enforces the grouping; this is the fail-closed
+/// re-check at the trust boundary).
+#[cfg(any(unix, windows))]
+struct ScriptArgs {
+    engine: String,
+    entrypoint: std::path::PathBuf,
+    script_deadline_ms: u64,
+    tick_ms: u64,
+    data_endpoint: String,
+    data_epoch: u64,
+}
+
+#[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
+fn collect_script_args(
+    engine: Option<String>,
+    entrypoint: Option<std::path::PathBuf>,
+    script_deadline_ms: Option<u64>,
+    tick_ms: Option<u64>,
+    data_endpoint: Option<String>,
+    data_epoch: Option<u64>,
+) -> Result<Option<ScriptArgs>> {
+    match (
+        engine,
+        entrypoint,
+        script_deadline_ms,
+        tick_ms,
+        data_endpoint,
+        data_epoch,
+    ) {
+        (None, None, None, None, None, None) => Ok(None),
+        (
+            Some(engine),
+            Some(entrypoint),
+            Some(script_deadline_ms),
+            Some(tick_ms),
+            Some(data_endpoint),
+            Some(data_epoch),
+        ) => Ok(Some(ScriptArgs {
+            engine,
+            entrypoint,
+            script_deadline_ms,
+            tick_ms,
+            data_endpoint,
+            data_epoch,
+        })),
+        _ => anyhow::bail!("runtime worker script flags must be given all together or not at all"),
+    }
+}
+
+/// The deployment's one engine plus its pinned revision identity.
+#[cfg(any(unix, windows))]
+struct ScriptHost {
+    engine: Box<dyn citadel::runtime::engine_host::MatchEngine>,
+    identity: String,
+}
+
+/// Load and validate the hosted script before readiness is reported.
+///
+/// A broken script must fail the bootstrap (the supervisor logs and applies
+/// its restart policy) instead of being discovered match by match, so a probe
+/// context is built and dropped here.
+#[cfg(any(unix, windows))]
+fn load_script_host(args: &ScriptArgs) -> Result<ScriptHost> {
+    let source = fs::read_to_string(&args.entrypoint).with_context(|| {
+        format!(
+            "runtime worker failed to read the script {}",
+            args.entrypoint.display()
+        )
+    })?;
+    let identity = citadel::runtime::external_worker::script_identity(source.as_bytes());
+    let mut engine: Box<dyn citadel::runtime::engine_host::MatchEngine> =
+        match args.engine.as_str() {
+            "lua" => Box::new(citadel::runtime::engine_host::LuaMatchEngine::new(
+                source,
+                args.script_deadline_ms,
+            )),
+            #[cfg(feature = "runtime-js")]
+            "js" => Box::new(citadel::runtime::engine_host::JsMatchEngine::new(
+                source,
+                args.script_deadline_ms,
+            )),
+            #[cfg(not(feature = "runtime-js"))]
+            "js" => anyhow::bail!(
+                "runtime worker was built without the 'runtime-js' feature and cannot host js"
+            ),
+            #[cfg(feature = "runtime-python")]
+            "python" => Box::new(citadel::runtime::engine_host::PythonMatchEngine::new(
+                source,
+                args.script_deadline_ms,
+            )),
+            #[cfg(not(feature = "runtime-python"))]
+            "python" => anyhow::bail!(
+                "runtime worker was built without the 'runtime-python' feature and cannot host python"
+            ),
+            other => anyhow::bail!("runtime worker does not know the engine '{other}'"),
+        };
+    engine
+        .open_match(u64::MAX)
+        .map_err(|fault| anyhow::anyhow!("runtime worker script failed to load: {fault:?}"))?;
+    Ok(ScriptHost { engine, identity })
+}
+
+/// Worker side of the data-plane handshake: prove knowledge of this
+/// generation's bootstrap secret on the freshly connected data stream.
+#[cfg(any(unix, windows))]
+fn worker_data_handshake<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    secret: &[u8; 32],
+) -> Result<()> {
+    let frame = citadel::runtime::worker_protocol::read_control_frame(stream)
+        .map_err(|_| anyhow::anyhow!("runtime worker data-plane hello invalid"))?;
+    let (protocol_version, nonce) = match frame {
+        citadel::runtime::worker_protocol::ControlFrame::ParentHello {
+            protocol_version,
+            nonce,
+        } => (protocol_version, nonce),
+        _ => anyhow::bail!("runtime worker expected a data-plane parent hello"),
+    };
+    if protocol_version != citadel::runtime::worker_protocol::PROTOCOL_VERSION {
+        anyhow::bail!("runtime worker data-plane protocol version unsupported");
+    }
+    let proof = citadel::runtime::worker_protocol::challenge_proof(secret, &nonce);
+    citadel::runtime::worker_protocol::write_control_frame(
+        stream,
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerHello {
+            protocol_version,
+            proof: proof.to_vec(),
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker data-plane hello write failed"))?;
+    Ok(())
+}
+
+/// Worker-side frame source over a unix domain socket: reads may block
+/// freely, the peer socket write path is independent.
+#[cfg(unix)]
+struct UnixFrameSource(UnixStream);
+
+#[cfg(unix)]
+impl citadel::runtime::worker_engine::FrameSource for UnixFrameSource {
+    fn read_frame(&mut self) -> Result<citadel::runtime::worker_data_protocol::DataFrame, ()> {
+        citadel::runtime::worker_data_protocol::read_data_frame(&mut self.0).map_err(|_| ())
+    }
+}
+
+/// Worker-side frame source over a synchronous named-pipe handle.
+///
+/// A blocked `ReadFile` on a synchronous pipe file object serializes with
+/// `WriteFile` from the engine thread (same object through `try_clone`), so
+/// the source peeks for a complete length prefix — with the same 5ms grain
+/// the control plane uses — before committing to a read.
+#[cfg(windows)]
+struct PipeFrameSource(std::fs::File);
+
+#[cfg(windows)]
+impl citadel::runtime::worker_engine::FrameSource for PipeFrameSource {
+    fn read_frame(&mut self) -> Result<citadel::runtime::worker_data_protocol::DataFrame, ()> {
+        loop {
+            let available =
+                citadel_win_proc::named_pipe_bytes_available(&self.0).map_err(|_| ())?;
+            if available >= 4 {
+                return citadel::runtime::worker_data_protocol::read_data_frame(&mut self.0)
+                    .map_err(|_| ());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// Run the hosted engine on its own thread over the connected data stream.
+///
+/// The heartbeat cadence reuses the supervisor's health cadence rather than
+/// inventing a second timing constant.
+#[cfg(any(unix, windows))]
+fn start_engine_thread<S, W>(
+    reader: S,
+    writer: W,
+    host: ScriptHost,
+    args: &ScriptArgs,
+    health_cadence_ms: u64,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()>
+where
+    S: citadel::runtime::worker_engine::FrameSource,
+    W: std::io::Write + Send + 'static,
+{
+    let engine_loop = citadel::runtime::worker_engine::EngineLoop::new(
+        host.engine,
+        citadel::runtime::engine_host::MatchSchedulerPolicy::default(),
+        args.data_epoch,
+        host.identity,
+    );
+    let tick = std::time::Duration::from_millis(args.tick_ms.max(1));
+    let heartbeat = std::time::Duration::from_millis(health_cadence_ms.max(1));
+    std::thread::Builder::new()
+        .name("citadel-worker-engine".to_owned())
+        .spawn(move || {
+            citadel::runtime::worker_engine::run_worker_data_plane(
+                reader, writer, engine_loop, tick, heartbeat, &stop, &healthy,
+            );
+        })
+        .expect("spawn worker engine thread")
+}
+
 /// Verify the supervising parent is still alive before bootstrap (Windows).
 ///
 /// The Job Object's kill-on-close covers any supervisor death after the
@@ -161,6 +368,7 @@ fn run_runtime_worker(
     parent_pid: u32,
     max_open_files: u64,
     health_cadence_ms: u64,
+    script: Option<ScriptArgs>,
 ) -> Result<()> {
     // Job containment is owned by the supervisor: the worker was assigned to
     // a kill-on-close Job Object before the bootstrap secret below was
@@ -206,17 +414,52 @@ fn run_runtime_worker(
         },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker hello write failed"))?;
+    // Load and validate the hosted script (if any) before reporting
+    // readiness, so a broken script fails the bootstrap instead of being
+    // discovered match by match.
+    let script_host = script
+        .as_ref()
+        .map(load_script_host)
+        .transpose()?;
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
         &citadel::runtime::worker_protocol::ControlFrame::WorkerReady {
             protocol_version,
-            // The protocol-stub worker loads no script yet; a future
-            // script-hosting worker reports its loaded revision here for
-            // revision fencing.
-            script_identity: None,
+            script_identity: script_host.as_ref().map(|host| host.identity.clone()),
         },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
+    // Connect the match data plane after readiness: its endpoint is a second
+    // parent-private pipe, validated to belong to the supervisor and
+    // authenticated with the same generation secret.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let healthy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut engine_thread = None;
+    if let (Some(host), Some(args)) = (script_host, script.as_ref()) {
+        let mut data_stream = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&args.data_endpoint)
+            .context("runtime worker data-plane connect failed")?;
+        let server_pid = citadel_win_proc::named_pipe_server_process_id(&data_stream)
+            .context("runtime worker data-plane peer query failed")?;
+        if server_pid != parent_pid {
+            anyhow::bail!("runtime worker data-plane endpoint is not owned by the supervisor");
+        }
+        worker_data_handshake(&mut data_stream, &secret)?;
+        let reader = data_stream
+            .try_clone()
+            .context("runtime worker data-plane stream clone failed")?;
+        engine_thread = Some(start_engine_thread(
+            PipeFrameSource(reader),
+            data_stream,
+            host,
+            args,
+            health_cadence_ms,
+            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(&healthy),
+        ));
+    }
     // Health is a continuous signal: emit one frame per cadence until the
     // parent orders shutdown. Pacing polls the pipe with the same 5ms grain
     // the unix supervisor uses in its accept loop — each cycle watches for a
@@ -224,6 +467,12 @@ fn run_runtime_worker(
     let cadence = std::time::Duration::from_millis(health_cadence_ms.max(1));
     let poll_grain = std::time::Duration::from_millis(5);
     'health: loop {
+        if !healthy.load(std::sync::atomic::Ordering::SeqCst) {
+            // The engine can no longer serve (quarantine budget exhausted,
+            // engine death, or a broken data plane): stop reassuring the
+            // supervisor and exit so the process is replaced.
+            anyhow::bail!("runtime worker engine is unhealthy; awaiting replacement");
+        }
         citadel::runtime::worker_protocol::write_control_frame(
             &mut stream,
             &citadel::runtime::worker_protocol::ControlFrame::WorkerHealth { protocol_version },
@@ -238,11 +487,20 @@ fn run_runtime_worker(
                 Some(_) => anyhow::bail!("runtime worker expected parent shutdown"),
                 None => {}
             }
+            if !healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("runtime worker engine is unhealthy; awaiting replacement");
+            }
             if std::time::Instant::now() >= cycle_end {
                 break;
             }
             std::thread::sleep(poll_grain);
         }
+    }
+    // Orderly stop: let the engine loop flush its shutdown closes before the
+    // stop acknowledgement ends this generation.
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(engine_thread) = engine_thread {
+        let _ = engine_thread.join();
     }
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
@@ -259,6 +517,7 @@ fn run_runtime_worker(
     parent_pid: u32,
     max_open_files: u64,
     health_cadence_ms: u64,
+    script: Option<ScriptArgs>,
 ) -> Result<()> {
     // Process-group isolation is owned by the supervisor, which places this
     // process in its own group pre-exec (see `SupervisedWorker::spawn`), so
@@ -303,17 +562,43 @@ fn run_runtime_worker(
         },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker hello write failed"))?;
+    // Load and validate the hosted script (if any) before reporting
+    // readiness, so a broken script fails the bootstrap instead of being
+    // discovered match by match.
+    let script_host = script
+        .as_ref()
+        .map(load_script_host)
+        .transpose()?;
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
         &citadel::runtime::worker_protocol::ControlFrame::WorkerReady {
             protocol_version,
-            // The protocol-stub worker loads no script yet; a future
-            // script-hosting worker reports its loaded revision here for
-            // revision fencing.
-            script_identity: None,
+            script_identity: script_host.as_ref().map(|host| host.identity.clone()),
         },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
+    // Connect the match data plane after readiness: its endpoint is a second
+    // parent-private socket, authenticated with the same generation secret.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let healthy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut engine_thread = None;
+    if let (Some(host), Some(args)) = (script_host, script.as_ref()) {
+        let mut data_stream = UnixStream::connect(&args.data_endpoint)
+            .context("runtime worker data-plane connect failed")?;
+        worker_data_handshake(&mut data_stream, &secret)?;
+        let reader = data_stream
+            .try_clone()
+            .context("runtime worker data-plane stream clone failed")?;
+        engine_thread = Some(start_engine_thread(
+            UnixFrameSource(reader),
+            data_stream,
+            host,
+            args,
+            health_cadence_ms,
+            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(&healthy),
+        ));
+    }
     // Health is a continuous signal: emit one frame per cadence until the
     // parent orders shutdown. The read timeout provides the pacing — each
     // cycle waits up to one cadence for a parent frame before reporting
@@ -323,6 +608,12 @@ fn run_runtime_worker(
         .set_read_timeout(Some(cadence))
         .context("runtime worker health pacing setup failed")?;
     loop {
+        if !healthy.load(std::sync::atomic::Ordering::SeqCst) {
+            // The engine can no longer serve (quarantine budget exhausted,
+            // engine death, or a broken data plane): stop reassuring the
+            // supervisor and exit so the process is replaced.
+            anyhow::bail!("runtime worker engine is unhealthy; awaiting replacement");
+        }
         citadel::runtime::worker_protocol::write_control_frame(
             &mut stream,
             &citadel::runtime::worker_protocol::ControlFrame::WorkerHealth { protocol_version },
@@ -336,6 +627,12 @@ fn run_runtime_worker(
             // No parent frame within one cadence: keep reporting health.
             None => {}
         }
+    }
+    // Orderly stop: let the engine loop flush its shutdown closes before the
+    // stop acknowledgement ends this generation.
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(engine_thread) = engine_thread {
+        let _ = engine_thread.join();
     }
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
@@ -382,12 +679,26 @@ fn main() -> Result<()> {
             parent_pid,
             max_open_files,
             health_cadence_ms,
+            engine,
+            entrypoint,
+            script_deadline_ms,
+            tick_ms,
+            data_endpoint,
+            data_epoch,
         } => run_runtime_worker(
             &bootstrap_endpoint,
             bootstrap_fd,
             parent_pid,
             max_open_files,
             health_cadence_ms,
+            collect_script_args(
+                engine,
+                entrypoint,
+                script_deadline_ms,
+                tick_ms,
+                data_endpoint,
+                data_epoch,
+            )?,
         ),
         #[cfg(not(any(unix, windows)))]
         Command::RuntimeWorker { .. } => {
