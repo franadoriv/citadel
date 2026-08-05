@@ -52,6 +52,124 @@ pub struct NodeMetrics {
     party_owner_stale_reject_total: AtomicU64,
     party_owner_forward_total: AtomicU64,
     party_resync_total: AtomicU64,
+    /// Current GameScript readiness state as its stable gauge value (see
+    /// `ScriptReadinessState::gauge_value`). Meaningful only on nodes running
+    /// with `runtime.require_script`; stays 0 (`no_script`) otherwise.
+    script_readiness_state: AtomicI64,
+    /// One counter per readiness-gate enforcement surface, indexed by
+    /// [`ScriptGateSurface`].
+    script_gate_rejections: [AtomicU64; ScriptGateSurface::COUNT],
+}
+
+/// The enforcement surfaces guarded by the GameScript readiness gate.
+///
+/// Every surface that can advertise, create, or admit into a match records
+/// its fail-closed rejections under its own stable label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScriptGateSurface {
+    /// `KIND_ROOM_CREATE` join-or-create.
+    RoomCreate,
+    /// `KIND_ROOM_JOIN` admission.
+    RoomJoin,
+    /// `matchmaker.add` ticket queueing.
+    MatchmakerQueue,
+    /// Local matchmaker cohort activation (room birth on the 250ms tick).
+    MatchmakerActivate,
+    /// `matchmaker.accept` trusted admission.
+    MatchmakerAccept,
+    /// Live matchmaker cohort formation (room birth on the shard owner).
+    LiveForm,
+    /// Live matchmaker acceptance into a locally owned match.
+    LiveAcceptLocal,
+    /// Live matchmaker acceptance completion for a remotely owned match.
+    LiveAcceptRemote,
+    /// Live fenced remote-member admission on the match-owner node.
+    LiveAdmitRemote,
+    /// Cluster control-plane remote-member admission on the match-owner node.
+    ClusterAdmitRemote,
+    /// Console match listing/detail reads.
+    ConsoleList,
+}
+
+impl ScriptGateSurface {
+    /// Number of gated surfaces (array size for the counters).
+    pub const COUNT: usize = 11;
+
+    /// Every surface, in stable index order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::RoomCreate,
+        Self::RoomJoin,
+        Self::MatchmakerQueue,
+        Self::MatchmakerActivate,
+        Self::MatchmakerAccept,
+        Self::LiveForm,
+        Self::LiveAcceptLocal,
+        Self::LiveAcceptRemote,
+        Self::LiveAdmitRemote,
+        Self::ClusterAdmitRemote,
+        Self::ConsoleList,
+    ];
+
+    /// Stable lowercase label for logs and metrics.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RoomCreate => "room_create",
+            Self::RoomJoin => "room_join",
+            Self::MatchmakerQueue => "matchmaker_queue",
+            Self::MatchmakerActivate => "matchmaker_activate",
+            Self::MatchmakerAccept => "matchmaker_accept",
+            Self::LiveForm => "live_form",
+            Self::LiveAcceptLocal => "live_accept_local",
+            Self::LiveAcceptRemote => "live_accept_remote",
+            Self::LiveAdmitRemote => "live_admit_remote",
+            Self::ClusterAdmitRemote => "cluster_admit_remote",
+            Self::ConsoleList => "console_list",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::RoomCreate => 0,
+            Self::RoomJoin => 1,
+            Self::MatchmakerQueue => 2,
+            Self::MatchmakerActivate => 3,
+            Self::MatchmakerAccept => 4,
+            Self::LiveForm => 5,
+            Self::LiveAcceptLocal => 6,
+            Self::LiveAcceptRemote => 7,
+            Self::LiveAdmitRemote => 8,
+            Self::ClusterAdmitRemote => 9,
+            Self::ConsoleList => 10,
+        }
+    }
+}
+
+/// Per-surface readiness-gate rejection totals, one stable field per surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct ScriptGateRejectionsSnapshot {
+    /// `KIND_ROOM_CREATE` requests refused.
+    pub room_create: u64,
+    /// `KIND_ROOM_JOIN` requests refused.
+    pub room_join: u64,
+    /// `matchmaker.add` submissions refused.
+    pub matchmaker_queue: u64,
+    /// Local matchmaker activation passes refused (no cohort became a room).
+    pub matchmaker_activate: u64,
+    /// `matchmaker.accept` admissions refused.
+    pub matchmaker_accept: u64,
+    /// Live matchmaker formations refused on the shard owner.
+    pub live_form: u64,
+    /// Live local acceptances refused.
+    pub live_accept_local: u64,
+    /// Live remote acceptance completions refused.
+    pub live_accept_remote: u64,
+    /// Live fenced remote-member admissions refused on the owner node.
+    pub live_admit_remote: u64,
+    /// Cluster control-plane remote admissions refused on the owner node.
+    pub cluster_admit_remote: u64,
+    /// Console listing/detail reads refused.
+    pub console_list: u64,
 }
 
 impl NodeMetrics {
@@ -204,6 +322,16 @@ impl NodeMetrics {
         self.party_resync_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Publish the current GameScript readiness state gauge value.
+    pub fn set_script_readiness_state(&self, value: i64) {
+        self.script_readiness_state.store(value, Ordering::Relaxed);
+    }
+
+    /// Record one fail-closed readiness-gate rejection on `surface`.
+    pub fn record_script_gate_rejection(&self, surface: ScriptGateSurface) {
+        self.script_gate_rejections[surface.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a consistent-enough snapshot for reporting.
     ///
     /// Values are read independently, so a snapshot may interleave concurrent
@@ -250,7 +378,27 @@ impl NodeMetrics {
                 .load(Ordering::Relaxed),
             party_owner_forward_total: self.party_owner_forward_total.load(Ordering::Relaxed),
             party_resync_total: self.party_resync_total.load(Ordering::Relaxed),
+            script_readiness_state: self.script_readiness_state.load(Ordering::Relaxed),
+            script_gate_rejections: ScriptGateRejectionsSnapshot {
+                room_create: self.script_gate_rejection(ScriptGateSurface::RoomCreate),
+                room_join: self.script_gate_rejection(ScriptGateSurface::RoomJoin),
+                matchmaker_queue: self.script_gate_rejection(ScriptGateSurface::MatchmakerQueue),
+                matchmaker_activate: self
+                    .script_gate_rejection(ScriptGateSurface::MatchmakerActivate),
+                matchmaker_accept: self.script_gate_rejection(ScriptGateSurface::MatchmakerAccept),
+                live_form: self.script_gate_rejection(ScriptGateSurface::LiveForm),
+                live_accept_local: self.script_gate_rejection(ScriptGateSurface::LiveAcceptLocal),
+                live_accept_remote: self.script_gate_rejection(ScriptGateSurface::LiveAcceptRemote),
+                live_admit_remote: self.script_gate_rejection(ScriptGateSurface::LiveAdmitRemote),
+                cluster_admit_remote: self
+                    .script_gate_rejection(ScriptGateSurface::ClusterAdmitRemote),
+                console_list: self.script_gate_rejection(ScriptGateSurface::ConsoleList),
+            },
         }
+    }
+
+    fn script_gate_rejection(&self, surface: ScriptGateSurface) -> u64 {
+        self.script_gate_rejections[surface.index()].load(Ordering::Relaxed)
     }
 }
 
@@ -307,6 +455,10 @@ pub struct NodeMetricsSnapshot {
     pub party_owner_forward_total: u64,
     /// Generation-fenced party client resync transitions emitted locally.
     pub party_resync_total: u64,
+    /// Current GameScript readiness state gauge value (0 when ungated).
+    pub script_readiness_state: i64,
+    /// Fail-closed readiness-gate rejections per enforcement surface.
+    pub script_gate_rejections: ScriptGateRejectionsSnapshot,
 }
 
 /// Build the [`EnvFilter`] for the given level directive.
@@ -460,6 +612,38 @@ mod tests {
         assert!(value.get("members").is_none());
         assert!(value.get("payload").is_none());
         assert!(value.get("token").is_none());
+    }
+
+    #[test]
+    fn script_gate_surfaces_have_unique_stable_labels_and_counters() {
+        // Eleven enforcement surfaces, each with a distinct label and index.
+        let mut codes: Vec<&str> = ScriptGateSurface::ALL.iter().map(|s| s.code()).collect();
+        codes.sort_unstable();
+        let mut deduped = codes.clone();
+        deduped.dedup();
+        assert_eq!(codes.len(), ScriptGateSurface::COUNT);
+        assert_eq!(deduped.len(), ScriptGateSurface::COUNT, "labels unique");
+
+        let m = NodeMetrics::new();
+        for surface in ScriptGateSurface::ALL {
+            m.record_script_gate_rejection(surface);
+        }
+        m.record_script_gate_rejection(ScriptGateSurface::ClusterAdmitRemote);
+        let snapshot = m.snapshot().script_gate_rejections;
+        assert_eq!(snapshot.room_create, 1);
+        assert_eq!(snapshot.room_join, 1);
+        assert_eq!(snapshot.matchmaker_queue, 1);
+        assert_eq!(snapshot.matchmaker_activate, 1);
+        assert_eq!(snapshot.matchmaker_accept, 1);
+        assert_eq!(snapshot.live_form, 1);
+        assert_eq!(snapshot.live_accept_local, 1);
+        assert_eq!(snapshot.live_accept_remote, 1);
+        assert_eq!(snapshot.live_admit_remote, 1);
+        assert_eq!(snapshot.cluster_admit_remote, 2, "extra rejection counted");
+        assert_eq!(snapshot.console_list, 1);
+
+        m.set_script_readiness_state(2);
+        assert_eq!(m.snapshot().script_readiness_state, 2);
     }
 
     #[test]
