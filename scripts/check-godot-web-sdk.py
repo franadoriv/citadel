@@ -31,7 +31,6 @@ def main() -> int:
     makefile_path = root / "Makefile"
     powershell_path = root / "make.ps1"
     artifact_script_path = root / "scripts/package_godot_web_artifact.py"
-    ci_workflow_path = root / ".github/workflows/ci.yml"
     release_workflow_path = root / ".github/workflows/release.yml"
     artifact_readme_path = root / "clients/godot/tests/web/README.md"
     smoke_path = root / "clients/godot/tests/web/smoke.gd"
@@ -46,7 +45,6 @@ def main() -> int:
     makefile = makefile_path.read_text(encoding="utf-8")
     powershell = powershell_path.read_text(encoding="utf-8")
     artifact_script = artifact_script_path.read_text(encoding="utf-8") if artifact_script_path.is_file() else ""
-    ci_workflow = ci_workflow_path.read_text(encoding="utf-8") if ci_workflow_path.is_file() else ""
     release_workflow = release_workflow_path.read_text(encoding="utf-8") if release_workflow_path.is_file() else ""
     artifact_readme = artifact_readme_path.read_text(encoding="utf-8") if artifact_readme_path.is_file() else ""
     smoke = smoke_path.read_text(encoding="utf-8") if smoke_path.is_file() else ""
@@ -76,11 +74,11 @@ def main() -> int:
         (artifact_script, "web/citadel-e2e.toml"),
         (artifact_script, "web/serve_web.py"),
         (artifact_script, "--verify-package"),
-        (ci_workflow, "package_godot_web_artifact.py --verify-package"),
-        (ci_workflow, "Run exported Godot Web app against real Citadel"),
-        (ci_workflow, "google-chrome"),
-        (ci_workflow, "verify_godot_web_e2e.py"),
-        (ci_workflow, "citadel-e2e.toml"),
+        (release_workflow, "package_godot_web_artifact.py --verify-package"),
+        (release_workflow, "Run exported Godot Web app against real Citadel"),
+        (release_workflow, "google-chrome"),
+        (release_workflow, "verify_godot_web_e2e.py"),
+        (release_workflow, "citadel-e2e.toml"),
         (release_workflow, "godot-web:"),
         (artifact_readme, "application/wasm"),
         (smoke, "CitadelWebClient.new()"),
