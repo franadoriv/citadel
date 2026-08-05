@@ -827,9 +827,11 @@ pub struct MongoTournamentsRepository {
 /// generation allocation, pinning, and retention pruning run in replayable
 /// replica-set transactions so a state change and its audit/outbox documents
 /// commit or disappear together. MongoDB has no foreign-key backstop for the
-/// "active revisions are never pruned" rule; the pruning transaction's
-/// snapshot reads plus the bounded transient-error retry loop enforce it
-/// instead.
+/// "active revisions are never pruned" rule, and its transactions abort only
+/// on write-write document conflicts, so operations that depend on a revision
+/// surviving (activation, pin, diagnostic append) deliberately WRITE the
+/// revision document (see [`gamescript_touch_revision_in_session`]); pruning
+/// deletes then conflict with those commits instead of skewing past them.
 pub struct MongoGameScriptRepository {
     client: Client,
     database: Database,
@@ -2021,17 +2023,33 @@ async fn next_gamescript_sequence(
     })
 }
 
-async fn gamescript_revision_exists_in_session(
+/// Existence check *and* write-skew guard for operations that need the
+/// revision to survive their transaction (activation, pin, diagnostics).
+///
+/// MongoDB transactions abort only on write-write document conflicts — reads
+/// never conflict — so a read-only existence check would let a concurrent
+/// `prune_revisions` delete the revision while this transaction commits an
+/// activation/pin that references it (there is no foreign-key backstop on
+/// MongoDB). Bumping the internal `retention_fence` field WRITES the revision
+/// document: a concurrent prune's delete now conflicts with this transaction
+/// and one side replays with the other's outcome visible. The field is
+/// bookkeeping only — it is not part of the domain revision record, which
+/// stays immutable (`mongo_gamescript_revision` never reads it).
+async fn gamescript_touch_revision_in_session(
     database: &Database,
     session: &mut ClientSession,
     revision_id: &str,
 ) -> Result<bool, SchedulerTransactionError> {
     Ok(database
         .collection::<Document>(GAMESCRIPT_REVISIONS)
-        .find_one(doc! { "revision_id": revision_id })
+        .update_one(
+            doc! { "revision_id": revision_id },
+            doc! { "$inc": { "retention_fence": 1_i64 } },
+        )
         .session(&mut *session)
         .await?
-        .is_some())
+        .matched_count
+        > 0)
 }
 
 async fn insert_gamescript_audit_in_session(
@@ -2348,7 +2366,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
             let source = source.clone();
             let message = message.clone();
             Box::pin(async move {
-                if !gamescript_revision_exists_in_session(database, session, &revision_id).await? {
+                if !gamescript_touch_revision_in_session(database, session, &revision_id).await? {
                     return Err(revision_not_found(&revision_id).into());
                 }
                 let last = database
@@ -2427,7 +2445,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
             let revision_id = revision_id.clone();
             let actor = actor.clone();
             Box::pin(async move {
-                if !gamescript_revision_exists_in_session(database, session, &revision_id).await? {
+                if !gamescript_touch_revision_in_session(database, session, &revision_id).await? {
                     return Err(revision_not_found(&revision_id).into());
                 }
                 let pins = database.collection::<Document>(GAMESCRIPT_REVISION_PINS);
@@ -2529,7 +2547,7 @@ impl GameScriptRepository for MongoGameScriptRepository {
             Box::pin(async move {
                 // Roll-forward and rollback share this gate: the target must be
                 // an existing, non-pruned revision before a generation is spent.
-                if !gamescript_revision_exists_in_session(database, session, &revision_id).await? {
+                if !gamescript_touch_revision_in_session(database, session, &revision_id).await? {
                     return Err(revision_not_found(&revision_id).into());
                 }
                 let counter = database
@@ -2681,10 +2699,16 @@ impl GameScriptRepository for MongoGameScriptRepository {
         gamescript_transaction(&self.client, &self.database, move |database, session| {
             Box::pin(async move {
                 // Snapshot-isolated candidate selection: pinned and
-                // activation-referenced revisions are excluded, and a
-                // concurrent pin/activation conflicts with the deletes below
-                // and replays this transaction. MongoDB has no foreign-key
-                // backstop; this transaction is the enforcement point.
+                // activation-referenced revisions are excluded. Snapshot reads
+                // alone would NOT close the race — MongoDB transactions abort
+                // only on write-write document conflicts, and there is no
+                // foreign-key backstop — so every operation that must keep its
+                // revision alive (activation, pin, diagnostic append) WRITES
+                // the revision document via
+                // `gamescript_touch_revision_in_session`. The deletes below
+                // therefore conflict with any such concurrent commit; the
+                // losing side replays and observes the other's outcome. That
+                // write-conflict protocol is the enforcement point here.
                 let revisions = database.collection::<Document>(GAMESCRIPT_REVISIONS);
                 let mut cursor = revisions
                     .find(doc! { "created_at_unix_ms": { "$lt": cutoff } })

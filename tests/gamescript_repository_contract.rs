@@ -878,6 +878,70 @@ async fn concurrent_generation_allocations_stay_monotonic(repo: Arc<dyn GameScri
     );
 }
 
+/// Race retention pruning against activation of the same (prunable) revision:
+/// whatever interleaving occurs, a committed activation must never reference a
+/// pruned revision.
+///
+/// A deterministic interleaving — pausing one repository transaction between
+/// its read and write phases — is not expressible through the repository API
+/// without server-side failpoints, so this bounded stress loop is the
+/// strongest expressible guard. Either racing operation may fail (the SQL
+/// foreign-key backstop surfaces as an error on the losing side; a pruned
+/// target is NotFound); the invariant below is what must always hold. Before
+/// the MongoDB retention-fence fix this loop reproduced the write-skew
+/// (a stranded activation referencing a deleted revision) reliably.
+async fn concurrent_prune_never_strands_an_activation(repo: Arc<dyn GameScriptRepository>) {
+    const ROUNDS: u64 = 16;
+    for round in 0..ROUNDS {
+        let draft_id = format!("d-race-{round}");
+        let scope = format!("scope-{round}");
+        repo.create_draft(draft(&draft_id, &format!("return {round}")), ts(10))
+            .await
+            .expect("create draft");
+        let revision = repo
+            .submit_draft(&draft_id, "op-1", &BTreeMap::new(), ts(10 + round))
+            .await
+            .expect("submit")
+            .revision;
+
+        let activate = {
+            let repo = Arc::clone(&repo);
+            let revision_id = revision.revision_id.clone();
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                repo.allocate_activation_generation(
+                    &scope,
+                    &revision_id,
+                    "op-race",
+                    &BTreeMap::new(),
+                    ts(20),
+                )
+                .await
+            })
+        };
+        let prune = {
+            let repo = Arc::clone(&repo);
+            tokio::spawn(async move { repo.prune_revisions(ts(1_000_000), 10).await })
+        };
+        let _ = activate.await.expect("join activation");
+        let _ = prune.await.expect("join prune");
+
+        for activation in repo
+            .list_activations(&scope, 10)
+            .await
+            .expect("list activations")
+        {
+            assert!(
+                repo.get_revision(&activation.revision_id)
+                    .await
+                    .expect("get revision")
+                    .is_some(),
+                "round {round}: a committed activation must reference an existing revision"
+            );
+        }
+    }
+}
+
 // --- Scenario table ---------------------------------------------------------
 
 type ScenarioFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
@@ -937,6 +1001,12 @@ async fn in_memory_concurrent_generation_allocations_stay_monotonic() {
         .await;
 }
 
+#[tokio::test]
+async fn in_memory_concurrent_prune_never_strands_an_activation() {
+    concurrent_prune_never_strands_an_activation(Arc::new(InMemoryGameScriptRepository::new()))
+        .await;
+}
+
 // --- SQLite runs (always; embedded, no server) -------------------------------
 
 mod sqlite {
@@ -973,6 +1043,12 @@ mod sqlite {
     async fn sqlite_concurrent_generation_allocations_stay_monotonic() {
         let db = fresh_database().await;
         concurrent_generation_allocations_stay_monotonic(db.gamescript_repository()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_concurrent_prune_never_strands_an_activation() {
+        let db = fresh_database().await;
+        concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
     }
 }
 
@@ -1025,6 +1101,8 @@ mod postgres {
         concurrent_identical_submissions_converge(db.gamescript_repository()).await;
         db.reset_storage_for_tests().await.expect("reset");
         concurrent_generation_allocations_stay_monotonic(db.gamescript_repository()).await;
+        db.reset_storage_for_tests().await.expect("reset");
+        concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
     }
 }
 
@@ -1074,6 +1152,8 @@ mod cockroach {
         concurrent_identical_submissions_converge(db.gamescript_repository()).await;
         db.reset_storage_for_tests().await.expect("reset");
         concurrent_generation_allocations_stay_monotonic(db.gamescript_repository()).await;
+        db.reset_storage_for_tests().await.expect("reset");
+        concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
     }
 }
 
@@ -1114,5 +1194,7 @@ mod mongodb {
         concurrent_identical_submissions_converge(db.gamescript_repository()).await;
         db.clear_gamescript_data_for_tests().await.expect("reset");
         concurrent_generation_allocations_stay_monotonic(db.gamescript_repository()).await;
+        db.clear_gamescript_data_for_tests().await.expect("reset");
+        concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
     }
 }
