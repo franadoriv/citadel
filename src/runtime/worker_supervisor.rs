@@ -68,6 +68,14 @@ pub enum RecoveryStatus {
     CircuitOpen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoverySnapshot {
+    pub status: RecoveryStatus,
+    pub consecutive_failures: u32,
+    pub restart_limit: u32,
+    pub next_restart_delay: Option<Duration>,
+}
+
 pub struct RestartCircuitBreaker {
     limit: u32,
     failures: u32,
@@ -97,6 +105,15 @@ impl RestartCircuitBreaker {
 
     pub fn record_healthy(&mut self) {
         self.failures = 0;
+    }
+
+    pub fn snapshot(&self) -> RecoverySnapshot {
+        RecoverySnapshot {
+            status: self.status(),
+            consecutive_failures: self.failures,
+            restart_limit: self.limit,
+            next_restart_delay: (!self.is_open()).then(|| restart_backoff(self.failures)),
+        }
     }
 
     pub fn status(&self) -> RecoveryStatus {
@@ -180,6 +197,7 @@ pub struct SupervisedWorker {
     stream: Option<UnixStream>,
     _bootstrap_reader: OwnedFd,
     child: Child,
+    process_group_id: Option<i32>,
 }
 
 #[cfg(unix)]
@@ -209,6 +227,7 @@ impl SupervisedWorker {
             stream: None,
             _bootstrap_reader: bootstrap_reader,
             child,
+            process_group_id: None,
         })
     }
 
@@ -271,6 +290,7 @@ impl SupervisedWorker {
                     if protocol_version == PROTOCOL_VERSION =>
                 {
                     self.stream = Some(stream);
+                    self.process_group_id = i32::try_from(self.child.id()).ok();
                     Ok(())
                 }
                 _ => Err(io::Error::new(
@@ -280,7 +300,7 @@ impl SupervisedWorker {
             }
         })();
         if result.is_err() {
-            let _ = self.child.kill();
+            let _ = self.terminate_process_group();
             let _ = self.child.wait();
         }
         result
@@ -321,7 +341,7 @@ impl SupervisedWorker {
             }
         })();
         if result.is_err() {
-            let _ = self.child.kill();
+            let _ = self.terminate_process_group();
         }
         let _ = self.child.wait();
         result
@@ -347,7 +367,7 @@ impl SupervisedWorker {
             }
         })();
         if result.is_err() {
-            let _ = self.child.kill();
+            let _ = self.terminate_process_group();
             let _ = self.child.wait();
         }
         result
@@ -357,15 +377,25 @@ impl SupervisedWorker {
         Ok(self.child.try_wait()?.is_some())
     }
 
-    pub fn kill(&mut self) -> io::Result<()> {
+    fn terminate_process_group(&mut self) -> io::Result<()> {
+        if let Some(pgid) = self.process_group_id {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
         self.child.kill()
+    }
+
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.terminate_process_group()
     }
 }
 
 #[cfg(unix)]
 impl Drop for SupervisedWorker {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.terminate_process_group();
         let _ = self.child.wait();
     }
 }
@@ -373,6 +403,31 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_snapshot_reports_failures_and_open_circuit() {
+        let mut breaker = super::RestartCircuitBreaker::new(2);
+        assert_eq!(
+            breaker.snapshot(),
+            super::RecoverySnapshot {
+                status: super::RecoveryStatus::Available,
+                consecutive_failures: 0,
+                restart_limit: 2,
+                next_restart_delay: Some(std::time::Duration::from_millis(100)),
+            }
+        );
+        assert!(breaker.next_restart_delay().is_some());
+        assert_eq!(breaker.snapshot().consecutive_failures, 1);
+        assert_eq!(
+            breaker.snapshot().next_restart_delay,
+            Some(std::time::Duration::from_millis(200))
+        );
+        assert_eq!(breaker.next_restart_delay(), None);
+        assert_eq!(
+            breaker.snapshot().status,
+            super::RecoveryStatus::CircuitOpen
+        );
+    }
+
     #[test]
     fn worker_resource_limits_reject_zero_open_files() {
         assert!(super::WorkerResourceLimits::new(0).is_err());
