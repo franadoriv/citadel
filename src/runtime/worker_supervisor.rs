@@ -305,11 +305,24 @@ impl RestartCircuitBreaker {
     }
 }
 
+/// Observer of worker-generation boundaries.
+///
+/// A "generation" is one authenticated worker process. When a generation ends
+/// abruptly (crash or failed health), every match it hosted is gone: the
+/// gateway must close all dependent matches (informing members with the
+/// requeue-hinted server-error close and pruning the rooms) and fence its
+/// data-plane epoch so a restarted worker can never resume or replay them.
+pub trait WorkerGenerationObserver: Send + Sync {
+    /// A worker generation ended without an orderly shutdown.
+    fn worker_generation_ended(&self);
+}
+
 pub struct RestartController {
     executable: PathBuf,
     parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     breaker: RestartCircuitBreaker,
+    generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
 }
 
 impl RestartController {
@@ -322,6 +335,24 @@ impl RestartController {
                 policy.restart_limit(),
                 policy.breaker_rearm_healthy_cycles(),
             ),
+            generation_observer: None,
+        }
+    }
+
+    /// Attach the observer notified whenever a worker generation ends
+    /// abruptly (before any replacement is booted).
+    #[must_use]
+    pub fn with_generation_observer(
+        mut self,
+        observer: std::sync::Arc<dyn WorkerGenerationObserver>,
+    ) -> Self {
+        self.generation_observer = Some(observer);
+        self
+    }
+
+    fn notify_generation_ended(&self) {
+        if let Some(observer) = &self.generation_observer {
+            observer.worker_generation_ended();
         }
     }
 
@@ -354,6 +385,11 @@ impl RestartController {
         active: &mut Option<SupervisedWorker>,
     ) -> io::Result<bool> {
         let _ = active.take();
+        // Dependent matches are closed before any replacement boots: the
+        // replacement starts with an empty match table either way, and the
+        // members must not wait out a restart backoff to learn their match
+        // is gone.
+        self.notify_generation_ended();
         *active = self.restart_after_failure()?;
         Ok(active.is_some())
     }
@@ -369,6 +405,7 @@ impl RestartController {
         // The exited worker is gone either way; drop it before the restart
         // attempt so a failed replacement never leaves a dead worker active.
         let _ = active.take();
+        self.notify_generation_ended();
         *active = self.restart_after_failure()?;
         Ok(active.is_some())
     }
@@ -488,6 +525,7 @@ pub struct WorkerLifecycleService {
     socket_parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     healthy_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
 }
 
 impl WorkerLifecycleService {
@@ -502,7 +540,19 @@ impl WorkerLifecycleService {
             socket_parent,
             policy,
             healthy_cycles: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            generation_observer: None,
         }
+    }
+
+    /// Attach the observer notified when a worker generation ends abruptly
+    /// (the gateway's close-all-dependent-matches + epoch-fence hook).
+    #[must_use]
+    pub fn with_generation_observer(
+        mut self,
+        observer: std::sync::Arc<dyn WorkerGenerationObserver>,
+    ) -> Self {
+        self.generation_observer = Some(observer);
+        self
     }
 
     /// Monotone count of successful health cycles — an observability probe
@@ -542,8 +592,12 @@ impl crate::lifecycle::AsyncService for WorkerLifecycleService {
         let socket_parent = self.socket_parent;
         let policy = self.policy;
         let healthy_cycles = Arc::clone(&self.healthy_cycles);
+        let generation_observer = self.generation_observer;
         let result = tokio::task::spawn_blocking(move || {
             let mut controller = RestartController::new(executable, socket_parent, policy);
+            if let Some(observer) = generation_observer {
+                controller = controller.with_generation_observer(observer);
+            }
             run_supervision_loop(&mut controller, &stop, &healthy_cycles)
         })
         .await;
@@ -1671,6 +1725,39 @@ mod tests {
             "the breaker-open halt must reach live tracing output: {logs:?}"
         );
         assert!(logs.contains("ERROR"), "halts log at error level: {logs:?}");
+    }
+
+    #[test]
+    fn abrupt_generation_end_notifies_the_match_closure_observer() {
+        #[derive(Default)]
+        struct CountingObserver(std::sync::atomic::AtomicU64);
+        impl super::WorkerGenerationObserver for CountingObserver {
+            fn worker_generation_ended(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let observer = std::sync::Arc::new(CountingObserver::default());
+        let mut controller = super::RestartController::new(
+            PathBuf::from("citadel-no-such-worker-executable"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        )
+        .with_generation_observer(std::sync::Arc::clone(&observer) as _);
+        // The active worker generation is gone (crash): the observer must be
+        // told exactly once, before any replacement attempt, so the gateway
+        // can close every dependent match and fence its data-plane epoch.
+        let mut active = None;
+        assert!(!controller.recover_if_exited(&mut active).expect("recover"));
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A healthy-side probe with no exit does not fire the observer... and
+        // an open breaker never re-fires it for the same dead generation.
+        assert!(!controller.recover_if_exited(&mut active).expect("recover"));
+        assert_eq!(
+            observer.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each recovery attempt is a generation boundary while no worker is active"
+        );
     }
 
     #[test]

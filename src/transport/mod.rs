@@ -777,12 +777,33 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             executable = %executable.display(),
             "starting supervised external runtime worker"
         );
+        // Worker-death closure: when a worker generation ends abruptly, every
+        // dependent match closes the same match-local way (members receive
+        // the requeue-hinted server-error close, rooms are pruned) before any
+        // replacement — which never resumes old matches — starts serving.
+        struct CloseMatchesOnGenerationEnd {
+            gateway: Arc<crate::realtime::Gateway>,
+        }
+        impl crate::runtime::worker_supervisor::WorkerGenerationObserver
+            for CloseMatchesOnGenerationEnd
+        {
+            fn worker_generation_ended(&self) {
+                let notified = self.gateway.close_all_matches();
+                tracing::warn!(
+                    notified,
+                    "external runtime worker generation ended; dependent matches closed"
+                );
+            }
+        }
         supervisor.spawn(
             crate::runtime::worker_supervisor::WorkerLifecycleService::new(
                 executable,
                 std::env::temp_dir(),
                 crate::runtime::worker_supervisor::WorkerSupervisionPolicy::default(),
-            ),
+            )
+            .with_generation_observer(std::sync::Arc::new(CloseMatchesOnGenerationEnd {
+                gateway: Arc::clone(&gateway),
+            })),
         );
     }
 
