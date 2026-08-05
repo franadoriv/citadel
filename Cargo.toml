@@ -175,6 +175,12 @@ mongodb = "3.8"
 # probing is needed for the status snapshot.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
 
+[target.'cfg(windows)'.dependencies]
+# Scoped Win32 FFI for the supervised runtime worker (job objects, restrictive
+# named-pipe DACLs, inherited-handle bootstrap). This crate forbids unsafe
+# code; the helper crate is the single audited place those calls may live.
+citadel-win-proc = { path = "crates/citadel-win-proc" }
+
 [dev-dependencies]
 # URL parsing for the in-process WebTransport client used in integration tests.
 url = "2"

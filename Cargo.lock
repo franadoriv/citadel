@@ -463,6 +463,7 @@ dependencies = [
  "citadel-process-env",
  "citadel-tmx",
  "citadel-transform",
+ "citadel-win-proc",
  "citadel-wire",
  "clap",
  "cron",
