@@ -40,6 +40,27 @@ pub fn fresh_bootstrap_secret() -> io::Result<[u8; 32]> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerResourceLimits {
+    max_open_files: u64,
+}
+
+impl WorkerResourceLimits {
+    pub fn new(max_open_files: u64) -> io::Result<Self> {
+        if max_open_files == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker open-file limit must be positive",
+            ));
+        }
+        Ok(Self { max_open_files })
+    }
+
+    pub fn max_open_files(self) -> u64 {
+        self.max_open_files
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryStatus {
     Available,
     CircuitOpen,
@@ -350,6 +371,17 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_resource_limits_reject_zero_open_files() {
+        assert!(super::WorkerResourceLimits::new(0).is_err());
+        assert_eq!(
+            super::WorkerResourceLimits::new(256)
+                .expect("limits")
+                .max_open_files(),
+            256
+        );
+    }
+
     #[test]
     fn recovery_status_reports_open_circuit_as_unavailable() {
         let mut breaker = super::RestartCircuitBreaker::new(1);
