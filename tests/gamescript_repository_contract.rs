@@ -942,6 +942,118 @@ async fn concurrent_prune_never_strands_an_activation(repo: Arc<dyn GameScriptRe
     }
 }
 
+/// Race identical-content submissions against retention pruning of their
+/// dedupe target.
+///
+/// The dedupe branch of `submit_draft` must conflict with a concurrent
+/// `prune_revisions` delete of the same revision: without that conflict both
+/// sides can commit blindly (PostgreSQL's `ON CONFLICT DO NOTHING` takes no
+/// lock on the existing row; MongoDB's dedupe branch writes no shared
+/// document) and a submission can consume its draft, report success, and
+/// still surface an internal re-read error or return content whose storage
+/// was never guaranteed at commit time. With the conflict in place the loser
+/// observes the winner: a submit that finds its dedupe target pruned falls
+/// back to re-creating the revision (the fresh row postdates the prune
+/// cutoff, so it must survive), and a prune that finds the revision touched
+/// replays against the committed state. A dedupe can still be followed by a
+/// *later-serialized* prune of its target on every backend — that is the
+/// documented retention policy (pinning is the caller's protection), not a
+/// race — so this loop only asserts what must hold under every interleaving.
+async fn concurrent_prune_never_loses_a_racing_submission(repo: Arc<dyn GameScriptRepository>) {
+    const ROUNDS: u64 = 16;
+    const RACERS: usize = 4;
+    /// Every seed revision predates this cutoff; every racing resubmission
+    /// postdates it, so a re-created revision is never prune-eligible.
+    const PRUNE_CUTOFF: u64 = 1_000_000;
+    const RESUBMIT_AT: u64 = 2_000_000;
+    for round in 0..ROUNDS {
+        let content = format!("return {round}");
+        let seed_draft = format!("d-seed-{round}");
+        repo.create_draft(draft(&seed_draft, &content), ts(10))
+            .await
+            .expect("create seed draft");
+        let seed = repo
+            .submit_draft(&seed_draft, "op-1", &BTreeMap::new(), ts(10 + round))
+            .await
+            .expect("seed submit")
+            .revision;
+
+        for racer in 0..RACERS {
+            repo.create_draft(draft(&format!("d-racer-{round}-{racer}"), &content), ts(11))
+                .await
+                .expect("create racer draft");
+        }
+        let mut submits = Vec::new();
+        for racer in 0..RACERS {
+            let repo = Arc::clone(&repo);
+            let draft_id = format!("d-racer-{round}-{racer}");
+            submits.push(tokio::spawn(async move {
+                repo.submit_draft(&draft_id, "op-race", &BTreeMap::new(), ts(RESUBMIT_AT))
+                    .await
+            }));
+        }
+        let prune = {
+            let repo = Arc::clone(&repo);
+            tokio::spawn(async move { repo.prune_revisions(ts(PRUNE_CUTOFF), 10).await })
+        };
+
+        let mut recreated = false;
+        for handle in submits {
+            let submission = handle
+                .await
+                .expect("join submit")
+                .expect("every racing submit succeeds");
+            assert_eq!(
+                submission.revision.revision_id, seed.revision_id,
+                "round {round}: identical content resolves to the content-hash id"
+            );
+            assert_eq!(
+                submission.revision.content, content,
+                "round {round}: the returned content is intact"
+            );
+            if submission.deduplicated {
+                assert!(
+                    submission.revision.created_at == seed.created_at
+                        || submission.revision.created_at == ts(RESUBMIT_AT),
+                    "round {round}: a dedupe returns a stored revision unchanged"
+                );
+            } else {
+                recreated = true;
+                assert_eq!(
+                    submission.revision.created_at,
+                    ts(RESUBMIT_AT),
+                    "round {round}: a re-created revision carries the resubmission instant"
+                );
+            }
+        }
+        prune.await.expect("join prune").expect("prune succeeds");
+
+        for racer in 0..RACERS {
+            assert!(
+                repo.get_draft(&format!("d-racer-{round}-{racer}"))
+                    .await
+                    .expect("get racer draft")
+                    .is_none(),
+                "round {round}: every successful submit consumed its draft"
+            );
+        }
+        if recreated {
+            let survivor = repo
+                .get_revision(&seed.revision_id)
+                .await
+                .expect("get revision");
+            assert!(
+                survivor.is_some(),
+                "round {round}: a re-created revision postdates the prune \
+                 cutoff and must survive the racing prune"
+            );
+            let survivor = survivor.expect("survivor is present");
+            assert_eq!(survivor.created_at, ts(RESUBMIT_AT));
+            assert_eq!(survivor.content, content);
+        }
+    }
+}
+
 // --- Scenario table ---------------------------------------------------------
 
 type ScenarioFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
@@ -1007,6 +1119,12 @@ async fn in_memory_concurrent_prune_never_strands_an_activation() {
         .await;
 }
 
+#[tokio::test]
+async fn in_memory_concurrent_prune_never_loses_a_racing_submission() {
+    concurrent_prune_never_loses_a_racing_submission(Arc::new(InMemoryGameScriptRepository::new()))
+        .await;
+}
+
 // --- SQLite runs (always; embedded, no server) -------------------------------
 
 mod sqlite {
@@ -1049,6 +1167,12 @@ mod sqlite {
     async fn sqlite_concurrent_prune_never_strands_an_activation() {
         let db = fresh_database().await;
         concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_concurrent_prune_never_loses_a_racing_submission() {
+        let db = fresh_database().await;
+        concurrent_prune_never_loses_a_racing_submission(db.gamescript_repository()).await;
     }
 }
 
@@ -1103,6 +1227,8 @@ mod postgres {
         concurrent_generation_allocations_stay_monotonic(db.gamescript_repository()).await;
         db.reset_storage_for_tests().await.expect("reset");
         concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
+        db.reset_storage_for_tests().await.expect("reset");
+        concurrent_prune_never_loses_a_racing_submission(db.gamescript_repository()).await;
     }
 }
 
@@ -1154,6 +1280,8 @@ mod cockroach {
         concurrent_generation_allocations_stay_monotonic(db.gamescript_repository()).await;
         db.reset_storage_for_tests().await.expect("reset");
         concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
+        db.reset_storage_for_tests().await.expect("reset");
+        concurrent_prune_never_loses_a_racing_submission(db.gamescript_repository()).await;
     }
 }
 
@@ -1196,5 +1324,7 @@ mod mongodb {
         concurrent_generation_allocations_stay_monotonic(db.gamescript_repository()).await;
         db.clear_gamescript_data_for_tests().await.expect("reset");
         concurrent_prune_never_strands_an_activation(db.gamescript_repository()).await;
+        db.clear_gamescript_data_for_tests().await.expect("reset");
+        concurrent_prune_never_loses_a_racing_submission(db.gamescript_repository()).await;
     }
 }
