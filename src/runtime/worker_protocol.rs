@@ -119,6 +119,60 @@ pub fn decode_frame(bytes: &[u8]) -> Result<ControlFrame, ProtocolError> {
     serde_json::from_slice(bytes).map_err(|_| ProtocolError::MalformedFrame)
 }
 
+/// Async twin of [`write_control_frame`], byte-for-byte identical on the wire.
+///
+/// The Windows supervisor drives its named-pipe transport through tokio, so
+/// the framing layer needs async variants; both variants share the encoder
+/// and the symmetric fail-closed size cap.
+pub async fn write_control_frame_async<W>(
+    stream: &mut W,
+    frame: &ControlFrame,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let payload = encode_frame(frame)?;
+    // Symmetric fail-closed limit, exactly as in the sync writer: nothing is
+    // written for an oversized frame so the stream never desynchronizes.
+    if payload.len() > MAX_CONTROL_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)
+}
+
+/// Async twin of [`read_control_frame`] with the same fail-closed limits.
+pub async fn read_control_frame_async<R>(stream: &mut R) -> Result<ControlFrame, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut prefix = [0; 4];
+    stream
+        .read_exact(&mut prefix)
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > MAX_CONTROL_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    let mut payload = vec![0; length];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)?;
+    decode_frame(&payload)
+}
+
 /// Bootstrap frame sent only over the parent-created private transport.
 #[derive(Clone, PartialEq, Eq)]
 pub struct BootstrapRequest {
@@ -370,6 +424,87 @@ mod tests {
         assert_eq!(
             error,
             super::ProtocolError::InvalidBootstrapSecretLength(31)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_frame_round_trips_over_a_duplex_stream() {
+        let frame = super::ControlFrame::ParentHello {
+            protocol_version: super::PROTOCOL_VERSION,
+            nonce: vec![3; 32],
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        super::write_control_frame_async(&mut writer, &frame)
+            .await
+            .expect("write");
+        assert_eq!(
+            super::read_control_frame_async(&mut reader)
+                .await
+                .expect("read"),
+            frame
+        );
+    }
+
+    #[tokio::test]
+    async fn async_and_sync_framing_share_one_wire_format() {
+        // The Windows supervisor reads frames asynchronously while the worker
+        // writes them synchronously (and vice versa); both sides must agree on
+        // the exact length-prefixed encoding.
+        let frame = super::ControlFrame::WorkerReady {
+            protocol_version: super::PROTOCOL_VERSION,
+            script_identity: Some("sha256:abc".to_string()),
+        };
+        let mut wire = Vec::new();
+        super::write_control_frame(&mut wire, &frame).expect("sync write");
+        assert_eq!(
+            super::read_control_frame_async(&mut wire.as_slice())
+                .await
+                .expect("async read"),
+            frame
+        );
+    }
+
+    #[tokio::test]
+    async fn async_reader_rejects_oversized_length_prefixes_before_reading() {
+        let mut wire = ((super::MAX_CONTROL_FRAME_BYTES + 1) as u32)
+            .to_be_bytes()
+            .to_vec();
+        wire.extend_from_slice(&[b' '; 8]);
+        assert_eq!(
+            super::read_control_frame_async(&mut wire.as_slice()).await,
+            Err(super::ProtocolError::FrameTooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_writer_rejects_oversized_frames_fail_closed() {
+        let frame = super::ControlFrame::ParentHello {
+            protocol_version: super::PROTOCOL_VERSION,
+            nonce: vec![7; super::MAX_CONTROL_FRAME_BYTES + 1],
+        };
+        let mut wire = Vec::new();
+        assert_eq!(
+            super::write_control_frame_async(&mut wire, &frame).await,
+            Err(super::ProtocolError::FrameTooLarge)
+        );
+        assert!(
+            wire.is_empty(),
+            "no bytes may reach the transport for an oversized frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_reader_rejects_truncated_frames_fail_closed() {
+        let frame = super::ControlFrame::ParentHello {
+            protocol_version: super::PROTOCOL_VERSION,
+            nonce: vec![2; 32],
+        };
+        let mut wire = Vec::new();
+        super::write_control_frame(&mut wire, &frame).expect("write");
+        wire.truncate(wire.len() - 3);
+        assert_eq!(
+            super::read_control_frame_async(&mut wire.as_slice()).await,
+            Err(super::ProtocolError::MalformedFrame)
         );
     }
 }
