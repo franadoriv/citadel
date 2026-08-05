@@ -215,6 +215,29 @@ library; the default Citadel executable stays lean by omitting this feature.
 Use `make bin-server-python` for local bundled staging, or
 `make package-windows-python` for the zipped Windows Python artifact.
 
+## Verified Python resource payload cache
+
+The Rust payload/cache API lets a caller verify packaged Python resources and
+materialize them in a private, per-user cache. It is not integrated into the
+Citadel runtime or launcher: Citadel does not invoke it automatically. The
+signed payload has an authenticated aggregate limit of **64 MiB**; payloads
+that exceed it fail closed rather than consuming unbounded process memory. This
+API does not extract or load `libpython`: Citadel still requires the matching
+dynamic CPython runtime described above.
+
+When a caller publishes a verified payload, it writes only verified regular
+files to same-filesystem staging, makes the result durable, then publishes it
+with a `READY` marker and an atomic rename. A cache entry is keyed by target,
+CPython ABI, and payload digest; an existing entry is validated before reuse.
+Publishers for the same digest use a lock, but lock acquisition can return
+`Busy`; callers must retry rather than assuming a concurrent start always
+reuses a complete entry. Once a publisher holds the lock, it revalidates the
+entry before reuse and never activates a partial tree. If an earlier publish
+is interrupted, its incomplete digest-scoped staging directory is removed
+while holding that lock; a later successful publish verifies and creates a
+fresh complete entry. Invalid hashes, signatures, paths, permissions, or cache
+contents fail closed without falling back to a global Python installation.
+
 ## Quick Example
 
 <Tabs syncKey="runtime-lang">
