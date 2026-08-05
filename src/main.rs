@@ -142,10 +142,15 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        #[cfg(unix)]
         Command::RuntimeWorker {
             bootstrap_endpoint,
             bootstrap_fd,
         } => run_runtime_worker(&bootstrap_endpoint, bootstrap_fd),
+        #[cfg(not(unix))]
+        Command::RuntimeWorker { .. } => {
+            anyhow::bail!("the runtime-worker subcommand requires a unix host")
+        }
         Command::Check => {
             let config = cli::run_check(&cli.global).context("configuration check failed")?;
             // Initialize logging after a successful check so diagnostics honor
