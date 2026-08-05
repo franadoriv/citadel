@@ -76,6 +76,12 @@ pub fn write_control_frame(
     frame: &ControlFrame,
 ) -> Result<(), ProtocolError> {
     let payload = encode_frame(frame)?;
+    // Symmetric fail-closed limit: outbound frames obey the same cap the
+    // reader enforces, and nothing is written for an oversized frame so the
+    // stream never desynchronizes.
+    if payload.len() > MAX_CONTROL_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge);
+    }
     stream
         .write_all(&(payload.len() as u32).to_be_bytes())
         .map_err(|_| ProtocolError::MalformedFrame)?;
@@ -269,6 +275,23 @@ mod tests {
         };
         let encoded = super::encode_frame(&frame).expect("frame encodes");
         assert_eq!(super::decode_frame(&encoded).expect("frame decodes"), frame);
+    }
+
+    #[test]
+    fn writer_rejects_oversized_frames_fail_closed() {
+        let frame = super::ControlFrame::ParentHello {
+            protocol_version: super::PROTOCOL_VERSION,
+            nonce: vec![7; super::MAX_CONTROL_FRAME_BYTES + 1],
+        };
+        let mut wire = Vec::new();
+        assert_eq!(
+            super::write_control_frame(&mut wire, &frame),
+            Err(super::ProtocolError::FrameTooLarge)
+        );
+        assert!(
+            wire.is_empty(),
+            "no bytes may reach the transport for an oversized frame"
+        );
     }
 
     #[test]
