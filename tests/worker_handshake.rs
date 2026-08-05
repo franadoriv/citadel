@@ -100,7 +100,11 @@ fn health_failure_triggers_an_authenticated_restart() {
         .expect("active worker")
         .health_check(Duration::from_secs(2))
         .expect("initial health");
-    active.as_mut().expect("active worker").kill().expect("kill");
+    active
+        .as_mut()
+        .expect("active worker")
+        .kill()
+        .expect("kill");
     // The monitor must observe the failure and recover with a replacement
     // that completed a fresh authenticated handshake.
     let mut replaced = false;
