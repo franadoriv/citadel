@@ -3237,7 +3237,19 @@ impl Gateway {
     /// Drive one scheduled local-matchmaker evaluation. The supervised service
     /// calls this at 250 ms even when no game-script tick is configured.
     pub fn matchmaker_tick(&self) -> usize {
-        self.activate_formed_matches(SystemClock.now())
+        let now = SystemClock.now();
+        // The 250 ms cadence doubles as the degraded-hold clock: a backend
+        // that stays unhealthy past the (PROVISIONAL, injectable) hold window
+        // escalates from Degraded to Unavailable. Both states gate new
+        // matches; the escalation is an operator signal, not a teardown.
+        if let Some(readiness) = &self.script_readiness
+            && readiness.expire_degraded_hold(now)
+        {
+            tracing::warn!(
+                "script readiness degraded hold expired without recovery; now unavailable"
+            );
+        }
+        self.activate_formed_matches(now)
     }
 
     /// Record that a transport connection was accepted (dashboard gauge +1).
@@ -10235,6 +10247,34 @@ mod script_gate_tests {
         let joined = ra.recv().await.expect("joined");
         assert_eq!(joined.envelope.kind, KIND_ROOM_JOINED);
         assert_eq!(gw.rooms().room_count(), 1);
+    }
+
+    // ---- Degraded hold expiry (PROVISIONAL window, injectable seam) ------
+
+    #[tokio::test]
+    async fn gate_15_degraded_hold_escalates_to_unavailable_on_the_tick() {
+        use crate::runtime::ScriptReadinessState;
+        let readiness = Arc::new(
+            GameScriptReadiness::new(now()).with_degraded_hold(std::time::Duration::from_millis(0)),
+        );
+        readiness.record_loaded("sha256:v1", now());
+        let gw = gated_gateway(&readiness);
+        let (a, mut ra) = register(&gw, Some("alice"));
+        gw.handle_inbound(a, &room_create(b"lobby"));
+        let _ = ra.recv().await.expect("joined");
+
+        readiness.record_degraded(now());
+        // The 250ms matchmaker tick is the escalation clock: a zero hold
+        // window (injected) escalates on the next tick, existing matches are
+        // held, and the gate stays closed either way.
+        let _ = gw.matchmaker_tick();
+        assert_eq!(
+            readiness.snapshot().state,
+            ScriptReadinessState::Unavailable
+        );
+        assert_eq!(gw.rooms().room_count(), 1, "the existing match is held");
+        gw.handle_inbound(a, &room_create(b"another"));
+        expect_room_reject(&mut ra, KIND_ROOM_CREATE).await;
     }
 
     // ---- The standing invariant (charter test 18) ------------------------
