@@ -27,6 +27,28 @@ fn configure_parent_death_signal() -> Result<()> {
 }
 
 #[cfg(unix)]
+fn disable_core_dumps() -> Result<()> {
+    nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+        .map_err(|_| anyhow::anyhow!("runtime worker core-dump limit setup failed"))
+}
+
+#[cfg(unix)]
+fn apply_open_file_limit(max_open_files: u64) -> Result<()> {
+    let (_, hard_limit) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+            .map_err(|_| anyhow::anyhow!("runtime worker open-file limit read failed"))?;
+    if hard_limit < max_open_files {
+        anyhow::bail!("runtime worker open-file hard limit is too low");
+    }
+    nix::sys::resource::setrlimit(
+        nix::sys::resource::Resource::RLIMIT_NOFILE,
+        max_open_files,
+        hard_limit,
+    )
+    .map_err(|_| anyhow::anyhow!("runtime worker open-file limit setup failed"))
+}
+
+#[cfg(unix)]
 fn isolate_process_group() -> Result<()> {
     let pid = nix::unistd::getpid();
     nix::unistd::setpgid(pid, pid)
@@ -37,6 +59,8 @@ fn isolate_process_group() -> Result<()> {
 fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32) -> Result<()> {
     isolate_process_group()?;
     configure_parent_death_signal()?;
+    disable_core_dumps()?;
+    apply_open_file_limit(citadel::runtime::worker_supervisor::DEFAULT_WORKER_MAX_OPEN_FILES)?;
     let secret = citadel::runtime::worker_bootstrap::read_secret_from_fd(bootstrap_fd)
         .context("runtime worker bootstrap secret unavailable")?;
     let mut stream =
@@ -216,6 +240,39 @@ fn print_wizard_summary(report: &WizardReport, paths: &WizardPaths) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn worker_disables_core_dumps_in_child() {
+        if std::env::var_os("CITADEL_CORE_LIMIT_TEST_CHILD").is_some() {
+            super::disable_core_dumps().expect("disable core dumps");
+            let limits = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
+                .expect("read core limits");
+            assert_eq!(limits, (0, 0));
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("tests::worker_disables_core_dumps_in_child")
+            .env("CITADEL_CORE_LIMIT_TEST_CHILD", "1")
+            .status()
+            .expect("run disposable child");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn worker_applies_open_file_limit() {
+        let resource = nix::sys::resource::Resource::RLIMIT_NOFILE;
+        let (soft, hard) = nix::sys::resource::getrlimit(resource).expect("read original limits");
+        super::apply_open_file_limit(32).expect("apply limit");
+        assert_eq!(
+            nix::sys::resource::getrlimit(resource)
+                .expect("read applied limit")
+                .0,
+            32
+        );
+        nix::sys::resource::setrlimit(resource, soft, hard).expect("restore limits");
+    }
+
     #[test]
     fn worker_configures_parent_death_signal() {
         let original = nix::sys::prctl::get_pdeathsig().expect("read original signal");

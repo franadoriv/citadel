@@ -39,6 +39,8 @@ pub fn fresh_bootstrap_secret() -> io::Result<[u8; 32]> {
     Ok(secret)
 }
 
+pub const DEFAULT_WORKER_MAX_OPEN_FILES: u64 = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerResourceLimits {
     max_open_files: u64,
