@@ -625,9 +625,9 @@ impl SupervisedWorker {
             match read_control_frame(&mut stream).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
             })? {
-                ControlFrame::WorkerReady { protocol_version }
-                    if protocol_version == PROTOCOL_VERSION =>
-                {
+                ControlFrame::WorkerReady {
+                    protocol_version, ..
+                } if protocol_version == PROTOCOL_VERSION => {
                     self.stream = Some(stream);
                     Ok(())
                 }
@@ -1351,6 +1351,7 @@ mod tests {
                 &mut stream,
                 &ControlFrame::WorkerReady {
                     protocol_version: PROTOCOL_VERSION,
+                    script_identity: None,
                 },
             )
             .expect("ready");

@@ -39,6 +39,12 @@ pub enum ControlFrame {
     },
     WorkerReady {
         protocol_version: u16,
+        /// Identity of the script revision the worker loaded (for example a
+        /// content hash), reserved for revision fencing. The protocol-stub
+        /// worker reports `None`; decoding tolerates the field's absence for
+        /// same-version compatibility.
+        #[serde(default)]
+        script_identity: Option<String>,
     },
     WorkerHello {
         protocol_version: u16,
@@ -262,9 +268,23 @@ mod tests {
     fn control_frame_round_trips_worker_ready() {
         let frame = super::ControlFrame::WorkerReady {
             protocol_version: super::PROTOCOL_VERSION,
+            script_identity: Some("sha256:abc123".to_string()),
         };
         let encoded = super::encode_frame(&frame).expect("encode");
         assert_eq!(super::decode_frame(&encoded).expect("decode"), frame);
+    }
+
+    #[test]
+    fn worker_ready_decodes_without_a_script_identity() {
+        let frame = super::decode_frame(br#"{"WorkerReady":{"protocol_version":1}}"#)
+            .expect("readiness without a script identity stays decodable");
+        assert_eq!(
+            frame,
+            super::ControlFrame::WorkerReady {
+                protocol_version: 1,
+                script_identity: None,
+            }
+        );
     }
 
     #[test]

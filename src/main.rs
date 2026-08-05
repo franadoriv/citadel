@@ -154,7 +154,13 @@ fn run_runtime_worker(
     .map_err(|_| anyhow::anyhow!("runtime worker hello write failed"))?;
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
-        &citadel::runtime::worker_protocol::ControlFrame::WorkerReady { protocol_version },
+        &citadel::runtime::worker_protocol::ControlFrame::WorkerReady {
+            protocol_version,
+            // The protocol-stub worker loads no script yet; a future
+            // script-hosting worker reports its loaded revision here for
+            // revision fencing.
+            script_identity: None,
+        },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
     // Health is a continuous signal: emit one frame per cadence until the
