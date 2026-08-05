@@ -5,7 +5,10 @@ use std::{
     io,
     os::{
         fd::OwnedFd,
-        unix::net::{UnixListener, UnixStream},
+        unix::{
+            net::{UnixListener, UnixStream},
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -214,8 +217,22 @@ impl SupervisedWorker {
             .arg(endpoint.path())
             .arg("--bootstrap-fd")
             .arg(bootstrap_fd.to_string())
+            // The worker must land in its own process group before exec so
+            // every cleanup path can signal the whole group. Relying on the
+            // worker to isolate itself would let a non-cooperating binary
+            // (and any descendants it forks) escape group termination.
+            .process_group(0)
             .spawn()?;
+        // The group id equals the leader pid and is valid from spawn, so
+        // failures before authentication also clean up descendants.
+        let process_group_id = i32::try_from(child.id()).ok();
         if let Err(error) = bootstrap_writer.write_secret(secret) {
+            if let Some(pgid) = process_group_id {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-pgid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
@@ -226,7 +243,7 @@ impl SupervisedWorker {
             stream: None,
             _bootstrap_reader: bootstrap_reader,
             child,
-            process_group_id: None,
+            process_group_id,
         })
     }
 
@@ -289,7 +306,6 @@ impl SupervisedWorker {
                     if protocol_version == PROTOCOL_VERSION =>
                 {
                     self.stream = Some(stream);
-                    self.process_group_id = i32::try_from(self.child.id()).ok();
                     Ok(())
                 }
                 _ => Err(io::Error::new(
@@ -299,8 +315,7 @@ impl SupervisedWorker {
             }
         })();
         if result.is_err() {
-            let _ = self.terminate_process_group();
-            let _ = self.child.wait();
+            self.kill_and_reap();
         }
         result
     }
@@ -339,10 +354,10 @@ impl SupervisedWorker {
                 )),
             }
         })();
-        if result.is_err() {
-            let _ = self.terminate_process_group();
-        }
-        let _ = self.child.wait();
+        // Even after a clean acknowledgement the group is signalled: the
+        // worker already performed its last protocol act, and this guarantees
+        // no descendant outlives an acknowledged shutdown.
+        self.kill_and_reap();
         result
     }
 
@@ -366,24 +381,47 @@ impl SupervisedWorker {
             }
         })();
         if result.is_err() {
-            let _ = self.terminate_process_group();
-            let _ = self.child.wait();
+            self.kill_and_reap();
         }
         result
     }
 
     pub fn has_exited(&mut self) -> io::Result<bool> {
-        Ok(self.child.try_wait()?.is_some())
+        let exited = self.child.try_wait()?.is_some();
+        if exited {
+            // `try_wait` reaped the leader, but descendants may linger in the
+            // group. The group id stays reserved while any member remains, so
+            // signal it now and forget it: once forgotten, a possibly recycled
+            // pid is never signalled again.
+            self.signal_process_group();
+            self.process_group_id = None;
+        }
+        Ok(exited)
     }
 
-    fn terminate_process_group(&mut self) -> io::Result<()> {
+    fn signal_process_group(&self) {
         if let Some(pgid) = self.process_group_id {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(-pgid),
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
+    }
+
+    fn terminate_process_group(&mut self) -> io::Result<()> {
+        self.signal_process_group();
         self.child.kill()
+    }
+
+    /// Kill the worker's whole process group and reap the leader.
+    ///
+    /// The group is signalled before the leader is reaped (a zombie leader
+    /// keeps the group id reserved), then forgotten so a later cleanup can
+    /// never signal a recycled process group.
+    fn kill_and_reap(&mut self) {
+        let _ = self.terminate_process_group();
+        let _ = self.child.wait();
+        self.process_group_id = None;
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
@@ -394,8 +432,7 @@ impl SupervisedWorker {
 #[cfg(unix)]
 impl Drop for SupervisedWorker {
     fn drop(&mut self) {
-        let _ = self.terminate_process_group();
-        let _ = self.child.wait();
+        self.kill_and_reap();
     }
 }
 
@@ -441,6 +478,57 @@ mod tests {
         let _ = fs::remove_file(pid_file);
         assert!(terminated, "descendant survived process-group termination");
     }
+    #[test]
+    fn bootstrap_failure_terminates_worker_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = uuid::Uuid::new_v4();
+        let pid_file = std::env::temp_dir().join(format!("citadel-worker-desc-{unique}.pid"));
+        let script = std::env::temp_dir().join(format!("citadel-worker-test-{unique}.sh"));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\nsleep 30 & echo $! > \"{}\"\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
+        let mut worker =
+            SupervisedWorker::spawn(&script, &std::env::temp_dir(), &[8; 32]).expect("spawn");
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !pid_file.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let descendant: i32 = fs::read_to_string(&pid_file)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        // The worker never connects, so bootstrap times out. Cleanup must
+        // remove the whole process group, not only the leader the worker
+        // forked from.
+        let error = worker
+            .authenticate(&[8; 32], vec![1; 32], Duration::from_millis(50))
+            .expect_err("worker never connects");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        let terminated = loop {
+            match fs::read_to_string(format!("/proc/{descendant}/stat")) {
+                Err(_) => break true,
+                Ok(stat) if stat.split_whitespace().nth(2) == Some("Z") => break true,
+                Ok(_) if std::time::Instant::now() >= until => break false,
+                Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&script);
+        assert!(
+            terminated,
+            "descendant survived bootstrap-failure process-group cleanup"
+        );
+    }
+
     #[test]
     fn recovery_snapshot_reports_failures_and_open_circuit() {
         let mut breaker = super::RestartCircuitBreaker::new(2);
