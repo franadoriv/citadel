@@ -34,8 +34,7 @@ pub fn restart_backoff(attempt: u32) -> Duration {
 
 pub fn fresh_bootstrap_secret() -> io::Result<[u8; 32]> {
     let mut secret = [0; 32];
-    getrandom::fill(&mut secret)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "bootstrap entropy unavailable"))?;
+    getrandom::fill(&mut secret).map_err(|_| io::Error::other("bootstrap entropy unavailable"))?;
     Ok(secret)
 }
 

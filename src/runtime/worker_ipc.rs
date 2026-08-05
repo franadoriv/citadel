@@ -57,11 +57,11 @@ mod tests {
     #[test]
     fn rejects_a_parent_that_would_exceed_socket_path_limit() {
         let parent = std::env::temp_dir().join("x".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
-        let error = match PrivateUnixEndpoint::create(&parent) {
-            Ok(_) => panic!("path must be rejected"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let result = PrivateUnixEndpoint::create(&parent);
+        assert_eq!(
+            result.as_ref().err().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput)
+        );
     }
 
     #[test]
