@@ -279,6 +279,10 @@ impl RestartController {
         &self.policy
     }
 
+    pub fn recovery_snapshot(&self) -> RecoverySnapshot {
+        self.breaker.snapshot()
+    }
+
     pub fn monitor_health(
         &mut self,
         active: &mut Option<SupervisedWorker>,
@@ -665,10 +669,21 @@ impl SupervisedWorker {
                 }
                 stream.set_read_timeout(Some(remaining))?;
                 match read_control_frame(stream).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "worker shutdown acknowledgement invalid",
-                    )
+                    // The socket read timeout fires only once `remaining` has
+                    // fully elapsed, so a read failure at or past the overall
+                    // deadline is the hung-worker case rather than a
+                    // malformed acknowledgement.
+                    if std::time::Instant::now() >= until {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "worker shutdown acknowledgement timed out",
+                        )
+                    } else {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "worker shutdown acknowledgement invalid",
+                        )
+                    }
                 })? {
                     ControlFrame::WorkerStopped { protocol_version }
                         if protocol_version == PROTOCOL_VERSION =>
@@ -1268,6 +1283,129 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(worker.child.try_wait().expect("child status").is_some());
         let _ = fs::remove_file(script);
+    }
+
+    #[test]
+    fn oversized_worker_frame_fails_closed_and_kills_the_child() {
+        use std::io::Write;
+        use std::{fs, os::unix::fs::PermissionsExt, thread};
+
+        let script =
+            std::env::temp_dir().join(format!("citadel-worker-test-{}.sh", uuid::Uuid::new_v4()));
+        fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
+        let mut worker = SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[6; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
+        let endpoint = worker._endpoint.path().to_path_buf();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(endpoint).expect("connect");
+            let _ = read_control_frame(&mut stream).expect("parent hello");
+            // A rogue worker claims a frame larger than the protocol allows;
+            // the supervisor must reject on the length prefix alone.
+            let oversized =
+                ((crate::runtime::worker_protocol::MAX_CONTROL_FRAME_BYTES + 1) as u32)
+                    .to_be_bytes();
+            let _ = stream.write_all(&oversized);
+            let _ = stream.write_all(&[b' '; 64]);
+            thread::sleep(Duration::from_millis(100));
+        });
+        let error = worker
+            .authenticate(&[6; 32], vec![1; 32], Duration::from_secs(1))
+            .expect_err("oversized frame must fail closed");
+        client.join().expect("client");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(worker.child.try_wait().expect("child status").is_some());
+        let _ = fs::remove_file(script);
+    }
+
+    #[test]
+    fn shutdown_of_a_hung_worker_times_out_and_kills_the_group() {
+        use std::{fs, os::unix::fs::PermissionsExt, thread};
+
+        let script =
+            std::env::temp_dir().join(format!("citadel-worker-test-{}.sh", uuid::Uuid::new_v4()));
+        fs::write(&script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable");
+        let secret = [8; 32];
+        let nonce = vec![9; 32];
+        let client_nonce = nonce.clone();
+        let mut worker = SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &secret,
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
+        let endpoint = worker._endpoint.path().to_path_buf();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(endpoint).expect("connect");
+            let _ = read_control_frame(&mut stream).expect("parent hello");
+            write_control_frame(
+                &mut stream,
+                &ControlFrame::WorkerHello {
+                    protocol_version: PROTOCOL_VERSION,
+                    proof: crate::runtime::worker_protocol::challenge_proof(&secret, &client_nonce)
+                        .to_vec(),
+                },
+            )
+            .expect("hello");
+            write_control_frame(
+                &mut stream,
+                &ControlFrame::WorkerReady {
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .expect("ready");
+            // The worker then hangs: it never acknowledges the shutdown.
+            thread::sleep(Duration::from_millis(500));
+        });
+        worker
+            .authenticate(&secret, nonce, Duration::from_secs(1))
+            .expect("authenticated bootstrap");
+        let error = worker
+            .shutdown(Duration::from_millis(100))
+            .expect_err("a hung worker cannot acknowledge shutdown");
+        client.join().expect("client");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            worker.child.try_wait().expect("child status").is_some(),
+            "the hung worker's process group must be killed and reaped"
+        );
+        let _ = fs::remove_file(script);
+    }
+
+    #[test]
+    fn restart_storm_trips_the_circuit_breaker() {
+        let mut controller = super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default()
+                .with_restart_limit(3)
+                .with_bootstrap_deadline(Duration::from_millis(50)),
+        );
+        let mut failed_attempts = 0;
+        loop {
+            match controller.restart_after_failure() {
+                // Each failed reboot charges the breaker.
+                Err(_) => {
+                    failed_attempts += 1;
+                    assert!(failed_attempts < 10, "the circuit breaker never opened");
+                }
+                // The breaker opened: restarts are refused from here on.
+                Ok(None) => break,
+                Ok(Some(_)) => panic!("an unauthenticatable fixture cannot restart"),
+            }
+        }
+        assert!(failed_attempts >= 1, "the storm must charge the breaker");
+        assert_eq!(
+            controller.recovery_snapshot().status,
+            super::RecoveryStatus::CircuitOpen
+        );
     }
 
     #[test]

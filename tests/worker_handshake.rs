@@ -59,6 +59,73 @@ fn restarted_worker_completes_a_fresh_authenticated_handshake() {
 }
 
 #[test]
+fn worker_with_wrong_secret_is_rejected_and_cleaned() {
+    let executable = Path::new(env!("CARGO_BIN_EXE_citadel"));
+    // The worker receives one secret over its bootstrap pipe while the
+    // supervisor verifies against another, modelling a worker that presents a
+    // proof from a stale or foreign secret.
+    let worker_secret = [21; 32];
+    let expected_secret = [22; 32];
+    let mut worker = SupervisedWorker::spawn(
+        executable,
+        &std::env::temp_dir(),
+        &worker_secret,
+        &WorkerSupervisionPolicy::default(),
+    )
+    .expect("worker process starts");
+    let error = worker
+        .authenticate(&expected_secret, vec![7; 32], Duration::from_secs(2))
+        .expect_err("a wrong-secret proof must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        worker.has_exited().expect("child status"),
+        "a rejected worker must be killed and reaped"
+    );
+}
+
+#[test]
+fn health_failure_triggers_an_authenticated_restart() {
+    let executable = Path::new(env!("CARGO_BIN_EXE_citadel")).to_path_buf();
+    let mut controller = RestartController::new(
+        executable,
+        std::env::temp_dir(),
+        WorkerSupervisionPolicy::default().with_restart_limit(3),
+    );
+    let mut active = Some(controller.start().expect("first boot"));
+    let first_worker = active.as_ref().expect("active worker").id();
+    // Consume the initial health frame, then kill the worker out from under
+    // the supervisor to model a crash between health cycles.
+    active
+        .as_mut()
+        .expect("active worker")
+        .health_check(Duration::from_secs(2))
+        .expect("initial health");
+    active.as_mut().expect("active worker").kill().expect("kill");
+    // The monitor must observe the failure and recover with a replacement
+    // that completed a fresh authenticated handshake.
+    let mut replaced = false;
+    for _ in 0..5 {
+        let available = controller
+            .monitor_health(&mut active, Duration::from_secs(2))
+            .expect("recovery must boot a replacement");
+        let current = active.as_ref().map(SupervisedWorker::id);
+        if available && current.is_some_and(|id| id != first_worker) {
+            replaced = true;
+            break;
+        }
+    }
+    assert!(
+        replaced,
+        "the health-failure restart policy must replace the killed worker"
+    );
+    active
+        .as_mut()
+        .expect("replacement worker")
+        .health_check(Duration::from_secs(2))
+        .expect("the replacement worker reports health");
+}
+
+#[test]
 fn same_binary_worker_completes_authenticated_bootstrap() {
     let executable = Path::new(env!("CARGO_BIN_EXE_citadel"));
     let secret = [9; 32];

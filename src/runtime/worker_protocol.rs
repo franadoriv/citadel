@@ -278,6 +278,46 @@ mod tests {
     }
 
     #[test]
+    fn reader_rejects_truncated_frames_fail_closed() {
+        let frame = super::ControlFrame::ParentHello {
+            protocol_version: super::PROTOCOL_VERSION,
+            nonce: vec![2; 32],
+        };
+        let mut wire = Vec::new();
+        super::write_control_frame(&mut wire, &frame).expect("write");
+        wire.truncate(wire.len() - 3);
+        assert_eq!(
+            super::read_control_frame(&mut wire.as_slice()),
+            Err(super::ProtocolError::MalformedFrame)
+        );
+    }
+
+    #[test]
+    fn reader_rejects_oversized_length_prefixes_before_reading() {
+        let mut wire = ((super::MAX_CONTROL_FRAME_BYTES + 1) as u32)
+            .to_be_bytes()
+            .to_vec();
+        // Only a few payload bytes follow the huge claimed length: the reader
+        // must reject on the prefix alone instead of trying to buffer it.
+        wire.extend_from_slice(&[b' '; 8]);
+        assert_eq!(
+            super::read_control_frame(&mut wire.as_slice()),
+            Err(super::ProtocolError::FrameTooLarge)
+        );
+    }
+
+    #[test]
+    fn reader_rejects_malformed_payloads_fail_closed() {
+        let payload = b"not a control frame";
+        let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(payload);
+        assert_eq!(
+            super::read_control_frame(&mut wire.as_slice()),
+            Err(super::ProtocolError::MalformedFrame)
+        );
+    }
+
+    #[test]
     fn writer_rejects_oversized_frames_fail_closed() {
         let frame = super::ControlFrame::ParentHello {
             protocol_version: super::PROTOCOL_VERSION,
