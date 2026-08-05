@@ -51,13 +51,14 @@ use super::groups::GroupsState;
 use super::pg::PgDatabase;
 use super::sqlite::SqliteDatabase;
 use super::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GroupsRepository,
-    InMemoryAuthIdentityRepository, InMemoryChatRepository, InMemoryFriendsRepository,
-    InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryNotificationsRepository,
-    InMemoryPurchasesRepository, InMemorySessionRepository, InMemoryStorageRepository,
-    InMemoryTournamentsRepository, InMemoryUserRepository, InMemoryWalletRepository,
-    LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
-    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
+    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
+    GroupsRepository, InMemoryAuthIdentityRepository, InMemoryChatRepository,
+    InMemoryFriendsRepository, InMemoryGameScriptRepository, InMemoryGroupsRepository,
+    InMemoryLeaderboardsRepository, InMemoryNotificationsRepository, InMemoryPurchasesRepository,
+    InMemorySessionRepository, InMemoryStorageRepository, InMemoryTournamentsRepository,
+    InMemoryUserRepository, InMemoryWalletRepository, LeaderboardsRepository,
+    NotificationsRepository, PurchasesRepository, SessionRepository, StorageRepository,
+    TournamentsRepository, UserRepository, WalletRepository,
 };
 
 /// Which persistence backend a node is running on.
@@ -182,6 +183,17 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// A pooled repository for tournament lifecycle and immutable results.
     fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository>;
 
+    /// A pooled repository for immutable GameScript revisions, drafts,
+    /// diagnostics, activation generations, redacted audit, and rollout
+    /// outbox.
+    ///
+    /// GameScript revision storage is a standalone feature — not part of the
+    /// account-creation multi-write workflow — so it is reached only through
+    /// this pooled accessor and deliberately absent from [`UnitOfWork`]. (Its
+    /// own audit/outbox atomicity is a per-operation transaction the
+    /// repository owns internally.)
+    fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository>;
+
     /// A pooled (autocommit) chat repository.
     ///
     /// Chat channel history is a standalone feature — not part of the
@@ -283,6 +295,7 @@ pub struct InMemoryBackend {
     leaderboards: Arc<InMemoryLeaderboardsRepository>,
     leaderboard_resets: Arc<InMemoryLeaderboardResetRepository>,
     tournaments: Arc<InMemoryTournamentsRepository>,
+    gamescript: Arc<InMemoryGameScriptRepository>,
     chat: Arc<InMemoryChatRepository>,
     notifications: Arc<InMemoryNotificationsRepository>,
     wallet: Arc<InMemoryWalletRepository>,
@@ -306,6 +319,7 @@ impl InMemoryBackend {
             leaderboards: Arc::new(InMemoryLeaderboardsRepository::new()),
             leaderboard_resets: Arc::new(InMemoryLeaderboardResetRepository::new()),
             tournaments: Arc::new(InMemoryTournamentsRepository::new()),
+            gamescript: Arc::new(InMemoryGameScriptRepository::new()),
             chat: Arc::new(InMemoryChatRepository::new()),
             notifications: Arc::new(InMemoryNotificationsRepository::new()),
             wallet: Arc::new(InMemoryWalletRepository::new()),
@@ -361,6 +375,10 @@ impl Backend for InMemoryBackend {
 
     fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
         Arc::clone(&self.tournaments) as Arc<dyn TournamentsRepository>
+    }
+
+    fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository> {
+        Arc::clone(&self.gamescript) as Arc<dyn GameScriptRepository>
     }
 
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {

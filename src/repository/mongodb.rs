@@ -40,6 +40,16 @@ use crate::repository::chat::{
     ChatMessage, ChatModerationAudit, ChatRateLimit, channel_not_found, finish_channel_listing,
     message_not_found, new_opaque_channel_id, serialize_delivery_event,
 };
+use crate::repository::gamescript::{
+    AUDIT_ACTION_ACTIVATE, AUDIT_ACTION_PIN, AUDIT_ACTION_SUBMIT, AUDIT_ACTION_UNPIN,
+    CreateGameScriptDraftRequest, GameScriptActivation, GameScriptAuditContext,
+    GameScriptAuditRecord, GameScriptDiagnostic, GameScriptDiagnosticSeverity, GameScriptDraft,
+    GameScriptLimits, GameScriptOutboxKind, GameScriptOutboxRecord, GameScriptRepository,
+    GameScriptRevision, GameScriptSubmission, UpdateGameScriptDraftRequest,
+    activation_audit_details, draft_not_found, gamescript_revision_content_hash,
+    language_from_token, revision_not_found, submit_audit_details, validate_create_draft,
+    validate_limit, validate_source,
+};
 use crate::repository::groups::{
     AdmissionKind, AdmissionOutcome, CreateGroupRequest, Group, GroupFilter, GroupId, GroupRole,
     GroupsPage, Membership, UpdateGroupRequest, ensure_can_add_member, ensure_can_kick, paginate,
@@ -101,10 +111,21 @@ const TOURNAMENTS: &str = "tournaments";
 const TOURNAMENT_ENTRIES: &str = "tournament_entries";
 const TOURNAMENT_RESULTS: &str = "tournament_results";
 const TOURNAMENT_SETTLEMENT_OUTBOX: &str = "tournament_settlement_outbox";
+const GAMESCRIPT_DRAFTS: &str = "gamescript_drafts";
+const GAMESCRIPT_REVISIONS: &str = "gamescript_revisions";
+const GAMESCRIPT_REVISION_PINS: &str = "gamescript_revision_pins";
+const GAMESCRIPT_REVISION_DIAGNOSTICS: &str = "gamescript_revision_diagnostics";
+const GAMESCRIPT_ACTIVATION_GENERATIONS: &str = "gamescript_activation_generations";
+const GAMESCRIPT_ACTIVATIONS: &str = "gamescript_activations";
+const GAMESCRIPT_AUDIT: &str = "gamescript_audit";
+const GAMESCRIPT_OUTBOX: &str = "gamescript_outbox";
+// Sequence documents for gamescript audit/outbox ids, allocated inside the
+// same replica-set transaction as the rows they identify.
+const GAMESCRIPT_COUNTERS: &str = "gamescript_counters";
 
 const SCHEMA_COLLECTION: &str = "citadel_schema";
 const SCHEMA_ID: &str = "mongodb-foundation";
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 // MongoDB recommends retrying a whole transaction on
 // `TransientTransactionError`, but retrying *only* the commit when the result
 // is unknown.  A direct `UnitOfWork` has no replayable user closure, so it can
@@ -590,6 +611,108 @@ const SCHEMA: &[CollectionSpec] = &[
             },
         ],
     },
+    CollectionSpec {
+        name: GAMESCRIPT_DRAFTS,
+        indexes: &[
+            IndexSpec {
+                name: "gamescript_draft_uq",
+                keys: &[("draft_id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "gamescript_draft_retention",
+                keys: &[("updated_at_unix_ms", 1), ("draft_id", 1)],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        // The unique content-hash identity both deduplicates identical
+        // submissions and resolves the concurrent-submission race to one
+        // document.
+        name: GAMESCRIPT_REVISIONS,
+        indexes: &[
+            IndexSpec {
+                name: "gamescript_revision_uq",
+                keys: &[("revision_id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "gamescript_revision_retention",
+                keys: &[("created_at_unix_ms", 1), ("revision_id", 1)],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        name: GAMESCRIPT_REVISION_PINS,
+        indexes: &[IndexSpec {
+            name: "gamescript_revision_pin_uq",
+            keys: &[("revision_id", 1)],
+            unique: true,
+        }],
+    },
+    CollectionSpec {
+        name: GAMESCRIPT_REVISION_DIAGNOSTICS,
+        indexes: &[IndexSpec {
+            name: "gamescript_diagnostic_uq",
+            keys: &[("revision_id", 1), ("seq", 1)],
+            unique: true,
+        }],
+    },
+    CollectionSpec {
+        name: GAMESCRIPT_ACTIVATION_GENERATIONS,
+        indexes: &[IndexSpec {
+            name: "gamescript_generation_scope_uq",
+            keys: &[("scope", 1)],
+            unique: true,
+        }],
+    },
+    CollectionSpec {
+        name: GAMESCRIPT_ACTIVATIONS,
+        indexes: &[
+            IndexSpec {
+                name: "gamescript_activation_uq",
+                keys: &[("scope", 1), ("generation", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "gamescript_activation_revision",
+                keys: &[("revision_id", 1)],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        name: GAMESCRIPT_AUDIT,
+        indexes: &[
+            IndexSpec {
+                name: "gamescript_audit_uq",
+                keys: &[("audit_id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "gamescript_audit_order",
+                keys: &[("created_at_unix_ms", -1), ("audit_id", -1)],
+                unique: false,
+            },
+        ],
+    },
+    CollectionSpec {
+        name: GAMESCRIPT_OUTBOX,
+        indexes: &[
+            IndexSpec {
+                name: "gamescript_outbox_uq",
+                keys: &[("outbox_id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "gamescript_outbox_pending_order",
+                keys: &[("created_at_unix_ms", 1), ("outbox_id", 1)],
+                unique: false,
+            },
+        ],
+    },
 ];
 
 /// Public, deterministic description of the foundation schema for operator and
@@ -690,6 +813,19 @@ pub struct MongoLeaderboardResetRepository {
 pub struct MongoTournamentsRepository {
     client: Client,
     database: Database,
+}
+
+/// Durable MongoDB GameScript revision adapter. Draft submission, activation
+/// generation allocation, pinning, and retention pruning run in replayable
+/// replica-set transactions so a state change and its audit/outbox documents
+/// commit or disappear together. MongoDB has no foreign-key backstop for the
+/// "active revisions are never pruned" rule; the pruning transaction's
+/// snapshot reads plus the bounded transient-error retry loop enforce it
+/// instead.
+pub struct MongoGameScriptRepository {
+    client: Client,
+    database: Database,
+    limits: GameScriptLimits,
 }
 
 /// Durable MongoDB notification store. Enqueues use a replica-set transaction
@@ -1663,6 +1799,914 @@ impl TournamentsRepository for MongoTournamentsRepository {
             .await
             .map_err(mongo_error)?;
         Ok(())
+    }
+}
+
+impl MongoGameScriptRepository {
+    fn pooled(client: Client, database: Database) -> Self {
+        Self {
+            client,
+            database,
+            limits: GameScriptLimits::default(),
+        }
+    }
+}
+
+fn gamescript_doc_str(document: &Document, field: &str) -> AppResult<String> {
+    document
+        .get_str(field)
+        .map(str::to_owned)
+        .map_err(|_| AppError::internal("invalid MongoDB gamescript record"))
+}
+
+fn gamescript_doc_u64(document: &Document, field: &str) -> AppResult<u64> {
+    u64::try_from(
+        document
+            .get_i64(field)
+            .map_err(|_| AppError::internal("invalid MongoDB gamescript record"))?,
+    )
+    .map_err(|_| AppError::internal("invalid MongoDB gamescript record"))
+}
+
+fn gamescript_doc_millis(document: &Document, field: &str) -> AppResult<TimestampMillis> {
+    Ok(TimestampMillis::from_unix_millis(gamescript_doc_u64(
+        document, field,
+    )?))
+}
+
+fn mongo_gamescript_draft(document: &Document) -> AppResult<GameScriptDraft> {
+    Ok(GameScriptDraft {
+        draft_id: gamescript_doc_str(document, "draft_id")?,
+        language: language_from_token(&gamescript_doc_str(document, "language")?)?,
+        entrypoint: gamescript_doc_str(document, "entrypoint")?,
+        content: gamescript_doc_str(document, "content")?,
+        created_by: gamescript_doc_str(document, "created_by")?,
+        created_at: gamescript_doc_millis(document, "created_at_unix_ms")?,
+        updated_at: gamescript_doc_millis(document, "updated_at_unix_ms")?,
+    })
+}
+
+fn mongo_gamescript_revision(document: &Document) -> AppResult<GameScriptRevision> {
+    Ok(GameScriptRevision {
+        revision_id: gamescript_doc_str(document, "revision_id")?,
+        language: language_from_token(&gamescript_doc_str(document, "language")?)?,
+        entrypoint: gamescript_doc_str(document, "entrypoint")?,
+        content: gamescript_doc_str(document, "content")?,
+        size_bytes: gamescript_doc_u64(document, "size_bytes")?,
+        created_by: gamescript_doc_str(document, "created_by")?,
+        created_at: gamescript_doc_millis(document, "created_at_unix_ms")?,
+    })
+}
+
+fn mongo_gamescript_activation(document: &Document) -> AppResult<GameScriptActivation> {
+    Ok(GameScriptActivation {
+        scope: gamescript_doc_str(document, "scope")?,
+        generation: gamescript_doc_u64(document, "generation")?,
+        revision_id: gamescript_doc_str(document, "revision_id")?,
+        activated_by: gamescript_doc_str(document, "activated_by")?,
+        activated_at: gamescript_doc_millis(document, "activated_at_unix_ms")?,
+    })
+}
+
+fn mongo_gamescript_diagnostic(document: &Document) -> AppResult<GameScriptDiagnostic> {
+    Ok(GameScriptDiagnostic {
+        revision_id: gamescript_doc_str(document, "revision_id")?,
+        seq: gamescript_doc_u64(document, "seq")?,
+        severity: GameScriptDiagnosticSeverity::from_token(&gamescript_doc_str(
+            document, "severity",
+        )?)?,
+        source: gamescript_doc_str(document, "source")?,
+        message: gamescript_doc_str(document, "message")?,
+        created_at: gamescript_doc_millis(document, "created_at_unix_ms")?,
+    })
+}
+
+fn mongo_gamescript_audit(document: &Document) -> AppResult<GameScriptAuditRecord> {
+    Ok(GameScriptAuditRecord {
+        audit_id: gamescript_doc_u64(document, "audit_id")?,
+        actor: gamescript_doc_str(document, "actor")?,
+        action: gamescript_doc_str(document, "action")?,
+        target: gamescript_doc_str(document, "target")?,
+        details: serde_json::from_str(&gamescript_doc_str(document, "details")?)
+            .map_err(|_| AppError::internal("invalid MongoDB gamescript audit details"))?,
+        created_at: gamescript_doc_millis(document, "created_at_unix_ms")?,
+    })
+}
+
+fn mongo_gamescript_outbox(document: &Document) -> AppResult<GameScriptOutboxRecord> {
+    Ok(GameScriptOutboxRecord {
+        outbox_id: gamescript_doc_u64(document, "outbox_id")?,
+        kind: GameScriptOutboxKind::from_token(&gamescript_doc_str(document, "kind")?)?,
+        scope: document.get_str("scope").ok().map(str::to_owned),
+        revision_id: gamescript_doc_str(document, "revision_id")?,
+        generation: document
+            .get_i64("generation")
+            .ok()
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| AppError::internal("invalid MongoDB gamescript record"))
+            })
+            .transpose()?,
+        created_at: gamescript_doc_millis(document, "created_at_unix_ms")?,
+    })
+}
+
+fn gamescript_details_json(details: &GameScriptAuditContext) -> AppResult<String> {
+    serde_json::to_string(details)
+        .map_err(|_| AppError::internal("failed to encode gamescript audit details"))
+}
+
+/// Allocate the next value of one gamescript sequence document inside the
+/// enclosing replica-set transaction, so ids commit atomically with the rows
+/// they identify.
+async fn next_gamescript_sequence(
+    database: &Database,
+    session: &mut ClientSession,
+    key: &str,
+) -> Result<i64, SchedulerTransactionError> {
+    let updated = database
+        .collection::<Document>(GAMESCRIPT_COUNTERS)
+        .find_one_and_update(doc! { "_id": key }, doc! { "$inc": { "value": 1_i64 } })
+        .upsert(true)
+        .return_document(ReturnDocument::After)
+        .session(&mut *session)
+        .await?
+        .ok_or_else(|| {
+            SchedulerTransactionError::App(AppError::internal(
+                "gamescript sequence upsert returned no document",
+            ))
+        })?;
+    updated.get_i64("value").map_err(|_| {
+        SchedulerTransactionError::App(AppError::internal("invalid gamescript sequence document"))
+    })
+}
+
+async fn gamescript_revision_exists_in_session(
+    database: &Database,
+    session: &mut ClientSession,
+    revision_id: &str,
+) -> Result<bool, SchedulerTransactionError> {
+    Ok(database
+        .collection::<Document>(GAMESCRIPT_REVISIONS)
+        .find_one(doc! { "revision_id": revision_id })
+        .session(&mut *session)
+        .await?
+        .is_some())
+}
+
+async fn insert_gamescript_audit_in_session(
+    database: &Database,
+    session: &mut ClientSession,
+    actor: &str,
+    action: &str,
+    target: &str,
+    details: &GameScriptAuditContext,
+    now: i64,
+) -> Result<(), SchedulerTransactionError> {
+    let audit_id = next_gamescript_sequence(database, session, "audit").await?;
+    database
+        .collection::<Document>(GAMESCRIPT_AUDIT)
+        .insert_one(doc! {
+            "audit_id": audit_id,
+            "actor": actor,
+            "action": action,
+            "target": target,
+            "details": gamescript_details_json(details)?,
+            "created_at_unix_ms": now,
+        })
+        .session(&mut *session)
+        .await?;
+    Ok(())
+}
+
+async fn insert_gamescript_outbox_in_session(
+    database: &Database,
+    session: &mut ClientSession,
+    kind: GameScriptOutboxKind,
+    scope: Option<&str>,
+    revision_id: &str,
+    generation: Option<i64>,
+    now: i64,
+) -> Result<(), SchedulerTransactionError> {
+    let outbox_id = next_gamescript_sequence(database, session, "outbox").await?;
+    let mut entry = doc! {
+        "outbox_id": outbox_id,
+        "kind": kind.as_str(),
+        "revision_id": revision_id,
+        "created_at_unix_ms": now,
+    };
+    if let Some(scope) = scope {
+        entry.insert("scope", scope);
+    }
+    if let Some(generation) = generation {
+        entry.insert("generation", generation);
+    }
+    database
+        .collection::<Document>(GAMESCRIPT_OUTBOX)
+        .insert_one(entry)
+        .session(&mut *session)
+        .await?;
+    Ok(())
+}
+
+#[async_trait]
+impl GameScriptRepository for MongoGameScriptRepository {
+    async fn create_draft(
+        &self,
+        request: CreateGameScriptDraftRequest,
+        now: TimestampMillis,
+    ) -> AppResult<GameScriptDraft> {
+        validate_create_draft(&request, &self.limits)?;
+        let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
+        self.database
+            .collection::<Document>(GAMESCRIPT_DRAFTS)
+            .insert_one(doc! {
+                "draft_id": &request.draft_id,
+                "language": request.language.as_str(),
+                "entrypoint": &request.entrypoint,
+                "content": &request.content,
+                "created_by": &request.created_by,
+                "created_at_unix_ms": now,
+                "updated_at_unix_ms": now,
+            })
+            .await
+            .map_err(|error| mongo_write_error(error, "gamescript draft already exists"))?;
+        Ok(GameScriptDraft {
+            draft_id: request.draft_id,
+            language: request.language,
+            entrypoint: request.entrypoint,
+            content: request.content,
+            created_by: request.created_by,
+            created_at: TimestampMillis::from_unix_millis(now as u64),
+            updated_at: TimestampMillis::from_unix_millis(now as u64),
+        })
+    }
+
+    async fn update_draft(
+        &self,
+        draft_id: &str,
+        update: UpdateGameScriptDraftRequest,
+        now: TimestampMillis,
+    ) -> AppResult<GameScriptDraft> {
+        validate_source(&update.entrypoint, &update.content, &self.limits)?;
+        let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
+        self.database
+            .collection::<Document>(GAMESCRIPT_DRAFTS)
+            .find_one_and_update(
+                doc! { "draft_id": draft_id },
+                doc! { "$set": {
+                    "language": update.language.as_str(),
+                    "entrypoint": &update.entrypoint,
+                    "content": &update.content,
+                    "updated_at_unix_ms": now,
+                } },
+            )
+            .return_document(ReturnDocument::After)
+            .await
+            .map_err(mongo_error)?
+            .as_ref()
+            .map(mongo_gamescript_draft)
+            .transpose()?
+            .ok_or_else(|| draft_not_found(draft_id))
+    }
+
+    async fn get_draft(&self, draft_id: &str) -> AppResult<Option<GameScriptDraft>> {
+        self.database
+            .collection::<Document>(GAMESCRIPT_DRAFTS)
+            .find_one(doc! { "draft_id": draft_id })
+            .await
+            .map_err(mongo_error)?
+            .as_ref()
+            .map(mongo_gamescript_draft)
+            .transpose()
+    }
+
+    async fn list_drafts(&self, limit: usize) -> AppResult<Vec<GameScriptDraft>> {
+        validate_limit(limit)?;
+        let mut cursor = self
+            .database
+            .collection::<Document>(GAMESCRIPT_DRAFTS)
+            .find(doc! {})
+            .sort(doc! { "draft_id": 1 })
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .await
+            .map_err(mongo_error)?;
+        let mut drafts = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            drafts.push(mongo_gamescript_draft(&document)?);
+        }
+        Ok(drafts)
+    }
+
+    async fn delete_draft(&self, draft_id: &str) -> AppResult<bool> {
+        Ok(self
+            .database
+            .collection::<Document>(GAMESCRIPT_DRAFTS)
+            .delete_one(doc! { "draft_id": draft_id })
+            .await
+            .map_err(mongo_error)?
+            .deleted_count
+            > 0)
+    }
+
+    async fn submit_draft(
+        &self,
+        draft_id: &str,
+        actor: &str,
+        context: &GameScriptAuditContext,
+        now: TimestampMillis,
+    ) -> AppResult<GameScriptSubmission> {
+        if actor.is_empty() {
+            return Err(AppError::validation("gamescript actor must not be empty"));
+        }
+        let draft_id = draft_id.to_owned();
+        let actor = actor.to_owned();
+        let context = context.clone();
+        let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            let draft_id = draft_id.clone();
+            let actor = actor.clone();
+            let context = context.clone();
+            Box::pin(async move {
+                let draft = database
+                    .collection::<Document>(GAMESCRIPT_DRAFTS)
+                    .find_one(doc! { "draft_id": &draft_id })
+                    .session(&mut *session)
+                    .await?
+                    .as_ref()
+                    .map(mongo_gamescript_draft)
+                    .transpose()?
+                    .ok_or_else(|| draft_not_found(&draft_id))?;
+                let revision_id = gamescript_revision_content_hash(
+                    draft.language,
+                    &draft.entrypoint,
+                    &draft.content,
+                );
+                let revisions = database.collection::<Document>(GAMESCRIPT_REVISIONS);
+                let existing = revisions
+                    .find_one(doc! { "revision_id": &revision_id })
+                    .session(&mut *session)
+                    .await?
+                    .as_ref()
+                    .map(mongo_gamescript_revision)
+                    .transpose()?;
+                let (revision, deduplicated) = match existing {
+                    Some(revision) => (revision, true),
+                    None => {
+                        // A concurrent identical submission conflicts on the
+                        // unique revision_id index; the transient-error retry
+                        // replays this transaction, which then observes the
+                        // committed document and deduplicates.
+                        revisions
+                            .insert_one(doc! {
+                                "revision_id": &revision_id,
+                                "language": draft.language.as_str(),
+                                "entrypoint": &draft.entrypoint,
+                                "content": &draft.content,
+                                "size_bytes": scheduler_i64(
+                                    draft.content.len() as u64,
+                                    "gamescript source size",
+                                )?,
+                                "created_by": &actor,
+                                "created_at_unix_ms": now,
+                            })
+                            .session(&mut *session)
+                            .await?;
+                        (
+                            GameScriptRevision {
+                                revision_id: revision_id.clone(),
+                                language: draft.language,
+                                entrypoint: draft.entrypoint.clone(),
+                                content: draft.content.clone(),
+                                size_bytes: draft.content.len() as u64,
+                                created_by: actor.clone(),
+                                created_at: TimestampMillis::from_unix_millis(now as u64),
+                            },
+                            false,
+                        )
+                    }
+                };
+                let details = submit_audit_details(&draft_id, &revision, deduplicated, &context);
+                insert_gamescript_audit_in_session(
+                    database,
+                    session,
+                    &actor,
+                    AUDIT_ACTION_SUBMIT,
+                    &revision_id,
+                    &details,
+                    now,
+                )
+                .await?;
+                if !deduplicated {
+                    insert_gamescript_outbox_in_session(
+                        database,
+                        session,
+                        GameScriptOutboxKind::RevisionCreated,
+                        None,
+                        &revision_id,
+                        None,
+                        now,
+                    )
+                    .await?;
+                }
+                database
+                    .collection::<Document>(GAMESCRIPT_DRAFTS)
+                    .delete_one(doc! { "draft_id": &draft_id })
+                    .session(&mut *session)
+                    .await?;
+                Ok(GameScriptSubmission {
+                    revision,
+                    deduplicated,
+                })
+            })
+        })
+        .await
+    }
+
+    async fn get_revision(&self, revision_id: &str) -> AppResult<Option<GameScriptRevision>> {
+        self.database
+            .collection::<Document>(GAMESCRIPT_REVISIONS)
+            .find_one(doc! { "revision_id": revision_id })
+            .await
+            .map_err(mongo_error)?
+            .as_ref()
+            .map(mongo_gamescript_revision)
+            .transpose()
+    }
+
+    async fn list_revisions(&self, limit: usize) -> AppResult<Vec<GameScriptRevision>> {
+        validate_limit(limit)?;
+        let mut cursor = self
+            .database
+            .collection::<Document>(GAMESCRIPT_REVISIONS)
+            .find(doc! {})
+            .sort(doc! { "created_at_unix_ms": 1, "revision_id": 1 })
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .await
+            .map_err(mongo_error)?;
+        let mut revisions = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            revisions.push(mongo_gamescript_revision(&document)?);
+        }
+        Ok(revisions)
+    }
+
+    async fn append_diagnostic(
+        &self,
+        revision_id: &str,
+        severity: GameScriptDiagnosticSeverity,
+        source: &str,
+        message: &str,
+        now: TimestampMillis,
+    ) -> AppResult<GameScriptDiagnostic> {
+        let revision_id = revision_id.to_owned();
+        let source = source.to_owned();
+        let message = message.to_owned();
+        let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            let revision_id = revision_id.clone();
+            let source = source.clone();
+            let message = message.clone();
+            Box::pin(async move {
+                if !gamescript_revision_exists_in_session(database, session, &revision_id).await? {
+                    return Err(revision_not_found(&revision_id).into());
+                }
+                let last = database
+                    .collection::<Document>(GAMESCRIPT_REVISION_DIAGNOSTICS)
+                    .find_one(doc! { "revision_id": &revision_id })
+                    .sort(doc! { "seq": -1 })
+                    .session(&mut *session)
+                    .await?;
+                let next_seq = match last {
+                    Some(document) => {
+                        document.get_i64("seq").map_err(|_| {
+                            SchedulerTransactionError::App(AppError::internal(
+                                "invalid MongoDB gamescript diagnostic",
+                            ))
+                        })? + 1
+                    }
+                    None => 1,
+                };
+                database
+                    .collection::<Document>(GAMESCRIPT_REVISION_DIAGNOSTICS)
+                    .insert_one(doc! {
+                        "revision_id": &revision_id,
+                        "seq": next_seq,
+                        "severity": severity.as_str(),
+                        "source": &source,
+                        "message": &message,
+                        "created_at_unix_ms": now,
+                    })
+                    .session(&mut *session)
+                    .await?;
+                Ok(GameScriptDiagnostic {
+                    revision_id,
+                    seq: u64::try_from(next_seq).map_err(|_| {
+                        SchedulerTransactionError::App(AppError::internal(
+                            "invalid gamescript diagnostic sequence",
+                        ))
+                    })?,
+                    severity,
+                    source,
+                    message,
+                    created_at: TimestampMillis::from_unix_millis(now as u64),
+                })
+            })
+        })
+        .await
+    }
+
+    async fn diagnostics(&self, revision_id: &str) -> AppResult<Vec<GameScriptDiagnostic>> {
+        if self.get_revision(revision_id).await?.is_none() {
+            return Err(revision_not_found(revision_id));
+        }
+        let mut cursor = self
+            .database
+            .collection::<Document>(GAMESCRIPT_REVISION_DIAGNOSTICS)
+            .find(doc! { "revision_id": revision_id })
+            .sort(doc! { "seq": 1 })
+            .await
+            .map_err(mongo_error)?;
+        let mut diagnostics = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            diagnostics.push(mongo_gamescript_diagnostic(&document)?);
+        }
+        Ok(diagnostics)
+    }
+
+    async fn pin_revision(
+        &self,
+        revision_id: &str,
+        actor: &str,
+        now: TimestampMillis,
+    ) -> AppResult<bool> {
+        let revision_id = revision_id.to_owned();
+        let actor = actor.to_owned();
+        let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            let revision_id = revision_id.clone();
+            let actor = actor.clone();
+            Box::pin(async move {
+                if !gamescript_revision_exists_in_session(database, session, &revision_id).await? {
+                    return Err(revision_not_found(&revision_id).into());
+                }
+                let pins = database.collection::<Document>(GAMESCRIPT_REVISION_PINS);
+                if pins
+                    .find_one(doc! { "revision_id": &revision_id })
+                    .session(&mut *session)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+                pins.insert_one(doc! {
+                    "revision_id": &revision_id,
+                    "pinned_by": &actor,
+                    "pinned_at_unix_ms": now,
+                })
+                .session(&mut *session)
+                .await?;
+                insert_gamescript_audit_in_session(
+                    database,
+                    session,
+                    &actor,
+                    AUDIT_ACTION_PIN,
+                    &revision_id,
+                    &GameScriptAuditContext::new(),
+                    now,
+                )
+                .await?;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    async fn unpin_revision(
+        &self,
+        revision_id: &str,
+        actor: &str,
+        now: TimestampMillis,
+    ) -> AppResult<bool> {
+        let revision_id = revision_id.to_owned();
+        let actor = actor.to_owned();
+        let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            let revision_id = revision_id.clone();
+            let actor = actor.clone();
+            Box::pin(async move {
+                let removed = database
+                    .collection::<Document>(GAMESCRIPT_REVISION_PINS)
+                    .delete_one(doc! { "revision_id": &revision_id })
+                    .session(&mut *session)
+                    .await?
+                    .deleted_count
+                    > 0;
+                if removed {
+                    insert_gamescript_audit_in_session(
+                        database,
+                        session,
+                        &actor,
+                        AUDIT_ACTION_UNPIN,
+                        &revision_id,
+                        &GameScriptAuditContext::new(),
+                        now,
+                    )
+                    .await?;
+                }
+                Ok(removed)
+            })
+        })
+        .await
+    }
+
+    async fn allocate_activation_generation(
+        &self,
+        scope: &str,
+        revision_id: &str,
+        actor: &str,
+        context: &GameScriptAuditContext,
+        now: TimestampMillis,
+    ) -> AppResult<GameScriptActivation> {
+        if scope.is_empty() {
+            return Err(AppError::validation(
+                "gamescript activation scope must not be empty",
+            ));
+        }
+        if actor.is_empty() {
+            return Err(AppError::validation("gamescript actor must not be empty"));
+        }
+        let scope = scope.to_owned();
+        let revision_id = revision_id.to_owned();
+        let actor = actor.to_owned();
+        let context = context.clone();
+        let now = scheduler_i64(now.unix_millis(), "gamescript timestamp")?;
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            let scope = scope.clone();
+            let revision_id = revision_id.clone();
+            let actor = actor.clone();
+            let context = context.clone();
+            Box::pin(async move {
+                // Roll-forward and rollback share this gate: the target must be
+                // an existing, non-pruned revision before a generation is spent.
+                if !gamescript_revision_exists_in_session(database, session, &revision_id).await? {
+                    return Err(revision_not_found(&revision_id).into());
+                }
+                let counter = database
+                    .collection::<Document>(GAMESCRIPT_ACTIVATION_GENERATIONS)
+                    .find_one_and_update(
+                        doc! { "scope": &scope },
+                        doc! { "$inc": { "current_generation": 1_i64 } },
+                    )
+                    .upsert(true)
+                    .return_document(ReturnDocument::After)
+                    .session(&mut *session)
+                    .await?
+                    .ok_or_else(|| {
+                        SchedulerTransactionError::App(AppError::internal(
+                            "gamescript generation upsert returned no document",
+                        ))
+                    })?;
+                let generation = counter.get_i64("current_generation").map_err(|_| {
+                    SchedulerTransactionError::App(AppError::internal(
+                        "invalid gamescript generation document",
+                    ))
+                })?;
+                database
+                    .collection::<Document>(GAMESCRIPT_ACTIVATIONS)
+                    .insert_one(doc! {
+                        "scope": &scope,
+                        "generation": generation,
+                        "revision_id": &revision_id,
+                        "activated_by": &actor,
+                        "activated_at_unix_ms": now,
+                    })
+                    .session(&mut *session)
+                    .await?;
+                let activation = GameScriptActivation {
+                    scope: scope.clone(),
+                    generation: u64::try_from(generation).map_err(|_| {
+                        SchedulerTransactionError::App(AppError::internal(
+                            "invalid gamescript activation generation",
+                        ))
+                    })?,
+                    revision_id: revision_id.clone(),
+                    activated_by: actor.clone(),
+                    activated_at: TimestampMillis::from_unix_millis(now as u64),
+                };
+                let details = activation_audit_details(&activation, &context);
+                insert_gamescript_audit_in_session(
+                    database,
+                    session,
+                    &actor,
+                    AUDIT_ACTION_ACTIVATE,
+                    &revision_id,
+                    &details,
+                    now,
+                )
+                .await?;
+                insert_gamescript_outbox_in_session(
+                    database,
+                    session,
+                    GameScriptOutboxKind::ActivationCommitted,
+                    Some(&scope),
+                    &revision_id,
+                    Some(generation),
+                    now,
+                )
+                .await?;
+                Ok(activation)
+            })
+        })
+        .await
+    }
+
+    async fn current_activation(&self, scope: &str) -> AppResult<Option<GameScriptActivation>> {
+        self.database
+            .collection::<Document>(GAMESCRIPT_ACTIVATIONS)
+            .find_one(doc! { "scope": scope })
+            .sort(doc! { "generation": -1 })
+            .await
+            .map_err(mongo_error)?
+            .as_ref()
+            .map(mongo_gamescript_activation)
+            .transpose()
+    }
+
+    async fn list_activations(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> AppResult<Vec<GameScriptActivation>> {
+        validate_limit(limit)?;
+        let mut cursor = self
+            .database
+            .collection::<Document>(GAMESCRIPT_ACTIVATIONS)
+            .find(doc! { "scope": scope })
+            .sort(doc! { "generation": -1 })
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .await
+            .map_err(mongo_error)?;
+        let mut activations = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            activations.push(mongo_gamescript_activation(&document)?);
+        }
+        Ok(activations)
+    }
+
+    async fn prune_drafts(
+        &self,
+        updated_before: TimestampMillis,
+        limit: usize,
+    ) -> AppResult<usize> {
+        validate_limit(limit)?;
+        let cutoff = scheduler_i64(updated_before.unix_millis(), "gamescript timestamp")?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            Box::pin(async move {
+                let drafts = database.collection::<Document>(GAMESCRIPT_DRAFTS);
+                let mut cursor = drafts
+                    .find(doc! { "updated_at_unix_ms": { "$lt": cutoff } })
+                    .sort(doc! { "updated_at_unix_ms": 1, "draft_id": 1 })
+                    .limit(limit)
+                    .session(&mut *session)
+                    .await?;
+                let stale = cursor.stream(&mut *session).try_collect::<Vec<_>>().await?;
+                let ids = stale
+                    .iter()
+                    .map(|document| gamescript_doc_str(document, "draft_id"))
+                    .collect::<AppResult<Vec<_>>>()?;
+                if ids.is_empty() {
+                    return Ok(0);
+                }
+                let deleted = drafts
+                    .delete_many(doc! { "draft_id": { "$in": &ids } })
+                    .session(&mut *session)
+                    .await?
+                    .deleted_count;
+                Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
+            })
+        })
+        .await
+    }
+
+    async fn prune_revisions(
+        &self,
+        created_before: TimestampMillis,
+        limit: usize,
+    ) -> AppResult<usize> {
+        validate_limit(limit)?;
+        let cutoff = scheduler_i64(created_before.unix_millis(), "gamescript timestamp")?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        scheduler_transaction(&self.client, &self.database, move |database, session| {
+            Box::pin(async move {
+                // Snapshot-isolated candidate selection: pinned and
+                // activation-referenced revisions are excluded, and a
+                // concurrent pin/activation conflicts with the deletes below
+                // and replays this transaction. MongoDB has no foreign-key
+                // backstop; this transaction is the enforcement point.
+                let revisions = database.collection::<Document>(GAMESCRIPT_REVISIONS);
+                let mut cursor = revisions
+                    .find(doc! { "created_at_unix_ms": { "$lt": cutoff } })
+                    .sort(doc! { "created_at_unix_ms": 1, "revision_id": 1 })
+                    .session(&mut *session)
+                    .await?;
+                let stale = cursor.stream(&mut *session).try_collect::<Vec<_>>().await?;
+                let mut candidates = Vec::new();
+                for document in &stale {
+                    candidates.push(gamescript_doc_str(document, "revision_id")?);
+                }
+                let mut protected = std::collections::BTreeSet::new();
+                let mut pins = database
+                    .collection::<Document>(GAMESCRIPT_REVISION_PINS)
+                    .find(doc! { "revision_id": { "$in": &candidates } })
+                    .session(&mut *session)
+                    .await?;
+                for document in pins.stream(&mut *session).try_collect::<Vec<_>>().await? {
+                    protected.insert(gamescript_doc_str(&document, "revision_id")?);
+                }
+                let mut activations = database
+                    .collection::<Document>(GAMESCRIPT_ACTIVATIONS)
+                    .find(doc! { "revision_id": { "$in": &candidates } })
+                    .session(&mut *session)
+                    .await?;
+                for document in activations
+                    .stream(&mut *session)
+                    .try_collect::<Vec<_>>()
+                    .await?
+                {
+                    protected.insert(gamescript_doc_str(&document, "revision_id")?);
+                }
+                let prunable = candidates
+                    .into_iter()
+                    .filter(|candidate| !protected.contains(candidate))
+                    .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                    .collect::<Vec<_>>();
+                if prunable.is_empty() {
+                    return Ok(0);
+                }
+                database
+                    .collection::<Document>(GAMESCRIPT_REVISION_DIAGNOSTICS)
+                    .delete_many(doc! { "revision_id": { "$in": &prunable } })
+                    .session(&mut *session)
+                    .await?;
+                let deleted = revisions
+                    .delete_many(doc! { "revision_id": { "$in": &prunable } })
+                    .session(&mut *session)
+                    .await?
+                    .deleted_count;
+                Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
+            })
+        })
+        .await
+    }
+
+    async fn audit_log(&self, limit: usize) -> AppResult<Vec<GameScriptAuditRecord>> {
+        validate_limit(limit)?;
+        let mut cursor = self
+            .database
+            .collection::<Document>(GAMESCRIPT_AUDIT)
+            .find(doc! {})
+            .sort(doc! { "created_at_unix_ms": -1, "audit_id": -1 })
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .await
+            .map_err(mongo_error)?;
+        let mut records = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            records.push(mongo_gamescript_audit(&document)?);
+        }
+        Ok(records)
+    }
+
+    async fn pending_outbox(&self, limit: usize) -> AppResult<Vec<GameScriptOutboxRecord>> {
+        validate_limit(limit)?;
+        let mut cursor = self
+            .database
+            .collection::<Document>(GAMESCRIPT_OUTBOX)
+            .find(doc! {})
+            .sort(doc! { "created_at_unix_ms": 1, "outbox_id": 1 })
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .await
+            .map_err(mongo_error)?;
+        let mut records = Vec::new();
+        while let Some(document) = cursor.try_next().await.map_err(mongo_error)? {
+            records.push(mongo_gamescript_outbox(&document)?);
+        }
+        Ok(records)
+    }
+
+    async fn acknowledge_outbox(&self, outbox_id: u64) -> AppResult<bool> {
+        let Ok(outbox_id) = i64::try_from(outbox_id) else {
+            return Ok(false);
+        };
+        Ok(self
+            .database
+            .collection::<Document>(GAMESCRIPT_OUTBOX)
+            .delete_one(doc! { "outbox_id": outbox_id })
+            .await
+            .map_err(mongo_error)?
+            .deleted_count
+            > 0)
     }
 }
 
@@ -6137,6 +7181,15 @@ impl MongoDatabase {
         ))
     }
 
+    /// Pooled durable GameScript revision repository.
+    #[must_use]
+    pub fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository> {
+        Arc::new(MongoGameScriptRepository::pooled(
+            self.client.clone(),
+            self.database.clone(),
+        ))
+    }
+
     /// Pooled durable repository for leaderboard reset scheduler state.
     #[must_use]
     pub fn leaderboard_reset_repository(&self) -> Arc<dyn LeaderboardResetRepository> {
@@ -6269,6 +7322,30 @@ impl MongoDatabase {
             LEADERBOARD_RESET_SNAPSHOT_RECORDS,
             LEADERBOARD_RESET_EPOCHS,
             LEADERBOARD_RESET_SCHEDULER_LEASE,
+        ] {
+            self.database
+                .collection::<Document>(collection)
+                .delete_many(doc! {})
+                .await
+                .map_err(mongo_error)?;
+        }
+        Ok(())
+    }
+
+    /// Clear only GameScript revision-store documents in an isolated MongoDB
+    /// integration database.
+    #[doc(hidden)]
+    pub async fn clear_gamescript_data_for_tests(&self) -> AppResult<()> {
+        for collection in [
+            GAMESCRIPT_OUTBOX,
+            GAMESCRIPT_AUDIT,
+            GAMESCRIPT_ACTIVATIONS,
+            GAMESCRIPT_ACTIVATION_GENERATIONS,
+            GAMESCRIPT_REVISION_DIAGNOSTICS,
+            GAMESCRIPT_REVISION_PINS,
+            GAMESCRIPT_REVISIONS,
+            GAMESCRIPT_DRAFTS,
+            GAMESCRIPT_COUNTERS,
         ] {
             self.database
                 .collection::<Document>(collection)
@@ -6654,6 +7731,9 @@ impl Backend for MongoDatabase {
     fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
         MongoDatabase::tournaments_repository(self)
     }
+    fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository> {
+        MongoDatabase::gamescript_repository(self)
+    }
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {
         Arc::new(self.mongo_chat_repository())
     }
@@ -6804,9 +7884,9 @@ mod tests {
     #[test]
     fn foundation_manifest_covers_every_existing_domain_projection() {
         let plan = MongoSchemaPlan::foundation();
-        assert_eq!(plan.version, 5);
-        assert_eq!(plan.collections, 31);
-        assert!(plan.indexes >= 48);
+        assert_eq!(plan.version, 6);
+        assert_eq!(plan.collections, 39);
+        assert!(plan.indexes >= 61);
     }
 
     #[test]

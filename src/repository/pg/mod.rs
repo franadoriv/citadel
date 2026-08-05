@@ -45,14 +45,15 @@ use crate::database_explorer::{DatabaseExplorer, PgMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GroupsRepository,
-    LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
-    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
+    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
+    GroupsRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
+    SessionRepository, StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
 mod chat;
 mod friends;
+mod gamescript;
 mod groups;
 mod identity;
 mod leaderboard_scheduler;
@@ -66,6 +67,7 @@ mod wallet;
 
 pub use chat::PgChatRepository;
 pub use friends::PgFriendsRepository;
+pub use gamescript::PgGameScriptRepository;
 pub use groups::PgGroupsRepository;
 pub use identity::{PgAuthIdentityRepository, PgUserRepository};
 pub use leaderboard_scheduler::PgLeaderboardResetRepository;
@@ -187,6 +189,14 @@ pub struct PgDatabase {
 /// coverage test below makes a new entry fail fast unless its table is also
 /// present in the CRDB migration set.
 const TEST_RESET_TABLES: &[&str] = &[
+    "gamescript_outbox",
+    "gamescript_audit",
+    "gamescript_activations",
+    "gamescript_activation_generations",
+    "gamescript_revision_diagnostics",
+    "gamescript_revision_pins",
+    "gamescript_revisions",
+    "gamescript_drafts",
     "tournament_results",
     "tournament_entries",
     "tournament_settlement_outbox",
@@ -435,6 +445,14 @@ impl PgDatabase {
         ))
     }
 
+    /// A pooled durable GameScript revision repository.
+    #[must_use]
+    pub fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository> {
+        Arc::new(PgGameScriptRepository::new(PgExecutor::Pool(
+            self.pool.clone(),
+        )))
+    }
+
     /// A pooled (autocommit) purchases repository handle.
     #[must_use]
     pub fn purchases_repository(&self) -> Arc<dyn PurchasesRepository> {
@@ -466,8 +484,9 @@ impl PgDatabase {
     /// of the supported API.
     #[doc(hidden)]
     pub async fn reset_storage_for_tests(&self) -> AppResult<()> {
-        // Order does not matter: no cross-table foreign keys are declared, so the
-        // repositories can be reset independently. `DELETE FROM` (plain DML) is
+        // `TEST_RESET_TABLES` is kept in dependency-safe delete order (children
+        // before the tables they reference, e.g. gamescript_activations before
+        // gamescript_revisions). `DELETE FROM` (plain DML) is
         // used rather than `TRUNCATE` because on CockroachDB `TRUNCATE` is an
         // asynchronous schema change (it drops and recreates the table's indexes);
         // calling it repeatedly between contract scenarios races the pending index
@@ -613,6 +632,10 @@ impl BackendTrait for PgDatabase {
         PgDatabase::tournaments_repository(self)
     }
 
+    fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository> {
+        PgDatabase::gamescript_repository(self)
+    }
+
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {
         PgDatabase::chat_repository(self)
     }
@@ -727,6 +750,8 @@ mod tests {
     );
     const CRDB_LEADERBOARD_RESET_SNAPSHOTS: &str =
         include_str!("../../../migrations-crdb/20260803142000_add_leaderboard_reset_snapshots.sql");
+    const CRDB_GAMESCRIPT: &str =
+        include_str!("../../../migrations-crdb/20260805100000_create_gamescript_revisions.sql");
 
     #[test]
     fn timestamp_round_trips_through_millis() {
@@ -756,6 +781,14 @@ mod tests {
     #[test]
     fn cockroach_migrations_cover_every_contract_reset_table() {
         let coverage = [
+            ("gamescript_outbox", CRDB_GAMESCRIPT),
+            ("gamescript_audit", CRDB_GAMESCRIPT),
+            ("gamescript_activations", CRDB_GAMESCRIPT),
+            ("gamescript_activation_generations", CRDB_GAMESCRIPT),
+            ("gamescript_revision_diagnostics", CRDB_GAMESCRIPT),
+            ("gamescript_revision_pins", CRDB_GAMESCRIPT),
+            ("gamescript_revisions", CRDB_GAMESCRIPT),
+            ("gamescript_drafts", CRDB_GAMESCRIPT),
             ("tournament_results", CRDB_TOURNAMENTS),
             ("tournament_entries", CRDB_TOURNAMENTS),
             (

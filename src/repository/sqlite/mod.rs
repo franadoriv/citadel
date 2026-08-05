@@ -56,14 +56,15 @@ use crate::database_explorer::{DatabaseExplorer, SqliteMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GroupsRepository,
-    LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
-    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
+    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
+    GroupsRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
+    SessionRepository, StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
 mod chat;
 mod friends;
+mod gamescript;
 mod groups;
 mod identity;
 mod leaderboard_scheduler;
@@ -77,6 +78,7 @@ mod wallet;
 
 pub use chat::SqliteChatRepository;
 pub use friends::SqliteFriendsRepository;
+pub use gamescript::SqliteGameScriptRepository;
 pub use groups::SqliteGroupsRepository;
 pub use identity::{SqliteAuthIdentityRepository, SqliteUserRepository};
 pub use leaderboard_scheduler::SqliteLeaderboardResetRepository;
@@ -350,6 +352,14 @@ impl SqliteDatabase {
         )))
     }
 
+    /// A pooled durable GameScript revision repository.
+    #[must_use]
+    pub fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository> {
+        Arc::new(SqliteGameScriptRepository::new(SqliteExecutor::Pool(
+            self.pool.clone(),
+        )))
+    }
+
     /// A pooled durable repository for leaderboard reset scheduler state.
     #[must_use]
     pub fn leaderboard_reset_repository(
@@ -425,6 +435,14 @@ impl SqliteDatabase {
     #[doc(hidden)]
     pub async fn reset_storage_for_tests(&self) -> AppResult<()> {
         for table in [
+            "gamescript_outbox",
+            "gamescript_audit",
+            "gamescript_activations",
+            "gamescript_activation_generations",
+            "gamescript_revision_diagnostics",
+            "gamescript_revision_pins",
+            "gamescript_revisions",
+            "gamescript_drafts",
             "leaderboard_reset_outbox",
             "leaderboard_reset_snapshot_records",
             "leaderboard_reset_epochs",
@@ -579,6 +597,10 @@ impl BackendTrait for SqliteDatabase {
 
     fn tournaments_repository(&self) -> Arc<dyn TournamentsRepository> {
         SqliteDatabase::tournaments_repository(self)
+    }
+
+    fn gamescript_repository(&self) -> Arc<dyn GameScriptRepository> {
+        SqliteDatabase::gamescript_repository(self)
     }
 
     fn chat_repository(&self) -> Arc<dyn ChatRepository> {
