@@ -682,6 +682,26 @@ if (level) citadel.log(`loaded ${level.triangle_count} collision triangles`);
 
 ---
 
+## citadel.map_names and citadel.find_path
+
+```js
+citadel.map_names() // -> string[]
+citadel.find_path(name, start, goal) // -> [number, number, number][] | null
+```
+
+`map_names` returns the loaded map keys in deterministic order. `find_path`
+asks the Rust core to query the map's authoritative Detour navigation data; it
+returns a navigation corridor ending at `goal`, or `null` when the map is
+unknown or either point cannot be routed. Game JavaScript never receives map
+geometry or executes pathfinding itself.
+
+```js
+const path = citadel.find_path("Lvl_ThirdPerson", [0, 0, 0], [900, 0, 300]);
+if (path) path.forEach(([x, y, z]) => citadel.move_actor(bot, x, y, z));
+```
+
+---
+
 ## citadel.raycast
 
 ```js

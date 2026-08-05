@@ -853,6 +853,28 @@ end
 
 ---
 
+## citadel.map_names and citadel.find_path
+
+```lua
+citadel.map_names() -> string[]
+citadel.find_path(name, start, goal) -> number[3][] | nil
+```
+
+`map_names` returns loaded map keys in deterministic order. `find_path` asks
+the Rust core to query the map's authoritative Detour navigation data and
+returns a corridor ending at `goal`; it returns `nil` for an unknown map or an
+unroutable endpoint. Lua sees neither collision geometry nor a pathfinding
+implementation.
+
+```lua
+local path = citadel.find_path("Lvl_ThirdPerson", {0, 0, 0}, {900, 0, 300})
+if path then
+  for _, point in ipairs(path) do citadel.move_actor(bot, point[1], point[2], point[3]) end
+end
+```
+
+---
+
 ## citadel.raycast
 
 ```lua

@@ -641,6 +641,28 @@ if level:
 
 ---
 
+## citadel.map_names and citadel.find_path
+
+```python
+citadel.map_names() -> list[str]
+citadel.find_path(name: str, start: tuple[float, float, float], goal: tuple[float, float, float]) -> list[tuple[float, float, float]] | None
+```
+
+`map_names` returns loaded map keys in deterministic order. `find_path` asks
+the Rust core to query the map's authoritative Detour navigation data and
+returns a corridor ending at `goal`; it returns `None` for an unknown map or an
+unroutable endpoint. Python receives no map geometry and performs no
+pathfinding.
+
+```python
+path = citadel.find_path("Lvl_ThirdPerson", (0, 0, 0), (900, 0, 300))
+if path:
+    for x, y, z in path:
+        citadel.move_actor(bot, x, y, z)
+```
+
+---
+
 ## citadel.raycast
 
 ```python

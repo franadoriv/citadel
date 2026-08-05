@@ -220,6 +220,26 @@
     "since": "pre-1.0"
   },
   {
+    "name": "map_names",
+    "category": "map",
+    "params": [],
+    "returns": "string[]",
+    "status": "shipped",
+    "since": "IMPL-20260805-AUTHORITATIVE-NAV-HOST-API"
+  },
+  {
+    "name": "find_path",
+    "category": "navigation",
+    "params": [
+      "map:string",
+      "start:[f32;3]",
+      "goal:[f32;3]"
+    ],
+    "returns": "[f32;3][]?",
+    "status": "shipped",
+    "since": "IMPL-20260805-AUTHORITATIVE-NAV-HOST-API"
+  },
+  {
     "name": "raycast",
     "category": "map",
     "params": [

@@ -2626,6 +2626,40 @@ fn install_host_api(
     })?;
     citadel.set("map_info", map_info)?;
 
+    // map_names() lists only already-loaded catalog keys in stable order. It
+    // does not disclose filesystem paths or permit catalog mutation.
+    let map_names = lua.create_function(|lua, ()| {
+        let value = lua.create_table()?;
+        if let Some(maps) = lua.app_data_ref::<MapCatalogHandle>() {
+            for (index, name) in maps.0.names().enumerate() {
+                value.set(index + 1, name)?;
+            }
+        }
+        Ok(value)
+    })?;
+    citadel.set("map_names", map_names)?;
+
+    // find_path(map, start, goal) invokes Detour in the Rust core. Scripts get
+    // only the resulting corridor; missing maps and unreachable endpoints are
+    // represented as nil so they cannot inspect native navigation failures.
+    let find_path =
+        lua.create_function(|lua, (name, start, goal): (mlua::String, Table, Table)| {
+            let start = lua_vector3(start)?;
+            let goal = lua_vector3(goal)?;
+            let Some(maps) = lua.app_data_ref::<MapCatalogHandle>() else {
+                return Ok(mlua::Value::Nil);
+            };
+            let Ok(Some(path)) = maps.0.find_path(&name.to_string_lossy(), start, goal) else {
+                return Ok(mlua::Value::Nil);
+            };
+            let value = lua.create_table()?;
+            for (index, point) in path.into_iter().enumerate() {
+                value.set(index + 1, point)?;
+            }
+            Ok(mlua::Value::Table(value))
+        })?;
+    citadel.set("find_path", find_path)?;
+
     let raycast = lua.create_function(|lua, (origin, direction): (Table, Table)| {
         let origin = lua_vector3(origin)?;
         let direction = lua_vector3(direction)?;
@@ -4373,6 +4407,8 @@ mod tests {
             "set_move_intent",
             "physics_state",
             "map_info",
+            "map_names",
+            "find_path",
             "raycast",
             "sphere_overlap",
             "ground_height",
