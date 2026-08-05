@@ -103,11 +103,15 @@ pub enum Command {
         #[arg(long)]
         bootstrap_fd: i32,
         /// Pid of the supervising parent, used to detect a parent that died
-        /// before the worker armed its parent-death signal.
+        /// before the worker armed its parent-death signal (unix) and to
+        /// validate the pipe server's identity before the handshake
+        /// (windows).
         #[arg(long)]
         parent_pid: u32,
-        /// Open-file limit from the supervisor's resource policy, applied
-        /// before the bootstrap secret is read.
+        /// Open-file limit from the supervisor's resource policy. Applied
+        /// before the bootstrap secret is read on unix; surfaced as
+        /// kernel-unenforceable on windows, where containment comes from the
+        /// job object instead.
         #[arg(long)]
         max_open_files: u64,
         /// How often (in milliseconds) the worker emits a health frame after

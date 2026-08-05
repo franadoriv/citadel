@@ -59,7 +59,7 @@ pub mod worker_bootstrap;
 #[cfg(any(unix, windows))]
 pub mod worker_ipc;
 pub mod worker_protocol;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod worker_supervisor;
 
 use std::time::Duration;

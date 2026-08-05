@@ -1,31 +1,38 @@
 //! Supervision primitives for the internal GameScript worker.
 
-#[cfg(unix)]
 use std::{
     io,
-    os::{
-        fd::OwnedFd,
-        unix::{
-            net::{UnixListener, UnixStream},
-            process::CommandExt,
-        },
-    },
     path::{Path, PathBuf},
     process::{Child, Command},
     time::Duration,
 };
 
 #[cfg(unix)]
-use super::{
-    worker_bootstrap::BootstrapPipe,
-    worker_ipc::PrivateUnixEndpoint,
-    worker_protocol::{
-        ControlFrame, PROTOCOL_VERSION, is_valid_worker_health, read_control_frame,
-        verify_worker_hello, write_control_frame,
+use std::os::{
+    fd::OwnedFd,
+    unix::{
+        net::{UnixListener, UnixStream},
+        process::CommandExt,
     },
 };
 
+use super::worker_protocol::{
+    ControlFrame, PROTOCOL_VERSION, is_valid_worker_health, verify_worker_hello,
+};
+
 #[cfg(unix)]
+use super::{
+    worker_bootstrap::BootstrapPipe,
+    worker_ipc::PrivateUnixEndpoint,
+    worker_protocol::{read_control_frame, write_control_frame},
+};
+
+#[cfg(windows)]
+use super::{
+    worker_ipc::PrivateNamedPipeEndpoint,
+    worker_protocol::{read_control_frame_async, write_control_frame_async},
+};
+
 const INITIAL_RESTART_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -398,12 +405,12 @@ pub fn run_supervision_loop(
             }
         }
     }
-    if let Some(mut worker) = active.take() {
-        if let Err(error) = worker.shutdown(policy.shutdown_deadline()) {
-            // The worker group was already killed by the failed shutdown
-            // path; an unacknowledged stop is not a supervision failure.
-            tracing::warn!(error = %error, "external runtime worker shutdown was not acknowledged");
-        }
+    if let Some(mut worker) = active.take()
+        && let Err(error) = worker.shutdown(policy.shutdown_deadline())
+    {
+        // The worker group was already killed by the failed shutdown
+        // path; an unacknowledged stop is not a supervision failure.
+        tracing::warn!(error = %error, "external runtime worker shutdown was not acknowledged");
     }
     Ok(())
 }
@@ -414,7 +421,6 @@ pub fn run_supervision_loop(
 /// `external-worker`: it boots the worker on server startup, keeps it healthy
 /// through [`run_supervision_loop`] (periodic liveness, restart policy,
 /// circuit breaker), and shuts it down together with the server.
-#[cfg(unix)]
 pub struct WorkerLifecycleService {
     executable: PathBuf,
     socket_parent: PathBuf,
@@ -422,7 +428,6 @@ pub struct WorkerLifecycleService {
     healthy_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[cfg(unix)]
 impl WorkerLifecycleService {
     #[must_use]
     pub fn new(
@@ -446,7 +451,6 @@ impl WorkerLifecycleService {
     }
 }
 
-#[cfg(unix)]
 impl crate::lifecycle::AsyncService for WorkerLifecycleService {
     fn name(&self) -> &str {
         "runtime-external-worker"
@@ -497,6 +501,7 @@ impl crate::lifecycle::AsyncService for WorkerLifecycleService {
     }
 }
 
+#[cfg(unix)]
 pub struct SupervisedWorker {
     _endpoint: PrivateUnixEndpoint,
     _listener: UnixListener,
@@ -791,11 +796,356 @@ impl Drop for SupervisedWorker {
     }
 }
 
-#[cfg(all(test, unix))]
+/// Windows supervised worker: named-pipe transport + Job Object containment.
+///
+/// The transport is a DACL-restricted, single-instance named pipe (see
+/// [`PrivateNamedPipeEndpoint`]) driven through tokio; the worker holds a
+/// private current-thread runtime so the synchronous supervision loop keeps
+/// the exact same shape as on unix, with every operation bounded by
+/// `tokio::time::timeout`. Lifecycle containment is a kill-on-close Job
+/// Object: the analog of the unix process group (group kill reaches every
+/// descendant) plus `PDEATHSIG` (a dying supervisor closes the job handle
+/// and the kernel terminates the whole worker tree).
+///
+/// Field order is load-bearing: the pipe endpoints must drop before the
+/// tokio runtime they are registered with.
+#[cfg(windows)]
+pub struct SupervisedWorker {
+    _endpoint: PrivateNamedPipeEndpoint,
+    server: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    stream: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    runtime: tokio::runtime::Runtime,
+    job: citadel_win_proc::JobObject,
+    _secret_reader: std::os::windows::io::OwnedHandle,
+    child: Child,
+}
+
+#[cfg(windows)]
+impl SupervisedWorker {
+    /// Spawn the worker under job containment with a one-shot secret pipe.
+    ///
+    /// `_parent` is the unix socket-parent directory and is unused here:
+    /// pipe names live in the kernel `\\.\pipe\` namespace, not on disk.
+    pub fn spawn(
+        executable: &Path,
+        _parent: &Path,
+        secret: &[u8; 32],
+        policy: &WorkerSupervisionPolicy,
+    ) -> io::Result<Self> {
+        let endpoint = PrivateNamedPipeEndpoint::create()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()?;
+        // The pipe server registers with this worker's private reactor; it
+        // must exist before the child so the worker can never observe a
+        // missing endpoint.
+        let server = {
+            let _context = runtime.enter();
+            endpoint.bind()?
+        };
+        // Kill-on-close is armed before the child exists: once assignment
+        // below succeeds, even an abrupt supervisor death tears the worker
+        // tree down with the closing job handle (the PDEATHSIG analog).
+        let job = citadel_win_proc::JobObject::create_kill_on_close()?;
+        let secret_pipe = citadel_win_proc::SecretPipe::create_with_inheritable_reader()?;
+        // Windows kernel handles fit in 32 bits by contract (WOW64 interop);
+        // refuse to spawn on the theoretical overflow instead of truncating.
+        let bootstrap_fd = i32::try_from(secret_pipe.reader_handle_value()).map_err(|_| {
+            io::Error::other("worker bootstrap handle value exceeds the command-line range")
+        })?;
+        let (secret_reader, secret_writer) = secret_pipe.into_reader_and_writer();
+        let mut child = Command::new(executable)
+            .arg("runtime-worker")
+            .arg("--bootstrap-endpoint")
+            .arg(endpoint.name())
+            // Numeric value of the inherited pipe read handle: std spawns
+            // with handle inheritance enabled and only the read end is
+            // marked inheritable, so the value stays valid in the child.
+            .arg("--bootstrap-fd")
+            .arg(bootstrap_fd.to_string())
+            // The worker checks this pid against the pipe's server process
+            // and its own parent-liveness pre-check before speaking the
+            // protocol.
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
+            // The supervisor's resource policy travels on the command line
+            // as on unix. Windows has no kernel open-file limit; the worker
+            // surfaces that instead of silently ignoring the policy.
+            .arg("--max-open-files")
+            .arg(policy.resource_limits().max_open_files().to_string())
+            // How often the worker emits a health frame after readiness; the
+            // supervisor's liveness deadline is calibrated against it.
+            .arg("--health-cadence-ms")
+            .arg(policy.health_cadence().as_millis().to_string())
+            .spawn()?;
+        // Containment before secrets: the child blocks reading the bootstrap
+        // secret, and the secret is only written after job assignment
+        // succeeds, so a worker that reached the protocol is provably inside
+        // the job. (Unlike the unix pre-exec `process_group(0)` there is no
+        // pre-start hook in std::process on Windows, so a non-cooperating
+        // binary could spawn descendants in the spawn-to-assign window; the
+        // cooperative worker does nothing before its secret read.)
+        if let Err(error) = job.assign(&child) {
+            let _ = job.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = secret_writer.write_secret(secret) {
+            let _ = job.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(Self {
+            _endpoint: endpoint,
+            server: Some(server),
+            stream: None,
+            runtime,
+            job,
+            _secret_reader: secret_reader,
+            child,
+        })
+    }
+
+    pub fn authenticate(
+        &mut self,
+        secret: &[u8; 32],
+        nonce: Vec<u8>,
+        deadline: Duration,
+    ) -> io::Result<()> {
+        let result = (|| -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+            let mut stream = self
+                .server
+                .take()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            let child_pid = self.child.id();
+            self.runtime.block_on(async {
+                tokio::time::timeout(deadline, stream.connect())
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "worker bootstrap deadline exceeded",
+                        )
+                    })??;
+                // Peer validation before any protocol byte: the DACL already
+                // limits the pipe to the current user, and this pins the one
+                // process — the spawned child — that may complete bootstrap.
+                let peer = citadel_win_proc::named_pipe_client_process_id(&stream)?;
+                if peer != child_pid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "worker bootstrap peer mismatch",
+                    ));
+                }
+                tokio::time::timeout(deadline, async {
+                    write_control_frame_async(
+                        &mut stream,
+                        &ControlFrame::ParentHello {
+                            protocol_version: PROTOCOL_VERSION,
+                            nonce: nonce.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bootstrap frame write failed")
+                    })?;
+                    let frame = read_control_frame_async(&mut stream).await.map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "worker bootstrap frame invalid")
+                    })?;
+                    if !verify_worker_hello(secret, &nonce, &frame) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "worker authentication failed",
+                        ));
+                    }
+                    match read_control_frame_async(&mut stream).await.map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
+                    })? {
+                        ControlFrame::WorkerReady {
+                            protocol_version, ..
+                        } if protocol_version == PROTOCOL_VERSION => Ok(()),
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "worker readiness frame invalid",
+                        )),
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "worker bootstrap deadline exceeded",
+                    )
+                })??;
+                Ok(stream)
+            })
+        })();
+        match result {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                Ok(())
+            }
+            Err(error) => {
+                self.kill_and_reap();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn shutdown(&mut self, deadline: Duration) -> io::Result<()> {
+        let result = (|| {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            self.runtime.block_on(async {
+                let until = std::time::Instant::now() + deadline;
+                tokio::time::timeout(
+                    deadline,
+                    write_control_frame_async(
+                        stream,
+                        &ControlFrame::ParentShutdown {
+                            protocol_version: PROTOCOL_VERSION,
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "worker shutdown acknowledgement timed out",
+                    )
+                })?
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "worker shutdown write failed")
+                })?;
+                // Health frames may already be in flight when shutdown
+                // begins; skip them (and only them) until the stop
+                // acknowledgement, all within the one overall deadline.
+                loop {
+                    let remaining = until.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "worker shutdown acknowledgement timed out",
+                        ));
+                    }
+                    let frame = tokio::time::timeout(remaining, read_control_frame_async(stream))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "worker shutdown acknowledgement timed out",
+                            )
+                        })?
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "worker shutdown acknowledgement invalid",
+                            )
+                        })?;
+                    match frame {
+                        ControlFrame::WorkerStopped { protocol_version }
+                            if protocol_version == PROTOCOL_VERSION =>
+                        {
+                            return Ok(());
+                        }
+                        ControlFrame::WorkerHealth { protocol_version }
+                            if protocol_version == PROTOCOL_VERSION => {}
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "worker shutdown acknowledgement invalid",
+                            ));
+                        }
+                    }
+                }
+            })
+        })();
+        // Even after a clean acknowledgement the job is terminated: the
+        // worker already performed its last protocol act, and this
+        // guarantees no descendant outlives an acknowledged shutdown.
+        self.kill_and_reap();
+        result
+    }
+
+    pub fn health_check(&mut self, deadline: Duration) -> io::Result<()> {
+        let result = (|| {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            let frame = self.runtime.block_on(async {
+                tokio::time::timeout(deadline, read_control_frame_async(stream))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "worker health frame overdue")
+                    })?
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "worker health frame invalid")
+                    })
+            })?;
+            if is_valid_worker_health(&frame) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker health frame invalid",
+                ))
+            }
+        })();
+        if result.is_err() {
+            self.kill_and_reap();
+        }
+        result
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn has_exited(&mut self) -> io::Result<bool> {
+        let exited = self.child.try_wait()?.is_some();
+        if exited {
+            // The leader is gone but descendants may linger in the job.
+            // Unlike a unix process group id, job identity is handle-based,
+            // so terminating here can never hit a recycled group.
+            let _ = self.job.terminate();
+        }
+        Ok(exited)
+    }
+
+    /// Kill the worker's whole job and reap the leader — the analog of the
+    /// unix process-group kill-and-reap.
+    fn kill_and_reap(&mut self) {
+        let _ = self.job.terminate();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    pub fn kill(&mut self) -> io::Result<()> {
+        let _ = self.job.terminate();
+        self.child.kill()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SupervisedWorker {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
 
+    #[cfg(unix)]
     #[test]
     fn process_group_signal_terminates_worker_descendant() {
         let pid_file =
@@ -833,6 +1183,7 @@ mod tests {
         let _ = fs::remove_file(pid_file);
         assert!(terminated, "descendant survived process-group termination");
     }
+    #[cfg(unix)]
     #[test]
     fn bootstrap_failure_terminates_worker_descendants() {
         use std::os::unix::fs::PermissionsExt;
@@ -949,6 +1300,7 @@ mod tests {
         assert!(active.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn health_failure_removes_active_worker_before_recovery() {
         let mut controller = super::RestartController::new(
@@ -985,6 +1337,7 @@ mod tests {
         assert!(active.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn exited_worker_is_removed_even_when_the_restart_fails() {
         let mut controller = super::RestartController::new(
@@ -1011,6 +1364,7 @@ mod tests {
         assert!(active.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn restart_attempt_fails_closed_without_authentication() {
         let mut controller = super::RestartController::new(
@@ -1069,6 +1423,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
+    #[cfg(unix)]
     #[test]
     fn supervision_loop_requires_an_authenticated_first_boot() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1093,6 +1448,7 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[cfg(unix)]
     #[test]
     fn crashed_worker_requires_a_permitted_restart_delay() {
         let mut breaker = super::RestartCircuitBreaker::new(1);
@@ -1108,6 +1464,7 @@ mod tests {
         assert_eq!(breaker.next_restart_delay(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reports_when_child_has_exited() {
         let mut worker = SupervisedWorker::spawn(
@@ -1164,6 +1521,7 @@ mod tests {
         let _ = SupervisedWorker::health_check;
     }
 
+    #[cfg(unix)]
     #[test]
     fn authenticated_worker_without_ready_is_rejected() {
         use std::{fs, os::unix::fs::PermissionsExt, thread};
@@ -1209,6 +1567,7 @@ mod tests {
         let _ = fs::remove_file(script);
     }
 
+    #[cfg(unix)]
     #[test]
     fn worker_that_stalls_after_connect_is_killed_and_reaped() {
         use std::{fs, os::unix::fs::PermissionsExt, thread};
@@ -1242,6 +1601,7 @@ mod tests {
         let _ = fs::remove_file(script);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_worker_hello_kills_and_reaps_the_child() {
         use std::{fs, os::unix::fs::PermissionsExt, thread};
@@ -1279,6 +1639,7 @@ mod tests {
         let _ = fs::remove_file(script);
     }
 
+    #[cfg(unix)]
     #[test]
     fn oversized_worker_frame_fails_closed_and_kills_the_child() {
         use std::io::Write;
@@ -1316,6 +1677,7 @@ mod tests {
         let _ = fs::remove_file(script);
     }
 
+    #[cfg(unix)]
     #[test]
     fn shutdown_of_a_hung_worker_times_out_and_kills_the_group() {
         use std::{fs, os::unix::fs::PermissionsExt, thread};
@@ -1373,6 +1735,7 @@ mod tests {
         let _ = fs::remove_file(script);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restart_storm_trips_the_circuit_breaker() {
         let mut controller = super::RestartController::new(
@@ -1402,6 +1765,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn bootstrap_acceptance_times_out_fail_closed() {
         let parent = std::env::temp_dir();
@@ -1417,5 +1781,250 @@ mod tests {
             .expect_err("must timeout");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(worker.child.try_wait().expect("child status").is_some());
+    }
+
+    /// Windows analog of `/bin/true`: resolves via PATH, ignores the worker
+    /// arguments, exits almost immediately, and never connects.
+    #[cfg(windows)]
+    fn immediate_exit_fixture() -> PathBuf {
+        PathBuf::from("where.exe")
+    }
+
+    #[cfg(windows)]
+    fn write_batch_fixture(body: &str) -> PathBuf {
+        let script =
+            std::env::temp_dir().join(format!("citadel-worker-test-{}.bat", uuid::Uuid::new_v4()));
+        std::fs::write(&script, body).expect("fixture script");
+        script
+    }
+
+    /// Windows analog of the `trap '' TERM; sleep 30` fixture: stays alive
+    /// for ~30s, ignores its arguments, and never connects to the endpoint.
+    #[cfg(windows)]
+    fn sleeper_fixture() -> PathBuf {
+        write_batch_fixture("@echo off\r\nping -n 30 127.0.0.1 > nul\r\n")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_failure_terminates_worker_descendants() {
+        let unique = uuid::Uuid::new_v4();
+        let pid_file = std::env::temp_dir().join(format!("citadel-worker-desc-{unique}.pid"));
+        // The batch leader spawns a grandchild (ping via powershell) and
+        // records its pid, mirroring the unix descendant fixture.
+        let script = write_batch_fixture(&format!(
+            "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -Command \
+             \"$p = Start-Process ping -ArgumentList '-n','60','127.0.0.1' -WindowStyle Hidden -PassThru; \
+             [IO.File]::WriteAllText('{}', [string]$p.Id); Wait-Process -Id $p.Id\"\r\n",
+            pid_file.display()
+        ));
+        let mut worker = SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[8; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !pid_file.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let descendant: u32 = std::fs::read_to_string(&pid_file)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        // The worker never connects, so bootstrap times out. Cleanup must
+        // terminate the whole job — batch leader, powershell, and ping — not
+        // only the process the supervisor spawned.
+        let error = worker
+            .authenticate(&[8; 32], vec![1; 32], Duration::from_millis(50))
+            .expect_err("worker never connects");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        let terminated = loop {
+            if !citadel_win_proc::process_is_alive(descendant).expect("descendant liveness") {
+                break true;
+            }
+            if std::time::Instant::now() >= until {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(&script);
+        assert!(terminated, "descendant survived job-object cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreign_client_fails_peer_validation_and_worker_is_cleaned() {
+        let script = sleeper_fixture();
+        let mut worker = SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[3; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
+        // A same-user process that is not the spawned child connects first.
+        // The DACL admits it (same user), so the peer pid check must be what
+        // rejects it before any protocol byte is exchanged.
+        let _client = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(worker._endpoint.name())
+            .expect("foreign client connects");
+        let error = worker
+            .authenticate(&[3; 32], vec![1; 32], Duration::from_secs(2))
+            .expect_err("a foreign client must fail peer validation");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            worker.child.try_wait().expect("child status").is_some(),
+            "a rejected bootstrap must kill and reap the worker"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_of_a_hung_worker_times_out_and_kills_the_group() {
+        let script = sleeper_fixture();
+        let mut worker = SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[8; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
+        // Peer validation stops the test process from completing the real
+        // handshake (by design), so the authenticated stream is injected
+        // directly; what this test pins down is shutdown's deadline and the
+        // job-wide kill that must follow it.
+        let endpoint = PrivateNamedPipeEndpoint::create().expect("endpoint");
+        let server = {
+            let _context = worker.runtime.enter();
+            endpoint.bind().expect("bind")
+        };
+        let name = endpoint.name().to_string();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(name)
+                .expect("connect");
+            let _ = crate::runtime::worker_protocol::read_control_frame(&mut stream)
+                .expect("parent shutdown frame");
+            // The worker then hangs: it never acknowledges the shutdown.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        worker
+            .runtime
+            .block_on(server.connect())
+            .expect("client connected");
+        worker.stream = Some(server);
+        let error = worker
+            .shutdown(Duration::from_millis(100))
+            .expect_err("a hung worker cannot acknowledge shutdown");
+        client.join().expect("client");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            worker.child.try_wait().expect("child status").is_some(),
+            "the hung worker's job must be killed and reaped"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_storm_trips_the_circuit_breaker() {
+        let mut controller = super::RestartController::new(
+            immediate_exit_fixture(),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default()
+                .with_restart_limit(3)
+                .with_bootstrap_deadline(Duration::from_millis(50)),
+        );
+        let mut failed_attempts = 0;
+        loop {
+            match controller.restart_after_failure() {
+                // Each failed reboot charges the breaker.
+                Err(_) => {
+                    failed_attempts += 1;
+                    assert!(failed_attempts < 10, "the circuit breaker never opened");
+                }
+                // The breaker opened: restarts are refused from here on.
+                Ok(None) => break,
+                Ok(Some(_)) => panic!("an unauthenticatable fixture cannot restart"),
+            }
+        }
+        assert!(failed_attempts >= 1, "the storm must charge the breaker");
+        assert_eq!(
+            controller.recovery_snapshot().status,
+            super::RecoveryStatus::CircuitOpen
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reports_when_child_has_exited() {
+        let mut worker = SupervisedWorker::spawn(
+            &immediate_exit_fixture(),
+            &std::env::temp_dir(),
+            &[7; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let exited = loop {
+            if worker.has_exited().expect("child status") {
+                break true;
+            }
+            if std::time::Instant::now() >= until {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(exited, "an immediately-exiting fixture must read as exited");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervision_loop_requires_an_authenticated_first_boot() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let mut controller = super::RestartController::new(
+            immediate_exit_fixture(),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default()
+                .with_restart_limit(1)
+                .with_bootstrap_deadline(Duration::from_millis(50)),
+        );
+        let healthy_cycles = AtomicU64::new(0);
+        super::run_supervision_loop(&mut controller, &AtomicBool::new(false), &healthy_cycles)
+            .expect_err("an unauthenticated first boot is a startup failure");
+        assert_eq!(healthy_cycles.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_authentication_times_out_fail_closed() {
+        // Windows has no separate accept step (`connect` is driven inside
+        // `authenticate`), so the deadline is asserted through the full
+        // bootstrap path against a fixture that never connects.
+        let script = sleeper_fixture();
+        let mut worker = SupervisedWorker::spawn(
+            &script,
+            &std::env::temp_dir(),
+            &[7; 32],
+            &WorkerSupervisionPolicy::default(),
+        )
+        .expect("spawn");
+        let error = worker
+            .authenticate(&[7; 32], vec![1; 32], Duration::from_millis(50))
+            .expect_err("must timeout");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(worker.child.try_wait().expect("child status").is_some());
+        let _ = std::fs::remove_file(&script);
     }
 }
