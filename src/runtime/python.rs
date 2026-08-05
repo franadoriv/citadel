@@ -3476,6 +3476,9 @@ def message(ctx, body):
         );
     }
 
+    // The slow subscriber must be the only one: the delivery budget is shared,
+    // and the timeout overrun grows arbitrarily under CPU/GIL contention, so an
+    // assertion about a second subscriber would depend on the scheduler.
     #[test]
     fn runtime_event_subscriber_timeout_preserves_outer_commands() {
         let bus = Arc::new(RuntimeEventBus::new(
@@ -3496,10 +3499,6 @@ def slow(event):
     while True:
         pass
 
-@citadel.events.subscribe("match", "slow")
-def next_subscriber(event):
-    citadel.broadcast(8, b"next")
-
 @citadel.on_message(1)
 def message(ctx, body):
     citadel.broadcast(7, b"outer")
@@ -3507,6 +3506,52 @@ def message(ctx, body):
 "#,
             "timeout.py",
             10,
+        )
+        .expect("runtime loads")
+        .with_event_bus(bus);
+        assert_eq!(
+            runtime.dispatch(1, None, 1, b""),
+            vec![OutboundCommand::Broadcast {
+                kind: 7,
+                body: b"outer".to_vec(),
+                unreliable: false,
+            }]
+        );
+    }
+
+    // Timing-independent twin of the timeout test above: the failing subscriber
+    // returns instantly, so the generous budget is never consumed and the later
+    // subscriber's share cannot be starved by a timeout overrun.
+    #[test]
+    fn runtime_event_subscriber_failure_keeps_later_subscribers() {
+        let bus = Arc::new(RuntimeEventBus::new(
+            crate::runtime::RuntimeEventPolicy {
+                enabled: true,
+                queue_capacity: 8,
+                max_event_bytes: 64,
+                max_events_per_minute: 10,
+            },
+            Arc::new(crate::observability::NodeMetrics::new()),
+        ));
+        let runtime = PythonRuntime::from_source(
+            r#"
+import citadel
+
+@citadel.events.subscribe("match", "boom")
+def failing(event):
+    raise RuntimeError("boom")
+
+@citadel.events.subscribe("match", "boom")
+def next_subscriber(event):
+    citadel.broadcast(8, b"next")
+
+@citadel.on_message(1)
+def message(ctx, body):
+    citadel.broadcast(7, b"outer")
+    citadel.events.emit("match", "boom", b"x")
+"#,
+            "failure.py",
+            1_000,
         )
         .expect("runtime loads")
         .with_event_bus(bus);

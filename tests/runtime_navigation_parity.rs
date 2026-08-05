@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use citadel::maps::MapCatalog;
-use citadel::runtime::{JsRuntime, LuaRuntime, PythonRuntime, Runtime};
+use citadel::runtime::{JsRuntime, LuaRuntime, PythonRuntime};
 use citadel_map::{CollisionMesh, MapFile, MapMetadata};
 
 const LUA: &str = r#"
