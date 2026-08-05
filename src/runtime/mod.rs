@@ -52,6 +52,7 @@ pub mod outbound_http;
 pub mod python;
 #[cfg(feature = "runtime-python")]
 mod python_bundle;
+pub mod python_payload;
 pub mod shared_cache;
 pub(crate) mod static_data;
 #[cfg(unix)]
@@ -94,6 +95,9 @@ pub use python::PythonRuntime;
 #[cfg(feature = "runtime-python")]
 pub use python_bundle::{
     BundledPythonEnv, configure_bundled_python_runtime, detect_bundled_python_runtime,
+};
+pub use python_payload::{
+    PayloadCache, PayloadFile, PayloadManifest, PythonPayloadError, VerifiedPayload,
 };
 pub use shared_cache::{
     RuntimeCachePublisher, RuntimeSharedCache, RuntimeSharedCacheError, RuntimeSharedCacheHandle,

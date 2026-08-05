@@ -169,7 +169,8 @@ impl MapCatalog {
 
     /// Find a server-authoritative navigation corridor over a loaded map's
     /// collision geometry. The native bake/query seam remains isolated in
-    /// `citadel-nav`; a missing map has no path.
+    /// `citadel-nav`; a missing map has no path. Script adapters expose this
+    /// through a narrow read-only host call and never receive mesh data.
     pub fn find_path(
         &self,
         name: &str,

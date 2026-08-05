@@ -54,6 +54,8 @@ pub enum HostApiCategory {
     Event,
     /// Read-only loaded-map query.
     Map,
+    /// Server-authoritative navigation query over a loaded map's baked mesh.
+    Navigation,
     /// Server-authoritative physics control and state query.
     Physics,
     /// Persisted domain-feature host call (friends, groups, …).
@@ -242,6 +244,22 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "{bounds_min:[f32;3],bounds_max:[f32;3],vertex_count:usize,triangle_count:usize}?",
         status: HostApiStatus::Shipped,
         since: "pre-1.0",
+    },
+    HostApiFn {
+        name: "map_names",
+        category: HostApiCategory::Map,
+        params: &[],
+        returns: "string[]",
+        status: HostApiStatus::Shipped,
+        since: "IMPL-20260805-AUTHORITATIVE-NAV-HOST-API",
+    },
+    HostApiFn {
+        name: "find_path",
+        category: HostApiCategory::Navigation,
+        params: &["map:string", "start:[f32;3]", "goal:[f32;3]"],
+        returns: "[f32;3][]?",
+        status: HostApiStatus::Shipped,
+        since: "IMPL-20260805-AUTHORITATIVE-NAV-HOST-API",
     },
     HostApiFn {
         name: "raycast",
