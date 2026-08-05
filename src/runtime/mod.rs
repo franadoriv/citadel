@@ -40,6 +40,7 @@
 
 pub mod cache_lease;
 pub mod cluster;
+pub mod engine_host;
 pub mod event_bus;
 pub mod host_api_spec;
 pub mod host_services;
