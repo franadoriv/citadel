@@ -217,6 +217,11 @@ impl SupervisedWorker {
             .arg(endpoint.path())
             .arg("--bootstrap-fd")
             .arg(bootstrap_fd.to_string())
+            // The worker re-checks this pid right after arming its
+            // parent-death signal, closing the window where the supervisor
+            // dies before the signal is armed.
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
             // The worker must land in its own process group before exec so
             // every cleanup path can signal the whole group. Relying on the
             // worker to isolate itself would let a non-cooperating binary

@@ -49,16 +49,35 @@ fn apply_open_file_limit(max_open_files: u64) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn isolate_process_group() -> Result<()> {
-    let pid = nix::unistd::getpid();
-    nix::unistd::setpgid(pid, pid)
-        .map_err(|_| anyhow::anyhow!("runtime worker process group setup failed"))
+fn ensure_supervising_parent(supervisor_pid: u32) -> Result<()> {
+    // PDEATHSIG only covers parent deaths that happen after it is armed. If
+    // the supervisor died between fork/exec and the arming in
+    // `run_runtime_worker`, no signal will ever arrive: this process was
+    // already reparented to init or a subreaper. Detect that by comparing the
+    // live parent pid against the pid the supervisor passed on the command
+    // line, and exit fail-closed instead of running unsupervised.
+    let live_parent = nix::unistd::getppid().as_raw();
+    if u32::try_from(live_parent) != Ok(supervisor_pid) {
+        anyhow::bail!("runtime worker lost its supervising parent before pdeathsig was armed");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32) -> Result<()> {
-    isolate_process_group()?;
+fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32, parent_pid: u32) -> Result<()> {
+    // Process-group isolation is owned by the supervisor, which places this
+    // process in its own group pre-exec (see `SupervisedWorker::spawn`), so
+    // group membership cannot depend on worker cooperation.
+    //
+    // Arm the parent-death signal as the very first act: from here on the
+    // kernel delivers SIGKILL when the supervisor dies. Together with the
+    // parent re-check below this closes the classic pdeathsig race — a parent
+    // death before arming leaves the worker reparented, which the re-check
+    // detects; a death after arming is covered by the signal itself. The only
+    // residual window is exec-to-first-instruction, and the re-check
+    // terminates the worker immediately after it.
     configure_parent_death_signal()?;
+    ensure_supervising_parent(parent_pid)?;
     disable_core_dumps()?;
     apply_open_file_limit(citadel::runtime::worker_supervisor::DEFAULT_WORKER_MAX_OPEN_FILES)?;
     let secret = citadel::runtime::worker_bootstrap::read_secret_from_fd(bootstrap_fd)
@@ -146,7 +165,8 @@ fn main() -> Result<()> {
         Command::RuntimeWorker {
             bootstrap_endpoint,
             bootstrap_fd,
-        } => run_runtime_worker(&bootstrap_endpoint, bootstrap_fd),
+            parent_pid,
+        } => run_runtime_worker(&bootstrap_endpoint, bootstrap_fd, parent_pid),
         #[cfg(not(unix))]
         Command::RuntimeWorker { .. } => {
             anyhow::bail!("the runtime-worker subcommand requires a unix host")
@@ -276,6 +296,21 @@ mod tests {
             32
         );
         nix::sys::resource::setrlimit(resource, soft, hard).expect("restore limits");
+    }
+
+    #[test]
+    fn worker_parent_check_accepts_the_live_parent() {
+        let live_parent =
+            u32::try_from(nix::unistd::getppid().as_raw()).expect("parent pid fits u32");
+        super::ensure_supervising_parent(live_parent).expect("live parent is accepted");
+    }
+
+    #[test]
+    fn worker_parent_check_rejects_a_reparented_worker() {
+        // This process's own pid can never be its parent pid, so this models a
+        // supervisor that died before pdeathsig was armed (the worker got
+        // reparented and the recorded supervisor pid no longer matches).
+        assert!(super::ensure_supervising_parent(std::process::id()).is_err());
     }
 
     #[test]

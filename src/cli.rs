@@ -102,6 +102,10 @@ pub enum Command {
         bootstrap_endpoint: String,
         #[arg(long)]
         bootstrap_fd: i32,
+        /// Pid of the supervising parent, used to detect a parent that died
+        /// before the worker armed its parent-death signal.
+        #[arg(long)]
+        parent_pid: u32,
     },
 }
 
@@ -132,6 +136,8 @@ mod tests {
             "/tmp/citadel.sock",
             "--bootstrap-fd",
             "3",
+            "--parent-pid",
+            "42",
         ])
         .expect("internal worker parses with endpoint");
         assert_eq!(
@@ -139,9 +145,22 @@ mod tests {
             Command::RuntimeWorker {
                 bootstrap_endpoint: "/tmp/citadel.sock".to_string(),
                 bootstrap_fd: 3,
+                parent_pid: 42,
             }
         );
         assert!(Cli::try_parse_from(["citadel", "runtime-worker"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+            ])
+            .is_err(),
+            "the supervising parent pid is mandatory"
+        );
     }
 
     #[test]
