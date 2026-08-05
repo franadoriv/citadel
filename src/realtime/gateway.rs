@@ -4836,6 +4836,22 @@ impl Gateway {
                 self.reply_rpc(sender, request_id, protocol::RPC_STATUS_OK, body.as_bytes())
             }
             "matchmaker.accept" => {
+                // Readiness gate at the session boundary: this covers the
+                // live path too, so a closed gate never consumes a durable
+                // admission claim the player could not redeem. The trusted
+                // admission paths re-check the gate (and the room's binding)
+                // for defense in depth.
+                if self
+                    .script_gate(ScriptGateSurface::MatchmakerAccept)
+                    .is_err()
+                {
+                    return self.reply_rpc(
+                        sender,
+                        request_id,
+                        protocol::RPC_STATUS_ERROR,
+                        SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+                    );
+                }
                 let id = match ticket_id_arg(payload) {
                     Ok(id) => id,
                     Err(message) => {
