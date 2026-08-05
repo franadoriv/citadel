@@ -88,15 +88,32 @@ pub const DEFAULT_WORKER_RESTART_LIMIT: u32 = 5;
 /// bootstrap latency distribution of a real script-loading worker.
 pub const DEFAULT_WORKER_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(5);
 
+/// PROVISIONAL health timing: no measurement of worker event-loop stall
+/// distributions under load exists yet. The cadence is how often the worker
+/// emits a health frame; the liveness deadline is how long the supervisor
+/// waits for one before declaring the worker dead, and must exceed the
+/// cadence.
+pub const DEFAULT_WORKER_HEALTH_CADENCE: Duration = Duration::from_secs(1);
+pub const DEFAULT_WORKER_LIVENESS_DEADLINE: Duration = Duration::from_secs(5);
+
+/// PROVISIONAL shutdown budget: how long an orderly shutdown waits for the
+/// worker's stop acknowledgement before the process group is killed anyway.
+pub const DEFAULT_WORKER_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Injectable supervision policy for the external GameScript worker.
 ///
 /// This is the single seam the serve lifecycle and tests configure; every
 /// limit the supervisor enforces on a worker process flows through it.
+/// Callers must keep `health_cadence` strictly below `liveness_deadline`;
+/// [`run_supervision_loop`] refuses a policy that violates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerSupervisionPolicy {
     resource_limits: WorkerResourceLimits,
     restart_limit: u32,
     bootstrap_deadline: Duration,
+    health_cadence: Duration,
+    liveness_deadline: Duration,
+    shutdown_deadline: Duration,
 }
 
 impl WorkerSupervisionPolicy {
@@ -118,6 +135,24 @@ impl WorkerSupervisionPolicy {
         self
     }
 
+    #[must_use]
+    pub fn with_health_cadence(mut self, health_cadence: Duration) -> Self {
+        self.health_cadence = health_cadence;
+        self
+    }
+
+    #[must_use]
+    pub fn with_liveness_deadline(mut self, liveness_deadline: Duration) -> Self {
+        self.liveness_deadline = liveness_deadline;
+        self
+    }
+
+    #[must_use]
+    pub fn with_shutdown_deadline(mut self, shutdown_deadline: Duration) -> Self {
+        self.shutdown_deadline = shutdown_deadline;
+        self
+    }
+
     pub fn resource_limits(&self) -> WorkerResourceLimits {
         self.resource_limits
     }
@@ -129,6 +164,18 @@ impl WorkerSupervisionPolicy {
     pub fn bootstrap_deadline(&self) -> Duration {
         self.bootstrap_deadline
     }
+
+    pub fn health_cadence(&self) -> Duration {
+        self.health_cadence
+    }
+
+    pub fn liveness_deadline(&self) -> Duration {
+        self.liveness_deadline
+    }
+
+    pub fn shutdown_deadline(&self) -> Duration {
+        self.shutdown_deadline
+    }
 }
 
 impl Default for WorkerSupervisionPolicy {
@@ -137,6 +184,9 @@ impl Default for WorkerSupervisionPolicy {
             resource_limits: WorkerResourceLimits::default(),
             restart_limit: DEFAULT_WORKER_RESTART_LIMIT,
             bootstrap_deadline: DEFAULT_WORKER_BOOTSTRAP_DEADLINE,
+            health_cadence: DEFAULT_WORKER_HEALTH_CADENCE,
+            liveness_deadline: DEFAULT_WORKER_LIVENESS_DEADLINE,
+            shutdown_deadline: DEFAULT_WORKER_SHUTDOWN_DEADLINE,
         }
     }
 }
@@ -277,13 +327,81 @@ impl RestartController {
         // A restarted worker is indistinguishable from a first boot: it gets
         // a fresh secret and must complete the same authenticated bootstrap,
         // so recovery can never hand back an unauthenticated worker.
+        self.boot().map(Some)
+    }
+
+    /// Boot the initial worker without charging the restart circuit breaker.
+    ///
+    /// First boot is not a recovery: a failure here is a startup error for
+    /// the caller to surface, not a restart-storm signal.
+    pub fn start(&mut self) -> io::Result<SupervisedWorker> {
+        let worker = self.boot()?;
+        self.breaker.record_healthy();
+        Ok(worker)
+    }
+
+    fn boot(&mut self) -> io::Result<SupervisedWorker> {
         let secret = fresh_bootstrap_secret()?;
         let mut worker =
             SupervisedWorker::spawn(&self.executable, &self.parent, &secret, &self.policy)?;
         let nonce = fresh_bootstrap_nonce()?;
         worker.authenticate(&secret, nonce.to_vec(), self.policy.bootstrap_deadline())?;
-        Ok(Some(worker))
+        Ok(worker)
     }
+}
+
+/// Drive continuous worker supervision until `stop` is set.
+///
+/// Boots the initial worker, then repeatedly enforces the policy liveness
+/// deadline: every cycle must observe a fresh worker health frame within it,
+/// otherwise the restart policy takes over (backoff, fresh-secret reboot,
+/// circuit breaker). Returns when `stop` is observed — after an orderly
+/// worker shutdown — or with an error when the breaker opens or the first
+/// boot fails. `healthy_cycles` is a monotone observability counter.
+///
+/// Cancellation latency is bounded by one liveness deadline plus, during
+/// recovery, the current restart backoff.
+pub fn run_supervision_loop(
+    controller: &mut RestartController,
+    stop: &std::sync::atomic::AtomicBool,
+    healthy_cycles: &std::sync::atomic::AtomicU64,
+) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let policy = *controller.policy();
+    if policy.health_cadence() >= policy.liveness_deadline() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker health cadence must stay below the liveness deadline",
+        ));
+    }
+    let mut active = Some(controller.start()?);
+    while !stop.load(Ordering::SeqCst) {
+        match controller.monitor_health(&mut active, policy.liveness_deadline()) {
+            Ok(true) => {
+                healthy_cycles.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(false) => {
+                return Err(io::Error::other(
+                    "worker restart circuit breaker is open; supervision halted",
+                ));
+            }
+            Err(error) => {
+                // A restart attempt failed to boot or authenticate. The
+                // breaker was already charged; keep looping so supervision
+                // either recovers or trips the breaker above.
+                tracing::warn!(error = %error, "external runtime worker restart attempt failed");
+            }
+        }
+    }
+    if let Some(mut worker) = active.take() {
+        if let Err(error) = worker.shutdown(policy.shutdown_deadline()) {
+            // The worker group was already killed by the failed shutdown
+            // path; an unacknowledged stop is not a supervision failure.
+            tracing::warn!(error = %error, "external runtime worker shutdown was not acknowledged");
+        }
+    }
+    Ok(())
 }
 
 pub struct SupervisedWorker {
@@ -325,6 +443,10 @@ impl SupervisedWorker {
             // secret, so an over-limit worker can never reach the protocol.
             .arg("--max-open-files")
             .arg(policy.resource_limits().max_open_files().to_string())
+            // How often the worker emits a health frame after readiness; the
+            // supervisor's liveness deadline is calibrated against it.
+            .arg("--health-cadence-ms")
+            .arg(policy.health_cadence().as_millis().to_string())
             // The worker must land in its own process group before exec so
             // every cleanup path can signal the whole group. Relying on the
             // worker to isolate itself would let a non-cooperating binary
@@ -434,7 +556,7 @@ impl SupervisedWorker {
                 .stream
                 .as_mut()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-            stream.set_read_timeout(Some(deadline))?;
+            let until = std::time::Instant::now() + deadline;
             stream.set_write_timeout(Some(deadline))?;
             write_control_frame(
                 stream,
@@ -445,21 +567,38 @@ impl SupervisedWorker {
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "worker shutdown write failed")
             })?;
-            match read_control_frame(stream).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "worker shutdown acknowledgement invalid",
-                )
-            })? {
-                ControlFrame::WorkerStopped { protocol_version }
-                    if protocol_version == PROTOCOL_VERSION =>
-                {
-                    Ok(())
+            // Health frames may already be in flight when shutdown begins;
+            // skip them (and only them) until the stop acknowledgement, all
+            // within the one overall deadline.
+            loop {
+                let remaining = until.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "worker shutdown acknowledgement timed out",
+                    ));
                 }
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "worker shutdown acknowledgement invalid",
-                )),
+                stream.set_read_timeout(Some(remaining))?;
+                match read_control_frame(stream).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "worker shutdown acknowledgement invalid",
+                    )
+                })? {
+                    ControlFrame::WorkerStopped { protocol_version }
+                        if protocol_version == PROTOCOL_VERSION =>
+                    {
+                        return Ok(());
+                    }
+                    ControlFrame::WorkerHealth { protocol_version }
+                        if protocol_version == PROTOCOL_VERSION => {}
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "worker shutdown acknowledgement invalid",
+                        ));
+                    }
+                }
             }
         })();
         // Even after a clean acknowledgement the group is signalled: the
@@ -809,6 +948,43 @@ mod tests {
         let first = super::fresh_bootstrap_secret().expect("first secret");
         let second = super::fresh_bootstrap_secret().expect("second secret");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn supervision_loop_rejects_a_cadence_at_or_above_liveness() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let mut controller = super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default()
+                .with_health_cadence(Duration::from_millis(100))
+                .with_liveness_deadline(Duration::from_millis(100)),
+        );
+        let error = super::run_supervision_loop(
+            &mut controller,
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+        )
+        .expect_err("a liveness deadline at or below the cadence cannot detect a hang");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn supervision_loop_requires_an_authenticated_first_boot() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let mut controller = super::RestartController::new(
+            PathBuf::from("/bin/true"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default()
+                .with_restart_limit(1)
+                .with_bootstrap_deadline(Duration::from_millis(50)),
+        );
+        let healthy_cycles = AtomicU64::new(0);
+        super::run_supervision_loop(&mut controller, &AtomicBool::new(false), &healthy_cycles)
+            .expect_err("an unauthenticated first boot is a startup failure");
+        assert_eq!(healthy_cycles.load(Ordering::SeqCst), 0);
     }
 
     #[test]

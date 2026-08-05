@@ -110,6 +110,10 @@ pub enum Command {
         /// before the bootstrap secret is read.
         #[arg(long)]
         max_open_files: u64,
+        /// How often (in milliseconds) the worker emits a health frame after
+        /// readiness; supplied by the supervisor's health policy.
+        #[arg(long)]
+        health_cadence_ms: u64,
     },
 }
 
@@ -144,6 +148,8 @@ mod tests {
             "42",
             "--max-open-files",
             "64",
+            "--health-cadence-ms",
+            "250",
         ])
         .expect("internal worker parses with endpoint");
         assert_eq!(
@@ -153,6 +159,7 @@ mod tests {
                 bootstrap_fd: 3,
                 parent_pid: 42,
                 max_open_files: 64,
+                health_cadence_ms: 250,
             }
         );
         assert!(Cli::try_parse_from(["citadel", "runtime-worker"]).is_err());
@@ -183,6 +190,22 @@ mod tests {
             ])
             .is_err(),
             "the resource policy is mandatory"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+                "--parent-pid",
+                "42",
+                "--max-open-files",
+                "64",
+            ])
+            .is_err(),
+            "the health cadence is mandatory"
         );
     }
 

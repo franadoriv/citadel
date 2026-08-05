@@ -63,12 +63,51 @@ fn ensure_supervising_parent(supervisor_pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Read one control frame, treating a receive-timeout as "no frame yet".
+///
+/// The socket read timeout doubles as the worker's health pacing. A timeout
+/// that fires mid-frame desynchronizes the stream, so any partial read fails
+/// closed on the next parse and the supervisor replaces the worker; in
+/// practice parent frames are tiny single-write messages.
+#[cfg(unix)]
+fn try_read_control_frame(
+    stream: &mut UnixStream,
+) -> Result<Option<citadel::runtime::worker_protocol::ControlFrame>> {
+    use std::io::Read;
+
+    let mut prefix = [0u8; 4];
+    match stream.read_exact(&mut prefix) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > citadel::runtime::worker_protocol::MAX_CONTROL_FRAME_BYTES {
+        anyhow::bail!("runtime worker received an oversized parent frame");
+    }
+    let mut payload = vec![0; length];
+    stream
+        .read_exact(&mut payload)
+        .context("runtime worker parent frame truncated")?;
+    citadel::runtime::worker_protocol::decode_frame(&payload)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent frame invalid"))
+}
+
 #[cfg(unix)]
 fn run_runtime_worker(
     endpoint: &str,
     bootstrap_fd: i32,
     parent_pid: u32,
     max_open_files: u64,
+    health_cadence_ms: u64,
 ) -> Result<()> {
     // Process-group isolation is owned by the supervisor, which places this
     // process in its own group pre-exec (see `SupervisedWorker::spawn`), so
@@ -118,18 +157,28 @@ fn run_runtime_worker(
         &citadel::runtime::worker_protocol::ControlFrame::WorkerReady { protocol_version },
     )
     .map_err(|_| anyhow::anyhow!("runtime worker readiness write failed"))?;
-    citadel::runtime::worker_protocol::write_control_frame(
-        &mut stream,
-        &citadel::runtime::worker_protocol::ControlFrame::WorkerHealth { protocol_version },
-    )
-    .map_err(|_| anyhow::anyhow!("runtime worker health write failed"))?;
-    match citadel::runtime::worker_protocol::read_control_frame(&mut stream)
-        .map_err(|_| anyhow::anyhow!("runtime worker shutdown frame invalid"))?
-    {
-        citadel::runtime::worker_protocol::ControlFrame::ParentShutdown {
-            protocol_version: shutdown_version,
-        } if shutdown_version == protocol_version => {}
-        _ => anyhow::bail!("runtime worker expected parent shutdown"),
+    // Health is a continuous signal: emit one frame per cadence until the
+    // parent orders shutdown. The read timeout provides the pacing — each
+    // cycle waits up to one cadence for a parent frame before reporting
+    // health again.
+    let cadence = std::time::Duration::from_millis(health_cadence_ms.max(1));
+    stream
+        .set_read_timeout(Some(cadence))
+        .context("runtime worker health pacing setup failed")?;
+    loop {
+        citadel::runtime::worker_protocol::write_control_frame(
+            &mut stream,
+            &citadel::runtime::worker_protocol::ControlFrame::WorkerHealth { protocol_version },
+        )
+        .map_err(|_| anyhow::anyhow!("runtime worker health write failed"))?;
+        match try_read_control_frame(&mut stream)? {
+            Some(citadel::runtime::worker_protocol::ControlFrame::ParentShutdown {
+                protocol_version: shutdown_version,
+            }) if shutdown_version == protocol_version => break,
+            Some(_) => anyhow::bail!("runtime worker expected parent shutdown"),
+            // No parent frame within one cadence: keep reporting health.
+            None => {}
+        }
     }
     citadel::runtime::worker_protocol::write_control_frame(
         &mut stream,
@@ -175,7 +224,14 @@ fn main() -> Result<()> {
             bootstrap_fd,
             parent_pid,
             max_open_files,
-        } => run_runtime_worker(&bootstrap_endpoint, bootstrap_fd, parent_pid, max_open_files),
+            health_cadence_ms,
+        } => run_runtime_worker(
+            &bootstrap_endpoint,
+            bootstrap_fd,
+            parent_pid,
+            max_open_files,
+            health_cadence_ms,
+        ),
         #[cfg(not(unix))]
         Command::RuntimeWorker { .. } => {
             anyhow::bail!("the runtime-worker subcommand requires a unix host")

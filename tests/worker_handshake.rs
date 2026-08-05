@@ -51,6 +51,34 @@ fn same_binary_worker_completes_authenticated_bootstrap() {
 }
 
 #[test]
+fn worker_reports_health_periodically_until_shutdown() {
+    let executable = Path::new(env!("CARGO_BIN_EXE_citadel"));
+    let secret = [13; 32];
+    let mut worker = SupervisedWorker::spawn(
+        executable,
+        &std::env::temp_dir(),
+        &secret,
+        &WorkerSupervisionPolicy::default(),
+    )
+    .expect("worker process starts");
+    worker
+        .authenticate(&secret, vec![6; 32], Duration::from_secs(2))
+        .expect("worker must complete the authenticated bootstrap");
+    // Health is a continuous signal, not a one-shot readiness echo: each
+    // check must observe a fresh report within the liveness deadline.
+    for cycle in 0..3 {
+        worker
+            .health_check(Duration::from_secs(2))
+            .unwrap_or_else(|error| {
+                panic!("worker must keep reporting health (cycle {cycle}): {error}")
+            });
+    }
+    worker
+        .shutdown(Duration::from_secs(2))
+        .expect("worker must acknowledge orderly shutdown");
+}
+
+#[test]
 fn worker_process_applies_supervised_resource_limits() {
     let executable = Path::new(env!("CARGO_BIN_EXE_citadel"));
     let secret = [11; 32];
