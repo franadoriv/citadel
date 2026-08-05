@@ -5361,6 +5361,12 @@ impl Gateway {
         let Some(members) = self.rooms.close(room_id) else {
             return 0;
         };
+        // Let a process-hosting runtime adapter release the match's execution
+        // context (a no-op for embedded adapters, and for a worker-initiated
+        // close whose context is already gone).
+        if let Some(runtime) = &self.runtime {
+            runtime.on_match_closed(room_id);
+        }
         tracing::warn!(
             room_id,
             members = members.len(),
@@ -5397,6 +5403,17 @@ impl Gateway {
             .into_iter()
             .map(|room| self.close_match(room.id))
             .sum()
+    }
+
+    /// Apply one external match's command batch, room-scoped exactly like an
+    /// embedded dispatch result (no excluded sender: the worker's fan-out
+    /// semantics are its own).
+    pub fn apply_external_match_commands(
+        &self,
+        room_id: RoomId,
+        commands: Vec<OutboundCommand>,
+    ) -> usize {
+        self.apply_commands_scoped(None, Some(room_id), commands)
     }
 
     /// Route a room frame (kinds 21-25).
@@ -5953,6 +5970,25 @@ impl Default for Gateway {
 #[must_use]
 pub fn shared() -> Arc<Gateway> {
     Arc::new(Gateway::new())
+}
+
+/// The gateway is where an external worker's match results land: command
+/// batches apply with room-scoped semantics, a worker-side closure becomes
+/// the standard server-side match close (requeue-hinted member notification +
+/// room prune). Every close reason maps to the same client-facing outcome by
+/// design; the distinct reasons stay in worker diagnostics.
+impl crate::runtime::external_worker::MatchCommandSink for Gateway {
+    fn apply_match_commands(&self, room_id: u64, commands: Vec<OutboundCommand>) -> usize {
+        self.apply_external_match_commands(room_id, commands)
+    }
+
+    fn on_match_closed(
+        &self,
+        room_id: u64,
+        _reason: crate::runtime::worker_data_protocol::MatchCloseReason,
+    ) {
+        self.close_match(room_id);
+    }
 }
 
 impl PlayerNotificationDelivery for Gateway {
@@ -6520,6 +6556,67 @@ mod transform_tests {
         assert_eq!(gw.rooms().room_of(b), None);
         // Closing an already-closed match delivers nothing.
         assert_eq!(gw.close_match(room_id), 0);
+    }
+
+    #[tokio::test]
+    async fn external_worker_sink_applies_room_scoped_commands_and_closes() {
+        use crate::runtime::external_worker::MatchCommandSink;
+        use citadel_wire::protocol::KIND_MATCH_CLOSED;
+        use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined};
+
+        let gw = Gateway::new();
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"M".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
+            .unwrap()
+            .room_id;
+        let (b, mut rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+        );
+        let _ = rb.recv().await; // B's ROOM_JOINED
+        // A third participant outside the room must not see the broadcast.
+        let (_c, mut rc) = register(&gw);
+
+        // A worker command batch applies with room-scoped semantics.
+        let delivered = MatchCommandSink::apply_match_commands(
+            &gw,
+            room_id,
+            vec![OutboundCommand::Broadcast {
+                kind: 40,
+                body: b"state".to_vec(),
+                unreliable: false,
+            }],
+        );
+        assert_eq!(delivered, 2, "both room members receive the broadcast");
+        for receiver in [&mut ra, &mut rb] {
+            let outbound = receiver.recv().await.expect("room broadcast delivered");
+            assert_eq!(outbound.envelope.kind, 40);
+            assert_eq!(outbound.envelope.body.as_ref(), b"state");
+        }
+        assert!(rc.try_recv().is_err(), "outsiders receive nothing");
+
+        // A worker-side closure becomes the standard server-side close.
+        MatchCommandSink::on_match_closed(
+            &gw,
+            room_id,
+            crate::runtime::worker_data_protocol::MatchCloseReason::ServerError,
+        );
+        for receiver in [&mut ra, &mut rb] {
+            let outbound = receiver.recv().await.expect("MATCH_CLOSED delivered");
+            assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
+        }
+        assert_eq!(gw.rooms().room_count(), 0, "the room is pruned");
     }
 
     #[tokio::test]

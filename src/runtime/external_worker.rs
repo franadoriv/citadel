@@ -38,6 +38,12 @@ use crate::runtime::worker_data_protocol::{
 
 use super::Runtime;
 
+/// PROVISIONAL round cadence used when `runtime.tick_hz` is disabled: the
+/// worker still needs a scheduler cadence to drain match mailboxes and run
+/// the layered watchdog. Replace once the latency distribution of real
+/// multiplexed-match dispatch under the external adapter has been measured.
+pub const DEFAULT_MATCH_ROUND_CADENCE_MS: u64 = 25;
+
 /// Everything the worker process needs to host the deployment's one script.
 ///
 /// Built by the transport layer from the resolved runtime selection and
@@ -543,6 +549,13 @@ impl Runtime for ExternalWorkerRuntime {
     fn tick(&self, _dt: Duration, _budget: Duration) -> Vec<OutboundCommand> {
         // The worker ticks its matches on its own scheduler cadence.
         Vec::new()
+    }
+
+    fn on_match_closed(&self, room_id: u64) {
+        // The gateway closed the match (or is echoing a worker-initiated
+        // close, in which case the transmit state is already gone and this
+        // is a no-op): tell the worker to release the execution context.
+        self.notify_match_closed(room_id);
     }
 
     fn call_rpc(

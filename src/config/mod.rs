@@ -830,10 +830,11 @@ pub struct RuntimeConfig {
     /// Explicit runtime language. `None` means autodetect from `scripts_dir`.
     pub language: Option<RuntimeLanguage>,
     /// Runtime hosting adapter. `embedded` executes game scripts in-process.
-    /// `external-worker` (unix and windows) spawns and supervises the runtime
-    /// worker process from the serve lifecycle but does not execute game
-    /// scripts yet; a present script entrypoint is rejected under it. `wasm`
-    /// is not implemented.
+    /// `external-worker` (unix and windows) executes them in a supervised
+    /// worker process instead: matches run in per-match engine contexts over
+    /// the authenticated data plane, while the match-independent surface
+    /// (global messages, RPC, lifecycle hooks) is not routed to the worker
+    /// yet. `wasm` is not implemented.
     pub adapter: RuntimeAdapter,
     /// Runtime trust tier. Only `trusted` is implemented today.
     pub tier: RuntimeTier,
@@ -2136,9 +2137,8 @@ impl RuntimeConfig {
         match self.adapter {
             RuntimeAdapter::Embedded => {}
             // The serve lifecycle spawns and supervises the worker process on
-            // unix and windows. Script execution inside the worker is not
-            // implemented yet; `resolve_selection` rejects a script entrypoint
-            // under this adapter so scripts are never silently ignored.
+            // unix and windows; a present script entrypoint is executed
+            // inside it through the match data plane.
             #[cfg(any(unix, windows))]
             RuntimeAdapter::ExternalWorker => {}
             #[cfg(not(any(unix, windows)))]
@@ -2177,19 +2177,6 @@ impl RuntimeConfig {
             Some(language) => self.resolve_explicit_selection(scripts_dir, language),
             None => self.resolve_autodetected_selection(scripts_dir),
         }?;
-        // The external-worker adapter supervises a worker process from the
-        // serve lifecycle but does not execute game scripts yet. A present
-        // entrypoint is a hard error so the operator's script is never
-        // silently ignored.
-        if self.adapter == RuntimeAdapter::ExternalWorker
-            && let Some(selection) = &selection
-        {
-            return Err(AppError::config(format!(
-                "runtime.adapter 'external-worker' does not execute game scripts yet; \
-                 use 'embedded' to run {}",
-                selection.entrypoint.display()
-            )));
-        }
         Ok(selection)
     }
 
@@ -2861,7 +2848,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn external_worker_adapter_rejects_a_script_entrypoint() {
+    fn external_worker_adapter_accepts_a_script_entrypoint() {
         let dir = unique_temp_dir("runtime-external-worker-script");
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("main.lua"), "-- lua").expect("main.lua");
@@ -2870,11 +2857,12 @@ mod tests {
             scripts_dir: dir.to_string_lossy().into_owned(),
             ..RuntimeConfig::default()
         };
-        let err = rc
+        let selection = rc
             .resolve_selection()
-            .expect_err("a script under external-worker must not be silently ignored");
-        assert_eq!(err.category(), crate::error::ErrorCategory::Config);
-        assert!(err.message().contains("does not execute game scripts"));
+            .expect("a script under external-worker resolves")
+            .expect("the entrypoint is selected");
+        assert_eq!(selection.adapter, RuntimeAdapter::ExternalWorker);
+        assert_eq!(selection.language, RuntimeLanguage::Lua);
         std::fs::remove_dir_all(&dir).ok();
     }
 

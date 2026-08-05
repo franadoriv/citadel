@@ -270,6 +270,13 @@ pub trait Runtime: Send + Sync + 'static {
         self.tick(dt, budget)
     }
 
+    /// Observe a server-side match closure so a process-hosting adapter can
+    /// release the match's execution context. The default preserves embedded
+    /// adapters, whose per-match state lives with the gateway's rooms.
+    fn on_match_closed(&self, room_id: u64) {
+        let _ = room_id;
+    }
+
     /// Run the RPC handler for `method`.
     fn call_rpc(&self, sender: u64, user_id: Option<&str>, method: &str, body: &[u8])
     -> RpcOutcome;
