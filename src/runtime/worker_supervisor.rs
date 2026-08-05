@@ -39,6 +39,12 @@ pub fn fresh_bootstrap_secret() -> io::Result<[u8; 32]> {
     Ok(secret)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryStatus {
+    Available,
+    CircuitOpen,
+}
+
 pub struct RestartCircuitBreaker {
     limit: u32,
     failures: u32,
@@ -68,6 +74,14 @@ impl RestartCircuitBreaker {
 
     pub fn record_healthy(&mut self) {
         self.failures = 0;
+    }
+
+    pub fn status(&self) -> RecoveryStatus {
+        if self.is_open() {
+            RecoveryStatus::CircuitOpen
+        } else {
+            RecoveryStatus::Available
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -336,6 +350,14 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_status_reports_open_circuit_as_unavailable() {
+        let mut breaker = super::RestartCircuitBreaker::new(1);
+        assert_eq!(breaker.status(), super::RecoveryStatus::Available);
+        assert_eq!(breaker.next_restart_delay(), None);
+        assert_eq!(breaker.status(), super::RecoveryStatus::CircuitOpen);
+    }
+
     #[test]
     fn monitor_health_keeps_unavailable_worker_fail_closed() {
         let mut controller =

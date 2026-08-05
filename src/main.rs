@@ -21,7 +21,22 @@ use citadel::startup::{self, StdioPrompt, WizardPaths, WizardReport};
 use citadel::{App, error_reporting, http, observability};
 
 #[cfg(unix)]
+fn configure_parent_death_signal() -> Result<()> {
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|_| anyhow::anyhow!("runtime worker parent-death signal setup failed"))
+}
+
+#[cfg(unix)]
+fn isolate_process_group() -> Result<()> {
+    let pid = nix::unistd::getpid();
+    nix::unistd::setpgid(pid, pid)
+        .map_err(|_| anyhow::anyhow!("runtime worker process group setup failed"))
+}
+
+#[cfg(unix)]
 fn run_runtime_worker(endpoint: &str, bootstrap_fd: i32) -> Result<()> {
+    isolate_process_group()?;
+    configure_parent_death_signal()?;
     let secret = citadel::runtime::worker_bootstrap::read_secret_from_fd(bootstrap_fd)
         .context("runtime worker bootstrap secret unavailable")?;
     let mut stream =
@@ -196,5 +211,19 @@ fn print_wizard_summary(report: &WizardReport, paths: &WizardPaths) {
     }
     if report.made_changes() {
         let _ = writeln!(out);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn worker_configures_parent_death_signal() {
+        let original = nix::sys::prctl::get_pdeathsig().expect("read original signal");
+        super::configure_parent_death_signal().expect("configure signal");
+        assert_eq!(
+            nix::sys::prctl::get_pdeathsig().expect("read configured signal"),
+            Some(nix::sys::signal::Signal::SIGKILL)
+        );
+        nix::sys::prctl::set_pdeathsig(original).expect("restore original signal");
     }
 }
