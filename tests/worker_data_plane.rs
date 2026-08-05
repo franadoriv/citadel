@@ -19,6 +19,8 @@ use citadel::runtime::worker_supervisor::{
     RestartController, SupervisedWorker, WorkerDataPlaneBridge, WorkerSupervisionPolicy,
 };
 
+mod common;
+
 /// Counter script: kind 1 answers with a per-match running count; kind 2 is a
 /// non-yielding pure Lua loop bounded only by the engine's deadline hook.
 const COUNTER_SCRIPT: &str = r#"
@@ -280,6 +282,147 @@ fn worker_crash_replacement_never_resumes_matches() {
         .expect("replacement worker")
         .shutdown(Duration::from_secs(5))
         .expect("orderly shutdown");
+}
+
+/// The full stack, end to end: a real WebSocket client joins a real gateway
+/// whose runtime is the external-worker adapter, the script executes in a
+/// real spawned worker process over the real IPC transport, and when the
+/// client's match wedges in a non-yielding loop the client itself receives
+/// the reliable `KIND_MATCH_CLOSED` carrying the requeue hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
+    use citadel::observability::NodeMetrics;
+    use citadel::realtime::{Authenticator, Gateway};
+    use citadel::transport::codec::Envelope;
+    use citadel::transport::websocket::WebSocketServer;
+    use citadel_wire::protocol::{KIND_MATCH_CLOSED, KIND_ROOM_CREATE, KIND_ROOM_JOINED};
+    use citadel_wire::room::{MATCH_CLOSE_REASON_SERVER_ERROR, MatchClosed, RoomCreate, RoomJoined};
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let script = ScriptDir::create("data-plane-full-stack", COUNTER_SCRIPT);
+    let runtime = Arc::new(
+        ExternalWorkerRuntime::load(WorkerScriptSpec {
+            language: RuntimeLanguage::Lua,
+            entrypoint: script.entrypoint(),
+            deadline_ms: 30,
+            tick_ms: 10,
+        })
+        .expect("load adapter"),
+    );
+    let gateway = Arc::new(Gateway::with_metrics_runtime_auth(
+        Arc::new(NodeMetrics::new()),
+        Some(Arc::clone(&runtime) as Arc<dyn Runtime>),
+        Authenticator::guest_only(),
+    ));
+    runtime.attach_sink(Arc::downgrade(&gateway) as Weak<dyn MatchCommandSink>);
+
+    // Boot the real worker process (blocking accept + handshake).
+    let controller_runtime = Arc::clone(&runtime);
+    let (mut controller, mut worker) = tokio::task::spawn_blocking(move || {
+        let mut controller = RestartController::new(
+            PathBuf::from(env!("CARGO_BIN_EXE_citadel")),
+            std::env::temp_dir(),
+            WorkerSupervisionPolicy::default().with_restart_limit(3),
+        )
+        .with_data_plane(WorkerDataPlaneBridge::new(controller_runtime));
+        let worker = controller.start().expect("boot script worker");
+        (controller, worker)
+    })
+    .await
+    .expect("worker boots");
+
+    // Real WebSocket transport on the same gateway.
+    let ws_server = WebSocketServer::bind_with_gateway(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        Arc::clone(&gateway),
+    )
+    .await
+    .expect("bind ws");
+    let ws_addr = ws_server.local_addr();
+    let mut supervisor = citadel::lifecycle::Supervisor::new();
+    supervisor.spawn(ws_server);
+
+    let (mut ws, _resp) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(format!("ws://{ws_addr}/")),
+    )
+    .await
+    .expect("ws connect did not time out")
+    .expect("ws connected");
+    common::ws_guest_handshake(&mut ws).await;
+
+    // Create the match room; the gateway echoes ROOM_JOINED with its id.
+    ws.send(Message::Binary(
+        Envelope::new(
+            KIND_ROOM_CREATE,
+            RoomCreate {
+                params: b"Arena".to_vec(),
+            }
+            .encode(),
+        )
+        .encode_framed()
+        .to_vec(),
+    ))
+    .await
+    .expect("send room create");
+    let joined = loop {
+        let envelope = common::decode_one(&common::ws_next_binary(&mut ws).await);
+        if envelope.kind == KIND_ROOM_JOINED {
+            break RoomJoined::decode(&envelope.body).expect("room joined decodes");
+        }
+    };
+
+    // First prove the script answers this member through the whole stack.
+    ws.send(Message::Binary(
+        Envelope::new(1, b"ping".to_vec()).encode_framed().to_vec(),
+    ))
+    .await
+    .expect("send counter event");
+    let answer = loop {
+        let envelope = common::decode_one(&common::ws_next_binary(&mut ws).await);
+        if envelope.kind == 99 {
+            break envelope;
+        }
+    };
+    assert_eq!(
+        answer.body.as_ref(),
+        b"1",
+        "the per-match Lua counter answers over the full stack"
+    );
+
+    // Now wedge the match: enough non-yielding invocations to exhaust the
+    // overrun policy. The member must receive the requeue-hinted close.
+    for _ in 0..3 {
+        ws.send(Message::Binary(
+            Envelope::new(2, Vec::new()).encode_framed().to_vec(),
+        ))
+        .await
+        .expect("send poison event");
+    }
+    let closed = loop {
+        let envelope = common::decode_one(&common::ws_next_binary(&mut ws).await);
+        if envelope.kind == KIND_MATCH_CLOSED {
+            break MatchClosed::decode(&envelope.body).expect("match closed decodes");
+        }
+    };
+    assert_eq!(closed.room_id, joined.room_id);
+    assert_eq!(closed.reason, MATCH_CLOSE_REASON_SERVER_ERROR);
+    assert!(
+        closed.requeue_hint,
+        "the member is prompted to requeue for a new match"
+    );
+
+    ws.close(None).await.ok();
+    supervisor.shutdown().await.expect("ws shutdown");
+    tokio::task::spawn_blocking(move || {
+        worker
+            .shutdown(Duration::from_secs(5))
+            .expect("orderly worker shutdown");
+        drop(controller);
+    })
+    .await
+    .expect("worker shutdown");
 }
 
 #[test]
