@@ -41,6 +41,12 @@ pub fn fresh_bootstrap_secret() -> io::Result<[u8; 32]> {
     Ok(secret)
 }
 
+pub fn fresh_bootstrap_nonce() -> io::Result<[u8; 32]> {
+    let mut nonce = [0; 32];
+    getrandom::fill(&mut nonce).map_err(|_| io::Error::other("bootstrap entropy unavailable"))?;
+    Ok(nonce)
+}
+
 pub const DEFAULT_WORKER_MAX_OPEN_FILES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +83,11 @@ impl Default for WorkerResourceLimits {
 /// measured in a real deployment.
 pub const DEFAULT_WORKER_RESTART_LIMIT: u32 = 5;
 
+/// PROVISIONAL bootstrap budget: no measurement of worker spawn-to-ready
+/// latency exists yet. Replace once the readiness investigation captures the
+/// bootstrap latency distribution of a real script-loading worker.
+pub const DEFAULT_WORKER_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Injectable supervision policy for the external GameScript worker.
 ///
 /// This is the single seam the serve lifecycle and tests configure; every
@@ -85,6 +96,7 @@ pub const DEFAULT_WORKER_RESTART_LIMIT: u32 = 5;
 pub struct WorkerSupervisionPolicy {
     resource_limits: WorkerResourceLimits,
     restart_limit: u32,
+    bootstrap_deadline: Duration,
 }
 
 impl WorkerSupervisionPolicy {
@@ -100,12 +112,22 @@ impl WorkerSupervisionPolicy {
         self
     }
 
+    #[must_use]
+    pub fn with_bootstrap_deadline(mut self, bootstrap_deadline: Duration) -> Self {
+        self.bootstrap_deadline = bootstrap_deadline;
+        self
+    }
+
     pub fn resource_limits(&self) -> WorkerResourceLimits {
         self.resource_limits
     }
 
     pub fn restart_limit(&self) -> u32 {
         self.restart_limit
+    }
+
+    pub fn bootstrap_deadline(&self) -> Duration {
+        self.bootstrap_deadline
     }
 }
 
@@ -114,6 +136,7 @@ impl Default for WorkerSupervisionPolicy {
         Self {
             resource_limits: WorkerResourceLimits::default(),
             restart_limit: DEFAULT_WORKER_RESTART_LIMIT,
+            bootstrap_deadline: DEFAULT_WORKER_BOOTSTRAP_DEADLINE,
         }
     }
 }
@@ -239,6 +262,9 @@ impl RestartController {
         if !exited {
             return Ok(false);
         }
+        // The exited worker is gone either way; drop it before the restart
+        // attempt so a failed replacement never leaves a dead worker active.
+        let _ = active.take();
         *active = self.restart_after_failure()?;
         Ok(active.is_some())
     }
@@ -248,8 +274,15 @@ impl RestartController {
             return Ok(None);
         };
         std::thread::sleep(delay);
+        // A restarted worker is indistinguishable from a first boot: it gets
+        // a fresh secret and must complete the same authenticated bootstrap,
+        // so recovery can never hand back an unauthenticated worker.
         let secret = fresh_bootstrap_secret()?;
-        SupervisedWorker::spawn(&self.executable, &self.parent, &secret, &self.policy).map(Some)
+        let mut worker =
+            SupervisedWorker::spawn(&self.executable, &self.parent, &secret, &self.policy)?;
+        let nonce = fresh_bootstrap_nonce()?;
+        worker.authenticate(&secret, nonce.to_vec(), self.policy.bootstrap_deadline())?;
+        Ok(Some(worker))
     }
 }
 
@@ -714,12 +747,13 @@ mod tests {
     }
 
     #[test]
-    fn controller_replaces_an_exited_active_worker() {
-        let mut controller =
-            super::RestartController::new(
+    fn exited_worker_is_removed_even_when_the_restart_fails() {
+        let mut controller = super::RestartController::new(
             PathBuf::from("/bin/true"),
             std::env::temp_dir(),
-            super::WorkerSupervisionPolicy::default().with_restart_limit(2),
+            super::WorkerSupervisionPolicy::default()
+                .with_restart_limit(2)
+                .with_bootstrap_deadline(Duration::from_millis(50)),
         );
         let mut active = Some(
             SupervisedWorker::spawn(
@@ -728,25 +762,30 @@ mod tests {
                 &[4; 32],
                 &WorkerSupervisionPolicy::default(),
             )
-                .expect("spawn"),
+            .expect("spawn"),
         );
         std::thread::sleep(Duration::from_millis(10));
-        assert!(controller.recover_if_exited(&mut active).expect("recover"));
-        assert!(active.is_some());
+        // The replacement fixture cannot authenticate, so recovery must fail
+        // closed: the dead worker is removed and no unauthenticated
+        // replacement is handed back.
+        assert!(controller.recover_if_exited(&mut active).is_err());
+        assert!(active.is_none());
     }
 
     #[test]
-    fn controller_restarts_before_breaker_limit() {
-        let mut controller =
-            super::RestartController::new(
+    fn restart_attempt_fails_closed_without_authentication() {
+        let mut controller = super::RestartController::new(
             PathBuf::from("/bin/true"),
             std::env::temp_dir(),
-            super::WorkerSupervisionPolicy::default().with_restart_limit(2),
+            super::WorkerSupervisionPolicy::default()
+                .with_restart_limit(2)
+                .with_bootstrap_deadline(Duration::from_millis(50)),
         );
-        let _worker = controller
-            .restart_after_failure()
-            .expect("restart")
-            .expect("permitted restart");
+        // The breaker permits this restart, but the fixture never completes
+        // the handshake: the controller must surface an error instead of an
+        // unauthenticated worker (the authenticated restart path is covered
+        // by the worker_handshake integration test against the real binary).
+        assert!(controller.restart_after_failure().is_err());
     }
 
     #[test]
@@ -769,6 +808,13 @@ mod tests {
     fn restart_secrets_are_fresh_32_byte_values() {
         let first = super::fresh_bootstrap_secret().expect("first secret");
         let second = super::fresh_bootstrap_secret().expect("second secret");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn restart_nonces_are_fresh_32_byte_values() {
+        let first = super::fresh_bootstrap_nonce().expect("first nonce");
+        let second = super::fresh_bootstrap_nonce().expect("second nonce");
         assert_ne!(first, second);
     }
 

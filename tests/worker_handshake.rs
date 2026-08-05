@@ -3,8 +3,28 @@
 use std::{path::Path, time::Duration};
 
 use citadel::runtime::worker_supervisor::{
-    SupervisedWorker, WorkerResourceLimits, WorkerSupervisionPolicy,
+    RestartController, SupervisedWorker, WorkerResourceLimits, WorkerSupervisionPolicy,
 };
+
+#[test]
+fn restarted_worker_completes_a_fresh_authenticated_handshake() {
+    let executable = Path::new(env!("CARGO_BIN_EXE_citadel")).to_path_buf();
+    let mut controller = RestartController::new(
+        executable,
+        std::env::temp_dir(),
+        WorkerSupervisionPolicy::default().with_restart_limit(3),
+    );
+    let mut worker = controller
+        .restart_after_failure()
+        .expect("restart must boot a replacement worker")
+        .expect("restart permitted below the breaker limit");
+    // A restarted worker must have completed the same fresh-secret handshake
+    // as a first boot; an unauthenticated replacement has no control stream
+    // and can neither report health nor be shut down.
+    worker
+        .health_check(Duration::from_secs(2))
+        .expect("a restarted worker must be authenticated and reporting health");
+}
 
 #[test]
 fn same_binary_worker_completes_authenticated_bootstrap() {
