@@ -277,8 +277,8 @@ impl EngineLoop {
 /// on the same file object, so the Windows source must peek before
 /// committing to a read (the same discipline the control plane uses).
 pub trait FrameSource: Send + 'static {
-    /// Block until the next frame arrives; an error ends the stream.
-    fn read_frame(&mut self) -> Result<DataFrame, ()>;
+    /// Block until the next frame arrives; `None` ends the stream.
+    fn read_frame(&mut self) -> Option<DataFrame>;
 }
 
 /// Drive one worker generation's data plane over a connected byte stream.
@@ -318,7 +318,7 @@ pub fn run_worker_data_plane<S, W>(
         .name("citadel-worker-data-rx".to_owned())
         .spawn(move || {
             let mut source = source;
-            while let Ok(frame) = source.read_frame() {
+            while let Some(frame) = source.read_frame() {
                 if frame_tx.send(frame).is_err() {
                     break;
                 }

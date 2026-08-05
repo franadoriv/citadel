@@ -243,8 +243,8 @@ struct UnixFrameSource(UnixStream);
 
 #[cfg(unix)]
 impl citadel::runtime::worker_engine::FrameSource for UnixFrameSource {
-    fn read_frame(&mut self) -> Result<citadel::runtime::worker_data_protocol::DataFrame, ()> {
-        citadel::runtime::worker_data_protocol::read_data_frame(&mut self.0).map_err(|_| ())
+    fn read_frame(&mut self) -> Option<citadel::runtime::worker_data_protocol::DataFrame> {
+        citadel::runtime::worker_data_protocol::read_data_frame(&mut self.0).ok()
     }
 }
 
@@ -259,13 +259,11 @@ struct PipeFrameSource(std::fs::File);
 
 #[cfg(windows)]
 impl citadel::runtime::worker_engine::FrameSource for PipeFrameSource {
-    fn read_frame(&mut self) -> Result<citadel::runtime::worker_data_protocol::DataFrame, ()> {
+    fn read_frame(&mut self) -> Option<citadel::runtime::worker_data_protocol::DataFrame> {
         loop {
-            let available =
-                citadel_win_proc::named_pipe_bytes_available(&self.0).map_err(|_| ())?;
+            let available = citadel_win_proc::named_pipe_bytes_available(&self.0).ok()?;
             if available >= 4 {
-                return citadel::runtime::worker_data_protocol::read_data_frame(&mut self.0)
-                    .map_err(|_| ());
+                return citadel::runtime::worker_data_protocol::read_data_frame(&mut self.0).ok();
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
