@@ -231,6 +231,300 @@ pub fn read_data_frame(stream: &mut impl std::io::Read) -> Result<DataFrame, Pro
     decode_data_frame(&payload)
 }
 
+/// Async twin of [`write_data_frame`], byte-for-byte identical on the wire.
+///
+/// The parent pumps the data plane through tokio (the Windows named-pipe
+/// transport is async-only) while the worker writes frames synchronously;
+/// both variants share the encoder and the symmetric fail-closed size cap.
+pub async fn write_data_frame_async<W>(
+    stream: &mut W,
+    frame: &DataFrame,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let payload = encode_data_frame(frame)?;
+    if payload.len() > MAX_DATA_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)
+}
+
+/// Async twin of [`read_data_frame`] with the same fail-closed limits.
+pub async fn read_data_frame_async<R>(stream: &mut R) -> Result<DataFrame, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut prefix = [0; 4];
+    stream
+        .read_exact(&mut prefix)
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > MAX_DATA_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    let mut payload = vec![0; length];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| ProtocolError::MalformedFrame)?;
+    decode_data_frame(&payload)
+}
+
+/// Serializable twin of the runtime's collision shape.
+///
+/// The physics types live in `citadel-physics`, which deliberately carries no
+/// serde dependency; the data plane keeps its own wire twins instead of
+/// leaking a serialization format into the physics crate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum WireShape {
+    Capsule { radius: f32, height: f32 },
+    Aabb { half_extents: [f32; 3] },
+}
+
+/// Serializable twin of [`crate::runtime::PhysicsOptions`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct WirePhysicsOptions {
+    enabled: bool,
+    shape: WireShape,
+    gravity: f32,
+    buoyancy: f32,
+    drag: f32,
+    max_speed: f32,
+}
+
+impl From<crate::runtime::PhysicsOptions> for WirePhysicsOptions {
+    fn from(opts: crate::runtime::PhysicsOptions) -> Self {
+        Self {
+            enabled: opts.enabled,
+            shape: match opts.config.shape {
+                citadel_physics::Shape::Capsule { radius, height } => {
+                    WireShape::Capsule { radius, height }
+                }
+                citadel_physics::Shape::Aabb { half_extents } => WireShape::Aabb { half_extents },
+            },
+            gravity: opts.config.gravity,
+            buoyancy: opts.config.buoyancy,
+            drag: opts.config.drag,
+            max_speed: opts.config.max_speed,
+        }
+    }
+}
+
+impl From<WirePhysicsOptions> for crate::runtime::PhysicsOptions {
+    fn from(opts: WirePhysicsOptions) -> Self {
+        Self {
+            enabled: opts.enabled,
+            config: citadel_physics::PhysicsConfig {
+                shape: match opts.shape {
+                    WireShape::Capsule { radius, height } => {
+                        citadel_physics::Shape::Capsule { radius, height }
+                    }
+                    WireShape::Aabb { half_extents } => citadel_physics::Shape::Aabb { half_extents },
+                },
+                gravity: opts.gravity,
+                buoyancy: opts.buoyancy,
+                drag: opts.drag,
+                max_speed: opts.max_speed,
+            },
+        }
+    }
+}
+
+/// Serializable twin of [`crate::runtime::OutboundCommand`], carried opaquely
+/// in [`DataFrame::MatchCommands`]. The variants mirror the runtime command
+/// surface one-to-one so the gateway applies exactly what the worker's match
+/// produced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum WireCommand {
+    Broadcast {
+        kind: u16,
+        body: Vec<u8>,
+        unreliable: bool,
+    },
+    Send {
+        session: u64,
+        kind: u16,
+        body: Vec<u8>,
+        unreliable: bool,
+    },
+    SpawnActor {
+        object_id: u32,
+        archetype: u16,
+        position: [f32; 3],
+    },
+    MoveActor {
+        object_id: u32,
+        position: [f32; 3],
+        rotation: [f32; 4],
+        velocity: [f32; 3],
+    },
+    SetPhysics {
+        object_id: u32,
+        opts: Option<WirePhysicsOptions>,
+    },
+    ApplyImpulse {
+        object_id: u32,
+        impulse: [f32; 3],
+    },
+    SetMoveIntent {
+        object_id: u32,
+        intent: [f32; 3],
+    },
+    DespawnActor {
+        object_id: u32,
+    },
+}
+
+impl From<crate::runtime::OutboundCommand> for WireCommand {
+    fn from(command: crate::runtime::OutboundCommand) -> Self {
+        use crate::runtime::OutboundCommand as Cmd;
+        match command {
+            Cmd::Broadcast {
+                kind,
+                body,
+                unreliable,
+            } => Self::Broadcast {
+                kind,
+                body,
+                unreliable,
+            },
+            Cmd::Send {
+                session,
+                kind,
+                body,
+                unreliable,
+            } => Self::Send {
+                session,
+                kind,
+                body,
+                unreliable,
+            },
+            Cmd::SpawnActor {
+                object_id,
+                archetype,
+                position,
+            } => Self::SpawnActor {
+                object_id,
+                archetype,
+                position,
+            },
+            Cmd::MoveActor {
+                object_id,
+                position,
+                rotation,
+                velocity,
+            } => Self::MoveActor {
+                object_id,
+                position,
+                rotation,
+                velocity,
+            },
+            Cmd::SetPhysics { object_id, opts } => Self::SetPhysics {
+                object_id,
+                opts: opts.map(WirePhysicsOptions::from),
+            },
+            Cmd::ApplyImpulse { object_id, impulse } => Self::ApplyImpulse { object_id, impulse },
+            Cmd::SetMoveIntent { object_id, intent } => Self::SetMoveIntent { object_id, intent },
+            Cmd::DespawnActor { object_id } => Self::DespawnActor { object_id },
+        }
+    }
+}
+
+impl From<WireCommand> for crate::runtime::OutboundCommand {
+    fn from(command: WireCommand) -> Self {
+        match command {
+            WireCommand::Broadcast {
+                kind,
+                body,
+                unreliable,
+            } => Self::Broadcast {
+                kind,
+                body,
+                unreliable,
+            },
+            WireCommand::Send {
+                session,
+                kind,
+                body,
+                unreliable,
+            } => Self::Send {
+                session,
+                kind,
+                body,
+                unreliable,
+            },
+            WireCommand::SpawnActor {
+                object_id,
+                archetype,
+                position,
+            } => Self::SpawnActor {
+                object_id,
+                archetype,
+                position,
+            },
+            WireCommand::MoveActor {
+                object_id,
+                position,
+                rotation,
+                velocity,
+            } => Self::MoveActor {
+                object_id,
+                position,
+                rotation,
+                velocity,
+            },
+            WireCommand::SetPhysics { object_id, opts } => Self::SetPhysics {
+                object_id,
+                opts: opts.map(crate::runtime::PhysicsOptions::from),
+            },
+            WireCommand::ApplyImpulse { object_id, impulse } => {
+                Self::ApplyImpulse { object_id, impulse }
+            }
+            WireCommand::SetMoveIntent { object_id, intent } => {
+                Self::SetMoveIntent { object_id, intent }
+            }
+            WireCommand::DespawnActor { object_id } => Self::DespawnActor { object_id },
+        }
+    }
+}
+
+/// Encode one invocation's command batch for [`DataFrame::MatchCommands`].
+pub fn encode_commands(
+    commands: &[crate::runtime::OutboundCommand],
+) -> Result<Vec<u8>, ProtocolError> {
+    let wire: Vec<WireCommand> = commands.iter().cloned().map(WireCommand::from).collect();
+    serde_json::to_vec(&wire).map_err(|_| ProtocolError::MalformedFrame)
+}
+
+/// Decode a [`DataFrame::MatchCommands`] batch, rejecting oversized payloads
+/// before parsing (the same fail-closed bound as the frame itself).
+pub fn decode_commands(
+    bytes: &[u8],
+) -> Result<Vec<crate::runtime::OutboundCommand>, ProtocolError> {
+    if bytes.len() > MAX_DATA_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    let wire: Vec<WireCommand> =
+        serde_json::from_slice(bytes).map_err(|_| ProtocolError::MalformedFrame)?;
+    Ok(wire
+        .into_iter()
+        .map(crate::runtime::OutboundCommand::from)
+        .collect())
+}
+
 /// Why [`DataPlaneRx`] rejected a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RxRejection {
@@ -355,6 +649,8 @@ impl DataPlaneRx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::runtime::{OutboundCommand, PhysicsOptions};
 
     fn header(match_id: u64, epoch: u64, seq: u64) -> FrameHeader {
         FrameHeader {
@@ -522,6 +818,143 @@ mod tests {
         assert_eq!(rx.accept(&event(1, 2, 1)), Ok(()));
         assert_eq!(rx.counters().stale_epoch, 1);
         assert_eq!(rx.counters().unknown_match, 1);
+    }
+
+    #[test]
+    fn every_outbound_command_round_trips_through_the_wire_codec() {
+        // One of each `OutboundCommand` variant: the wire twin must preserve
+        // the full command surface so the gateway applies exactly what the
+        // worker's match produced.
+        let commands = vec![
+            OutboundCommand::Broadcast {
+                kind: 40,
+                body: vec![1, 2],
+                unreliable: true,
+            },
+            OutboundCommand::Send {
+                session: 9,
+                kind: 41,
+                body: vec![3],
+                unreliable: false,
+            },
+            OutboundCommand::SpawnActor {
+                object_id: 0x4000_0001,
+                archetype: 7,
+                position: [1.0, 2.0, 3.0],
+            },
+            OutboundCommand::MoveActor {
+                object_id: 0x4000_0001,
+                position: [4.0, 5.0, 6.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [7.0, 8.0, 9.0],
+            },
+            OutboundCommand::SetPhysics {
+                object_id: 0x4000_0001,
+                opts: Some(PhysicsOptions::default()),
+            },
+            OutboundCommand::SetPhysics {
+                object_id: 0x4000_0002,
+                opts: None,
+            },
+            OutboundCommand::ApplyImpulse {
+                object_id: 0x4000_0001,
+                impulse: [0.0, 100.0, 0.0],
+            },
+            OutboundCommand::SetMoveIntent {
+                object_id: 0x4000_0001,
+                intent: [50.0, 0.0, 0.0],
+            },
+            OutboundCommand::DespawnActor {
+                object_id: 0x4000_0001,
+            },
+        ];
+        let encoded = encode_commands(&commands).expect("encode");
+        assert_eq!(decode_commands(&encoded).expect("decode"), commands);
+    }
+
+    #[test]
+    fn wire_codec_preserves_aabb_physics_shapes() {
+        let commands = vec![OutboundCommand::SetPhysics {
+            object_id: 1,
+            opts: Some(PhysicsOptions {
+                enabled: false,
+                config: citadel_physics::PhysicsConfig {
+                    shape: citadel_physics::Shape::Aabb {
+                        half_extents: [10.0, 20.0, 30.0],
+                    },
+                    gravity: 1.0,
+                    buoyancy: 2.0,
+                    drag: 3.0,
+                    max_speed: 4.0,
+                },
+            }),
+        }];
+        let encoded = encode_commands(&commands).expect("encode");
+        assert_eq!(decode_commands(&encoded).expect("decode"), commands);
+    }
+
+    #[test]
+    fn command_decoder_rejects_oversized_and_malformed_payloads() {
+        assert_eq!(
+            decode_commands(&vec![b' '; MAX_DATA_FRAME_BYTES + 1]),
+            Err(ProtocolError::FrameTooLarge)
+        );
+        assert_eq!(
+            decode_commands(b"not a command batch"),
+            Err(ProtocolError::MalformedFrame)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_and_sync_data_framing_share_one_wire_format() {
+        // The parent pumps the data plane through tokio while the worker
+        // writes frames synchronously (and vice versa); both sides must agree
+        // on the exact length-prefixed encoding.
+        let frame = event(1, 3, 2);
+        let mut wire = Vec::new();
+        write_data_frame(&mut wire, &frame).expect("sync write");
+        assert_eq!(
+            read_data_frame_async(&mut wire.as_slice())
+                .await
+                .expect("async read"),
+            frame
+        );
+        let mut wire = Vec::new();
+        write_data_frame_async(&mut wire, &frame)
+            .await
+            .expect("async write");
+        assert_eq!(
+            read_data_frame(&mut wire.as_slice()).expect("sync read"),
+            frame
+        );
+    }
+
+    #[tokio::test]
+    async fn async_data_reader_rejects_oversized_length_prefixes_before_reading() {
+        let mut wire = ((MAX_DATA_FRAME_BYTES + 1) as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&[b' '; 8]);
+        assert_eq!(
+            read_data_frame_async(&mut wire.as_slice()).await,
+            Err(ProtocolError::FrameTooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_data_writer_rejects_oversized_frames_fail_closed() {
+        let frame = DataFrame::MatchCommands {
+            protocol_version: DATA_PROTOCOL_VERSION,
+            header: header(1, 1, 1),
+            commands: vec![7; MAX_DATA_FRAME_BYTES + 1],
+        };
+        let mut wire = Vec::new();
+        assert_eq!(
+            write_data_frame_async(&mut wire, &frame).await,
+            Err(ProtocolError::FrameTooLarge)
+        );
+        assert!(
+            wire.is_empty(),
+            "no bytes may reach the transport for an oversized frame"
+        );
     }
 
     #[test]
