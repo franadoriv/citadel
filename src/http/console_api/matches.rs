@@ -62,6 +62,11 @@ pub struct MatchRow {
     pub max_players: u16,
     /// Whether new joins are currently accepted.
     pub open: bool,
+    /// GameScript revision the room was born bound to (`require_script`
+    /// nodes; `None` on ungated nodes).
+    pub script_revision: Option<String>,
+    /// Load generation of that revision at the room's birth.
+    pub script_generation: Option<u64>,
 }
 
 impl MatchRow {
@@ -74,6 +79,14 @@ impl MatchRow {
             players: snapshot.members.len() + snapshot.remote_member_count,
             max_players: snapshot.label.max_players,
             open: snapshot.label.open,
+            script_revision: snapshot
+                .script_binding
+                .as_ref()
+                .map(|binding| binding.revision_id.clone()),
+            script_generation: snapshot
+                .script_binding
+                .as_ref()
+                .map(|binding| binding.generation),
         }
     }
 }
@@ -112,20 +125,27 @@ pub struct MatchDetail {
 }
 
 /// `GET /console/v1/matches`: list live rooms.
+///
+/// On a `runtime.require_script` node the listing is an enforcement surface:
+/// while the readiness gate is not `Ready` no matches are advertised — the
+/// endpoint fails closed with the stable `503 runtime_unavailable` error
+/// (the console's readiness surface on `GET /console/v1/runtime` explains
+/// why to the operator).
 pub(super) async fn list_handler(
     State(app): State<App>,
     _operator: ConsoleIdentity,
     Query(query): Query<MatchesQuery>,
-) -> Json<MatchesResponse> {
+) -> Result<Json<MatchesResponse>, ApiError> {
     app.metrics().record_http_request();
     let Some(gateway) = app.realtime_gateway() else {
-        return Json(MatchesResponse {
+        return Ok(Json(MatchesResponse {
             realtime_attached: false,
             total: 0,
             matchmaker: None,
             items: Vec::new(),
-        });
+        }));
     };
+    console_script_gate(&app, &gateway)?;
     let snapshot = gateway.rooms().snapshot();
     let total = snapshot.len();
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -135,15 +155,16 @@ pub(super) async fn list_handler(
         .take(limit)
         .map(MatchRow::from_snapshot)
         .collect();
-    Json(MatchesResponse {
+    Ok(Json(MatchesResponse {
         realtime_attached: true,
         total,
         matchmaker: Some(gateway.matchmaker_stats()),
         items,
-    })
+    }))
 }
 
-/// `GET /console/v1/matches/{id}`: one room with its member roll.
+/// `GET /console/v1/matches/{id}`: one room with its member roll. Fails
+/// closed like the listing on a gated, not-ready node.
 pub(super) async fn detail_handler(
     State(app): State<App>,
     _operator: ConsoleIdentity,
@@ -153,6 +174,7 @@ pub(super) async fn detail_handler(
     let gateway = app
         .realtime_gateway()
         .ok_or_else(|| AppError::not_found("no realtime gateway is running"))?;
+    console_script_gate(&app, &gateway)?;
     let snapshot = gateway
         .rooms()
         .snapshot()
@@ -171,6 +193,22 @@ pub(super) async fn detail_handler(
         row: MatchRow::from_snapshot(&snapshot),
         members,
     }))
+}
+
+/// The listing/detail enforcement surface of the GameScript readiness gate.
+///
+/// `Ok` when the node is ungated or the gate is `Ready`; otherwise counts the
+/// rejection and fails closed with the stable client-safe `503`.
+fn console_script_gate(app: &App, gateway: &crate::realtime::Gateway) -> Result<(), ApiError> {
+    let Some(readiness) = gateway.script_readiness() else {
+        return Ok(());
+    };
+    if readiness.gate().is_err() {
+        app.metrics()
+            .record_script_gate_rejection(crate::observability::ScriptGateSurface::ConsoleList);
+        return Err(ApiError::script_unavailable());
+    }
+    Ok(())
 }
 
 /// Whether a room matches the listing filter (name, map, or mode substring).

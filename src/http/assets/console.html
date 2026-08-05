@@ -1888,10 +1888,11 @@ pre.code {
             + '<td>' + esc(r.map || '—') + '</td>'
             + '<td>' + esc(r.mode || '—') + '</td>'
             + '<td>' + esc(fmtNum(r.players)) + ' / ' + esc(r.max_players ? fmtNum(r.max_players) : '∞') + '</td>'
-            + '<td>' + boolTag(r.open, 'open', 'closed') + '</td></tr>';
+            + '<td>' + boolTag(r.open, 'open', 'closed') + '</td>'
+            + '<td class="mono">' + esc(r.script_revision ? (r.script_revision.slice(0, 15) + '… g' + r.script_generation) : '—') + '</td></tr>';
         });
-        if (!d.items.length) rows = emptyRowHtml(6, 'No live rooms right now.');
-        html = tableHtml(['ID', 'Name', 'Map', 'Mode', 'Players', 'Open'], rows);
+        if (!d.items.length) rows = emptyRowHtml(7, 'No live rooms right now.');
+        html = tableHtml(['ID', 'Name', 'Map', 'Mode', 'Players', 'Open', 'Script'], rows);
       }
       setHtml('mt-table', html);
       setText('mt-count', fmtNum(d.total) + ' room(s)');
@@ -1913,6 +1914,7 @@ pre.code {
         + kv('Map', d.map || '—')
         + kv('Mode', d.mode || '—')
         + kv('Players', fmtNum(d.players) + ' / ' + (d.max_players ? fmtNum(d.max_players) : 'unlimited'))
+        + (d.script_revision ? kv('Script revision', d.script_revision + ' (generation ' + d.script_generation + ')') : '')
         + '</table></div></div>';
       var rows = '';
       (d.members || []).forEach(function (m) {

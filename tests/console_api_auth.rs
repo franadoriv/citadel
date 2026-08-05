@@ -595,6 +595,75 @@ async fn matches_section_lists_live_rooms_from_the_gateway() {
 }
 
 #[tokio::test]
+async fn matches_listing_fails_closed_under_the_script_readiness_gate() {
+    use citadel::realtime::Gateway;
+    use citadel::runtime::GameScriptReadiness;
+    use citadel::time::{Clock, SystemClock};
+
+    let app = App::new(console_config());
+    let (addr, tx, server) = spawn_server(app.clone()).await;
+    let token = login(addr, "ops", "operator-secret")
+        .await
+        .body
+        .expect("login")["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    // A require_script gateway boots not-ready (NoScript).
+    let readiness = std::sync::Arc::new(GameScriptReadiness::new(SystemClock.now()));
+    let gateway = std::sync::Arc::new(
+        Gateway::new().with_script_readiness(std::sync::Arc::clone(&readiness)),
+    );
+    app.attach_realtime_gateway(std::sync::Arc::clone(&gateway));
+
+    // Listing and detail both fail closed with the one stable client-safe
+    // error; nothing is advertised.
+    let gated = get(addr, "/console/v1/matches", Some(&token)).await;
+    assert_eq!(gated.status, 503);
+    let gated = gated.body.expect("body");
+    assert_eq!(gated["code"], "runtime_unavailable");
+    assert_eq!(gated["message"], "game script unavailable");
+    let detail = get(addr, "/console/v1/matches/1", Some(&token)).await;
+    assert_eq!(detail.status, 503);
+
+    // The readiness surface explains the closed gate to the operator.
+    let runtime = get(addr, "/console/v1/runtime", Some(&token)).await;
+    assert_eq!(runtime.status, 200);
+    let runtime = runtime.body.expect("body");
+    assert_eq!(runtime["readiness"]["state"], "no_script");
+    assert_eq!(runtime["readiness"]["generation"], 0);
+
+    // A successful load opens the gate: matches list again, and the row
+    // carries the binding the room was born with.
+    readiness.record_loaded("sha256:console-v1", Clock::now(&SystemClock));
+    let (lobby, _) = gateway
+        .rooms()
+        .join_or_create_bound(
+            citadel::realtime::ParticipantId::from_raw(1),
+            "lobby",
+            gateway
+                .script_readiness()
+                .and_then(|authority| authority.snapshot().binding()),
+            || citadel::realtime::RoomLabel::with_map("ForestArena"),
+        )
+        .expect("bound room");
+    let listed = get(addr, "/console/v1/matches", Some(&token)).await;
+    assert_eq!(listed.status, 200);
+    let listed = listed.body.expect("body");
+    assert_eq!(listed["items"][0]["id"], lobby);
+    assert_eq!(listed["items"][0]["script_revision"], "sha256:console-v1");
+    assert_eq!(listed["items"][0]["script_generation"], 1);
+    let runtime = get(addr, "/console/v1/runtime", Some(&token)).await;
+    let runtime = runtime.body.expect("body");
+    assert_eq!(runtime["readiness"]["state"], "ready");
+    assert_eq!(runtime["readiness"]["revision_id"], "sha256:console-v1");
+
+    let _ = tx.send(());
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn runtime_section_introspects_and_invokes_rpcs() {
     use citadel::realtime::Gateway;
     use citadel::runtime::LuaRuntime;

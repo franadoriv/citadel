@@ -58,9 +58,48 @@ pub struct RuntimeResponse {
     pub attached: bool,
     /// Configured `citadel.on_tick` rate (0 = no game loop).
     pub tick_hz: u32,
+    /// Whether `runtime.require_script` gates match surfaces on this node.
+    pub require_script: bool,
+    /// GameScript readiness (state/revision/generation/recovery), present
+    /// only on `require_script` nodes once the transports have started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ReadinessView>,
     /// What the loaded script registered, when attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script: Option<RuntimeIntrospection>,
+}
+
+/// Operator-facing GameScript readiness, mirrored from the gate authority.
+///
+/// This is the operator surface: unlike client-facing rejections it names the
+/// loaded revision and generation so a stuck gate is explainable.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessView {
+    /// Stable state token (`no_script`/`validating`/`ready`/`activating`/
+    /// `degraded`/`unavailable`).
+    pub state: &'static str,
+    /// Content identity of the most recently loaded script, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    /// Local monotonic load generation (0 before the first load).
+    pub generation: u64,
+    /// When the current state was entered (Unix millis).
+    pub since_unix_millis: u64,
+    /// Supervised-worker recovery posture, when the worker adapter reported
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ReadinessRecoveryView>,
+}
+
+/// Worker restart posture for the readiness surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessRecoveryView {
+    /// Whether the restart circuit breaker is open (budget exhausted).
+    pub circuit_open: bool,
+    /// Consecutive restart failures observed by the supervisor.
+    pub consecutive_failures: u32,
+    /// The supervisor's restart budget.
+    pub restart_limit: u32,
 }
 
 /// The JSON body accepted by the RPC caller. `payload` is passed to the
@@ -103,9 +142,27 @@ pub(super) async fn get_handler(
         ),
         Ok(None) | Err(_) => (None, None, None),
     };
-    let script = app
-        .realtime_gateway()
+    let gateway = app.realtime_gateway();
+    let script = gateway
+        .as_ref()
         .and_then(|gateway| gateway.runtime().map(|runtime| runtime.introspect()));
+    let readiness = gateway
+        .as_ref()
+        .and_then(|gateway| gateway.script_readiness())
+        .map(|authority| {
+            let snapshot = authority.snapshot();
+            ReadinessView {
+                state: snapshot.state.code(),
+                revision_id: snapshot.revision_id,
+                generation: snapshot.generation,
+                since_unix_millis: snapshot.since.unix_millis(),
+                recovery: authority.recovery().map(|recovery| ReadinessRecoveryView {
+                    circuit_open: recovery.circuit_open,
+                    consecutive_failures: recovery.consecutive_failures,
+                    restart_limit: recovery.restart_limit,
+                }),
+            }
+        });
     Json(RuntimeResponse {
         enabled: runtime_config.enabled,
         configured_language: runtime_config.language.map(|language| language.as_str()),
@@ -116,6 +173,8 @@ pub(super) async fn get_handler(
         tier: runtime_config.tier.as_str(),
         attached: script.is_some(),
         tick_hz: runtime_config.tick_hz,
+        require_script: runtime_config.require_script,
+        readiness,
         script,
     })
 }
