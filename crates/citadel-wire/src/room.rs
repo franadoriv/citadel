@@ -159,6 +159,42 @@ impl RoomMapReady {
     }
 }
 
+/// `KIND_ROOM_REJECT` (S→C, reliable): a server-side policy gate refused a room
+/// request that would otherwise be silently dropped. `request_kind` names the
+/// refused request (`KIND_ROOM_CREATE` or `KIND_ROOM_JOIN`); `reason` is a
+/// stable, client-safe string that never carries revision ids, paths, or worker
+/// detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomReject {
+    /// The wire kind of the request being refused.
+    pub request_kind: u16,
+    /// Stable, client-safe rejection reason.
+    pub reason: String,
+}
+
+impl RoomReject {
+    /// Encode: `request_kind u16`, then `reason` as `u16`-length UTF-8.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(2 + 2 + self.reason.len());
+        buf.extend_from_slice(&self.request_kind.to_be_bytes());
+        write_str(&mut buf, &self.reason);
+        buf
+    }
+
+    /// Decode a reject body.
+    pub fn decode(body: &[u8]) -> Result<Self, TsyncError> {
+        need(body, 2)?;
+        let mut off = 0usize;
+        let request_kind = read_u16(body, &mut off);
+        let reason = read_str(body, &mut off)?;
+        Ok(Self {
+            request_kind,
+            reason,
+        })
+    }
+}
+
 // ------------------------------- byte helpers ------------------------------- //
 
 fn need(body: &[u8], needed: usize) -> Result<(), TsyncError> {
@@ -270,6 +306,28 @@ mod tests {
         body.extend_from_slice(b"short"); // but only 5 bytes follow
         assert!(matches!(
             RoomJoined::decode(&body),
+            Err(TsyncError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn room_reject_round_trips_including_empty_reason() {
+        for reason in ["", "game script unavailable"] {
+            let m = RoomReject {
+                request_kind: 21,
+                reason: reason.to_owned(),
+            };
+            assert_eq!(RoomReject::decode(&m.encode()).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn room_reject_rejects_truncated_reason() {
+        let mut body = 22u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&9u16.to_be_bytes()); // claims a 9-byte reason
+        body.extend_from_slice(b"shrt"); // but only 4 bytes follow
+        assert!(matches!(
+            RoomReject::decode(&body),
             Err(TsyncError::TooShort { .. })
         ));
     }

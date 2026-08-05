@@ -168,6 +168,14 @@ pub const KIND_NOTIFICATION: u16 = 27;
 /// receiver-side `expires_at` timestamp instead of an event id.
 pub const KIND_CHAT_EVENT: u16 = 28;
 
+/// Room/matchmaking policy rejection (`S→C`, reliable): `{request_kind, reason}`.
+/// Sent when a server-side policy gate (e.g. the GameScript readiness gate)
+/// refuses a `KIND_ROOM_CREATE`/`KIND_ROOM_JOIN` request that would otherwise
+/// be silently dropped. The reason is a stable, client-safe string; it never
+/// carries revision ids, paths, or worker detail. Kind 32 sits outside the
+/// contiguous room range (21-25), which is pinned by SDKs and cannot grow.
+pub const KIND_ROOM_REJECT: u16 = 32;
+
 /// Transform-sync v2 negotiation manifest (reliable, C↔S).  This is a
 /// separate kind rather than an appended v1 `HELLO`, so a v1 decoder can never
 /// accidentally interpret epoch-bearing metadata.
@@ -198,6 +206,9 @@ const _: () = assert!(
 );
 const _: () = assert!(NOTIFICATION_KIND_MAX < CHAT_KIND_MIN);
 const _: () = assert!(KIND_CHAT_EVENT == CHAT_KIND_MIN && CHAT_KIND_MIN == CHAT_KIND_MAX);
+// The room-reject kind postdates the pinned room range (21-25) and must never
+// collide with the transform-sync v2 kinds that already claimed 29-31.
+const _: () = assert!(KIND_ROOM_REJECT > KIND_TSYNC_V2_INPUT);
 
 /// [`KIND_AUTH_RESULT`] status: the token validated; the connection is bound to
 /// the `user_id` that follows in the body.
@@ -558,6 +569,8 @@ mod tests {
         assert_eq!(KIND_MATCHMAKER_MATCHED, 26);
         assert_eq!(KIND_NOTIFICATION, 27);
         assert_eq!(KIND_CHAT_EVENT, 28);
+        // Room policy rejection (post-range; the room range 21-25 is pinned).
+        assert_eq!(KIND_ROOM_REJECT, 32);
         // Range bounds.
         assert_eq!((TSYNC_KIND_MIN, TSYNC_KIND_MAX), (7, 12));
         assert_eq!((REP_KIND_MIN, REP_KIND_MAX), (13, 15));
