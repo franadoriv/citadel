@@ -402,6 +402,45 @@ impl Drop for SupervisedWorker {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn process_group_signal_terminates_worker_descendant() {
+        let pid_file =
+            std::env::temp_dir().join(format!("citadel-pgid-{}.pid", uuid::Uuid::new_v4()));
+        let mut worker = std::process::Command::new("setsid")
+            .args(["sh", "-c", "sleep 30 & echo $! > \"$1\"; wait", "sh"])
+            .arg(&pid_file)
+            .spawn()
+            .expect("spawn fixture");
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while !pid_file.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let descendant: i32 = fs::read_to_string(&pid_file)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let pgid = i32::try_from(worker.id()).expect("worker pgid");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("kill process group");
+        assert!(!worker.wait().expect("reap leader").success());
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        let terminated = loop {
+            match fs::read_to_string(format!("/proc/{descendant}/stat")) {
+                Err(_) => break true,
+                Ok(stat) if stat.split_whitespace().nth(2) == Some("Z") => break true,
+                Ok(_) if std::time::Instant::now() >= until => break false,
+                Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let _ = fs::remove_file(pid_file);
+        assert!(terminated, "descendant survived process-group termination");
+    }
     #[test]
     fn recovery_snapshot_reports_failures_and_open_circuit() {
         let mut breaker = super::RestartCircuitBreaker::new(2);
