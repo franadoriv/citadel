@@ -1,4 +1,5 @@
-//! Room (match/lobby) wire messages (kinds 21-25).
+//! Room (match/lobby) wire messages (kinds 21-25, plus the server-driven
+//! match-closed notification on kind 32).
 //!
 //! Rooms are server-owned, admission-gated groupings of participants. A client
 //! creates a room ([`RoomCreate`]) or joins an existing one ([`RoomJoin`]); the
@@ -159,6 +160,60 @@ impl RoomMapReady {
     }
 }
 
+/// [`MatchClosed`] reason: the match's server-side execution failed (script
+/// fault, blown budget, or a worker crash). Deliberately coarse: the client
+/// learns the match is gone, never why at a level that leaks server internals.
+pub const MATCH_CLOSE_REASON_SERVER_ERROR: u8 = 0;
+
+/// `KIND_MATCH_CLOSED` (S→C, reliable): the participant's authoritative match
+/// was closed by the server and its room no longer exists.
+///
+/// Carries a coarse `reason` and a `requeue_hint`. The requeue model is
+/// client-prompted: when `requeue_hint` is set the client should prompt (or
+/// auto-drive) its own fresh matchmaker ticket submission — the server retains
+/// no ticket on the member's behalf, so a raw reconnect can never land back in
+/// the dead match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchClosed {
+    /// The room (match) that was closed.
+    pub room_id: u64,
+    /// Coarse close reason ([`MATCH_CLOSE_REASON_SERVER_ERROR`]).
+    pub reason: u8,
+    /// Whether the client should re-submit its own matchmaker ticket.
+    pub requeue_hint: bool,
+}
+
+/// Bytes in a serialized [`MatchClosed`]: `room_id` (8) + `reason` (1) +
+/// `requeue_hint` (1).
+pub const MATCH_CLOSED_BYTES: usize = 10;
+
+impl MatchClosed {
+    /// Encode the match-closed body.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(MATCH_CLOSED_BYTES);
+        buf.extend_from_slice(&self.room_id.to_be_bytes());
+        buf.push(self.reason);
+        buf.push(u8::from(self.requeue_hint));
+        buf
+    }
+
+    /// Decode a match-closed body. Any nonzero requeue byte reads as a hint,
+    /// so a future hint refinement stays decodable by this version.
+    pub fn decode(body: &[u8]) -> Result<Self, TsyncError> {
+        need(body, MATCH_CLOSED_BYTES)?;
+        let mut off = 0usize;
+        let room_id = read_u64(body, &mut off);
+        let reason = body[off];
+        let requeue_hint = body[off + 1] != 0;
+        Ok(Self {
+            room_id,
+            reason,
+            requeue_hint,
+        })
+    }
+}
+
 // ------------------------------- byte helpers ------------------------------- //
 
 fn need(body: &[u8], needed: usize) -> Result<(), TsyncError> {
@@ -270,6 +325,39 @@ mod tests {
         body.extend_from_slice(b"short"); // but only 5 bytes follow
         assert!(matches!(
             RoomJoined::decode(&body),
+            Err(TsyncError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn match_closed_round_trips_reason_and_requeue_hint() {
+        let closed = MatchClosed {
+            room_id: 77,
+            reason: MATCH_CLOSE_REASON_SERVER_ERROR,
+            requeue_hint: true,
+        };
+        let body = closed.encode();
+        assert_eq!(body.len(), MATCH_CLOSED_BYTES);
+        assert_eq!(MatchClosed::decode(&body).unwrap(), closed);
+        let quiet = MatchClosed {
+            room_id: 1,
+            reason: MATCH_CLOSE_REASON_SERVER_ERROR,
+            requeue_hint: false,
+        };
+        assert_eq!(MatchClosed::decode(&quiet.encode()).unwrap(), quiet);
+    }
+
+    #[test]
+    fn match_closed_rejects_truncated_body() {
+        let mut body = MatchClosed {
+            room_id: 3,
+            reason: MATCH_CLOSE_REASON_SERVER_ERROR,
+            requeue_hint: true,
+        }
+        .encode();
+        body.pop();
+        assert!(matches!(
+            MatchClosed::decode(&body),
             Err(TsyncError::TooShort { .. })
         ));
     }
