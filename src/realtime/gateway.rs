@@ -5360,6 +5360,19 @@ impl Gateway {
                 // Player-slot mode: hand this participant a client-owned player
                 // object and tell it (reliably) so its client flips that object to
                 // owner-predicted. A no-op when `player_slots == 0`.
+                //
+                // B8 disposition: a player-slot grant spawns a transform object,
+                // so it is not allowed to run inside an authoritative match. HELLO
+                // is session setup that precedes room membership, so the normal
+                // grant happens outside any match; this guard additionally refuses
+                // a re-HELLO from a participant already in a bound match, where the
+                // script owns spawns through the SpawnRequest path (B5). Making the
+                // pre-match grant itself script-confirmed (spec §3.2 hybrid) is a
+                // follow-up. Once in a match, the object cannot move or replicate
+                // without script authorization (B1/B4/B6).
+                if self.authoritative_match(sender).is_some() {
+                    return sent;
+                }
                 if let Some((object_id, role)) = hub.assign_player_slot(sender.get()) {
                     let role_out =
                         Outbound::reliable(Envelope::new(KIND_TSYNC_ROLE, role.encode()));
@@ -8467,6 +8480,35 @@ mod transform_tests {
             Some(citadel_wire::netpeer::RepValue::Int(10)),
             "a rejected rep write applies nothing"
         );
+    }
+
+    // ---- B8: player-slot grant is refused inside an authoritative match ----
+
+    #[tokio::test]
+    async fn player_slot_grant_is_refused_inside_an_authoritative_match() {
+        // A player-slot grant spawns a transform object; inside an authoritative
+        // match a (re-)HELLO must reply with the negotiation only and grant no
+        // slot, so no Rust-authored spawn happens in-match (the script owns
+        // spawns via SpawnRequest). Outside a match the grant is unchanged.
+        let (gw, _hub) =
+            authoritative_gateway_slots("citadel.on_input(function(e) return nil end)", 2);
+        let (a, mut ra) = register(&gw);
+        let binding = ScriptBinding {
+            revision_id: "sha256:test".to_owned(),
+            generation: 1,
+        };
+        gw.rooms()
+            .join_or_create_bound(a, "arena", Some(binding), || RoomLabel::with_map("arena"))
+            .expect("bound room");
+        let sent = gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        // Exactly one delivery: the negotiation reply. A player-slot grant would
+        // deliver a second frame (KIND_TSYNC_ROLE) and make this 2.
+        assert_eq!(
+            sent, 1,
+            "HELLO in an authoritative match replies with the negotiation only, no slot grant"
+        );
+        let hello = ra.recv().await.expect("negotiation reply");
+        assert_eq!(hello.envelope.kind, KIND_TSYNC_HELLO);
     }
 
     #[tokio::test]
