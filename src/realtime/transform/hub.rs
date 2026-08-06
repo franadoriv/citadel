@@ -188,6 +188,9 @@ fn state_to_na(s: TransformState) -> NaTransform {
 pub struct HubOutbound {
     /// Target participant (raw id).
     pub participant: u64,
+    /// Room membership scope captured while constructing a snapshot. `None`
+    /// is the legacy roomless relay scope; control frames never carry a scope.
+    pub room_scope: Option<u64>,
     /// Envelope kind (`KIND_TSYNC_*`).
     pub kind: u16,
     /// Encoded body.
@@ -719,6 +722,7 @@ impl TransformHub {
         self.register_client(participant);
         HubOutbound {
             participant,
+            room_scope: None,
             kind: citadel_wire::protocol::KIND_TSYNC_HELLO,
             body: self.hello_body(),
             unreliable: false,
@@ -735,6 +739,7 @@ impl TransformHub {
         g.clients.get_mut(&participant)?.v2_clock = true;
         Some(HubOutbound {
             participant,
+            room_scope: None,
             kind: citadel_wire::protocol::KIND_TSYNC_V2_HELLO,
             body: manifest.encode().to_vec(),
             unreliable: false,
@@ -847,6 +852,7 @@ impl TransformHub {
                 };
                 out.push(HubOutbound {
                     participant,
+                    room_scope: None,
                     kind: citadel_wire::protocol::KIND_TSYNC_REWIND,
                     body: result.encode(),
                     unreliable: false,
@@ -945,6 +951,9 @@ impl TransformHub {
         let object_rooms = g.object_rooms.clone();
         let gameplay_clock = g.gameplay_clock.snapshot();
         let hard_cap = self.config.budget;
+        // One filtered frame is retained per populated room scope. This remains
+        // O(populated rooms × objects); avoid adding a second object index until
+        // profiling shows it matters more than the added invalidation surface.
         let mut room_frames = HashMap::new();
         for (&participant, client) in g.clients.iter_mut() {
             let viewer_room = room_of(participant);
@@ -995,6 +1004,7 @@ impl TransformHub {
             match encoded {
                 Ok((kind, body)) => out.push(HubOutbound {
                     participant,
+                    room_scope: viewer_room,
                     kind,
                     body,
                     unreliable: true,

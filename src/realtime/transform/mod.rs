@@ -45,7 +45,7 @@ pub use authority::TransformAuthority;
 // `crate::realtime::transform::*` paths are unchanged.
 pub use citadel_transform::{RemoteObject, RemoteWorldView, TransformState};
 pub use congestion::{CongestionConfig, CongestionController, CongestionSignals, SendMode};
-pub use hub::{OwnerMovementMode, TransformHub, TransformHubConfig};
+pub use hub::{HubOutbound, OwnerMovementMode, TransformHub, TransformHubConfig};
 pub use input::{InputLimits, InputOutcome, OwnerInputQueue, integrate_owner_frame};
 pub use prediction::{PredictedInput, PredictionRing, ReconcileConfig};
 pub use rewind::{

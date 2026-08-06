@@ -5962,24 +5962,34 @@ impl Gateway {
         for out in hub.snapshot_tick_scoped(|participant| {
             self.rooms.room_of(ParticipantId::from_raw(participant))
         }) {
-            let outbound = Outbound::new(
-                if out.unreliable {
-                    Delivery::Unreliable
-                } else {
-                    Delivery::Reliable
-                },
-                Envelope::new(out.kind, out.body),
-            );
-            let out_bytes = outbound.envelope.body.len() as u64;
-            if self
-                .registry
-                .send_to(ParticipantId::from_raw(out.participant), &outbound)
-            {
+            let out_bytes = out.body.len() as u64;
+            if self.deliver_transform_snapshot(out) {
                 self.metrics.record_message_out(out_bytes);
                 delivered += 1;
             }
         }
         delivered
+    }
+
+    /// Deliver a snapshot only if its recipient still holds the room scope that
+    /// was used to build it. `RoomRegistry::while_member_in` keeps the membership
+    /// lock through the enqueue so a room move cannot slip between validation and
+    /// delivery.
+    fn deliver_transform_snapshot(&self, out: crate::realtime::transform::HubOutbound) -> bool {
+        let outbound = Outbound::new(
+            if out.unreliable {
+                Delivery::Unreliable
+            } else {
+                Delivery::Reliable
+            },
+            Envelope::new(out.kind, out.body),
+        );
+        let participant = ParticipantId::from_raw(out.participant);
+        self.rooms
+            .while_member_in(participant, out.room_scope, || {
+                self.registry.send_to(participant, &outbound)
+            })
+            .unwrap_or(false)
     }
 
     /// The built-in position relay used when no script runtime is attached.
@@ -6889,6 +6899,41 @@ mod transform_tests {
         assert!(view_a.object(2).is_none(), "A must not receive B's object");
         assert!(view_b.object(1).is_none(), "B must not receive A's object");
         assert!(view_b.object(2).is_some(), "B receives B's object");
+    }
+
+    #[tokio::test]
+    async fn snapshot_built_for_previous_room_is_not_delivered_after_move() {
+        use crate::realtime::rooms::RoomLabel;
+
+        let (gw, hub) = gateway_with_hub();
+        let (participant, mut outbound_rx) = register(&gw);
+        let first_room = gw.rooms().create(RoomLabel::with_map("R1"));
+        gw.rooms()
+            .join(participant, first_room)
+            .expect("participant joins first room");
+        gw.handle_inbound(participant, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = outbound_rx.recv().await.expect("hello reply");
+        hub.spawn_server_simulated(99, TransformState::at([1.0, 2.0, 3.0]));
+        hub.sim_tick();
+        let snapshot = hub
+            .snapshot_tick_scoped(|id| gw.rooms().room_of(ParticipantId::from_raw(id)))
+            .pop()
+            .expect("snapshot is built for the first room");
+        assert_eq!(snapshot.room_scope, Some(first_room));
+
+        let second_room = gw.rooms().create(RoomLabel::with_map("R2"));
+        gw.rooms()
+            .join(participant, second_room)
+            .expect("participant moves rooms");
+
+        assert!(
+            !gw.deliver_transform_snapshot(snapshot),
+            "a snapshot built under the previous room membership is rejected"
+        );
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "the stale-room snapshot never reaches the moved participant"
+        );
     }
 
     #[tokio::test]

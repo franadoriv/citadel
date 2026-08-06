@@ -351,6 +351,21 @@ impl RoomRegistry {
         self.lock().membership.get(&participant).copied()
     }
 
+    /// Run `f` only while `participant` still belongs to `expected_room`.
+    ///
+    /// The membership comparison and `f` share the registry lock, giving
+    /// client-delivery paths a linearization point: a room move cannot land
+    /// between the check and a queued outbound frame.
+    pub fn while_member_in<R>(
+        &self,
+        participant: ParticipantId,
+        expected_room: Option<RoomId>,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let g = self.lock();
+        (g.membership.get(&participant).copied() == expected_room).then(f)
+    }
+
     /// The current members of a room (empty if it does not exist).
     #[must_use]
     pub fn members(&self, room_id: RoomId) -> Vec<ParticipantId> {
