@@ -923,32 +923,86 @@ impl TransformHub {
         out
     }
 
-    /// Apply one script-validated owner input frame and resolve any fire it
-    /// carries — the authoritative-bridge executor for an accepted
-    /// `TransformInput`. It runs the same `world.apply_owner_input` gate
-    /// (ownership, epoch, contiguous-seq dedup) as [`handle_input`](Self::handle_input),
-    /// so an out-of-order, replayed, or foreign frame still mutates nothing. Any
-    /// rewind result is returned for the gateway to unicast to the shooter.
-    pub fn apply_validated_input(
+    /// Apply one script-validated owner input frame — the authoritative-bridge
+    /// executor for an accepted `TransformInput`. It runs the same
+    /// `world.apply_owner_input` gate (ownership, epoch, contiguous-seq dedup)
+    /// as [`handle_input`](Self::handle_input), so an out-of-order, replayed, or
+    /// foreign frame still mutates nothing.
+    ///
+    /// Unlike the relay path it does **not** resolve any fire carried by the
+    /// frame: owner decision 1 keeps lag-compensated hit detection a
+    /// script-invoked bounded host API ([`rewind_query`](Self::rewind_query)),
+    /// and the script's batch decides the consequence.
+    pub fn apply_validated_input(&self, participant: u64, frame: &tsync::InputFrame) {
+        if let Ok(mut g) = self.inner.lock() {
+            let _ = g.world.apply_owner_input(participant, frame);
+        }
+    }
+
+    /// Bounded lag-compensated hit query (owner decision 1). The server computes
+    /// the rewind tick from the shooter's measured lag and the hub's
+    /// [`RewindConfig`] (`max_unlag_ticks` bounds the window, `rtt_cutoff_ms`
+    /// gates it); the client's `_client_tick` is accepted for API completeness
+    /// but never trusted. Returns the nearest candidate hit (favor-the-shooter),
+    /// excluding the shooter's own object. Rust owns the geometry; the script
+    /// decides the consequence.
+    #[must_use]
+    pub fn rewind_query(
         &self,
-        participant: u64,
-        frame: &tsync::InputFrame,
-    ) -> Vec<HubOutbound> {
-        let mut out = Vec::new();
-        let Ok(mut g) = self.inner.lock() else {
-            return out;
+        shooter: u64,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        _client_tick: u64,
+    ) -> Vec<crate::runtime::RewindHit> {
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
         };
         let current_tick = g.world.tick();
         let rewind_cfg = self.config.rewind;
-        let released = g.world.apply_owner_input(participant, frame);
-        for applied in &released {
-            if let Some(reply) =
-                resolve_fire_reply(&g, participant, applied, current_tick, &rewind_cfg)
-            {
-                out.push(reply);
+        let lag = g
+            .clients
+            .get(&shooter)
+            .map(|c| c.lag)
+            .unwrap_or(LagProfile {
+                owd_ticks: 0.0,
+                interp_delay_ticks: 0.0,
+                rtt_ms: 0.0,
+            });
+        let rewind_tick = if lag_comp_enabled(&lag, &rewind_cfg) {
+            compute_rewind_tick(current_tick, &lag, &rewind_cfg)
+        } else {
+            f64::from(current_tick)
+        };
+        let shooter_object = g.na_presence.get(&shooter).map(|entry| entry.object_id);
+        let ray = HitRay { origin, direction };
+        let radius = rewind_cfg.hit_radius_cm;
+        let targets = g
+            .world
+            .rewind_centers(rewind_tick)
+            .into_iter()
+            .filter(|&(id, _)| Some(id) != shooter_object)
+            .map(|(id, center)| HitTarget {
+                object_id: id,
+                center,
+                radius,
+            });
+        match rewind::resolve_hit(&ray, targets) {
+            Some(hit) => {
+                let participant = g
+                    .na_presence
+                    .iter()
+                    .find(|(_, entry)| entry.object_id == hit.object_id)
+                    .map(|(&p, _)| p)
+                    .unwrap_or(0);
+                vec![crate::runtime::RewindHit {
+                    object_id: hit.object_id,
+                    participant,
+                    point: hit.point,
+                    distance: hit.distance,
+                }]
             }
+            None => Vec::new(),
         }
-        out
     }
 
     /// Read-only structural ownership check for the bridge: `participant` must

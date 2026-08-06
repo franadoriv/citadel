@@ -6774,17 +6774,11 @@ impl Gateway {
                         direction: fire.direction,
                     }),
                 };
-                let mut sent = 0;
-                for reply in hub.apply_validated_input(participant, &frame) {
-                    if self.send_reliable(
-                        ParticipantId::from_raw(reply.participant),
-                        reply.kind,
-                        reply.body,
-                    ) {
-                        sent += 1;
-                    }
-                }
-                sent
+                // Owner decision 1: the movement integrates, but any fire is not
+                // auto-resolved here — the script queried the rewind and decided
+                // the consequence during on_input.
+                hub.apply_validated_input(participant, &frame);
+                0
             }
             NormalizedPayload::SpawnRequest {
                 archetype_id,
