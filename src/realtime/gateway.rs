@@ -6105,7 +6105,7 @@ impl Gateway {
                     velocity,
                 } => {
                     if let (Some(object_id), Some(hub)) =
-                        (self.actor_object_id(room_id, object_id), &self.transform)
+                        (self.command_object_id(room_id, object_id), &self.transform)
                     {
                         hub.set_transform(
                             object_id,
@@ -6119,7 +6119,7 @@ impl Gateway {
                 }
                 OutboundCommand::SetPhysics { object_id, opts } => {
                     if let (Some(object_id), Some(hub)) =
-                        (self.actor_object_id(room_id, object_id), &self.transform)
+                        (self.command_object_id(room_id, object_id), &self.transform)
                     {
                         if opts.is_some_and(|opts| opts.enabled) {
                             self.select_physics_map(hub, room_id);
@@ -6129,14 +6129,14 @@ impl Gateway {
                 }
                 OutboundCommand::ApplyImpulse { object_id, impulse } => {
                     if let (Some(object_id), Some(hub)) =
-                        (self.actor_object_id(room_id, object_id), &self.transform)
+                        (self.command_object_id(room_id, object_id), &self.transform)
                     {
                         hub.apply_impulse(object_id, impulse);
                     }
                 }
                 OutboundCommand::SetMoveIntent { object_id, intent } => {
                     if let (Some(object_id), Some(hub)) =
-                        (self.actor_object_id(room_id, object_id), &self.transform)
+                        (self.command_object_id(room_id, object_id), &self.transform)
                     {
                         hub.set_move_intent(object_id, intent);
                     }
@@ -6274,6 +6274,15 @@ impl Gateway {
             .lock()
             .ok()
             .and_then(|npcs| npcs.get(&(room_id, script_object_id)).map(|npc| npc.object_id))
+    }
+
+    /// Resolve a command target without changing the legacy unscoped path for
+    /// transform objects that are not script-owned actors. A room-scoped command
+    /// deliberately has no raw-id fallback: that would reintroduce cross-room
+    /// mutation of a same-numbered actor.
+    fn command_object_id(&self, room_id: Option<RoomId>, script_object_id: u32) -> Option<u32> {
+        self.actor_object_id(room_id, script_object_id)
+            .or_else(|| room_id.is_none().then_some(script_object_id))
     }
 
     fn allocate_scoped_actor_id(&self, npcs: &HashMap<NpcKey, NpcEntry>) -> Option<u32> {
