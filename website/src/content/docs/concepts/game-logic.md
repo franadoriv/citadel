@@ -80,6 +80,15 @@ and reject a join before the player enters.
 Cross-node authoritative match ownership and failover remain planned. Do not
 store the only copy of durable progression in an in-memory room table.
 
+:::caution[Known limitation: transform snapshots are node-global]
+The transform snapshot that fans out to clients is currently node-global — it is
+not yet scoped per room. Two or more concurrent authoritative matches on one node
+can leak transform state across matches (a client in one match can receive
+another match's objects). This is a known limitation, not a feature: per-room
+snapshot scoping is required before running multiple authoritative matches per
+node. Until then, run a single authoritative match per node.
+:::
+
 ## Server physics is optional
 
 Replicated actors can opt into deterministic kinematic physics against a cooked

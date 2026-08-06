@@ -7,7 +7,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use citadel_physics::{PhysicsConfig, Shape};
@@ -24,13 +24,15 @@ use crate::runtime::outbound_http::{
 };
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
-    MAX_RUNTIME_EVENTS_PER_INVOCATION, RealtimeAfterOutcome, RealtimeInterception, Runtime,
-    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
-    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
-    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle,
+    BridgeCommandSink, BridgeTransform, Correction, Decision, InputOutcome,
+    MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEvent, NormalizedEventBatch, NormalizedPayload,
+    RealtimeAfterOutcome, RealtimeInterception, Runtime, RuntimeEvent, RuntimeEventBus,
+    RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint,
+    RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest,
+    RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
     append_runtime_event_commands, disabled_runtime_event_bus_handle,
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
-    set_runtime_event_bus, set_runtime_shared_cache,
+    script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use crate::storage::StorageIndexName;
@@ -147,6 +149,11 @@ const ON_ROOM_JOIN_KEY: &str = "citadel.on_room_join";
 
 /// Registry key holding the `before_realtime` interceptor.
 const BEFORE_REALTIME_KEY: &str = "citadel.before_realtime";
+
+/// Registry key holding the authoritative-bridge per-input handler
+/// (`citadel.on_input`). Invoked once per normalized event in a delivered
+/// batch; its return value becomes the event's [`InputOutcome`].
+const ON_INPUT_KEY: &str = "citadel.on_input";
 
 /// Registry key holding the `after_realtime` observer.
 const AFTER_REALTIME_KEY: &str = "citadel.after_realtime";
@@ -506,6 +513,12 @@ pub struct LuaRuntime {
     http_endpoint_policy: RuntimeHttpEndpointPolicy,
     event_bus_handle: RuntimeEventBusHandle,
     shared_cache_handle: RuntimeSharedCacheHandle,
+    /// Where this runtime's authoritative-bridge answers land (the gateway),
+    /// held weakly to avoid an `Arc` cycle. Lives on the runtime rather than in
+    /// VM app data so it survives a hot-reload's whole-VM swap. `None` until the
+    /// gateway attaches it; a runtime with no sink evaluates batches but its
+    /// answers reach no one (a no-op, which is fail-closed).
+    bridge_sink: Mutex<Option<Weak<dyn BridgeCommandSink>>>,
 }
 
 impl std::fmt::Debug for LuaRuntime {
@@ -647,6 +660,7 @@ impl LuaRuntime {
             http_endpoint_policy,
             event_bus_handle,
             shared_cache_handle,
+            bridge_sink: Mutex::new(None),
         }))
     }
 
@@ -697,6 +711,7 @@ impl LuaRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            bridge_sink: Mutex::new(None),
         })
     }
 
@@ -746,6 +761,7 @@ impl LuaRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            bridge_sink: Mutex::new(None),
         })
     }
 
@@ -848,6 +864,7 @@ impl LuaRuntime {
             ("on_room_join", ON_ROOM_JOIN_KEY),
             ("before_realtime", BEFORE_REALTIME_KEY),
             ("after_realtime", AFTER_REALTIME_KEY),
+            ("on_input", ON_INPUT_KEY),
         ]
         .iter()
         .filter(|(_, key)| {
@@ -1110,6 +1127,109 @@ impl LuaRuntime {
             handler.call::<()>((ctx, body_value))?;
             Ok(true)
         })
+    }
+
+    /// Attach the gateway's authoritative-bridge sink (weakly).
+    pub fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        *self.bridge_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    fn bridge_sink(&self) -> Option<Arc<dyn BridgeCommandSink>> {
+        self.bridge_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// Evaluate one delivered batch inline and deliver the fenced answer to the
+    /// attached sink. A batch that produces no answer (no `on_input` handler, or
+    /// a script fault) delivers nothing — the fail-closed failure policy.
+    pub fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        let Some(answer) = self.evaluate_event_batch(&batch) else {
+            return;
+        };
+        if let Some(sink) = self.bridge_sink() {
+            sink.deliver_command_batch(answer);
+        }
+    }
+
+    /// Evaluate a normalized-event batch and build the script's fenced answer.
+    ///
+    /// Runs `citadel.on_input` once per event under the same serialized lock,
+    /// per-invocation deadline, and error/panic isolation as every other
+    /// handler, then maps the drained command sink to the batch-level
+    /// [`ScriptCommand`]s. Returns `None` — no answer, fail-closed — when no
+    /// `on_input` handler is registered or the invocation errors, deadlines, or
+    /// panics. The validator is the sole authority on whether the returned
+    /// answer materializes; this method only builds it.
+    pub fn evaluate_event_batch(&self, batch: &NormalizedEventBatch) -> Option<ScriptCommandBatch> {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = &guard.lua;
+        let budget = self.budget;
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_sink(lua);
+            set_invocation_mode(lua, InvocationMode::Normal);
+            set_deadline(lua, Some(Instant::now() + budget));
+            let outcomes = (|| -> mlua::Result<Option<Vec<InputOutcome>>> {
+                let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_INPUT_KEY)?
+                else {
+                    return Ok(None);
+                };
+                let mut outcomes = Vec::with_capacity(batch.events.len());
+                for event in &batch.events {
+                    let ev = build_event_table(lua, batch, event)?;
+                    let ret: Value = handler.call(ev)?;
+                    let (decision, reply) = parse_input_decision(ret)?;
+                    outcomes.push(InputOutcome {
+                        event_id: event.event_id,
+                        decision,
+                        reply,
+                    });
+                }
+                Ok(Some(outcomes))
+            })();
+            set_deadline(lua, None);
+            set_invocation_mode(lua, InvocationMode::Normal);
+            outcomes
+        }));
+        match result {
+            Ok(Ok(Some(outcomes))) => {
+                let commands = take_commands(lua, &guard.source_label, "on_input")
+                    .into_iter()
+                    .map(script_command_from_outbound)
+                    .collect();
+                let mut answer = ScriptCommandBatch::answering(batch);
+                answer.input_outcomes = outcomes;
+                answer.commands = commands;
+                Some(answer)
+            }
+            Ok(Ok(None)) => {
+                clear_sink(lua);
+                None
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "on_input",
+                    error = %error,
+                    "lua on_input failed; batch fails closed (no answer)"
+                );
+                clear_sink(lua);
+                None
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "on_input",
+                    "lua on_input panicked; batch fails closed (no answer)"
+                );
+                set_deadline(lua, None);
+                set_invocation_mode(lua, InvocationMode::Normal);
+                clear_sink(lua);
+                None
+            }
+        }
     }
 
     /// Run the optional before-realtime interceptor.
@@ -1600,6 +1720,14 @@ impl Runtime for LuaRuntime {
         LuaRuntime::before_realtime(self, sender, user_id, room_id, kind, body)
     }
 
+    fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        LuaRuntime::attach_bridge_sink(self, sink);
+    }
+
+    fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        LuaRuntime::deliver_event_batch(self, batch);
+    }
+
     fn after_realtime(
         &self,
         sender: u64,
@@ -1784,6 +1912,206 @@ fn build_ctx(
     }
     set_user_id(&ctx, user_id)?;
     Ok(ctx)
+}
+
+/// A `{x, y, z}` table for a 3-vector.
+fn vec3_table(lua: &Lua, v: [f32; 3]) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("x", v[0])?;
+    t.set("y", v[1])?;
+    t.set("z", v[2])?;
+    Ok(t)
+}
+
+/// A `{position, rotation = {x,y,z,w}, velocity}` table for a transform.
+fn transform_table(lua: &Lua, tr: BridgeTransform) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("position", vec3_table(lua, tr.position)?)?;
+    let rot = lua.create_table()?;
+    rot.set("x", tr.rotation[0])?;
+    rot.set("y", tr.rotation[1])?;
+    rot.set("z", tr.rotation[2])?;
+    rot.set("w", tr.rotation[3])?;
+    t.set("rotation", rot)?;
+    t.set("velocity", vec3_table(lua, tr.velocity)?)?;
+    Ok(t)
+}
+
+/// Marshal one normalized event into the table handed to `citadel.on_input`.
+///
+/// `kind` is a stable string tag the handler switches on; the remaining fields
+/// are the decoded, ownership-verified intent. Replicated-field marshaling is
+/// intentionally shallow in v1 (count only): rich per-field access is a
+/// follow-up once script-owned rep values land.
+fn build_event_table(
+    lua: &Lua,
+    batch: &NormalizedEventBatch,
+    event: &NormalizedEvent,
+) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("event_id", event.event_id)?;
+    t.set("participant", event.participant)?;
+    if let Some(user_id) = &event.user_id {
+        t.set("user_id", user_id.clone())?;
+    }
+    t.set("match_id", batch.match_id)?;
+    t.set("tick", batch.tick)?;
+    match &event.payload {
+        NormalizedPayload::TransformInput {
+            object_id,
+            ownership_epoch,
+            input_seq,
+            sim_tick,
+            dt,
+            move_velocity,
+            payload,
+            fire,
+        } => {
+            t.set("kind", "transform_input")?;
+            t.set("object_id", *object_id)?;
+            t.set("ownership_epoch", *ownership_epoch)?;
+            t.set("input_seq", *input_seq)?;
+            t.set("sim_tick", *sim_tick)?;
+            t.set("dt", *dt)?;
+            t.set("move_velocity", vec3_table(lua, *move_velocity)?)?;
+            t.set("payload", lua.create_string(payload)?)?;
+            t.set("has_fire", fire.is_some())?;
+            if let Some(fire) = fire {
+                let ft = lua.create_table()?;
+                ft.set("origin", vec3_table(lua, fire.origin)?)?;
+                ft.set("direction", vec3_table(lua, fire.direction)?)?;
+                ft.set("weapon", fire.weapon)?;
+                t.set("fire", ft)?;
+            }
+        }
+        NormalizedPayload::ActorStateReport {
+            object_id,
+            transform,
+        } => {
+            t.set("kind", "actor_state")?;
+            t.set("object_id", *object_id)?;
+            t.set("transform", transform_table(lua, *transform)?)?;
+        }
+        NormalizedPayload::ReplicatedVarWrite {
+            object_id,
+            class_id,
+            result_id,
+            fields,
+            ..
+        } => {
+            t.set("kind", "replicated_var")?;
+            t.set("object_id", *object_id)?;
+            t.set("class_id", *class_id)?;
+            t.set("result_id", *result_id)?;
+            t.set("field_count", fields.len() as u64)?;
+        }
+        NormalizedPayload::SpawnRequest {
+            archetype_id,
+            transform,
+        } => {
+            t.set("kind", "spawn_request")?;
+            t.set("archetype_id", *archetype_id)?;
+            t.set("transform", transform_table(lua, *transform)?)?;
+        }
+        NormalizedPayload::MatchMessage { kind, body } => {
+            t.set("kind", "message")?;
+            t.set("message_kind", *kind)?;
+            t.set("body", lua.create_string(body)?)?;
+        }
+        NormalizedPayload::ParticipantJoined => {
+            t.set("kind", "join")?;
+        }
+        NormalizedPayload::ParticipantLeft => {
+            t.set("kind", "leave")?;
+        }
+    }
+    Ok(t)
+}
+
+/// Parse the value a `citadel.on_input` handler returned into a decision plus an
+/// optional bounded reply.
+///
+/// Accepted shapes: `nil`/`true`/`"accept"` (Accept), `false`/`"reject"`
+/// (Reject, code 0), or a table `{ decision = "accept"|"reject"|"correct",
+/// reason_code?, reply?, transform? }`. Anything else is a script error — which
+/// fails the whole batch closed, never a silent accept.
+fn parse_input_decision(value: Value) -> mlua::Result<(Decision, Option<Vec<u8>>)> {
+    match value {
+        Value::Nil | Value::Boolean(true) => Ok((Decision::Accept, None)),
+        Value::Boolean(false) => Ok((Decision::Reject { reason_code: 0 }, None)),
+        Value::String(s) => {
+            let s = s.to_string_lossy();
+            match s.as_ref() {
+                "accept" => Ok((Decision::Accept, None)),
+                "reject" => Ok((Decision::Reject { reason_code: 0 }, None)),
+                other => Err(mlua::Error::RuntimeError(format!(
+                    "on_input returned an unknown decision string {other:?}"
+                ))),
+            }
+        }
+        Value::Table(t) => {
+            let reply = t
+                .get::<Option<mlua::String>>("reply")?
+                .map(|r| r.as_bytes().to_vec());
+            let decision = t
+                .get::<Option<mlua::String>>("decision")?
+                .map(|d| d.to_string_lossy());
+            match decision.as_deref() {
+                None | Some("accept") => Ok((Decision::Accept, reply)),
+                Some("reject") => {
+                    let reason_code = t.get::<Option<u16>>("reason_code")?.unwrap_or(0);
+                    Ok((Decision::Reject { reason_code }, reply))
+                }
+                Some("correct") => Ok((
+                    Decision::Correct {
+                        correction: parse_correction(&t)?,
+                    },
+                    reply,
+                )),
+                Some(other) => Err(mlua::Error::RuntimeError(format!(
+                    "on_input returned an unknown decision {other:?}"
+                ))),
+            }
+        }
+        _ => Err(mlua::Error::RuntimeError(
+            "on_input must return nil, a boolean, a string, or a table".to_string(),
+        )),
+    }
+}
+
+/// Parse a `Correct` decision's substituted value. v1 supports transform
+/// corrections (the movement path); rep/spawn corrections error until their
+/// Lua shape lands, so an unsupported correction fails the batch closed rather
+/// than materializing a wrong value.
+fn parse_correction(t: &Table) -> mlua::Result<Correction> {
+    if let Some(transform) = t.get::<Option<Table>>("transform")? {
+        return Ok(Correction::Transform(parse_transform(&transform)?));
+    }
+    Err(mlua::Error::RuntimeError(
+        "a correct decision requires a transform table (rep/spawn corrections are not yet supported in Lua)"
+            .to_string(),
+    ))
+}
+
+fn parse_vec3(t: &Table) -> mlua::Result<[f32; 3]> {
+    Ok([t.get("x")?, t.get("y")?, t.get("z")?])
+}
+
+fn parse_transform(t: &Table) -> mlua::Result<BridgeTransform> {
+    let position = parse_vec3(&t.get::<Table>("position")?)?;
+    let rotation = {
+        let r = t.get::<Table>("rotation")?;
+        [r.get("x")?, r.get("y")?, r.get("z")?, r.get("w")?]
+    };
+    let velocity = match t.get::<Option<Table>>("velocity")? {
+        Some(v) => parse_vec3(&v)?,
+        None => [0.0; 3],
+    };
+    Ok(BridgeTransform {
+        position,
+        rotation,
+        velocity,
+    })
 }
 
 /// Build the `ctx` table handed to a lifecycle handler: `sender` plus `user_id`.
@@ -2206,6 +2534,7 @@ fn install_host_api(
         ("on_room_join", ON_ROOM_JOIN_KEY),
         ("before_realtime", BEFORE_REALTIME_KEY),
         ("after_realtime", AFTER_REALTIME_KEY),
+        ("on_input", ON_INPUT_KEY),
     ] {
         let register = lua.create_function(move |lua, handler: Function| {
             lua.set_named_registry_value(key, handler)?;
@@ -2607,6 +2936,36 @@ fn install_host_api(
         Ok(mlua::Value::Table(value))
     })?;
     citadel.set("physics_state", physics_state)?;
+
+    // rewind_query(shooter, origin, direction, tick) is the bounded
+    // lag-compensated hit query (owner decision 1). Rust owns the rewind
+    // geometry; the script decides the consequence. Returns { hits = { ... } }.
+    let rewind_query = lua.create_function(
+        |lua, (shooter, origin, direction, tick): (u64, Table, Table, u64)| {
+            let value = lua.create_table()?;
+            let hits_table = lua.create_table()?;
+            if let Some(hub) = lua.app_data_ref::<TransformHubHandle>() {
+                let origin = lua_vector3(origin)?;
+                let direction = lua_vector3(direction)?;
+                for (index, hit) in hub
+                    .0
+                    .rewind_query(shooter, origin, direction, tick)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let entry = lua.create_table()?;
+                    entry.set("object_id", hit.object_id)?;
+                    entry.set("participant", hit.participant)?;
+                    entry.set("point", hit.point)?;
+                    entry.set("distance", hit.distance)?;
+                    hits_table.set(index + 1, entry)?;
+                }
+            }
+            value.set("hits", hits_table)?;
+            Ok(mlua::Value::Table(value))
+        },
+    )?;
+    citadel.set("rewind_query", rewind_query)?;
 
     // map_info(name) returns the loaded CMAP's read-only geometry summary, or
     // nil when the map is not loaded. No catalog mutation is exposed to scripts.
@@ -3661,6 +4020,181 @@ mod tests {
         LuaRuntime::from_source(src, "test", DEFAULT_DEADLINE_MS).expect("runtime loads")
     }
 
+    // ---- authoritative bridge: citadel.on_input ----
+
+    #[derive(Default)]
+    struct RecordingBridgeSink(Mutex<Vec<ScriptCommandBatch>>);
+
+    impl BridgeCommandSink for RecordingBridgeSink {
+        fn deliver_command_batch(&self, answer: ScriptCommandBatch) {
+            self.0.lock().unwrap().push(answer);
+        }
+    }
+
+    fn input_event(event_id: u64, object_id: u32) -> NormalizedEvent {
+        NormalizedEvent {
+            event_id,
+            participant: 1001,
+            user_id: None,
+            payload: NormalizedPayload::TransformInput {
+                object_id,
+                ownership_epoch: 1,
+                input_seq: 1,
+                sim_tick: 1,
+                dt: 0.016,
+                move_velocity: [1.0, 0.0, 0.0],
+                payload: Vec::new(),
+                fire: None,
+            },
+        }
+    }
+
+    fn batch_with(events: Vec<NormalizedEvent>) -> NormalizedEventBatch {
+        let mut batch = NormalizedEventBatch::new(5, 42, 9, 100, 1);
+        batch.events = events;
+        batch
+    }
+
+    #[test]
+    fn on_input_nil_return_accepts_the_event() {
+        let rt = runtime("citadel.on_input(function(e) return nil end)");
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.input_outcomes.len(), 1);
+        assert_eq!(answer.input_outcomes[0].event_id, 1);
+        assert_eq!(answer.input_outcomes[0].decision, Decision::Accept);
+        // Fencing echoes the delivered batch exactly.
+        assert_eq!(answer.generation, 5);
+        assert_eq!(answer.match_id, 42);
+        assert_eq!(answer.batch_id, 1);
+    }
+
+    #[test]
+    fn on_input_reject_table_carries_reason_and_reply() {
+        let rt = runtime(
+            r#"citadel.on_input(function(e)
+                return { decision = "reject", reason_code = 7, reply = "no" }
+            end)"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.input_outcomes[0].decision,
+            Decision::Reject { reason_code: 7 }
+        );
+        assert_eq!(
+            answer.input_outcomes[0].reply.as_deref(),
+            Some(b"no".as_ref())
+        );
+    }
+
+    #[test]
+    fn on_input_correct_returns_a_transform_correction() {
+        let rt = runtime(
+            r#"citadel.on_input(function(e)
+                return {
+                    decision = "correct",
+                    transform = {
+                        position = { x = 1, y = 2, z = 3 },
+                        rotation = { x = 0, y = 0, z = 0, w = 1 },
+                        velocity = { x = 4, y = 5, z = 6 },
+                    },
+                }
+            end)"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        match &answer.input_outcomes[0].decision {
+            Decision::Correct {
+                correction: Correction::Transform(t),
+            } => {
+                assert_eq!(t.position, [1.0, 2.0, 3.0]);
+                assert_eq!(t.rotation, [0.0, 0.0, 0.0, 1.0]);
+                assert_eq!(t.velocity, [4.0, 5.0, 6.0]);
+            }
+            other => panic!("expected a transform correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_input_broadcast_maps_to_a_match_broadcast_command() {
+        let rt = runtime(
+            r#"citadel.on_input(function(e)
+                citadel.broadcast(100, "hi", true)
+                return nil
+            end)"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.commands.len(), 1);
+        assert_eq!(
+            answer.commands[0],
+            crate::runtime::ScriptCommand::BroadcastMatch {
+                kind: 100,
+                body: b"hi".to_vec(),
+                unreliable: true,
+                exclude: None,
+            }
+        );
+    }
+
+    #[test]
+    fn no_on_input_handler_fails_closed_with_no_answer() {
+        // A script that never registered on_input is not a bridge script: a
+        // delivered batch produces no answer, so nothing materializes.
+        let rt = runtime("citadel.on_message(1, function(ctx, body) end)");
+        let batch = batch_with(vec![input_event(1, 7)]);
+        assert!(rt.evaluate_event_batch(&batch).is_none());
+    }
+
+    #[test]
+    fn on_input_error_fails_the_whole_batch_closed() {
+        let rt = runtime(r#"citadel.on_input(function(e) error("boom") end)"#);
+        let batch = batch_with(vec![input_event(1, 7), input_event(2, 8)]);
+        assert!(
+            rt.evaluate_event_batch(&batch).is_none(),
+            "a script fault must not produce a partial or default-accept answer"
+        );
+    }
+
+    #[test]
+    fn deliver_event_batch_reaches_the_attached_sink() {
+        let rt = runtime("citadel.on_input(function(e) return nil end)");
+        let sink = Arc::new(RecordingBridgeSink::default());
+        rt.attach_bridge_sink(Arc::downgrade(&sink) as Weak<dyn BridgeCommandSink>);
+        rt.deliver_event_batch(batch_with(vec![input_event(1, 7)]));
+        let got = sink.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].batch_id, 1);
+        assert_eq!(got[0].input_outcomes[0].decision, Decision::Accept);
+    }
+
+    #[test]
+    fn deliver_event_batch_without_a_handler_delivers_nothing() {
+        let rt = runtime("citadel.on_message(1, function(ctx, body) end)");
+        let sink = Arc::new(RecordingBridgeSink::default());
+        rt.attach_bridge_sink(Arc::downgrade(&sink) as Weak<dyn BridgeCommandSink>);
+        rt.deliver_event_batch(batch_with(vec![input_event(1, 7)]));
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_input_can_call_rewind_query() {
+        // The fire/hit host API is callable from on_input (owner decision 1).
+        // Without a hub attached it returns an empty hit list, proving the API
+        // is wired and the batch still answers.
+        let rt = runtime(
+            r#"citadel.on_input(function(e)
+                local r = citadel.rewind_query(e.participant, {x=0,y=0,z=0}, {x=1,y=0,z=0}, e.tick)
+                assert(type(r.hits) == "table")
+                return nil
+            end)"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.input_outcomes[0].decision, Decision::Accept);
+    }
+
     #[test]
     fn trusted_lua_http_policy_is_applied_at_the_host_boundary() {
         let static_data =
@@ -4397,6 +4931,7 @@ mod tests {
             "on_room_join",
             "before_realtime",
             "after_realtime",
+            "on_input",
             "broadcast",
             "send",
             "spawn_actor",
@@ -4406,6 +4941,7 @@ mod tests {
             "apply_impulse",
             "set_move_intent",
             "physics_state",
+            "rewind_query",
             "map_info",
             "map_names",
             "find_path",

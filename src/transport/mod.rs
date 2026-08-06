@@ -415,6 +415,30 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     );
     if let Some(readiness) = &script_readiness {
         gateway = gateway.with_script_readiness(Arc::clone(readiness));
+        // A require_script node runs authoritative matches: enable the gameplay
+        // bridge so a bound match's protected frames route through the per-match
+        // validator. Quotas + capabilities come from `[runtime.bridge]`
+        // (PROVISIONAL measure-first quota defaults; capabilities opt-in).
+        let bridge_cfg = &app.config().runtime.bridge;
+        let quotas = crate::runtime::BridgeQuotas {
+            max_commands: bridge_cfg.max_commands,
+            max_command_body_bytes: bridge_cfg.max_command_body_bytes,
+            max_reply_bytes: bridge_cfg.max_reply_bytes,
+            max_recipients: bridge_cfg.max_recipients,
+            max_persist_ops: bridge_cfg.max_persist_ops,
+            max_schedule_ops: bridge_cfg.max_schedule_ops,
+        };
+        let mut capabilities = std::collections::HashSet::new();
+        if bridge_cfg.allow_persist {
+            capabilities.insert(crate::runtime::Capability::Persist);
+        }
+        if bridge_cfg.allow_schedule {
+            capabilities.insert(crate::runtime::Capability::Schedule);
+        }
+        if bridge_cfg.allow_physics {
+            capabilities.insert(crate::runtime::Capability::Physics);
+        }
+        gateway = gateway.with_bridge(quotas, capabilities);
     }
 
     gateway = gateway.with_maps(maps);
@@ -655,6 +679,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         external.attach_sink(Arc::downgrade(&gateway)
             as std::sync::Weak<dyn crate::runtime::external_worker::MatchCommandSink>);
     }
+    // Wire the gateway as the authoritative-bridge command sink for whichever
+    // runtime is attached (embedded or external worker): a bound match's
+    // script answers land here for validation + materialization.
+    gateway.attach_bridge_sink();
     let mut chat_delivery_dispatcher = None;
     if let (Some(directory), Some(router), Some(local_node)) = (
         chat_cluster_directory,
