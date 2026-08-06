@@ -218,6 +218,73 @@ fn sanitize_owner_transform(t: NaTransform) -> Option<NaTransform> {
     })
 }
 
+/// Resolve the lag-compensated fire (if any) carried by one applied input
+/// frame into a `KIND_TSYNC_REWIND` reply. Shared by the relay input path
+/// ([`TransformHub::handle_input`]) and the authoritative-bridge executor
+/// ([`TransformHub::apply_validated_input`]) so both compute the identical,
+/// server-clamped rewind (the client's time is never trusted).
+fn resolve_fire_reply(
+    g: &HubInner,
+    participant: u64,
+    applied: &tsync::InputFrame,
+    current_tick: u32,
+    rewind_cfg: &RewindConfig,
+) -> Option<HubOutbound> {
+    let fire = applied.fire?;
+    let lag = g
+        .clients
+        .get(&participant)
+        .map(|c| c.lag)
+        .unwrap_or(LagProfile {
+            owd_ticks: 0.0,
+            interp_delay_ticks: 0.0,
+            rtt_ms: 0.0,
+        });
+    let rewind_tick = if lag_comp_enabled(&lag, rewind_cfg) {
+        compute_rewind_tick(current_tick, &lag, rewind_cfg)
+    } else {
+        f64::from(current_tick) // above the cutoff: resolve at present
+    };
+    let ray = HitRay {
+        origin: fire.origin,
+        direction: fire.direction,
+    };
+    let shooter_object = applied.object_id;
+    let radius = rewind_cfg.hit_radius_cm;
+    let targets = g
+        .world
+        .rewind_centers(rewind_tick)
+        .into_iter()
+        .filter(|&(id, _)| id != shooter_object)
+        .map(|(id, center)| HitTarget {
+            object_id: id,
+            center,
+            radius,
+        });
+    let result = match rewind::resolve_hit(&ray, targets) {
+        Some(h) => RewindResult {
+            input_seq: applied.input_seq,
+            hit: true,
+            object_id: h.object_id,
+            hit_point: h.point,
+            rewind_tick: rewind_tick.round().max(0.0) as u32,
+        },
+        None => RewindResult {
+            input_seq: applied.input_seq,
+            hit: false,
+            object_id: 0,
+            hit_point: [0.0; 3],
+            rewind_tick: rewind_tick.round().max(0.0) as u32,
+        },
+    };
+    Some(HubOutbound {
+        participant,
+        kind: citadel_wire::protocol::KIND_TSYNC_REWIND,
+        body: result.encode(),
+        unreliable: false,
+    })
+}
+
 /// One outbound transform-sync frame the gateway must deliver.
 #[derive(Debug, Clone)]
 pub struct HubOutbound {
@@ -846,65 +913,83 @@ impl TransformHub {
             // resolve a fire per released frame (each exactly once, in seq order).
             let released = g.world.apply_owner_input(participant, f);
             for applied in &released {
-                let Some(fire) = applied.fire else {
-                    continue;
-                };
-                // Server-computed, clamped rewind time (client time never trusted).
-                let lag = g
-                    .clients
-                    .get(&participant)
-                    .map(|c| c.lag)
-                    .unwrap_or(LagProfile {
-                        owd_ticks: 0.0,
-                        interp_delay_ticks: 0.0,
-                        rtt_ms: 0.0,
-                    });
-                let rewind_tick = if lag_comp_enabled(&lag, &rewind_cfg) {
-                    compute_rewind_tick(current_tick, &lag, &rewind_cfg)
-                } else {
-                    f64::from(current_tick) // above the cutoff: resolve at present
-                };
-                let ray = HitRay {
-                    origin: fire.origin,
-                    direction: fire.direction,
-                };
-                let shooter_object = applied.object_id;
-                let radius = rewind_cfg.hit_radius_cm;
-                let targets = g
-                    .world
-                    .rewind_centers(rewind_tick)
-                    .into_iter()
-                    .filter(|&(id, _)| id != shooter_object)
-                    .map(|(id, center)| HitTarget {
-                        object_id: id,
-                        center,
-                        radius,
-                    });
-                let result = match rewind::resolve_hit(&ray, targets) {
-                    Some(h) => RewindResult {
-                        input_seq: applied.input_seq,
-                        hit: true,
-                        object_id: h.object_id,
-                        hit_point: h.point,
-                        rewind_tick: rewind_tick.round().max(0.0) as u32,
-                    },
-                    None => RewindResult {
-                        input_seq: applied.input_seq,
-                        hit: false,
-                        object_id: 0,
-                        hit_point: [0.0; 3],
-                        rewind_tick: rewind_tick.round().max(0.0) as u32,
-                    },
-                };
-                out.push(HubOutbound {
-                    participant,
-                    kind: citadel_wire::protocol::KIND_TSYNC_REWIND,
-                    body: result.encode(),
-                    unreliable: false,
-                });
+                if let Some(reply) =
+                    resolve_fire_reply(&g, participant, applied, current_tick, &rewind_cfg)
+                {
+                    out.push(reply);
+                }
             }
         }
         out
+    }
+
+    /// Apply one script-validated owner input frame and resolve any fire it
+    /// carries — the authoritative-bridge executor for an accepted
+    /// `TransformInput`. It runs the same `world.apply_owner_input` gate
+    /// (ownership, epoch, contiguous-seq dedup) as [`handle_input`](Self::handle_input),
+    /// so an out-of-order, replayed, or foreign frame still mutates nothing. Any
+    /// rewind result is returned for the gateway to unicast to the shooter.
+    pub fn apply_validated_input(
+        &self,
+        participant: u64,
+        frame: &tsync::InputFrame,
+    ) -> Vec<HubOutbound> {
+        let mut out = Vec::new();
+        let Ok(mut g) = self.inner.lock() else {
+            return out;
+        };
+        let current_tick = g.world.tick();
+        let rewind_cfg = self.config.rewind;
+        let released = g.world.apply_owner_input(participant, frame);
+        for applied in &released {
+            if let Some(reply) =
+                resolve_fire_reply(&g, participant, applied, current_tick, &rewind_cfg)
+            {
+                out.push(reply);
+            }
+        }
+        out
+    }
+
+    /// Read-only structural ownership check for the bridge: `participant` must
+    /// own `object_id` at `ownership_epoch`. Nothing mutates.
+    #[must_use]
+    pub fn input_ownership_ok(
+        &self,
+        participant: u64,
+        object_id: ObjectId,
+        ownership_epoch: u32,
+    ) -> bool {
+        self.inner.lock().ok().is_some_and(|g| {
+            g.world
+                .input_ownership_ok(participant, object_id, ownership_epoch)
+        })
+    }
+
+    /// Decode + epoch-validate a `KIND_TSYNC_V2_INPUT` body, returning the inner
+    /// bundle only when the participant's v2 clock epoch matches. Shared by
+    /// [`handle_v2_input`](Self::handle_v2_input) and the bridge input route so
+    /// the epoch fence is enforced identically on both paths.
+    #[must_use]
+    pub fn decode_v2_input(&self, participant: u64, body: &[u8]) -> Option<tsync::InputBundle> {
+        let Ok((epoch, _hint, bundle)) = tsync::InputDiagnosticHint::decode_v2(body) else {
+            if let Ok(mut g) = self.inner.lock() {
+                g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
+            }
+            return None;
+        };
+        let mut g = self.inner.lock().ok()?;
+        let valid = g.clients.get(&participant).is_some_and(|c| c.v2_clock)
+            && g.gameplay_clock.snapshot().epoch == epoch;
+        if valid {
+            g.input_hint_metrics.accepted = g.input_hint_metrics.accepted.saturating_add(1);
+            // The authority decision is counted separately from decode: no hint
+            // field is retained or passed into gameplay.
+            g.input_hint_metrics.ignored = g.input_hint_metrics.ignored.saturating_add(1);
+        } else {
+            g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
+        }
+        valid.then_some(bundle)
     }
 
     /// Handle an epoch-fenced v2 input. Hints are decoded only to bound and
@@ -912,29 +997,9 @@ impl TransformHub {
     /// scheduling, authorization, latency, or rewind calculations.
     #[must_use]
     pub fn handle_v2_input(&self, participant: u64, body: &[u8]) -> Vec<HubOutbound> {
-        let Ok((epoch, _hint, bundle)) = tsync::InputDiagnosticHint::decode_v2(body) else {
-            if let Ok(mut g) = self.inner.lock() {
-                g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
-            }
+        let Some(bundle) = self.decode_v2_input(participant, body) else {
             return Vec::new();
         };
-        let Ok(mut g) = self.inner.lock() else {
-            return Vec::new();
-        };
-        let valid = g.clients.get(&participant).is_some_and(|c| c.v2_clock)
-            && g.gameplay_clock.snapshot().epoch == epoch;
-        if valid {
-            g.input_hint_metrics.accepted = g.input_hint_metrics.accepted.saturating_add(1);
-            // Deliberately count the authority decision separately from decode:
-            // no hint field is retained or passed into gameplay.
-            g.input_hint_metrics.ignored = g.input_hint_metrics.ignored.saturating_add(1);
-        } else {
-            g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
-        }
-        drop(g);
-        if !valid {
-            return Vec::new();
-        }
         self.handle_input(participant, &bundle.encode())
     }
 

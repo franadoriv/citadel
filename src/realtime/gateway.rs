@@ -58,7 +58,7 @@ use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, Roo
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
     BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepValue, BridgeTransform,
-    Capability, Correction, Decision, EventDraft, GameScriptReadiness, LifecycleHook,
+    Capability, Correction, Decision, EventDraft, FireIntent, GameScriptReadiness, LifecycleHook,
     NormalizedPayload, OutboundCommand, PendingBatchLedger, RealtimeAfterOutcome,
     RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
     ScriptCommand, ScriptCommandBatch, ValidatedBatch, ValidatedOutcome,
@@ -5394,6 +5394,16 @@ impl Gateway {
                 0
             }
             KIND_TSYNC_INPUT => {
+                // Authoritative match: owner input becomes TransformInput events
+                // routed through the validator; the direct apply_owner_input
+                // (bypass B1) is unreachable here. Non-authoritative deployments
+                // keep the direct owner-input path unchanged.
+                if let Some((room_id, binding)) = self.authoritative_match(sender) {
+                    let Ok(bundle) = citadel_wire::tsync::InputBundle::decode(&env.body) else {
+                        return 0;
+                    };
+                    return self.route_bridge_input(sender, &bundle.frames, room_id, &binding);
+                }
                 // Owner input rides the unreliable path; a carried fire command
                 // yields an authoritative rewind result delivered reliably to the
                 // shooter only (design §5.2). The client never resolves hits.
@@ -5409,6 +5419,14 @@ impl Gateway {
                 sent
             }
             KIND_TSYNC_V2_INPUT => {
+                // Authoritative match: epoch-validate the v2 wrapper, then route
+                // the inner bundle through the validator (bypass B3 closed).
+                if let Some((room_id, binding)) = self.authoritative_match(sender) {
+                    let Some(bundle) = hub.decode_v2_input(sender.get(), &env.body) else {
+                        return 0;
+                    };
+                    return self.route_bridge_input(sender, &bundle.frames, room_id, &binding);
+                }
                 let mut sent = 0;
                 for reply in hub.handle_v2_input(sender.get(), &env.body) {
                     let outbound = Outbound::reliable(Envelope::new(reply.kind, reply.body));
@@ -6422,6 +6440,57 @@ impl Gateway {
         0
     }
 
+    /// Structural stage for authoritative owner input: for each frame the sender
+    /// owns (ownership + epoch + finite move), issue a `TransformInput`
+    /// normalized event. Nothing integrates here — `apply_owner_input` runs only
+    /// on the script's accept. Returns 0 (no synchronous reply).
+    fn route_bridge_input(
+        &self,
+        sender: ParticipantId,
+        frames: &[citadel_wire::tsync::InputFrame],
+        room_id: RoomId,
+        binding: &ScriptBinding,
+    ) -> usize {
+        let Some(hub) = &self.transform else {
+            return 0;
+        };
+        let user_id = self.registry.user_id_of(sender);
+        let mut drafts = Vec::new();
+        for frame in frames {
+            // Structural: only the owner's own object at the right epoch, with a
+            // finite movement intent, becomes an event.
+            if !hub.input_ownership_ok(sender.get(), frame.object_id, frame.ownership_epoch) {
+                continue;
+            }
+            if frame.move_velocity.iter().any(|v| !v.is_finite()) || !frame.dt.is_finite() {
+                continue;
+            }
+            drafts.push(EventDraft {
+                participant: sender.get(),
+                user_id: user_id.clone(),
+                payload: NormalizedPayload::TransformInput {
+                    object_id: frame.object_id,
+                    ownership_epoch: frame.ownership_epoch,
+                    input_seq: frame.input_seq,
+                    sim_tick: frame.sim_tick,
+                    dt: frame.dt,
+                    move_velocity: frame.move_velocity,
+                    payload: frame.payload.clone(),
+                    fire: frame.fire.map(|fire| FireIntent {
+                        origin: fire.origin,
+                        direction: fire.direction,
+                        weapon: 0,
+                    }),
+                },
+            });
+        }
+        if drafts.is_empty() {
+            return 0;
+        }
+        self.deliver_bridge_batch(room_id, binding, drafts);
+        0
+    }
+
     /// Materialize one fully validated batch: apply each accepted/corrected
     /// outcome's canonical effect, then apply the script-originated commands
     /// room-scoped. Called only from [`BridgeCommandSink::deliver_command_batch`]
@@ -6468,6 +6537,44 @@ impl Gateway {
                 hub.apply_owner_state(participant, *object_id, (*transform).into());
                 0
             }
+            NormalizedPayload::TransformInput {
+                object_id,
+                ownership_epoch,
+                input_seq,
+                sim_tick,
+                dt,
+                move_velocity,
+                payload: input_payload,
+                fire,
+            } => {
+                // Reconstruct the wire frame and apply it through the same
+                // ownership/epoch/seq gate as the relay path; any rewind reply
+                // is unicast reliably to the shooter.
+                let frame = citadel_wire::tsync::InputFrame {
+                    input_seq: *input_seq,
+                    sim_tick: *sim_tick,
+                    dt: *dt,
+                    object_id: *object_id,
+                    ownership_epoch: *ownership_epoch,
+                    move_velocity: *move_velocity,
+                    payload: input_payload.clone(),
+                    fire: fire.map(|fire| citadel_wire::tsync::FireCommand {
+                        origin: fire.origin,
+                        direction: fire.direction,
+                    }),
+                };
+                let mut sent = 0;
+                for reply in hub.apply_validated_input(participant, &frame) {
+                    if self.send_reliable(
+                        ParticipantId::from_raw(reply.participant),
+                        reply.kind,
+                        reply.body,
+                    ) {
+                        sent += 1;
+                    }
+                }
+                sent
+            }
             // Other protected kinds are not yet routed through the bridge, so
             // their accepted effect is materialized where they are wired in a
             // later step. Reaching here is defensive.
@@ -6489,7 +6596,8 @@ impl Gateway {
         };
         match (payload, correction) {
             (
-                NormalizedPayload::ActorStateReport { object_id, .. },
+                NormalizedPayload::ActorStateReport { object_id, .. }
+                | NormalizedPayload::TransformInput { object_id, .. },
                 Correction::Transform(transform),
             ) => {
                 hub.set_transform(*object_id, na_to_transform_state(*transform));
@@ -7806,6 +7914,146 @@ mod transform_tests {
         assert!(
             hub.get_transform(foreign).is_none(),
             "a foreign-object report is dropped before it becomes an event"
+        );
+    }
+
+    // ---- authoritative bridge: KIND_TSYNC_INPUT flows through the validator ----
+
+    fn authoritative_gateway_slots(
+        on_input_src: &str,
+        slots: u32,
+    ) -> (Arc<Gateway>, Arc<TransformHub>) {
+        let cfg = TransformHubConfig {
+            player_slots: slots,
+            ..TransformHubConfig::default()
+        };
+        let hub = Arc::new(TransformHub::new(cfg).expect("hub"));
+        let runtime: Arc<dyn Runtime> = Arc::new(
+            crate::runtime::LuaRuntime::from_source(
+                on_input_src,
+                "bridge-test",
+                crate::runtime::DEFAULT_DEADLINE_MS,
+            )
+            .expect("lua runtime"),
+        );
+        let gw = Arc::new(
+            Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
+                .with_transform_hub(Arc::clone(&hub))
+                .with_bridge(BridgeQuotas::default()),
+        );
+        gw.attach_bridge_sink();
+        (gw, hub)
+    }
+
+    /// HELLO a participant into a player slot (owned object + epoch), then bind
+    /// it into an authoritative room. Returns the participant, its object id,
+    /// and the assigned ownership epoch.
+    async fn authoritative_slot_member(gw: &Arc<Gateway>) -> (ParticipantId, u32, u32) {
+        let (p, mut rp) = register(gw);
+        gw.handle_inbound(p, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _hello = rp.recv().await.expect("hello reply");
+        let role_out = rp.recv().await.expect("role frame");
+        let role = tsync::Role::decode(&role_out.envelope.body).expect("role decodes");
+        let binding = ScriptBinding {
+            revision_id: "sha256:test".to_owned(),
+            generation: 1,
+        };
+        gw.rooms()
+            .join_or_create_bound(p, "arena", Some(binding), || RoomLabel::with_map("arena"))
+            .expect("bound room");
+        (p, role.object_id, role.ownership_epoch)
+    }
+
+    fn input_bundle(object_id: u32, epoch: u32, seq: u32, vel_x: f32, dt: f32) -> Envelope {
+        let bundle = tsync::InputBundle {
+            acked_snapshot_id: 0,
+            last_seen_snapshot_id: 0,
+            frames: vec![tsync::InputFrame {
+                input_seq: seq,
+                sim_tick: 0,
+                dt,
+                object_id,
+                ownership_epoch: epoch,
+                move_velocity: [vel_x, 0.0, 0.0],
+                payload: Vec::new(),
+                fire: None,
+            }],
+        };
+        Envelope::new(KIND_TSYNC_INPUT, bundle.encode())
+    }
+
+    #[tokio::test]
+    async fn authoritative_input_is_not_integrated_without_a_script_answer() {
+        let (gw, hub) = authoritative_gateway_slots("-- no on_input handler", 1);
+        let (a, object_id, epoch) = authoritative_slot_member(&gw).await;
+        let start = hub.get_transform(object_id).expect("object").position[0];
+        gw.handle_inbound(a, &input_bundle(object_id, epoch, 1, 100.0, 0.1));
+        assert!(
+            (hub.get_transform(object_id).expect("object").position[0] - start).abs() < 1e-3,
+            "no answer must not integrate owner input (bypass B1 closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_input_integrates_only_after_accept() {
+        let (gw, hub) =
+            authoritative_gateway_slots("citadel.on_input(function(e) return nil end)", 1);
+        let (a, object_id, epoch) = authoritative_slot_member(&gw).await;
+        let start = hub.get_transform(object_id).expect("object").position[0];
+        gw.handle_inbound(a, &input_bundle(object_id, epoch, 1, 100.0, 0.1));
+        assert!(
+            hub.get_transform(object_id).expect("object").position[0] > start + 1.0,
+            "an accepted input integrates the movement intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_input_reject_integrates_nothing() {
+        let (gw, hub) =
+            authoritative_gateway_slots("citadel.on_input(function(e) return false end)", 1);
+        let (a, object_id, epoch) = authoritative_slot_member(&gw).await;
+        let start = hub.get_transform(object_id).expect("object").position[0];
+        gw.handle_inbound(a, &input_bundle(object_id, epoch, 1, 100.0, 0.1));
+        assert!(
+            (hub.get_transform(object_id).expect("object").position[0] - start).abs() < 1e-3,
+            "a rejected input integrates nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_input_correction_overrides_the_integrated_value() {
+        let (gw, hub) = authoritative_gateway_slots(
+            r#"citadel.on_input(function(e)
+                return {
+                    decision = "correct",
+                    transform = {
+                        position = { x = 3, y = 0, z = 0 },
+                        rotation = { x = 0, y = 0, z = 0, w = 1 },
+                        velocity = { x = 0, y = 0, z = 0 },
+                    },
+                }
+            end)"#,
+            1,
+        );
+        let (a, object_id, epoch) = authoritative_slot_member(&gw).await;
+        gw.handle_inbound(a, &input_bundle(object_id, epoch, 1, 100.0, 0.1));
+        let pos = hub.get_transform(object_id).expect("object").position;
+        assert!(
+            (pos[0] - 3.0).abs() < 1e-3,
+            "the script's corrected transform is materialized, not the client's integration: {pos:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_input_for_a_foreign_object_is_dropped_structurally() {
+        let (gw, hub) =
+            authoritative_gateway_slots("citadel.on_input(function(e) return nil end)", 1);
+        let (a, object_id, epoch) = authoritative_slot_member(&gw).await;
+        let foreign = object_id + 100;
+        gw.handle_inbound(a, &input_bundle(foreign, epoch, 1, 100.0, 0.1));
+        assert!(
+            hub.get_transform(foreign).is_none(),
+            "input for an unowned object never becomes an event or mutates"
         );
     }
 
