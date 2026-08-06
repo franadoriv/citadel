@@ -99,6 +99,14 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         since: "unreleased",
     },
     HostApiFn {
+        name: "on_input",
+        category: HostApiCategory::RealtimeHook,
+        params: &["handler:fn(event)->outcome"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
         name: "on_join",
         category: HostApiCategory::LifecycleHook,
         params: &["handler:fn(ctx)"],

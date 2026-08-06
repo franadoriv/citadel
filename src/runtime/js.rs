@@ -75,6 +75,7 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "on_room_join",
     "before_realtime",
     "after_realtime",
+    "on_input",
     "broadcast",
     "send",
     "spawn_actor",

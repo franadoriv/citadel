@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -27,14 +27,16 @@ use crate::runtime::outbound_http::{
 };
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
-    LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, OutboundCommand, PhysicsOptions,
-    RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
-    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
-    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
-    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
-    RuntimeSharedCacheHandle, append_runtime_event_commands, disabled_runtime_event_bus_handle,
-    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
-    set_runtime_event_bus, set_runtime_shared_cache,
+    BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEventBatch,
+    OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome,
+    RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
+    RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
+    RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
+    append_runtime_event_commands, bridge_event_json, bridge_input_outcome_from_json,
+    disabled_runtime_event_bus_handle, disabled_runtime_shared_cache_handle, runtime_event_bus,
+    runtime_shared_cache, script_command_from_outbound, set_runtime_event_bus,
+    set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use citadel_physics::{PhysicsConfig, Shape};
@@ -81,6 +83,7 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "on_room_join",
     "before_realtime",
     "after_realtime",
+    "on_input",
     "broadcast",
     "send",
     "spawn_actor",
@@ -152,6 +155,7 @@ _on_room_create = None
 _on_room_join = None
 _on_before_realtime = None
 _on_after_realtime = None
+_on_input = None
 _commands = []
 _total_bytes = 0
 _overflowed = False
@@ -260,6 +264,9 @@ def before_realtime(handler=None):
 
 def after_realtime(handler=None):
     return _single("_on_after_realtime", handler)
+
+def on_input(handler=None):
+    return _single("_on_input", handler)
 
 def log(message, level="info"):
     logger = logging.getLogger("citadel.script")
@@ -499,6 +506,35 @@ def _dispatch_after_realtime(ctx, body):
     _on_after_realtime(ctx, _bytes(body))
     return True
 
+def _normalize_input_decision(ret):
+    if ret is None or ret is True or ret == "accept":
+        return {"decision": "accept"}
+    if ret is False or ret == "reject":
+        return {"decision": "reject", "reason_code": 0}
+    if isinstance(ret, dict):
+        decision = str(ret.get("decision", "accept"))
+        out = {"decision": decision}
+        if "reason_code" in ret:
+            out["reason_code"] = int(ret["reason_code"])
+        if ret.get("reply") is not None:
+            reply = ret["reply"]
+            out["reply"] = reply.decode("utf-8") if isinstance(reply, (bytes, bytearray)) else str(reply)
+        if decision == "correct":
+            if not ret.get("transform"):
+                raise TypeError("a correct decision requires a transform")
+            out["transform"] = ret["transform"]
+        return out
+    raise TypeError("on_input must return None, a bool, a str, or a dict")
+
+def _dispatch_input(event_json):
+    if _on_input is None:
+        return None
+    decision = _normalize_input_decision(_on_input(json.loads(event_json)))
+    return json.dumps(decision, separators=(",", ":"))
+
+def _has_on_input():
+    return _on_input is not None
+
 def _dispatch_lifecycle(hook, ctx):
     handler = _on_join if hook == "on_join" else _on_leave
     if handler is None:
@@ -593,6 +629,7 @@ def _has_any_handler():
         or _on_room_join is not None
         or _on_before_realtime is not None
         or _on_after_realtime is not None
+        or _on_input is not None
         or bool(_http_endpoint_handlers)
         or bool(_event_handlers)
     )
@@ -615,6 +652,8 @@ def _introspect():
         hooks.append("before_realtime")
     if _on_after_realtime is not None:
         hooks.append("after_realtime")
+    if _on_input is not None:
+        hooks.append("on_input")
     return (
         sorted(str(name) for name in _rpc_handlers.keys()),
         sorted(int(kind) for kind in _message_handlers.keys()),
@@ -1544,6 +1583,9 @@ pub struct PythonRuntime {
     domain: Option<Arc<dyn DomainHost>>,
     maps: Option<Arc<MapCatalog>>,
     transform_hub: Option<Arc<TransformHub>>,
+    /// Where this runtime's authoritative-bridge answers land (the gateway),
+    /// held weakly. Lives on the runtime so it survives a hot-reload swap.
+    bridge_sink: Mutex<Option<Weak<dyn BridgeCommandSink>>>,
 }
 
 impl std::fmt::Debug for PythonRuntime {
@@ -1653,6 +1695,7 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            bridge_sink: Mutex::new(None),
         }))
     }
 
@@ -1697,6 +1740,7 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            bridge_sink: Mutex::new(None),
         })
     }
 
@@ -1742,6 +1786,7 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            bridge_sink: Mutex::new(None),
         })
     }
 
@@ -1948,6 +1993,107 @@ impl PythonRuntime {
                 .call1((kind, ctx, body))?
                 .extract::<bool>()
         })
+    }
+
+    /// Attach the gateway's authoritative-bridge sink (weakly).
+    pub fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        *self.bridge_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    fn bridge_sink(&self) -> Option<Arc<dyn BridgeCommandSink>> {
+        self.bridge_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// Evaluate one delivered batch inline and deliver the fenced answer to the
+    /// attached sink. No answer (no `on_input` handler, or a fault) delivers
+    /// nothing — the fail-closed failure policy.
+    pub fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        let Some(answer) = self.evaluate_event_batch(&batch) else {
+            return;
+        };
+        if let Some(sink) = self.bridge_sink() {
+            sink.deliver_command_batch(answer);
+        }
+    }
+
+    /// Evaluate a normalized-event batch and build the script's fenced answer.
+    ///
+    /// Runs `citadel.on_input` once per event (via the shared JSON bridge) under
+    /// the same VM lock, deadline, and error/panic isolation as every other
+    /// handler, then maps the drained command sink to the batch-level
+    /// [`ScriptCommand`]s. Returns `None` — no answer, fail-closed — when no
+    /// `on_input` handler is registered or the invocation errors, times out, or
+    /// panics.
+    pub fn evaluate_event_batch(&self, batch: &NormalizedEventBatch) -> Option<ScriptCommandBatch> {
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Python::attach(
+                |_py| -> PyResult<Option<(Vec<crate::runtime::InputOutcome>, Vec<OutboundCommand>)>> {
+                    let module = guard.citadel.bind(_py);
+                    clear_commands(module);
+                    run_with_python_deadline(module, self.budget, || {
+                        let present: bool =
+                            module.getattr("_has_on_input")?.call0()?.extract()?;
+                        if !present {
+                            clear_commands(module);
+                            return Ok(None);
+                        }
+                        let dispatch = module.getattr("_dispatch_input")?;
+                        let mut outcomes = Vec::with_capacity(batch.events.len());
+                        for event in &batch.events {
+                            let event_json = bridge_event_json(batch, event);
+                            let decision = dispatch.call1((event_json,))?;
+                            if decision.is_none() {
+                                clear_commands(module);
+                                return Ok(None);
+                            }
+                            let decision_json: String = decision.extract()?;
+                            let outcome =
+                                bridge_input_outcome_from_json(event.event_id, &decision_json)
+                                    .map_err(PyRuntimeError::new_err)?;
+                            outcomes.push(outcome);
+                        }
+                        let commands = take_commands(module, &guard.source_label, "on_input")?;
+                        Ok(Some((outcomes, commands)))
+                    })
+                },
+            )
+        }));
+        match outcome {
+            Ok(Ok(Some((outcomes, commands)))) => {
+                let mut answer = ScriptCommandBatch::answering(batch);
+                answer.input_outcomes = outcomes;
+                answer.commands = commands
+                    .into_iter()
+                    .map(script_command_from_outbound)
+                    .collect();
+                Some(answer)
+            }
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "on_input",
+                    error = %error,
+                    "python on_input failed; batch fails closed (no answer)"
+                );
+                clear_vm_commands(&guard);
+                None
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "on_input",
+                    "python on_input panicked; batch fails closed (no answer)"
+                );
+                clear_vm_commands(&guard);
+                None
+            }
+        }
     }
 
     /// Run the optional before-realtime interceptor. A `False` result vetoes the
@@ -2502,6 +2648,14 @@ impl Runtime for PythonRuntime {
         body: &[u8],
     ) -> RealtimeInterception {
         PythonRuntime::before_realtime(self, sender, user_id, room_id, kind, body)
+    }
+
+    fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        PythonRuntime::attach_bridge_sink(self, sink);
+    }
+
+    fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        PythonRuntime::deliver_event_batch(self, batch);
     }
 
     fn after_realtime(
@@ -3323,6 +3477,139 @@ mod tests {
 
     fn runtime(src: &str) -> PythonRuntime {
         PythonRuntime::from_source(src, "test.py", 100).expect("python runtime loads")
+    }
+
+    // ---- authoritative bridge: citadel.on_input parity ----
+
+    #[derive(Default)]
+    struct RecordingBridgeSink(Mutex<Vec<ScriptCommandBatch>>);
+
+    impl BridgeCommandSink for RecordingBridgeSink {
+        fn deliver_command_batch(&self, answer: ScriptCommandBatch) {
+            self.0.lock().unwrap().push(answer);
+        }
+    }
+
+    fn input_event(event_id: u64, object_id: u32) -> crate::runtime::NormalizedEvent {
+        crate::runtime::NormalizedEvent {
+            event_id,
+            participant: 1001,
+            user_id: None,
+            payload: crate::runtime::NormalizedPayload::TransformInput {
+                object_id,
+                ownership_epoch: 1,
+                input_seq: 1,
+                sim_tick: 1,
+                dt: 0.016,
+                move_velocity: [1.0, 0.0, 0.0],
+                payload: Vec::new(),
+                fire: None,
+            },
+        }
+    }
+
+    fn batch_with(events: Vec<crate::runtime::NormalizedEvent>) -> NormalizedEventBatch {
+        let mut batch = NormalizedEventBatch::new(5, 42, 9, 100, 1);
+        batch.events = events;
+        batch
+    }
+
+    #[test]
+    fn on_input_accepts_on_none_return() {
+        let rt = runtime("import citadel\ndef h(e):\n    return None\ncitadel.on_input(h)\n");
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.input_outcomes.len(), 1);
+        assert_eq!(
+            answer.input_outcomes[0].decision,
+            crate::runtime::Decision::Accept
+        );
+        assert_eq!(answer.generation, 5);
+        assert_eq!(answer.batch_id, 1);
+    }
+
+    #[test]
+    fn on_input_reject_dict_carries_reason_and_reply() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    return {\"decision\": \"reject\", \"reason_code\": 7, \"reply\": \"no\"}\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.input_outcomes[0].decision,
+            crate::runtime::Decision::Reject { reason_code: 7 }
+        );
+        assert_eq!(
+            answer.input_outcomes[0].reply.as_deref(),
+            Some(b"no".as_ref())
+        );
+    }
+
+    #[test]
+    fn on_input_correct_returns_a_transform_correction() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    return {\"decision\": \"correct\", \"transform\": {\"position\": [1, 2, 3], \"rotation\": [0, 0, 0, 1], \"velocity\": [4, 5, 6]}}\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        match &answer.input_outcomes[0].decision {
+            crate::runtime::Decision::Correct {
+                correction: crate::runtime::Correction::Transform(t),
+            } => {
+                assert_eq!(t.position, [1.0, 2.0, 3.0]);
+                assert_eq!(t.velocity, [4.0, 5.0, 6.0]);
+            }
+            other => panic!("expected a transform correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_input_broadcast_maps_to_a_match_broadcast_command() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    citadel.broadcast(100, \"hi\", True)\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.commands.len(), 1);
+        assert_eq!(
+            answer.commands[0],
+            crate::runtime::ScriptCommand::BroadcastMatch {
+                kind: 100,
+                body: b"hi".to_vec(),
+                unreliable: true,
+                exclude: None,
+            }
+        );
+    }
+
+    #[test]
+    fn no_on_input_handler_fails_closed() {
+        let rt = runtime("import citadel\ndef h(ctx, body):\n    pass\ncitadel.on_message(1, h)\n");
+        let batch = batch_with(vec![input_event(1, 7)]);
+        assert!(rt.evaluate_event_batch(&batch).is_none());
+    }
+
+    #[test]
+    fn on_input_error_fails_the_whole_batch_closed() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    raise RuntimeError(\"boom\")\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![input_event(1, 7), input_event(2, 8)]);
+        assert!(rt.evaluate_event_batch(&batch).is_none());
+    }
+
+    #[test]
+    fn deliver_event_batch_reaches_the_attached_sink() {
+        let rt = runtime("import citadel\ndef h(e):\n    return None\ncitadel.on_input(h)\n");
+        let sink = Arc::new(RecordingBridgeSink::default());
+        rt.attach_bridge_sink(Arc::downgrade(&sink) as Weak<dyn BridgeCommandSink>);
+        rt.deliver_event_batch(batch_with(vec![input_event(1, 7)]));
+        let got = sink.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].input_outcomes[0].decision,
+            crate::runtime::Decision::Accept
+        );
     }
 
     #[test]

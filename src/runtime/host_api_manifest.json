@@ -31,6 +31,16 @@
     "since": "unreleased"
   },
   {
+    "name": "on_input",
+    "category": "realtime_hook",
+    "params": [
+      "handler:fn(event)->outcome"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "on_join",
     "category": "lifecycle_hook",
     "params": [
