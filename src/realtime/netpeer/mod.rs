@@ -37,7 +37,7 @@ pub mod peer;
 
 pub use authority::{
     RateLimits, RepAuthority, RepAuthorityMetrics, RepInterestConfig, RepOutbound, RepReject,
-    RepVetoContext, RepVetoHook, Validated,
+    Validated,
 };
 pub use delta::{
     BuiltDelta, CollectionState, MAX_COLLECTION_BASELINE, MAX_PENDING_PER_RECEIVER,

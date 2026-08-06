@@ -19,9 +19,9 @@
 //!                  items per sec) + per-bunch hard caps; charged even on reject.
 //!   6. DECODE+BOUNDS decode ONLY now, validate each value against the server's
 //!                  compiled FieldBounds (finite floats, post-dequant range/clamp).
-//!   7. APPLY       re-check the owner epoch under the lock (TOCTOU), write
-//!                  validated values, a veto hook may veto (leaving the value
-//!                  unchanged and correcting the owner).
+//!   7. APPLY       re-check the owner epoch under the lock (TOCTOU), then write
+//!                  every validated value (game-logic reconciliation now lives in
+//!                  the authoritative gameplay bridge, not a per-delta hook).
 //!   8. REBROADCAST server re-encodes ITS OWN authoritative delta to peers,
 //!                  honoring COND_*; rebroadcast bytes charged to the originating
 //!                  budget (no amplification).
@@ -42,7 +42,7 @@
 //! deferred to the interest/relevancy pass.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use citadel_wire::baseline::{AckField, BaselineAllocator};
 use citadel_wire::interest::{InterestGrid, RelevanceSet};
@@ -220,28 +220,6 @@ impl ConnBudget {
     }
 }
 
-/// A veto hook (the Lua/game-logic reconciliation analogue, §7.4). Given the
-/// validated proposal, it returns the set of `field_id`s to **veto**: those are
-/// left at their authoritative value and a correction is sent back to the owner;
-/// the rest apply normally. An empty result accepts everything.
-pub trait RepVetoHook: Send + Sync {
-    /// Decide which proposed fields to veto.
-    fn veto(&self, ctx: RepVetoContext<'_>) -> Vec<u16>;
-}
-
-/// The context passed to a [`RepVetoHook`].
-#[derive(Debug)]
-pub struct RepVetoContext<'a> {
-    /// The proposing connection (raw participant id).
-    pub conn: u64,
-    /// The target object.
-    pub object_id: u32,
-    /// The proposed, already bounds-validated scalar `(field_id, value)` changes.
-    /// Collection operations are authoritative transactions and are therefore not
-    /// exposed to the scalar veto hook.
-    pub proposed: &'a [(u16, RepValue)],
-}
-
 /// An outbound replication frame the gateway must deliver to one participant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepOutbound {
@@ -316,7 +294,6 @@ struct Inner {
     matches: BTreeMap<u64, BTreeSet<u64>>,
     alloc: BaselineAllocator,
     limits: RateLimits,
-    veto: Option<Arc<dyn RepVetoHook>>,
     interest: InterestGrid,
     interest_config: RepInterestConfig,
     last_fanout_width: usize,
@@ -423,7 +400,6 @@ impl RepAuthority {
                 matches: BTreeMap::new(),
                 alloc: BaselineAllocator::new(),
                 limits,
-                veto: None,
                 interest: InterestGrid::new(interest_config.cell_size),
                 interest_config,
                 last_fanout_width: 0,
@@ -441,15 +417,6 @@ impl RepAuthority {
     pub fn with_shared_quantized_state(self, enabled: bool) -> Self {
         if let Ok(mut g) = self.inner.lock() {
             g.shared_quantized_state = enabled;
-        }
-        self
-    }
-
-    /// Attach a veto hook (game-logic / Lua reconciliation, §7.4).
-    #[must_use]
-    pub fn with_veto(self, hook: Arc<dyn RepVetoHook>) -> Self {
-        if let Ok(mut g) = self.inner.lock() {
-            g.veto = Some(hook);
         }
         self
     }
@@ -1108,10 +1075,9 @@ impl RepAuthority {
     }
 
     /// Step 7 + 8: re-check the owner epoch under the apply lock (TOCTOU), write the
-    /// validated values to authoritative state (a veto hook may veto), then
-    /// **re-derive and rebroadcast the server's own delta** to peers and correct the
-    /// owner for any vetoed field. Rebroadcast bytes are charged to the originating
-    /// connection's budget (no amplification).
+    /// validated values to authoritative state, then **re-derive and rebroadcast the
+    /// server's own delta** to peers. Rebroadcast bytes are charged to the
+    /// originating connection's budget (no amplification).
     ///
     /// # Errors
     /// Returns [`RepReject::Toctou`] if ownership changed since validate, or a coarse
@@ -1158,44 +1124,17 @@ impl RepAuthority {
             }
         }
 
-        // Veto hook (§7.4): decide which fields to leave unchanged. A panicking hook
-        // is caught and fails closed (veto everything), never poisoning the lock
-        // (finding 8).
-        let vetoed: BTreeSet<u16> = match g.veto.clone() {
-            Some(hook) => {
-                let ctx_fields: Vec<(u16, RepValue)> = v
-                    .fields
-                    .iter()
-                    .filter_map(|(fid, delta)| match delta {
-                        FieldDelta::Value(value) => Some((*fid, value.clone())),
-                        FieldDelta::Collection(_) => None,
-                    })
-                    .collect();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    hook.veto(RepVetoContext {
-                        conn: v.conn,
-                        object_id: v.object_id,
-                        proposed: &ctx_fields,
-                    })
-                }));
-                match result {
-                    Ok(vetoed) => vetoed.into_iter().collect(),
-                    Err(_) => {
-                        tracing::warn!("rep veto hook panicked; failing closed (veto all)");
-                        ctx_fields.iter().map(|(fid, _)| *fid).collect()
-                    }
-                }
-            }
-            None => BTreeSet::new(),
-        };
-
+        // Game-logic reconciliation of replicated writes is the authoritative
+        // gameplay bridge's job now (the validator + ScriptCommandBatch): the
+        // former per-delta RepVetoHook has been retired to avoid two competing
+        // authority seams. Every validated field applies.
         let layout = g
             .classes
             .get(&v.class_id)
             .ok_or(RepReject::UnknownObject)?
             .layout;
 
-        // Apply non-vetoed values to authoritative state + peer-visible projection.
+        // Apply validated values to authoritative state + peer-visible projection.
         {
             let obj = g
                 .objects
@@ -1204,9 +1143,6 @@ impl RepAuthority {
             for (fid, delta) in &v.fields {
                 match delta {
                     FieldDelta::Value(value) => {
-                        if vetoed.contains(fid) {
-                            continue;
-                        }
                         obj.authoritative.set_scalar(*fid, value.clone());
                         obj.field_last_change_ms.insert(*fid, v.now_ms);
                         if layout
@@ -1361,40 +1297,6 @@ impl RepAuthority {
             fanout_width,
             "NetworkPeer authoritative delta rebroadcast"
         );
-
-        // Veto correction to the owner (RepNotify analogue): a full snapshot of the
-        // vetoed fields' authoritative (unchanged) values, so the cheating client
-        // sees its illegal change corrected.
-        if !vetoed.is_empty() {
-            let (correction, result_id) = {
-                let Inner { objects, alloc, .. } = &mut *g;
-                let obj = objects.get(&v.object_id).ok_or(RepReject::UnknownObject)?;
-                let result = alloc.allocate().map_err(|_| RepReject::Frame)?;
-                let mut bunch = DeltaBunch::new(v.object_id, true, result.get(), 0);
-                for fid in &vetoed {
-                    if let Some(value) = obj.authoritative.scalars.get(fid) {
-                        bunch.set(*fid, FieldDelta::Value(value.clone()));
-                    }
-                }
-                (bunch, result.get())
-            };
-            let _ = result_id;
-            if let Ok(body) = correction.encode(&schema) {
-                // Charge the owner correction to the originating budget too.
-                if let Some(conn_entry) = g.conns.get_mut(&v.conn) {
-                    conn_entry
-                        .budget
-                        .bytes
-                        .charge_forced(v.now_ms, body.len() as f64);
-                }
-                out.push(RepOutbound {
-                    participant: v.conn,
-                    kind: KIND_REP_DELTA,
-                    body,
-                    reliable: true,
-                });
-            }
-        }
 
         Ok(out)
     }
@@ -2500,48 +2402,6 @@ mod tests {
     }
 
     #[test]
-    fn veto_leaves_value_unchanged_and_corrects_the_owner() {
-        struct VetoHealth;
-        impl RepVetoHook for VetoHealth {
-            fn veto(&self, ctx: RepVetoContext<'_>) -> Vec<u16> {
-                ctx.proposed.iter().map(|(fid, _)| *fid).collect()
-            }
-        }
-        let a = RepAuthority::new(RateLimits::default()).with_veto(Arc::new(VetoHealth));
-        a.register_class(CLASS, layout(), schema()).unwrap();
-        let mut initial = RepSnapshot::new();
-        initial.set_scalar(F_HEALTH, RepValue::Int(100));
-        a.spawn_object(OBJ, MATCH, CLASS, Some(OWNER), false, initial)
-            .unwrap();
-        a.join_match(OWNER, MATCH, false);
-        a.join_match(PEER, MATCH, false);
-
-        let out = a.handle_delta(OWNER, &full_health(10, 50), 1000);
-        // Authoritative value is unchanged (vetoed): the illegal 50 never lands.
-        assert_eq!(
-            a.authoritative_scalar(OBJ, F_HEALTH),
-            Some(RepValue::Int(100))
-        );
-        // The owner receives a correction carrying the real (unchanged) value.
-        let owner_frame = out
-            .iter()
-            .find(|o| o.participant == OWNER)
-            .expect("owner is corrected");
-        assert_eq!(
-            decode(&owner_frame.body).changes.get(&F_HEALTH),
-            Some(&FieldDelta::Value(RepValue::Int(100)))
-        );
-        // The illegal value 50 never reaches anyone — every frame reflects 100.
-        for o in &out {
-            if let Some(FieldDelta::Value(RepValue::Int(v))) =
-                decode(&o.body).changes.get(&F_HEALTH)
-            {
-                assert_eq!(*v, 100, "vetoed value must never be broadcast");
-            }
-        }
-    }
-
-    #[test]
     fn ack_advances_baseline_so_next_rebroadcast_is_a_delta() {
         let a = authority();
         // First change -> peer gets a full snapshot.
@@ -2834,31 +2694,6 @@ mod tests {
             .unwrap();
         // A fresh full snapshot with a LOW token is now accepted (state was reset).
         assert!(a.validate(OWNER, &full_health(1, 40), 1002).is_ok());
-    }
-
-    #[test]
-    fn veto_hook_panic_fails_closed() {
-        struct Boom;
-        impl RepVetoHook for Boom {
-            fn veto(&self, _ctx: RepVetoContext<'_>) -> Vec<u16> {
-                panic!("hostile hook");
-            }
-        }
-        let a = RepAuthority::new(RateLimits::default()).with_veto(Arc::new(Boom));
-        a.register_class(CLASS, layout(), schema()).unwrap();
-        let mut initial = RepSnapshot::new();
-        initial.set_scalar(F_HEALTH, RepValue::Int(100));
-        a.spawn_object(OBJ, MATCH, CLASS, Some(OWNER), false, initial)
-            .unwrap();
-        a.join_match(OWNER, MATCH, false);
-        // The panic is caught; the proposal is not applied (fail closed) and the
-        // authority is not poisoned (a later call still works).
-        let _ = a.handle_delta(OWNER, &full_health(10, 50), 1000);
-        assert_eq!(
-            a.authoritative_scalar(OBJ, F_HEALTH),
-            Some(RepValue::Int(100))
-        );
-        assert!(a.bytes_tokens(OWNER).is_some(), "lock not poisoned");
     }
 
     #[test]
