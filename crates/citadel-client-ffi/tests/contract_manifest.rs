@@ -62,9 +62,11 @@ fn contract_path() -> PathBuf {
 /// Render the canonical manifest JSON (pretty-printed, trailing newline).
 ///
 /// Every value is read from a canonical Rust const/route — nothing is
-/// hand-written — so the file can never disagree with the sources. `serde_json`
-/// (without `preserve_order`) sorts object keys deterministically, which is all
-/// the stale-guard requires.
+/// hand-written — so the file can never disagree with the sources. Key ordering
+/// is deterministic because this crate pins serde_json's `preserve_order`
+/// feature (see `Cargo.toml`): objects render in `json!`-literal insertion order
+/// in every build graph, so the byte-for-byte stale-guard below never depends on
+/// whether some other crate happens to unify that feature in.
 fn render_manifest() -> String {
     // Field-name lists mirror `citadel::http::auth::AuthRequest` /
     // `AuthResponse`. `AuthRequest` is `Deserialize`-only (no `Serialize`) so it
