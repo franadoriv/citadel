@@ -823,6 +823,29 @@ impl RepAuthority {
             .and_then(|o| o.authoritative.scalars.get(&field_id).cloned())
     }
 
+    /// Whether `value` is within the compiled `FieldBounds` of `object_id`'s
+    /// `field_id`. Read-only; the authoritative gameplay bridge uses it to
+    /// validate a script-authored replicated write against the object's real
+    /// layout. Returns `false` for an unknown object, class, or field, and for a
+    /// value that violates its bounds — script values are exact, never clamped on
+    /// rejection.
+    #[must_use]
+    pub fn value_in_bounds(&self, object_id: u32, field_id: u16, value: &RepValue) -> bool {
+        let Ok(g) = self.inner.lock() else {
+            return false;
+        };
+        let Some(object) = g.objects.get(&object_id) else {
+            return false;
+        };
+        let Some(class) = g.classes.get(&object.class_id) else {
+            return false;
+        };
+        let Some(desc) = class.layout.field(field_id) else {
+            return false;
+        };
+        validate_bounds(value, desc.bounds, desc.type_tag).is_ok()
+    }
+
     /// Snapshot NetworkPeer object and fan-out telemetry. This samples the maps
     /// already held by the authority lock; it does not add per-field hot-path work.
     #[must_use]
@@ -2212,6 +2235,28 @@ mod tests {
         assert_eq!(
             a.authoritative_scalar(OBJ, F_HEALTH),
             Some(RepValue::Int(80))
+        );
+    }
+
+    #[test]
+    fn value_in_bounds_checks_the_compiled_field_bounds() {
+        // The authoritative bridge queries this to validate a script-authored
+        // replicated write against the object's real RepLayout. Values are exact.
+        let a = authority();
+        assert!(a.value_in_bounds(OBJ, F_HEALTH, &RepValue::Int(50)));
+        assert!(a.value_in_bounds(OBJ, F_HEALTH, &RepValue::Int(0)));
+        assert!(a.value_in_bounds(OBJ, F_HEALTH, &RepValue::Int(100)));
+        assert!(
+            !a.value_in_bounds(OBJ, F_HEALTH, &RepValue::Int(150)),
+            "above the field's IntRange max is out of bounds"
+        );
+        assert!(
+            !a.value_in_bounds(OBJ, F_HEALTH, &RepValue::Int(-1)),
+            "below the field's IntRange min is out of bounds"
+        );
+        assert!(
+            !a.value_in_bounds(999, F_HEALTH, &RepValue::Int(50)),
+            "an unknown object is out of bounds"
         );
     }
 

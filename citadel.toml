@@ -113,6 +113,24 @@ tick_hz = 0
 hot_reload = true
 hot_reload_poll_ms = 500
 
+# Authoritative gameplay bridge quotas + capabilities. Applied only when
+# require_script is enabled (authoritative matches); ignored in the default
+# relay mode. Quota defaults are PROVISIONAL (measure-first): they mirror the
+# per-invocation command-sink precedents until the bench harness fixes them.
+# Every capability defaults OFF (opt-in): a script may emit Persist/Schedule/
+# physics commands in an authoritative match only when granted here. This is
+# deployment-wide until the revision store declares capabilities per revision.
+[runtime.bridge]
+max_commands = 1024
+max_command_body_bytes = 1048576
+max_reply_bytes = 65536
+max_recipients = 1024
+max_persist_ops = 64
+max_schedule_ops = 64
+allow_persist = false
+allow_schedule = false
+allow_physics = false
+
 # Runtime extension capabilities. Existing bounded outbound HTTP remains enabled
 # for compatibility. Script-defined external endpoints are available but
 # disabled by default. Events and the shared cache are node-local, non-durable,

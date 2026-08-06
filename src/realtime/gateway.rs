@@ -2685,8 +2685,12 @@ impl Gateway {
     /// gameplay frames route through the per-match validator; leaving it unset
     /// preserves the non-authoritative relay path byte for byte.
     #[must_use]
-    pub fn with_bridge(mut self, quotas: BridgeQuotas) -> Self {
-        self.bridge = Some(Arc::new(GatewayBridge::new(quotas)));
+    pub fn with_bridge(
+        mut self,
+        quotas: BridgeQuotas,
+        capabilities: std::collections::HashSet<Capability>,
+    ) -> Self {
+        self.bridge = Some(Arc::new(GatewayBridge::new(quotas, capabilities)));
         self
     }
 
@@ -6325,9 +6329,14 @@ struct GatewayBridge {
     /// One ledger per authoritative match (keyed by `RoomId`). Created lazily on
     /// the match's first protected frame, dropped when the match closes.
     ledgers: Mutex<HashMap<RoomId, PendingBatchLedger>>,
-    /// Per-batch quotas the validator enforces (PROVISIONAL defaults; surfaced
-    /// in `citadel.toml` by a later step).
+    /// Per-batch quotas the validator enforces (from `[runtime.bridge]`;
+    /// PROVISIONAL measure-first defaults).
     quotas: BridgeQuotas,
+    /// Capabilities the deployment grants scripts (from `[runtime.bridge]`).
+    /// A capability-gated command family (Persist/Schedule/Physics) is rejected
+    /// unless its capability is present. Deployment-wide until the revision store
+    /// declares capabilities per revision.
+    capabilities: std::collections::HashSet<Capability>,
     /// Replicated-delta writes awaiting a script answer, keyed by `(RoomId,
     /// event_id)`. A `KIND_REP_DELTA` validates to a non-serializable
     /// [`Validated`] proposal that only [`RepAuthority::apply_and_rebroadcast`]
@@ -6339,10 +6348,11 @@ struct GatewayBridge {
 }
 
 impl GatewayBridge {
-    fn new(quotas: BridgeQuotas) -> Self {
+    fn new(quotas: BridgeQuotas, capabilities: std::collections::HashSet<Capability>) -> Self {
         Self {
             ledgers: Mutex::new(HashMap::new()),
             quotas,
+            capabilities,
             pending_rep: Mutex::new(HashMap::new()),
         }
     }
@@ -6377,25 +6387,23 @@ impl BridgeMatchContext for GatewayBridgeContext<'_> {
             .is_some()
     }
 
-    fn rep_value_in_bounds(
-        &self,
-        _object_id: u32,
-        _field_id: u16,
-        _value: &BridgeRepValue,
-    ) -> bool {
-        // v1: replicated-field bounds are not yet queryable from the bridge, so
-        // a script rep write cannot be proven in-bounds and is rejected
-        // fail-closed. Wired to `RepAuthority` bounds by a later step; until
-        // then the (unrouted) rep path never materializes through the bridge.
-        false
+    fn rep_value_in_bounds(&self, object_id: u32, field_id: u16, value: &BridgeRepValue) -> bool {
+        // Query the object's real RepLayout bounds. A script value is exact —
+        // out of bounds is rejected, never clamped. No authority attached ⇒ no
+        // replicated object exists ⇒ fail closed.
+        match &self.gateway.rep {
+            Some(rep) => rep.value_in_bounds(object_id, field_id, &value.clone().into()),
+            None => false,
+        }
     }
 
-    fn has_capability(&self, _capability: Capability) -> bool {
-        // v1: the revision manifest does not yet declare bridge capabilities, so
-        // no capability-gated command family (Persist/Schedule/Physics) is
-        // permitted — fail-closed. Wired to revision capabilities by a later
-        // step.
-        false
+    fn has_capability(&self, capability: Capability) -> bool {
+        // Granted deployment-wide via `[runtime.bridge]` (opt-in); per-revision
+        // capability declaration is a later step.
+        self.gateway
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.capabilities.contains(&capability))
     }
 }
 
@@ -8020,7 +8028,7 @@ mod transform_tests {
         let gw = Arc::new(
             Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
                 .with_transform_hub(Arc::clone(&hub))
-                .with_bridge(BridgeQuotas::default()),
+                .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new()),
         );
         gw.attach_bridge_sink();
         (gw, hub)
@@ -8171,7 +8179,7 @@ mod transform_tests {
         let gw = Arc::new(
             Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
                 .with_transform_hub(Arc::clone(&hub))
-                .with_bridge(BridgeQuotas::default()),
+                .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new()),
         );
         gw.attach_bridge_sink();
         (gw, hub)
@@ -8409,7 +8417,7 @@ mod transform_tests {
         let gw = Arc::new(
             Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
                 .with_rep_authority(Arc::clone(&rep))
-                .with_bridge(BridgeQuotas::default()),
+                .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new()),
         );
         gw.attach_bridge_sink();
         gw.register_rep_class(REP_CLASS, rep_layout(), rep_schema())
@@ -8503,6 +8511,96 @@ mod transform_tests {
         );
         let hello = ra.recv().await.expect("negotiation reply");
         assert_eq!(hello.envelope.kind, KIND_TSYNC_HELLO);
+    }
+
+    // ---- STEP 2: capability gating (has_capability wired to [runtime.bridge]) ----
+
+    fn authoritative_gateway_caps(
+        on_input_src: &str,
+        capabilities: std::collections::HashSet<Capability>,
+    ) -> (Arc<Gateway>, Arc<TransformHub>) {
+        let hub = Arc::new(TransformHub::new(TransformHubConfig::default()).expect("hub"));
+        let runtime: Arc<dyn Runtime> = Arc::new(
+            crate::runtime::LuaRuntime::from_source(
+                on_input_src,
+                "bridge-test",
+                crate::runtime::DEFAULT_DEADLINE_MS,
+            )
+            .expect("lua runtime"),
+        );
+        let gw = Arc::new(
+            Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
+                .with_transform_hub(Arc::clone(&hub))
+                .with_bridge(BridgeQuotas::default(), capabilities),
+        );
+        gw.attach_bridge_sink();
+        (gw, hub)
+    }
+
+    /// A member owning a relay object in a `gw` built with specific capabilities.
+    fn caps_member(gw: &Arc<Gateway>) -> (ParticipantId, u32) {
+        use citadel_wire::na::{NaPresence, NaTransform};
+        let (p, _rp) = register(gw);
+        gw.handle_inbound(
+            p,
+            &Envelope::new(
+                KIND_NA_PRESENCE,
+                NaPresence {
+                    archetype_id: 0,
+                    transform: NaTransform::identity(),
+                }
+                .encode(),
+            ),
+        );
+        let object_id = gw
+            .transform
+            .as_ref()
+            .and_then(|h| h.relay_owned_object(p.get()))
+            .expect("relay object");
+        let binding = ScriptBinding {
+            revision_id: "sha256:test".to_owned(),
+            generation: 1,
+        };
+        gw.rooms()
+            .join_or_create_bound(p, "arena", Some(binding), || RoomLabel::with_map("arena"))
+            .expect("bound room");
+        (p, object_id)
+    }
+
+    // on_input accepts the report AND emits a capability-gated physics command.
+    const PHYSICS_ON_INPUT: &str = r#"citadel.on_input(function(e)
+        citadel.apply_impulse(e.object_id, 1, 0, 0)
+        return nil
+    end)"#;
+
+    #[tokio::test]
+    async fn physics_command_without_capability_rejects_the_whole_batch() {
+        // No Physics capability granted: the physics command fails the whole
+        // batch closed, so even the accepted report does not materialize.
+        let (gw, hub) =
+            authoritative_gateway_caps(PHYSICS_ON_INPUT, std::collections::HashSet::new());
+        let (p, object_id) = caps_member(&gw);
+        gw.handle_inbound(p, &na_state_frame(object_id, 5.0));
+        assert!(
+            hub.get_transform(object_id).expect("object").position[0].abs() < 1e-3,
+            "an undeclared physics capability rejects the batch; nothing materializes"
+        );
+    }
+
+    #[tokio::test]
+    async fn physics_command_with_capability_materializes_the_batch() {
+        // Physics granted via [runtime.bridge]: the batch validates and the
+        // accepted report materializes (the impulse is a no-op without a body).
+        let (gw, hub) = authoritative_gateway_caps(
+            PHYSICS_ON_INPUT,
+            std::iter::once(Capability::Physics).collect(),
+        );
+        let (p, object_id) = caps_member(&gw);
+        gw.handle_inbound(p, &na_state_frame(object_id, 5.0));
+        assert!(
+            (hub.get_transform(object_id).expect("object").position[0] - 5.0).abs() < 1e-3,
+            "a granted physics capability lets the batch materialize"
+        );
     }
 
     #[tokio::test]
