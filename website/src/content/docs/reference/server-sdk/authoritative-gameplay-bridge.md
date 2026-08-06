@@ -45,12 +45,19 @@ once for every normalized event in a delivered batch. Each event carries a stabl
 | `actor_state` | `object_id`, `transform` |
 | `replicated_var` | `object_id`, `class_id`, `result_id`, `field_count` |
 | `spawn_request` | `archetype_id`, `transform` |
-| `message` | `message_kind`, `body` |
-| `join` / `leave` | — |
 
 Every event also carries `event_id`, `participant`, `user_id` (absent for
 guests), `match_id`, and `tick`. Vectors are `{x, y, z}` tables in Lua and
 `[x, y, z]` arrays in JavaScript and Python.
+
+:::caution[Planned, not yet delivered]
+Only `transform_input`, `actor_state`, `replicated_var`, and `spawn_request`
+are ever produced today. The `message`, `join`, and `leave` events are defined
+in the protocol and marshaled across all three runtimes, but the gateway does
+not yet emit them, so `on_input` never receives them. Routing custom message
+kinds and participant join/leave through the fenced batch is planned — do not
+build logic on `message`/`join`/`leave` yet.
+:::
 
 ## Decisions
 
@@ -65,6 +72,13 @@ decisions into a fenced answer for Rust to validate and materialize:
 - **Correct** — materialize *your* value instead of the client's (the
   authoritative state carries your value, never the client's bytes). Return
   `{ decision = "correct", transform = { position, rotation, velocity } }`.
+
+:::caution[`reply` is not delivered yet]
+A reject's optional `reply` is accepted and size-checked by the validator, but
+the server does not yet send it back to the client: that needs a dedicated
+reply wire kind (a planned `citadel-wire` and contract-manifest change). Treat
+`reply` as reserved for now — a rejected action simply does not materialize.
+:::
 
 <Tabs syncKey="engine">
 <TabItem label="Lua">
@@ -138,6 +152,14 @@ are collected into the same fenced answer and validated before they materialize:
 messages are scope-checked against match membership, object mutations against the
 match's world, and physics commands against the match's declared physics
 capability.
+
+:::caution[`persist` and `schedule` are validated but not yet executed]
+The messaging, actor, and physics commands above materialize today. Persist and
+schedule commands are capability-gated and quota-bounded by the validator, but
+no executor is wired behind them yet: an authorized `persist` or `schedule`
+validates and then no-ops — it does **not** write durable state or enqueue a
+task. The durable-effect executor is planned.
+:::
 
 ## Fire/hit — the rewind host API
 
