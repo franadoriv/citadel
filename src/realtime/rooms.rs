@@ -366,6 +366,25 @@ impl RoomRegistry {
         (g.membership.get(&participant).copied() == expected_room).then(f)
     }
 
+    /// Run `f` only while a snapshot recipient and every owning participant
+    /// captured for that snapshot all remain in `expected_room`. The membership
+    /// checks and enqueue share one lock, so neither a recipient nor a source
+    /// owner can move between validation and client delivery.
+    pub fn while_member_and_owners_in<R>(
+        &self,
+        participant: ParticipantId,
+        expected_room: Option<RoomId>,
+        owners: &[u64],
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let g = self.lock();
+        (g.membership.get(&participant).copied() == expected_room
+            && owners.iter().all(|owner| {
+                g.membership.get(&ParticipantId::from_raw(*owner)).copied() == expected_room
+            }))
+        .then(f)
+    }
+
     /// Run `f` only while both participants remain in the same room scope.
     /// Roomless participants share the legacy relay-compatible scope. The check
     /// and `f` are one membership-lock critical section, so a move cannot turn

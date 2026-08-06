@@ -8,7 +8,7 @@
 //! envelopes through the [`SessionRegistry`](crate::realtime::SessionRegistry)
 //! with the right delivery mode (snapshots unreliable, hello/role reliable).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -283,6 +283,8 @@ fn resolve_fire_reply(
     Some(HubOutbound {
         participant,
         room_scope: None,
+        source_owners: Vec::new(),
+        sources: Vec::new(),
         kind: citadel_wire::protocol::KIND_TSYNC_REWIND,
         body: result.encode(),
         unreliable: false,
@@ -297,12 +299,27 @@ pub struct HubOutbound {
     /// Room membership scope captured while constructing a snapshot. `None`
     /// is the legacy roomless relay scope; control frames never carry a scope.
     pub room_scope: Option<u64>,
+    /// Owning participants for every room-scoped object considered for this
+    /// snapshot. The gateway rechecks them together with the recipient before
+    /// enqueueing, closing source-membership moves after construction.
+    pub(crate) source_owners: Vec<u64>,
+    sources: Vec<SnapshotSource>,
     /// Envelope kind (`KIND_TSYNC_*`).
     pub kind: u16,
     /// Encoded body.
     pub body: Vec<u8>,
     /// `true` for the unreliable snapshot hot path, `false` for control frames.
     pub unreliable: bool,
+}
+
+/// The ownership and server-room binding captured for a room-scoped object.
+/// Kept with the encoded snapshot so delivery can reject a stale source without
+/// decoding a client-facing packet.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotSource {
+    object_id: ObjectId,
+    owner: u64,
+    server_room: Option<u64>,
 }
 
 /// The transform-sync hub. Cheap to clone the handle via `Arc<TransformHub>`.
@@ -871,6 +888,8 @@ impl TransformHub {
         HubOutbound {
             participant,
             room_scope: None,
+            source_owners: Vec::new(),
+            sources: Vec::new(),
             kind: citadel_wire::protocol::KIND_TSYNC_HELLO,
             body: self.hello_body(),
             unreliable: false,
@@ -888,6 +907,8 @@ impl TransformHub {
         Some(HubOutbound {
             participant,
             room_scope: None,
+            source_owners: Vec::new(),
+            sources: Vec::new(),
             kind: citadel_wire::protocol::KIND_TSYNC_V2_HELLO,
             body: manifest.encode().to_vec(),
             unreliable: false,
@@ -1153,18 +1174,42 @@ impl TransformHub {
         // One filtered frame is retained per populated room scope. This remains
         // O(populated rooms × objects); avoid adding a second object index until
         // profiling shows it matters more than the added invalidation surface.
+        struct ScopedFrame {
+            frame: Arc<Frame>,
+            sources: Vec<SnapshotSource>,
+            owners: Vec<u64>,
+        }
+
         let mut room_frames = HashMap::new();
         for (&participant, client) in g.clients.iter_mut() {
             let viewer_room = room_of(participant);
             let scoped_frame = room_frames.entry(viewer_room).or_insert_with(|| {
-                Arc::new(frame.filtered(|object| {
-                    match object.owner {
+                let mut sources = Vec::new();
+                let mut owners = BTreeSet::new();
+                let scoped = frame.filtered(|object| {
+                    let in_scope = match object.owner {
                         0 => object_rooms
                             .get(&object.object_id)
                             .is_none_or(|room_id| Some(*room_id) == viewer_room),
                         owner => room_of(owner) == viewer_room,
+                    };
+                    if in_scope {
+                        if object.owner != 0 {
+                            owners.insert(object.owner);
+                        }
+                        sources.push(SnapshotSource {
+                            object_id: object.object_id,
+                            owner: object.owner,
+                            server_room: object_rooms.get(&object.object_id).copied(),
+                        });
                     }
-                }))
+                    in_scope
+                });
+                ScopedFrame {
+                    frame: Arc::new(scoped),
+                    sources,
+                    owners: owners.into_iter().collect(),
+                }
             });
             // The adaptive controller owns the per-client budget + coarse send
             // rate (design §6.5); an optional hub-level hard cap tightens it.
@@ -1176,7 +1221,7 @@ impl TransformHub {
             };
             let send_rate = client.congestion.send_rate_hz();
             let Some(snapshot) = client.builder.build(
-                scoped_frame,
+                &scoped_frame.frame,
                 participant,
                 client.viewer_pos,
                 budget,
@@ -1204,6 +1249,8 @@ impl TransformHub {
                 Ok((kind, body)) => out.push(HubOutbound {
                     participant,
                     room_scope: viewer_room,
+                    source_owners: scoped_frame.owners.clone(),
+                    sources: scoped_frame.sources.clone(),
                     kind,
                     body,
                     unreliable: true,
@@ -1214,6 +1261,26 @@ impl TransformHub {
             }
         }
         out
+    }
+
+    /// Run `f` only while every source object in `out` still has the ownership
+    /// and server-room binding captured during snapshot construction. The hub
+    /// lock remains held through `f`, so a trusted object move cannot land
+    /// between this check and the gateway's bounded enqueue.
+    pub(crate) fn while_snapshot_sources_current<R>(
+        &self,
+        out: &HubOutbound,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let g = self.inner.lock().ok()?;
+        out.sources
+            .iter()
+            .all(|source| {
+                g.world.owner_of(source.object_id) == Some(source.owner)
+                    && (source.owner != 0
+                        || g.object_rooms.get(&source.object_id).copied() == source.server_room)
+            })
+            .then(f)
     }
 
     /// The number of registered transform-sync clients (tests/metrics).

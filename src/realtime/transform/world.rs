@@ -399,6 +399,12 @@ impl TransformWorld {
         self.objects.get(&id).map(|a| a.current)
     }
 
+    /// The current owner of an object, or `None` when it no longer exists.
+    #[must_use]
+    pub(crate) fn owner_of(&self, id: ObjectId) -> Option<u64> {
+        self.objects.get(&id).map(|authority| authority.owner)
+    }
+
     /// Attach/reconfigure a body from `config`, or detach it when `config` is
     /// `None`. Only `ServerSimulated` actors may hold bodies.
     pub fn set_physics(&mut self, id: ObjectId, config: Option<PhysicsConfig>) {

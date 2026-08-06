@@ -6177,10 +6177,10 @@ impl Gateway {
         delivered
     }
 
-    /// Deliver a snapshot only if its recipient still holds the room scope that
-    /// was used to build it. `RoomRegistry::while_member_in` keeps the membership
-    /// lock through the enqueue so a room move cannot slip between validation and
-    /// delivery.
+    /// Deliver a snapshot only if its recipient and every source object still
+    /// hold the room scope used to build it. The transform and membership locks
+    /// stay held through the enqueue, so neither an object/owner move nor a
+    /// recipient move can slip between validation and delivery.
     fn deliver_transform_snapshot(&self, out: crate::realtime::transform::HubOutbound) -> bool {
         let outbound = Outbound::new(
             if out.unreliable {
@@ -6188,14 +6188,22 @@ impl Gateway {
             } else {
                 Delivery::Reliable
             },
-            Envelope::new(out.kind, out.body),
+            Envelope::new(out.kind, out.body.clone()),
         );
         let participant = ParticipantId::from_raw(out.participant);
-        self.rooms
-            .while_member_in(participant, out.room_scope, || {
-                self.registry.send_to(participant, &outbound)
-            })
-            .unwrap_or(false)
+        let Some(hub) = &self.transform else {
+            return false;
+        };
+        hub.while_snapshot_sources_current(&out, || {
+            self.rooms.while_member_and_owners_in(
+                participant,
+                out.room_scope,
+                &out.source_owners,
+                || self.registry.send_to(participant, &outbound),
+            )
+        })
+        .flatten()
+        .unwrap_or(false)
     }
 
     /// The built-in position relay used when no script runtime is attached.
@@ -7855,6 +7863,68 @@ mod transform_tests {
             outbound_rx.try_recv().is_err(),
             "the stale-room snapshot never reaches the moved participant"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_owner_moved_to_another_room_is_not_delivered() {
+        use crate::realtime::rooms::RoomLabel;
+
+        let (gw, hub) = gateway_with_hub();
+        let (viewer_a, mut viewer_a_rx) = register(&gw);
+        let (viewer_b, mut viewer_b_rx) = register(&gw);
+        let (owner, _owner_rx) = register(&gw);
+        let room_a = gw.rooms().create(RoomLabel::with_map("A"));
+        let room_b = gw.rooms().create(RoomLabel::with_map("B"));
+        for (participant, room) in [(viewer_a, room_a), (viewer_b, room_b), (owner, room_a)] {
+            gw.rooms()
+                .join(participant, room)
+                .expect("participant joins room");
+        }
+        for receiver in [viewer_a, viewer_b] {
+            gw.handle_inbound(receiver, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        }
+        let _ = viewer_a_rx.recv().await.expect("A hello reply");
+        let _ = viewer_b_rx.recv().await.expect("B hello reply");
+
+        hub.spawn_server_simulated(99, TransformState::at([1.0, 2.0, 3.0]));
+        hub.assign_owner(99, owner.get())
+            .expect("actor owner assigned");
+        hub.sim_tick();
+        let stale_for_a = hub
+            .snapshot_tick_scoped(|id| gw.rooms().room_of(ParticipantId::from_raw(id)))
+            .into_iter()
+            .find(|out| out.participant == viewer_a.get())
+            .expect("A snapshot built while actor owner is in A");
+
+        gw.rooms()
+            .join(owner, room_b)
+            .expect("actor owner moves to B");
+
+        assert!(
+            !gw.deliver_transform_snapshot(stale_for_a),
+            "A must not receive an actor after its owner moved to B"
+        );
+        assert!(
+            viewer_a_rx.try_recv().is_err(),
+            "the stale A snapshot must never reach its viewer"
+        );
+
+        hub.sim_tick();
+        let fresh_for_b = hub
+            .snapshot_tick_scoped(|id| gw.rooms().room_of(ParticipantId::from_raw(id)))
+            .into_iter()
+            .find(|out| out.participant == viewer_b.get())
+            .expect("B snapshot built after actor owner moved to B");
+        assert!(
+            gw.deliver_transform_snapshot(fresh_for_b),
+            "B receives the actor in its new room"
+        );
+        let codec = *hub.codec();
+        let mut view_b = RemoteWorldView::new(codec, 60, 20);
+        assert!(
+            view_b.apply_datagram(&viewer_b_rx.recv().await.expect("B snapshot").envelope.body)
+        );
+        assert!(view_b.object(99).is_some(), "B receives the moved actor");
     }
 
     #[tokio::test]
