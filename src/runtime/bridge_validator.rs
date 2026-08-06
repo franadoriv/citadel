@@ -472,12 +472,12 @@ fn validate_content(
     let mut outcomes = Vec::with_capacity(pending.events.len());
     for event in &pending.events {
         let outcome = answered[&event.event_id];
-        if let Some(reply) = &outcome.reply {
-            if reply.len() > quotas.max_reply_bytes {
-                return Err(BatchRejection::QuotaExceeded {
-                    quota: Quota::ReplyBytes,
-                });
-            }
+        if let Some(reply) = &outcome.reply
+            && reply.len() > quotas.max_reply_bytes
+        {
+            return Err(BatchRejection::QuotaExceeded {
+                quota: Quota::ReplyBytes,
+            });
         }
         if let Decision::Correct { correction } = &outcome.decision {
             validate_correction(event, correction, context)?;
@@ -643,12 +643,12 @@ fn validate_command(
         }
         ScriptCommand::BroadcastMatch { kind, exclude, .. } => {
             reject_reserved_kind(*kind)?;
-            if let Some(participant) = exclude {
-                if !context.is_member(*participant) {
-                    return Err(BatchRejection::RecipientNotMember {
-                        participant: *participant,
-                    });
-                }
+            if let Some(participant) = exclude
+                && !context.is_member(*participant)
+            {
+                return Err(BatchRejection::RecipientNotMember {
+                    participant: *participant,
+                });
             }
         }
         // Bounded host effects require a declared capability.
