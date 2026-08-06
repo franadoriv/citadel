@@ -16,6 +16,8 @@ use std::os::{
     },
 };
 
+use super::external_worker::{ExternalWorkerRuntime, WorkerScriptSpec};
+use super::worker_data_plane::DataPlaneConnection;
 use super::worker_protocol::{
     ControlFrame, PROTOCOL_VERSION, is_valid_worker_health, verify_worker_hello,
 };
@@ -54,6 +56,10 @@ pub fn fresh_bootstrap_nonce() -> io::Result<[u8; 32]> {
     Ok(nonce)
 }
 
+/// PROVISIONAL descriptor budget: no measurement of a script-hosting worker's
+/// real open-file footprint (script + module files, sockets, engine
+/// internals) exists yet. Replace once descriptor usage of a worker running
+/// representative game scripts has been profiled.
 pub const DEFAULT_WORKER_MAX_OPEN_FILES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +113,14 @@ pub const DEFAULT_WORKER_LIVENESS_DEADLINE: Duration = Duration::from_secs(5);
 /// worker's stop acknowledgement before the process group is killed anyway.
 pub const DEFAULT_WORKER_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
+/// PROVISIONAL re-arm streak: how many consecutive healthy cycles prove a
+/// recovery before the restart circuit breaker clears its failure count. One
+/// healthy cycle is not proof — a crash-looping worker can squeeze a health
+/// frame in between crashes and would otherwise reset the breaker forever.
+/// Replace once restart-storm telemetry shows the healthy-streak length that
+/// separates real recoveries from flapping workers.
+pub const DEFAULT_WORKER_BREAKER_REARM_CYCLES: u32 = 3;
+
 /// Injectable supervision policy for the external GameScript worker.
 ///
 /// This is the single seam the serve lifecycle and tests configure; every
@@ -117,6 +131,7 @@ pub const DEFAULT_WORKER_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 pub struct WorkerSupervisionPolicy {
     resource_limits: WorkerResourceLimits,
     restart_limit: u32,
+    breaker_rearm_healthy_cycles: u32,
     bootstrap_deadline: Duration,
     health_cadence: Duration,
     liveness_deadline: Duration,
@@ -133,6 +148,12 @@ impl WorkerSupervisionPolicy {
     #[must_use]
     pub fn with_restart_limit(mut self, restart_limit: u32) -> Self {
         self.restart_limit = restart_limit.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_breaker_rearm_healthy_cycles(mut self, breaker_rearm_healthy_cycles: u32) -> Self {
+        self.breaker_rearm_healthy_cycles = breaker_rearm_healthy_cycles.max(1);
         self
     }
 
@@ -168,6 +189,10 @@ impl WorkerSupervisionPolicy {
         self.restart_limit
     }
 
+    pub fn breaker_rearm_healthy_cycles(&self) -> u32 {
+        self.breaker_rearm_healthy_cycles
+    }
+
     pub fn bootstrap_deadline(&self) -> Duration {
         self.bootstrap_deadline
     }
@@ -190,6 +215,7 @@ impl Default for WorkerSupervisionPolicy {
         Self {
             resource_limits: WorkerResourceLimits::default(),
             restart_limit: DEFAULT_WORKER_RESTART_LIMIT,
+            breaker_rearm_healthy_cycles: DEFAULT_WORKER_BREAKER_REARM_CYCLES,
             bootstrap_deadline: DEFAULT_WORKER_BOOTSTRAP_DEADLINE,
             health_cadence: DEFAULT_WORKER_HEALTH_CADENCE,
             liveness_deadline: DEFAULT_WORKER_LIVENESS_DEADLINE,
@@ -215,17 +241,30 @@ pub struct RecoverySnapshot {
 pub struct RestartCircuitBreaker {
     limit: u32,
     failures: u32,
+    /// Consecutive healthy cycles required before the failure count clears.
+    rearm_after: u32,
+    healthy_streak: u32,
 }
 
 impl RestartCircuitBreaker {
     pub fn new(limit: u32) -> Self {
+        Self::with_rearm(limit, DEFAULT_WORKER_BREAKER_REARM_CYCLES)
+    }
+
+    /// A breaker that re-arms only after `rearm_after` consecutive healthy
+    /// cycles, so a crash-looping worker's intermittent health frames cannot
+    /// keep resetting the failure count.
+    pub fn with_rearm(limit: u32, rearm_after: u32) -> Self {
         Self {
             limit: limit.max(1),
             failures: 0,
+            rearm_after: rearm_after.max(1),
+            healthy_streak: 0,
         }
     }
 
     pub fn record_failure(&mut self) -> bool {
+        self.healthy_streak = 0;
         self.failures = self.failures.saturating_add(1);
         !self.is_open()
     }
@@ -240,7 +279,10 @@ impl RestartCircuitBreaker {
     }
 
     pub fn record_healthy(&mut self) {
-        self.failures = 0;
+        self.healthy_streak = self.healthy_streak.saturating_add(1);
+        if self.healthy_streak >= self.rearm_after {
+            self.failures = 0;
+        }
     }
 
     pub fn snapshot(&self) -> RecoverySnapshot {
@@ -265,11 +307,51 @@ impl RestartCircuitBreaker {
     }
 }
 
+/// Observer of worker-generation boundaries.
+///
+/// A "generation" is one authenticated worker process. When a generation ends
+/// abruptly (crash or failed health), every match it hosted is gone: the
+/// gateway must close all dependent matches (informing members with the
+/// requeue-hinted server-error close and pruning the rooms) and fence its
+/// data-plane epoch so a restarted worker can never resume or replay them.
+pub trait WorkerGenerationObserver: Send + Sync {
+    /// A worker generation ended without an orderly shutdown.
+    fn worker_generation_ended(&self);
+}
+
+/// Everything the supervisor needs to host a script-serving worker: the spec
+/// travels to the worker on its command line, the runtime adapter receives
+/// each generation's authenticated data-plane connection.
+#[derive(Clone)]
+pub struct WorkerDataPlaneBridge {
+    runtime: std::sync::Arc<ExternalWorkerRuntime>,
+}
+
+impl WorkerDataPlaneBridge {
+    #[must_use]
+    pub fn new(runtime: std::sync::Arc<ExternalWorkerRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    fn spec(&self) -> WorkerScriptSpec {
+        self.runtime.spec().clone()
+    }
+}
+
+/// A script spec pinned to one spawned worker generation.
+#[derive(Debug, Clone)]
+pub struct SpawnedScript {
+    pub spec: WorkerScriptSpec,
+    pub epoch: u64,
+}
+
 pub struct RestartController {
     executable: PathBuf,
     parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     breaker: RestartCircuitBreaker,
+    generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
+    data_plane: Option<WorkerDataPlaneBridge>,
 }
 
 impl RestartController {
@@ -278,7 +360,43 @@ impl RestartController {
             executable,
             parent,
             policy,
-            breaker: RestartCircuitBreaker::new(policy.restart_limit()),
+            breaker: RestartCircuitBreaker::with_rearm(
+                policy.restart_limit(),
+                policy.breaker_rearm_healthy_cycles(),
+            ),
+            generation_observer: None,
+            data_plane: None,
+        }
+    }
+
+    /// Host the deployment's script in every worker this controller boots,
+    /// installing each generation's data plane into `runtime`.
+    #[must_use]
+    pub fn with_data_plane(mut self, bridge: WorkerDataPlaneBridge) -> Self {
+        self.data_plane = Some(bridge);
+        self
+    }
+
+    /// Attach the observer notified whenever a worker generation ends
+    /// abruptly (before any replacement is booted).
+    #[must_use]
+    pub fn with_generation_observer(
+        mut self,
+        observer: std::sync::Arc<dyn WorkerGenerationObserver>,
+    ) -> Self {
+        self.generation_observer = Some(observer);
+        self
+    }
+
+    fn notify_generation_ended(&self) {
+        // Stop feeding the dead generation's connection before the gateway is
+        // told: dispatches between now and the replacement's install drop
+        // fail-closed at the adapter instead of queueing into a dead pump.
+        if let Some(bridge) = &self.data_plane {
+            bridge.runtime.clear_active_generation();
+        }
+        if let Some(observer) = &self.generation_observer {
+            observer.worker_generation_ended();
         }
     }
 
@@ -311,6 +429,11 @@ impl RestartController {
         active: &mut Option<SupervisedWorker>,
     ) -> io::Result<bool> {
         let _ = active.take();
+        // Dependent matches are closed before any replacement boots: the
+        // replacement starts with an empty match table either way, and the
+        // members must not wait out a restart backoff to learn their match
+        // is gone.
+        self.notify_generation_ended();
         *active = self.restart_after_failure()?;
         Ok(active.is_some())
     }
@@ -326,6 +449,7 @@ impl RestartController {
         // The exited worker is gone either way; drop it before the restart
         // attempt so a failed replacement never leaves a dead worker active.
         let _ = active.take();
+        self.notify_generation_ended();
         *active = self.restart_after_failure()?;
         Ok(active.is_some())
     }
@@ -353,10 +477,40 @@ impl RestartController {
 
     fn boot(&mut self) -> io::Result<SupervisedWorker> {
         let secret = fresh_bootstrap_secret()?;
-        let mut worker =
-            SupervisedWorker::spawn(&self.executable, &self.parent, &secret, &self.policy)?;
+        let script = self.data_plane.as_ref().map(|bridge| SpawnedScript {
+            spec: bridge.spec(),
+            // A monotone epoch per boot: every frame of this generation is
+            // fenced to it, so nothing from a previous worker can replay.
+            epoch: bridge.runtime.allocate_epoch(),
+        });
+        let mut worker = SupervisedWorker::spawn_with_script(
+            &self.executable,
+            &self.parent,
+            &secret,
+            &self.policy,
+            script.as_ref(),
+        )?;
         let nonce = fresh_bootstrap_nonce()?;
         worker.authenticate(&secret, nonce.to_vec(), self.policy.bootstrap_deadline())?;
+        if let (Some(bridge), Some(script)) = (&self.data_plane, &script) {
+            // Revision fence: the worker must have loaded exactly the script
+            // revision the adapter pinned; drift between the two reads is a
+            // boot failure, not something to discover match by match.
+            if worker.script_identity() != Some(bridge.runtime.identity()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker loaded a different script revision than the runtime adapter",
+                ));
+            }
+            let connection =
+                worker.establish_data_plane(&secret, self.policy.bootstrap_deadline())?;
+            bridge
+                .runtime
+                .install_generation(script.epoch, connection.sender);
+            bridge
+                .runtime
+                .spawn_rx_pump(script.epoch, connection.frames);
+        }
         Ok(worker)
     }
 }
@@ -386,16 +540,26 @@ pub fn run_supervision_loop(
             "worker health cadence must stay below the liveness deadline",
         ));
     }
-    let mut active = Some(controller.start()?);
+    // First-boot and breaker-open failures are surfaced in live logs here,
+    // at the moment they happen — not only through the error the serve
+    // lifecycle joins at shutdown.
+    let mut active = match controller.start() {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "external runtime worker first boot failed; supervision halted"
+            );
+            return Err(error);
+        }
+    };
     while !stop.load(Ordering::SeqCst) {
         match controller.monitor_health(&mut active, policy.liveness_deadline()) {
             Ok(true) => {
                 healthy_cycles.fetch_add(1, Ordering::SeqCst);
             }
             Ok(false) => {
-                return Err(io::Error::other(
-                    "worker restart circuit breaker is open; supervision halted",
-                ));
+                return Err(breaker_open_halt());
             }
             Err(error) => {
                 // A restart attempt failed to boot or authenticate. The
@@ -415,6 +579,15 @@ pub fn run_supervision_loop(
     Ok(())
 }
 
+/// Report the breaker-open supervision halt in live logs and build its error.
+///
+/// One shared path for the halt so the live-log surface and the returned
+/// error can never drift apart.
+fn breaker_open_halt() -> io::Error {
+    tracing::error!("external runtime worker restart circuit breaker is open; supervision halted");
+    io::Error::other("worker restart circuit breaker is open; supervision halted")
+}
+
 /// Serve-lifecycle service owning the external GameScript worker.
 ///
 /// Spawned by the transport supervisor when `runtime.adapter` is
@@ -426,6 +599,8 @@ pub struct WorkerLifecycleService {
     socket_parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     healthy_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
+    data_plane: Option<WorkerDataPlaneBridge>,
 }
 
 impl WorkerLifecycleService {
@@ -440,7 +615,28 @@ impl WorkerLifecycleService {
             socket_parent,
             policy,
             healthy_cycles: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            generation_observer: None,
+            data_plane: None,
         }
+    }
+
+    /// Attach the observer notified when a worker generation ends abruptly
+    /// (the gateway's close-all-dependent-matches + epoch-fence hook).
+    #[must_use]
+    pub fn with_generation_observer(
+        mut self,
+        observer: std::sync::Arc<dyn WorkerGenerationObserver>,
+    ) -> Self {
+        self.generation_observer = Some(observer);
+        self
+    }
+
+    /// Host the deployment's script in the supervised workers, installing
+    /// each generation's data plane into the external-worker runtime adapter.
+    #[must_use]
+    pub fn with_data_plane(mut self, bridge: WorkerDataPlaneBridge) -> Self {
+        self.data_plane = Some(bridge);
+        self
     }
 
     /// Monotone count of successful health cycles — an observability probe
@@ -480,8 +676,16 @@ impl crate::lifecycle::AsyncService for WorkerLifecycleService {
         let socket_parent = self.socket_parent;
         let policy = self.policy;
         let healthy_cycles = Arc::clone(&self.healthy_cycles);
+        let generation_observer = self.generation_observer;
+        let data_plane = self.data_plane;
         let result = tokio::task::spawn_blocking(move || {
             let mut controller = RestartController::new(executable, socket_parent, policy);
+            if let Some(observer) = generation_observer {
+                controller = controller.with_generation_observer(observer);
+            }
+            if let Some(bridge) = data_plane {
+                controller = controller.with_data_plane(bridge);
+            }
             run_supervision_loop(&mut controller, &stop, &healthy_cycles)
         })
         .await;
@@ -509,6 +713,10 @@ pub struct SupervisedWorker {
     _bootstrap_reader: OwnedFd,
     child: Child,
     process_group_id: Option<i32>,
+    /// Private data-plane endpoint, present when this worker hosts a script.
+    data_endpoint: Option<(PrivateUnixEndpoint, UnixListener)>,
+    /// Script revision the worker reported in its readiness frame.
+    script_identity: Option<String>,
 }
 
 #[cfg(unix)]
@@ -519,13 +727,33 @@ impl SupervisedWorker {
         secret: &[u8; 32],
         policy: &WorkerSupervisionPolicy,
     ) -> io::Result<Self> {
+        Self::spawn_with_script(executable, parent, secret, policy, None)
+    }
+
+    pub fn spawn_with_script(
+        executable: &Path,
+        parent: &Path,
+        secret: &[u8; 32],
+        policy: &WorkerSupervisionPolicy,
+        script: Option<&SpawnedScript>,
+    ) -> io::Result<Self> {
         let endpoint = PrivateUnixEndpoint::create(parent)?;
         let listener = endpoint.bind()?;
+        // The data plane gets its own private endpoint so supervision frames
+        // (64 KiB cap) and match frames (1 MiB cap) never share a stream.
+        let data_endpoint = script
+            .map(|_| -> io::Result<_> {
+                let endpoint = PrivateUnixEndpoint::create(parent)?;
+                let listener = endpoint.bind()?;
+                Ok((endpoint, listener))
+            })
+            .transpose()?;
         let bootstrap = BootstrapPipe::create()?;
         bootstrap.make_reader_inheritable()?;
         let bootstrap_fd = bootstrap.reader_fd();
         let (bootstrap_reader, bootstrap_writer) = bootstrap.into_reader_and_writer();
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("runtime-worker")
             .arg("--bootstrap-endpoint")
             .arg(endpoint.path())
@@ -544,7 +772,23 @@ impl SupervisedWorker {
             // How often the worker emits a health frame after readiness; the
             // supervisor's liveness deadline is calibrated against it.
             .arg("--health-cadence-ms")
-            .arg(policy.health_cadence().as_millis().to_string())
+            .arg(policy.health_cadence().as_millis().to_string());
+        if let (Some(script), Some((data, _))) = (script, &data_endpoint) {
+            command
+                .arg("--engine")
+                .arg(script.spec.language.as_str())
+                .arg("--entrypoint")
+                .arg(&script.spec.entrypoint)
+                .arg("--script-deadline-ms")
+                .arg(script.spec.deadline_ms.to_string())
+                .arg("--tick-ms")
+                .arg(script.spec.tick_ms.to_string())
+                .arg("--data-endpoint")
+                .arg(data.path())
+                .arg("--data-epoch")
+                .arg(script.epoch.to_string());
+        }
+        let mut child = command
             // The worker must land in its own process group before exec so
             // every cleanup path can signal the whole group. Relying on the
             // worker to isolate itself would let a non-cooperating binary
@@ -572,7 +816,42 @@ impl SupervisedWorker {
             _bootstrap_reader: bootstrap_reader,
             child,
             process_group_id,
+            data_endpoint,
+            script_identity: None,
         })
+    }
+
+    /// Accept and authenticate this generation's data-plane connection.
+    ///
+    /// Must run after [`Self::authenticate`]; the same generation secret
+    /// backs both handshakes. Consumes the endpoint: a generation gets
+    /// exactly one data connection.
+    pub fn establish_data_plane(
+        &mut self,
+        secret: &[u8; 32],
+        deadline: Duration,
+    ) -> io::Result<DataPlaneConnection> {
+        let Some((endpoint, listener)) = self.data_endpoint.take() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "worker was not spawned with a script data plane",
+            ));
+        };
+        let result =
+            super::worker_data_plane::establish_unix_data_plane(&listener, secret, deadline);
+        // Keep the endpoint directory alive for the connection's lifetime by
+        // storing it back; the listener itself is no longer needed.
+        self.data_endpoint = Some((endpoint, listener));
+        if result.is_err() {
+            self.kill_and_reap();
+        }
+        result
+    }
+
+    /// The script revision the worker reported at readiness, if any.
+    #[must_use]
+    pub fn script_identity(&self) -> Option<&str> {
+        self.script_identity.as_deref()
     }
 
     pub fn accept_with_deadline(&self, deadline: Duration) -> io::Result<UnixStream> {
@@ -631,8 +910,10 @@ impl SupervisedWorker {
                 io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
             })? {
                 ControlFrame::WorkerReady {
-                    protocol_version, ..
+                    protocol_version,
+                    script_identity,
                 } if protocol_version == PROTOCOL_VERSION => {
+                    self.script_identity = script_identity;
                     self.stream = Some(stream);
                     Ok(())
                 }
@@ -818,6 +1099,11 @@ pub struct SupervisedWorker {
     job: citadel_win_proc::JobObject,
     _secret_reader: std::os::windows::io::OwnedHandle,
     child: Child,
+    /// Data-plane pump, present when this worker hosts a script. Its thread
+    /// owns the pipe server (bound before the child spawned).
+    data_plane: Option<super::worker_data_plane::WindowsDataPlane>,
+    /// Script revision the worker reported in its readiness frame.
+    script_identity: Option<String>,
 }
 
 #[cfg(windows)]
@@ -832,6 +1118,16 @@ impl SupervisedWorker {
         secret: &[u8; 32],
         policy: &WorkerSupervisionPolicy,
     ) -> io::Result<Self> {
+        Self::spawn_with_script(executable, _parent, secret, policy, None)
+    }
+
+    pub fn spawn_with_script(
+        executable: &Path,
+        _parent: &Path,
+        secret: &[u8; 32],
+        policy: &WorkerSupervisionPolicy,
+        script: Option<&SpawnedScript>,
+    ) -> io::Result<Self> {
         let endpoint = PrivateNamedPipeEndpoint::create()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -844,6 +1140,17 @@ impl SupervisedWorker {
             let _context = runtime.enter();
             endpoint.bind()?
         };
+        // The data plane binds on its own pump thread before the child exists
+        // for the same reason (the tokio pipe server is tied to the runtime
+        // that created it, and the pump outlives this call).
+        let data_plane = script
+            .map(|_| {
+                super::worker_data_plane::WindowsDataPlane::start(
+                    *secret,
+                    policy.bootstrap_deadline(),
+                )
+            })
+            .transpose()?;
         // Kill-on-close is armed before the child exists: once assignment
         // below succeeds, even an abrupt supervisor death tears the worker
         // tree down with the closing job handle (the PDEATHSIG analog).
@@ -855,7 +1162,8 @@ impl SupervisedWorker {
             io::Error::other("worker bootstrap handle value exceeds the command-line range")
         })?;
         let (secret_reader, secret_writer) = secret_pipe.into_reader_and_writer();
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("runtime-worker")
             .arg("--bootstrap-endpoint")
             .arg(endpoint.name())
@@ -877,8 +1185,27 @@ impl SupervisedWorker {
             // How often the worker emits a health frame after readiness; the
             // supervisor's liveness deadline is calibrated against it.
             .arg("--health-cadence-ms")
-            .arg(policy.health_cadence().as_millis().to_string())
-            .spawn()?;
+            .arg(policy.health_cadence().as_millis().to_string());
+        if let (Some(script), Some(data)) = (script, &data_plane) {
+            command
+                .arg("--engine")
+                .arg(script.spec.language.as_str())
+                .arg("--entrypoint")
+                .arg(&script.spec.entrypoint)
+                .arg("--script-deadline-ms")
+                .arg(script.spec.deadline_ms.to_string())
+                .arg("--tick-ms")
+                .arg(script.spec.tick_ms.to_string())
+                .arg("--data-endpoint")
+                .arg(&data.endpoint)
+                .arg("--data-epoch")
+                .arg(script.epoch.to_string());
+        }
+        let mut child = command.spawn()?;
+        // Only the spawned child may complete the data-plane connection.
+        if let Some(data) = &data_plane {
+            data.set_child_pid(child.id());
+        }
         // Containment before secrets: the child blocks reading the bootstrap
         // secret, and the secret is only written after job assignment
         // succeeds, so a worker that reached the protocol is provably inside
@@ -906,7 +1233,37 @@ impl SupervisedWorker {
             job,
             _secret_reader: secret_reader,
             child,
+            data_plane,
+            script_identity: None,
         })
+    }
+
+    /// Wait for this generation's authenticated data-plane connection.
+    ///
+    /// Must run after [`Self::authenticate`]; the pump thread performs the
+    /// accept, peer-pid validation, and challenge-proof handshake itself.
+    pub fn establish_data_plane(
+        &mut self,
+        _secret: &[u8; 32],
+        deadline: Duration,
+    ) -> io::Result<DataPlaneConnection> {
+        let Some(data_plane) = self.data_plane.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "worker was not spawned with a script data plane",
+            ));
+        };
+        let result = data_plane.establish(deadline);
+        if result.is_err() {
+            self.kill_and_reap();
+        }
+        result
+    }
+
+    /// The script revision the worker reported at readiness, if any.
+    #[must_use]
+    pub fn script_identity(&self) -> Option<&str> {
+        self.script_identity.as_deref()
     }
 
     pub fn authenticate(
@@ -915,7 +1272,11 @@ impl SupervisedWorker {
         nonce: Vec<u8>,
         deadline: Duration,
     ) -> io::Result<()> {
-        let result = (|| -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        type Authenticated = (
+            tokio::net::windows::named_pipe::NamedPipeServer,
+            Option<String>,
+        );
+        let result = (|| -> io::Result<Authenticated> {
             let mut stream = self
                 .server
                 .take()
@@ -940,7 +1301,7 @@ impl SupervisedWorker {
                         "worker bootstrap peer mismatch",
                     ));
                 }
-                tokio::time::timeout(deadline, async {
+                let script_identity = tokio::time::timeout(deadline, async {
                     write_control_frame_async(
                         &mut stream,
                         &ControlFrame::ParentHello {
@@ -965,8 +1326,9 @@ impl SupervisedWorker {
                         io::Error::new(io::ErrorKind::InvalidData, "worker readiness frame invalid")
                     })? {
                         ControlFrame::WorkerReady {
-                            protocol_version, ..
-                        } if protocol_version == PROTOCOL_VERSION => Ok(()),
+                            protocol_version,
+                            script_identity,
+                        } if protocol_version == PROTOCOL_VERSION => Ok(script_identity),
                         _ => Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "worker readiness frame invalid",
@@ -980,12 +1342,13 @@ impl SupervisedWorker {
                         "worker bootstrap deadline exceeded",
                     )
                 })??;
-                Ok(stream)
+                Ok((stream, script_identity))
             })
         })();
         match result {
-            Ok(stream) => {
+            Ok((stream, script_identity)) => {
                 self.stream = Some(stream);
+                self.script_identity = script_identity;
                 Ok(())
             }
             Err(error) => {
@@ -1491,14 +1854,159 @@ mod tests {
 
     #[test]
     fn circuit_breaker_opens_at_restart_limit() {
-        let mut breaker = super::RestartCircuitBreaker::new(3);
+        let mut breaker = super::RestartCircuitBreaker::with_rearm(3, 2);
         assert!(breaker.record_failure());
         assert!(breaker.record_failure());
         assert!(!breaker.record_failure());
         assert!(breaker.is_open());
+        // One healthy cycle is not proof of recovery: the breaker re-arms
+        // only after the configured healthy streak.
+        breaker.record_healthy();
+        assert!(breaker.is_open());
         breaker.record_healthy();
         assert!(!breaker.is_open());
         assert!(breaker.record_failure());
+    }
+
+    #[test]
+    fn breaker_requires_n_healthy_cycles_before_rearming() {
+        // A crash-loop that squeezes in a single healthy cycle between
+        // failures must not keep resetting the failure count, otherwise the
+        // breaker can never trip on a flapping worker.
+        let mut breaker = super::RestartCircuitBreaker::with_rearm(3, 2);
+        assert!(breaker.record_failure());
+        breaker.record_healthy();
+        assert_eq!(
+            breaker.snapshot().consecutive_failures,
+            1,
+            "a lone healthy cycle must not re-arm the breaker"
+        );
+        assert!(breaker.record_failure());
+        breaker.record_healthy();
+        assert_eq!(
+            breaker.snapshot().consecutive_failures,
+            2,
+            "intermittent health in a crash-loop keeps charging the breaker"
+        );
+        // A genuine recovery — N consecutive healthy cycles — re-arms.
+        breaker.record_healthy();
+        assert_eq!(breaker.snapshot().consecutive_failures, 0);
+
+        // The default construction sources the PROVISIONAL re-arm streak.
+        let _defaulted = super::RestartCircuitBreaker::new(3);
+        assert_eq!(
+            super::WorkerSupervisionPolicy::default().breaker_rearm_healthy_cycles(),
+            super::DEFAULT_WORKER_BREAKER_REARM_CYCLES
+        );
+    }
+
+    /// Capture everything the closure emits through `tracing` on this thread.
+    fn captured_tracing(run: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).write(data)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Buffer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn first_boot_failure_surfaces_in_live_tracing() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        // An unresolvable worker executable fails the first boot. The failure
+        // must appear in live logs at error level immediately — not only in
+        // the error joined at shutdown.
+        let mut controller = super::RestartController::new(
+            PathBuf::from("citadel-no-such-worker-executable"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        );
+        let logs = captured_tracing(|| {
+            let result = super::run_supervision_loop(
+                &mut controller,
+                &AtomicBool::new(false),
+                &AtomicU64::new(0),
+            );
+            assert!(result.is_err(), "an unbootable first boot must fail");
+        });
+        assert!(
+            logs.contains("first boot failed"),
+            "the first-boot failure must reach live tracing output: {logs:?}"
+        );
+        assert!(
+            logs.contains("ERROR"),
+            "failure logs at error level: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn open_breaker_halt_surfaces_in_live_tracing() {
+        // The breaker-open halt goes through one shared reporting path; the
+        // supervision loop calls it when `monitor_health` refuses a restart.
+        let logs = captured_tracing(|| {
+            let error = super::breaker_open_halt();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+        });
+        assert!(
+            logs.contains("circuit breaker is open"),
+            "the breaker-open halt must reach live tracing output: {logs:?}"
+        );
+        assert!(logs.contains("ERROR"), "halts log at error level: {logs:?}");
+    }
+
+    #[test]
+    fn abrupt_generation_end_notifies_the_match_closure_observer() {
+        #[derive(Default)]
+        struct CountingObserver(std::sync::atomic::AtomicU64);
+        impl super::WorkerGenerationObserver for CountingObserver {
+            fn worker_generation_ended(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let observer = std::sync::Arc::new(CountingObserver::default());
+        let mut controller = super::RestartController::new(
+            PathBuf::from("citadel-no-such-worker-executable"),
+            std::env::temp_dir(),
+            super::WorkerSupervisionPolicy::default().with_restart_limit(1),
+        )
+        .with_generation_observer(std::sync::Arc::clone(&observer) as _);
+        // The active worker generation is gone (crash): the observer must be
+        // told exactly once, before any replacement attempt, so the gateway
+        // can close every dependent match and fence its data-plane epoch.
+        let mut active = None;
+        assert!(!controller.recover_if_exited(&mut active).expect("recover"));
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A healthy-side probe with no exit does not fire the observer... and
+        // an open breaker never re-fires it for the same dead generation.
+        assert!(!controller.recover_if_exited(&mut active).expect("recover"));
+        assert_eq!(
+            observer.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each recovery attempt is a generation boundary while no worker is active"
+        );
     }
 
     #[test]

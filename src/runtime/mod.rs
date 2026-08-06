@@ -40,7 +40,9 @@
 
 pub mod cache_lease;
 pub mod cluster;
+pub mod engine_host;
 pub mod event_bus;
+pub mod external_worker;
 pub mod host_api_spec;
 pub mod host_services;
 pub mod http_endpoint;
@@ -57,6 +59,10 @@ pub mod shared_cache;
 pub(crate) mod static_data;
 #[cfg(unix)]
 pub mod worker_bootstrap;
+#[cfg(any(unix, windows))]
+pub mod worker_data_plane;
+pub mod worker_data_protocol;
+pub mod worker_engine;
 #[cfg(any(unix, windows))]
 pub mod worker_ipc;
 pub mod worker_protocol;
@@ -262,6 +268,13 @@ pub trait Runtime: Send + Sync + 'static {
     fn tick_in_room(&self, room_id: u64, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
         let _ = room_id;
         self.tick(dt, budget)
+    }
+
+    /// Observe a server-side match closure so a process-hosting adapter can
+    /// release the match's execution context. The default preserves embedded
+    /// adapters, whose per-match state lives with the gateway's rooms.
+    fn on_match_closed(&self, room_id: u64) {
+        let _ = room_id;
     }
 
     /// Run the RPC handler for `method`.

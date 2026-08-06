@@ -179,6 +179,13 @@ pub const KIND_TSYNC_V2_SNAPSHOT: u16 = 30;
 /// fence and bounded diagnostics followed by the unchanged v1 input body.
 pub const KIND_TSYNC_V2_INPUT: u16 = 31;
 
+/// Server-driven match closure (`S→C`, reliable): the participant's
+/// authoritative match was closed server-side (script fault, blown budget, or
+/// a worker crash) and its room no longer exists. Body: coarse reason +
+/// requeue hint (see `citadel_wire::room::MatchClosed`); when the hint is set
+/// the client re-submits its own matchmaker ticket — the server retains none.
+pub const KIND_MATCH_CLOSED: u16 = 32;
+
 // Compile-time guarantees that the reserved ranges are disjoint and sit above the
 // legacy kinds (1..=6). A future edit that overlaps them fails to build rather
 // than silently colliding on the wire.
@@ -198,6 +205,9 @@ const _: () = assert!(
 );
 const _: () = assert!(NOTIFICATION_KIND_MAX < CHAT_KIND_MIN);
 const _: () = assert!(KIND_CHAT_EVENT == CHAT_KIND_MIN && CHAT_KIND_MIN == CHAT_KIND_MAX);
+// The match-closed notification sits above the transform-sync v2 block; a
+// future edit that collides with the v2 kinds fails to build.
+const _: () = assert!(KIND_MATCH_CLOSED > KIND_TSYNC_V2_INPUT);
 
 /// [`KIND_AUTH_RESULT`] status: the token validated; the connection is bound to
 /// the `user_id` that follows in the body.
@@ -558,6 +568,7 @@ mod tests {
         assert_eq!(KIND_MATCHMAKER_MATCHED, 26);
         assert_eq!(KIND_NOTIFICATION, 27);
         assert_eq!(KIND_CHAT_EVENT, 28);
+        assert_eq!(KIND_MATCH_CLOSED, 32);
         // Range bounds.
         assert_eq!((TSYNC_KIND_MIN, TSYNC_KIND_MAX), (7, 12));
         assert_eq!((REP_KIND_MIN, REP_KIND_MAX), (13, 15));

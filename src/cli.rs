@@ -118,6 +118,28 @@ pub enum Command {
         /// readiness; supplied by the supervisor's health policy.
         #[arg(long)]
         health_cadence_ms: u64,
+        /// Engine token for the hosted GameScript (`lua` / `js` / `python`).
+        /// Present only when the deployment runs a script under the
+        /// external-worker adapter; requires the other `--data-*`/script
+        /// flags.
+        #[arg(long, requires_all = ["entrypoint", "script_deadline_ms", "tick_ms", "data_endpoint", "data_epoch"])]
+        engine: Option<String>,
+        /// Entry point file of the hosted script.
+        #[arg(long, requires = "engine")]
+        entrypoint: Option<std::path::PathBuf>,
+        /// Per-invocation handler budget for the hosted script, in ms.
+        #[arg(long, requires = "engine")]
+        script_deadline_ms: Option<u64>,
+        /// Scheduler round cadence for the hosted matches, in ms.
+        #[arg(long, requires = "engine")]
+        tick_ms: Option<u64>,
+        /// Private endpoint of the match data plane (unix socket path or
+        /// named-pipe name), created by the supervisor.
+        #[arg(long, requires = "engine")]
+        data_endpoint: Option<String>,
+        /// Worker-generation epoch stamped on every data-plane frame.
+        #[arg(long, requires = "engine")]
+        data_epoch: Option<u64>,
     },
 }
 
@@ -164,6 +186,12 @@ mod tests {
                 parent_pid: 42,
                 max_open_files: 64,
                 health_cadence_ms: 250,
+                engine: None,
+                entrypoint: None,
+                script_deadline_ms: None,
+                tick_ms: None,
+                data_endpoint: None,
+                data_epoch: None,
             }
         );
         assert!(Cli::try_parse_from(["citadel", "runtime-worker"]).is_err());
@@ -210,6 +238,97 @@ mod tests {
             ])
             .is_err(),
             "the health cadence is mandatory"
+        );
+    }
+
+    #[test]
+    fn parses_runtime_worker_script_hosting_flags_as_a_group() {
+        let cli = Cli::try_parse_from([
+            "citadel",
+            "runtime-worker",
+            "--bootstrap-endpoint",
+            "/tmp/citadel.sock",
+            "--bootstrap-fd",
+            "3",
+            "--parent-pid",
+            "42",
+            "--max-open-files",
+            "64",
+            "--health-cadence-ms",
+            "250",
+            "--engine",
+            "lua",
+            "--entrypoint",
+            "/game/main.lua",
+            "--script-deadline-ms",
+            "50",
+            "--tick-ms",
+            "25",
+            "--data-endpoint",
+            "/tmp/citadel-data.sock",
+            "--data-epoch",
+            "7",
+        ])
+        .expect("script-hosting worker parses");
+        let Command::RuntimeWorker {
+            engine,
+            entrypoint,
+            script_deadline_ms,
+            tick_ms,
+            data_endpoint,
+            data_epoch,
+            ..
+        } = cli.command()
+        else {
+            unreachable!("expected the runtime-worker command");
+        };
+        assert_eq!(engine.as_deref(), Some("lua"));
+        assert_eq!(entrypoint, Some(PathBuf::from("/game/main.lua")));
+        assert_eq!(script_deadline_ms, Some(50));
+        assert_eq!(tick_ms, Some(25));
+        assert_eq!(data_endpoint.as_deref(), Some("/tmp/citadel-data.sock"));
+        assert_eq!(data_epoch, Some(7));
+        // The script flags are all-or-nothing: an engine without its data
+        // endpoint (or vice versa) must be rejected, never half-configured.
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+                "--parent-pid",
+                "42",
+                "--max-open-files",
+                "64",
+                "--health-cadence-ms",
+                "250",
+                "--engine",
+                "lua",
+            ])
+            .is_err(),
+            "an engine without the rest of the script flags must be rejected"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "citadel",
+                "runtime-worker",
+                "--bootstrap-endpoint",
+                "/tmp/citadel.sock",
+                "--bootstrap-fd",
+                "3",
+                "--parent-pid",
+                "42",
+                "--max-open-files",
+                "64",
+                "--health-cadence-ms",
+                "250",
+                "--data-endpoint",
+                "/tmp/citadel-data.sock",
+            ])
+            .is_err(),
+            "a data endpoint without an engine must be rejected"
         );
     }
 

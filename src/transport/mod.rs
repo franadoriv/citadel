@@ -371,7 +371,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // install its synchronous `physics_state` read handle. The gateway receives
     // the same shared hub below.
     let transform_hub = build_transform_hub(&cfg.transform_sync);
-    let runtime = build_runtime(
+    let BuiltRuntime {
+        runtime,
+        external: external_runtime,
+    } = build_runtime(
         app.config(),
         Some(domain_host),
         Arc::clone(&maps),
@@ -628,6 +631,13 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     let gateway = Arc::new(gateway);
     gateway.register_live_matchmaker_endpoint();
     gateway.register_party_directory_endpoint();
+    // Under the external-worker adapter the worker's match results land on
+    // the gateway: attach it (weakly — the gateway owns the runtime, so a
+    // strong reference here would leak the cycle) as the command sink.
+    if let Some(external) = &external_runtime {
+        external.attach_sink(Arc::downgrade(&gateway)
+            as std::sync::Weak<dyn crate::runtime::external_worker::MatchCommandSink>);
+    }
     let mut chat_delivery_dispatcher = None;
     if let (Some(directory), Some(router), Some(local_node)) = (
         chat_cluster_directory,
@@ -757,11 +767,11 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
 
     // Supervise the external GameScript worker process when the operator
     // opted into the external-worker adapter (unix and windows; config
-    // validation rejects it elsewhere). Script execution does not route
-    // through the worker yet — a present entrypoint is rejected by
-    // `resolve_selection` — but the worker's lifecycle (boot, periodic
-    // health, restart policy, shutdown) is owned by the same supervisor as
-    // every other service.
+    // validation rejects it elsewhere). With a present script entrypoint the
+    // worker hosts the per-match engine contexts and the lifecycle service
+    // installs each generation's data plane into the runtime adapter; the
+    // worker's lifecycle (boot, periodic health, restart policy, shutdown)
+    // is owned by the same supervisor as every other service either way.
     #[cfg(any(unix, windows))]
     if app.config().runtime.enabled
         && app.config().runtime.adapter == crate::config::RuntimeAdapter::ExternalWorker
@@ -777,13 +787,36 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             executable = %executable.display(),
             "starting supervised external runtime worker"
         );
-        supervisor.spawn(
-            crate::runtime::worker_supervisor::WorkerLifecycleService::new(
-                executable,
-                std::env::temp_dir(),
-                crate::runtime::worker_supervisor::WorkerSupervisionPolicy::default(),
-            ),
-        );
+        // Worker-death closure: when a worker generation ends abruptly, every
+        // dependent match closes the same match-local way (members receive
+        // the requeue-hinted server-error close, rooms are pruned) before any
+        // replacement — which never resumes old matches — starts serving.
+        struct CloseMatchesOnGenerationEnd {
+            gateway: Arc<crate::realtime::Gateway>,
+        }
+        impl crate::runtime::worker_supervisor::WorkerGenerationObserver for CloseMatchesOnGenerationEnd {
+            fn worker_generation_ended(&self) {
+                let notified = self.gateway.close_all_matches();
+                tracing::warn!(
+                    notified,
+                    "external runtime worker generation ended; dependent matches closed"
+                );
+            }
+        }
+        let mut service = crate::runtime::worker_supervisor::WorkerLifecycleService::new(
+            executable,
+            std::env::temp_dir(),
+            crate::runtime::worker_supervisor::WorkerSupervisionPolicy::default(),
+        )
+        .with_generation_observer(std::sync::Arc::new(CloseMatchesOnGenerationEnd {
+            gateway: Arc::clone(&gateway),
+        }));
+        if let Some(external) = &external_runtime {
+            service = service.with_data_plane(
+                crate::runtime::worker_supervisor::WorkerDataPlaneBridge::new(Arc::clone(external)),
+            );
+        }
+        supervisor.spawn(service);
     }
 
     if cfg.quic.enabled {
@@ -1033,7 +1066,7 @@ fn maybe_spawn_reload(
 /// error so the operator sees a real misconfiguration instead of a silent
 /// fallback.
 pub(crate) fn validate_runtime_for_check(config: &Config) -> AppResult<()> {
-    let _runtime = build_runtime(
+    let _built = build_runtime(
         config,
         None,
         Arc::new(crate::maps::MapCatalog::empty()),
@@ -1052,6 +1085,93 @@ pub(crate) fn validate_runtime_for_check(config: &Config) -> AppResult<()> {
     Ok(())
 }
 
+/// The runtime selected by `build_runtime`: the gateway-facing trait object
+/// plus, under the external-worker adapter, the concrete adapter handle the
+/// worker lifecycle wires the data plane into.
+struct BuiltRuntime {
+    runtime: Option<Arc<dyn Runtime>>,
+    external: Option<Arc<crate::runtime::external_worker::ExternalWorkerRuntime>>,
+}
+
+impl BuiltRuntime {
+    fn none() -> Self {
+        Self {
+            runtime: None,
+            external: None,
+        }
+    }
+
+    fn embedded(runtime: Arc<dyn Runtime>) -> Self {
+        Self {
+            runtime: Some(runtime),
+            external: None,
+        }
+    }
+}
+
+/// Build the external-worker runtime adapter for a resolved script selection.
+///
+/// The build must carry the selected engine (single-binary invariant: the
+/// worker is this same executable), so a language whose feature is compiled
+/// out is a configuration error here, exactly like the embedded loaders.
+fn build_external_runtime(
+    rc: &crate::config::RuntimeConfig,
+    selection: &crate::config::RuntimeSelection,
+) -> AppResult<BuiltRuntime> {
+    match selection.language {
+        RuntimeLanguage::Lua => {}
+        #[cfg(feature = "runtime-python")]
+        RuntimeLanguage::Python => {}
+        #[cfg(not(feature = "runtime-python"))]
+        RuntimeLanguage::Python => {
+            return Err(AppError::new(
+                ErrorCategory::Config,
+                format!(
+                    "runtime.language 'python' selected from {} but this build was compiled without the 'runtime-python' feature",
+                    selection.entrypoint.display()
+                ),
+            ));
+        }
+        #[cfg(feature = "runtime-js")]
+        RuntimeLanguage::Js => {}
+        #[cfg(not(feature = "runtime-js"))]
+        RuntimeLanguage::Js => {
+            return Err(AppError::new(
+                ErrorCategory::Config,
+                format!(
+                    "runtime.language 'js' selected from {} but this build was compiled without the 'runtime-js' feature",
+                    selection.entrypoint.display()
+                ),
+            ));
+        }
+    }
+    let tick_ms = rc
+        .tick_period()
+        .map(|period| u64::try_from(period.as_millis()).unwrap_or(u64::MAX).max(1))
+        .unwrap_or(crate::runtime::external_worker::DEFAULT_MATCH_ROUND_CADENCE_MS);
+    let external = Arc::new(
+        crate::runtime::external_worker::ExternalWorkerRuntime::load(
+            crate::runtime::external_worker::WorkerScriptSpec {
+                language: selection.language,
+                entrypoint: selection.entrypoint.clone(),
+                deadline_ms: rc.deadline_ms,
+                tick_ms,
+            },
+        )?,
+    );
+    tracing::info!(
+        entrypoint = %selection.entrypoint.display(),
+        language = selection.language.as_str(),
+        script_identity = external.identity(),
+        tick_ms,
+        "selected external-worker game runtime"
+    );
+    Ok(BuiltRuntime {
+        runtime: Some(Arc::clone(&external) as Arc<dyn Runtime>),
+        external: Some(external),
+    })
+}
+
 fn build_runtime(
     config: &Config,
     domain: Option<Arc<dyn crate::runtime::DomainHost>>,
@@ -1059,11 +1179,11 @@ fn build_runtime(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
-) -> AppResult<Option<Arc<dyn Runtime>>> {
+) -> AppResult<BuiltRuntime> {
     let rc = &config.runtime;
     if !rc.enabled {
         tracing::info!("embedded runtime disabled; using the built-in relay");
-        return Ok(None);
+        return Ok(BuiltRuntime::none());
     }
     if rc.lua_execution_mode == LuaExecutionMode::Trusted {
         tracing::warn!(
@@ -1084,8 +1204,11 @@ fn build_runtime(
                 "no game entrypoint found; using the built-in relay fallback"
             );
         }
-        return Ok(None);
+        return Ok(BuiltRuntime::none());
     };
+    if selection.adapter == crate::config::RuntimeAdapter::ExternalWorker {
+        return build_external_runtime(rc, &selection);
+    }
     tracing::info!(
         scripts_dir = %rc.scripts_dir,
         entrypoint = %selection.entrypoint.display(),
@@ -1131,23 +1254,29 @@ fn build_runtime(
                         None => runtime,
                     };
                     let runtime: Arc<dyn Runtime> = Arc::new(runtime);
-                    Ok(Some(runtime))
+                    Ok(BuiltRuntime::embedded(runtime))
                 }
                 None => {
                     tracing::info!(
                         scripts_dir = %rc.scripts_dir,
                         "selected Lua entrypoint disappeared before load; using the built-in relay fallback"
                     );
-                    Ok(None)
+                    Ok(BuiltRuntime::none())
                 }
             }
         }
-        RuntimeLanguage::Python => {
-            load_python_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)
-        }
-        RuntimeLanguage::Js => {
-            load_js_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)
-        }
+        RuntimeLanguage::Python => Ok(
+            match load_python_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)? {
+                Some(runtime) => BuiltRuntime::embedded(runtime),
+                None => BuiltRuntime::none(),
+            },
+        ),
+        RuntimeLanguage::Js => Ok(
+            match load_js_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)? {
+                Some(runtime) => BuiltRuntime::embedded(runtime),
+                None => BuiltRuntime::none(),
+            },
+        ),
     }
 }
 

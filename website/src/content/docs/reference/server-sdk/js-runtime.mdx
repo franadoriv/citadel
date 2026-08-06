@@ -190,6 +190,18 @@ threads, and no TypeScript transpilation. The future full-power JavaScript mode
 is supervised Node and is not part of this adapter.
 :::
 
+:::caution[Cooperative yielding required]
+Handlers and ticks must **yield by returning**. The per-invocation deadline
+is enforced through the engine's interrupt handler, so a pure-JS
+`while (true) {}` is interrupted — but the platform cannot safely terminate
+non-cooperative code in-thread, and a handler wedged inside a blocking native
+call is beyond the interrupt's reach. A match whose script stops yielding is
+closed server-side: its members receive a server-error close and are prompted
+to requeue. If the stuck thread cannot be reclaimed, the hosting worker
+process is restarted, which closes every match it was hosting. Write handlers
+that return quickly and never busy-wait for game state.
+:::
+
 ## Enable JavaScript
 
 ```toml

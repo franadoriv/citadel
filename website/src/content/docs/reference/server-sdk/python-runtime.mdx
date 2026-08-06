@@ -189,6 +189,30 @@ the server. Multi-tenant or third-party code belongs in the future hardened WASM
 tier.
 :::
 
+:::caution[Cooperative yielding required]
+Handlers and ticks must **yield by returning**. The per-invocation deadline is
+checked between Python bytecode operations, so a pure-Python `while True:
+pass` is interrupted — but the platform cannot safely terminate
+non-cooperative code in-thread, and a handler wedged inside a blocking C-level
+call cannot be interrupted at all. A match whose script stops yielding is
+closed server-side: its members receive a server-error close and are prompted
+to requeue. If the interpreter itself wedges, the engine is reported dead and
+the hosting worker process is restarted, which closes every match it was
+hosting. Write handlers that return quickly and never busy-wait for game
+state.
+:::
+
+:::note[Per-match isolation is soft on Python]
+Under the external-worker adapter each match runs the script in its **own
+module namespace**, so module globals (counters, state tables, handler
+registrations) are match-local. CPython still allows only one interpreter per
+worker process, so this isolation is *soft*: `sys`, imported third-party
+modules, and anything a script mutates on a shared module are visible across
+matches, and an interpreter-level failure costs every match in the worker.
+Keep per-match state in module globals and avoid mutating shared modules. Lua
+and JavaScript matches get fully separate engine states instead.
+:::
+
 ## Enable Python
 
 ```toml
