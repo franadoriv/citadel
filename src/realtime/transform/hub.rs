@@ -180,6 +180,44 @@ fn state_to_na(s: TransformState) -> NaTransform {
     }
 }
 
+/// Structural sanitization for a client-reported owner transform.
+///
+/// The relay-mode `KIND_NA_STATE` path (and presence spawn) historically wrote
+/// the decoded transform verbatim into authoritative state — no finite-float
+/// check and no quaternion normalization (the §2.2 gap; F30). This closes the
+/// structural half of that gap regardless of scripts: any non-finite component
+/// or degenerate rotation is rejected (`None`, the caller drops it before it
+/// can mutate the world), and a valid rotation is normalized so downstream
+/// state and replication always carry a unit quaternion.
+///
+/// Speed/world-bounds clamping is intentionally not applied here: those are
+/// config-sourced limits handled on the validated-input path and (for the
+/// authoritative bridge) by the batch validator, not by structural decode.
+fn sanitize_owner_transform(t: NaTransform) -> Option<NaTransform> {
+    if t.position.iter().any(|v| !v.is_finite()) || t.velocity.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    if t.rotation.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let norm_sq: f32 = t.rotation.iter().map(|v| v * v).sum();
+    if !norm_sq.is_finite() || norm_sq <= 1e-12 {
+        // A zero-length or non-finite quaternion has no valid orientation.
+        return None;
+    }
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    Some(NaTransform {
+        position: t.position,
+        rotation: [
+            t.rotation[0] * inv_norm,
+            t.rotation[1] * inv_norm,
+            t.rotation[2] * inv_norm,
+            t.rotation[3] * inv_norm,
+        ],
+        velocity: t.velocity,
+    })
+}
+
 /// One outbound transform-sync frame the gateway must deliver.
 #[derive(Debug, Clone)]
 pub struct HubOutbound {
@@ -496,6 +534,10 @@ impl TransformHub {
         transform: NaTransform,
     ) -> Option<PresenceRegistration> {
         let mut g = self.inner.lock().ok()?;
+        // Structural stage: drop a presence whose transform is non-finite or
+        // degenerate; normalize a valid rotation (F30). Both the spawn write
+        // and the spawn fan-out then carry the sanitized transform.
+        let transform = sanitize_owner_transform(transform)?;
         let state = na_to_state(transform);
         let mode = if self
             .config
@@ -606,6 +648,11 @@ impl TransformHub {
         object_id: ObjectId,
         transform: NaTransform,
     ) -> bool {
+        // Structural stage: a non-finite or degenerate transform never mutates
+        // authoritative state (F30). Valid rotations are normalized.
+        let Some(transform) = sanitize_owner_transform(transform) else {
+            return false;
+        };
         let Ok(mut g) = self.inner.lock() else {
             return false;
         };
@@ -1155,6 +1202,83 @@ mod tests {
         assert!(!hub.apply_owner_state(2, r1.object_id, t));
         // An unknown object is rejected too.
         assert!(!hub.apply_owner_state(1, 999, t));
+    }
+
+    #[test]
+    fn sanitize_owner_transform_drops_non_finite_and_normalizes() {
+        // A finite, already-normalized transform is preserved.
+        let good = NaTransform {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [4.0, 5.0, 6.0],
+        };
+        assert_eq!(sanitize_owner_transform(good), Some(good));
+
+        // A non-normalized (but finite) quaternion is normalized in place.
+        let unnormalized = NaTransform {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 2.0],
+            velocity: [0.0; 3],
+        };
+        let sanitized = sanitize_owner_transform(unnormalized).expect("finite quat normalizes");
+        let norm: f32 = sanitized.rotation.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "rotation normalized: norm={norm}");
+
+        // Non-finite position / velocity / rotation are dropped.
+        for bad in [
+            NaTransform {
+                position: [f32::NAN, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [0.0; 3],
+            },
+            NaTransform {
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [f32::INFINITY, 0.0, 0.0],
+            },
+            NaTransform {
+                position: [0.0; 3],
+                rotation: [f32::NAN, 0.0, 0.0, 1.0],
+                velocity: [0.0; 3],
+            },
+            // A degenerate (zero-length) quaternion has no orientation.
+            NaTransform {
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 0.0],
+                velocity: [0.0; 3],
+            },
+        ] {
+            assert_eq!(sanitize_owner_transform(bad), None);
+        }
+    }
+
+    #[test]
+    fn na_owner_state_drops_non_finite_report() {
+        let hub = hub();
+        let r = hub
+            .register_presence(1, 0, NaTransform::identity())
+            .expect("presence");
+        let before = hub.get_transform(r.object_id).expect("spawned");
+        // A NaN report is dropped structurally — authoritative state is untouched.
+        let poisoned = NaTransform {
+            position: [f32::NAN, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [0.0; 3],
+        };
+        assert!(!hub.apply_owner_state(1, r.object_id, poisoned));
+        let after = hub.get_transform(r.object_id).expect("still exists");
+        assert_eq!(before.position, after.position, "state unchanged after drop");
+    }
+
+    #[test]
+    fn na_presence_with_non_finite_transform_is_dropped() {
+        let hub = hub();
+        let poisoned = NaTransform {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 0.0], // degenerate
+            velocity: [0.0; 3],
+        };
+        assert!(hub.register_presence(1, 0, poisoned).is_none());
     }
 
     #[test]
