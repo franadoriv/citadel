@@ -39,6 +39,7 @@
 //! same shape later.
 
 pub mod bridge_protocol;
+pub mod bridge_validator;
 pub mod cache_lease;
 pub mod cluster;
 pub mod engine_host;
@@ -81,6 +82,10 @@ pub use bridge_protocol::{
     Decision, FireIntent, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome, MAX_BRIDGE_PAYLOAD_BYTES,
     NormalizedEvent, NormalizedEventBatch, NormalizedPayload, PersistOp, RewindHit, RewindQuery,
     RewindResult, ScriptCommand, ScriptCommandBatch,
+};
+pub use bridge_validator::{
+    BatchRejection, BridgeMatchContext, BridgeQuotas, Capability, EventDraft, MAX_RESERVED_KIND,
+    PendingBatchLedger, Quota, ValidatedBatch, ValidatedOutcome,
 };
 pub use event_bus::{
     MAX_RUNTIME_EVENTS_PER_INVOCATION, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
