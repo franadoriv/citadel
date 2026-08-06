@@ -38,6 +38,7 @@
 //! (`website/src/content/docs/reference/server-sdk/index.mdx`) so other languages can adopt the
 //! same shape later.
 
+pub mod bridge_protocol;
 pub mod cache_lease;
 pub mod cluster;
 pub mod engine_host;
@@ -75,6 +76,12 @@ use std::time::Duration;
 use crate::error::AppResult;
 use crate::leaderboard_scheduler::{ResetEpoch, SchedulerFencingToken};
 
+pub use bridge_protocol::{
+    BridgePhysicsOptions, BridgeRepField, BridgeRepValue, BridgeShape, BridgeTransform, Correction,
+    Decision, FireIntent, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome, MAX_BRIDGE_PAYLOAD_BYTES,
+    NormalizedEvent, NormalizedEventBatch, NormalizedPayload, PersistOp, RewindHit, RewindQuery,
+    RewindResult, ScriptCommand, ScriptCommandBatch,
+};
 pub use event_bus::{
     MAX_RUNTIME_EVENTS_PER_INVOCATION, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
     RuntimeEventEmitOutcome, RuntimeEventError, RuntimeEventPolicy, RuntimeEventPublisher,
