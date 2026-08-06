@@ -19,7 +19,16 @@ blake3 = "1"
 [dev-dependencies]
 # Emit/verify the published bit-level test-vector fixture (wire_vectors.json),
 # the cross-SDK ground truth for the codec/ack/schema_hash layout.
-serde_json = "1"
+#
+# `preserve_order` is pinned on purpose: the stale-guard compares the rendered
+# JSON string byte-for-byte against the checked-in fixture, so key ordering must
+# be deterministic. Without this feature serde_json backs its objects with a
+# `BTreeMap` (alphabetical); with it, insertion order — matching the `json!`
+# literal and the committed file. Because features unify across a build graph,
+# some other crate enables `preserve_order` in a full workspace build but NOT in
+# an isolated `cargo test -p citadel-wire`, which flipped the ordering and broke
+# the guard. Pinning it here makes the render insertion-order in every build.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [lints.rust]
 unsafe_code = "forbid"

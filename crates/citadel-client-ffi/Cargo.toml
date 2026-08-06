@@ -34,7 +34,16 @@ citadel = { path = "../.." }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # The contract-manifest generator/stale-guard test emits crates/citadel-wire/
 # contract.json from the canonical Rust consts.
-serde_json = "1"
+#
+# `preserve_order` is pinned on purpose: the stale-guard compares the rendered
+# JSON string byte-for-byte against the checked-in manifest, so key ordering must
+# be deterministic. Without this feature serde_json backs its objects with a
+# `BTreeMap` (alphabetical); with it, insertion order — matching the `json!`
+# literal and the committed file. In a full workspace build some crate unifies
+# `preserve_order` in (today it also arrives via the `citadel` dev-dependency),
+# but that must not be what the guard relies on: pinning it here keeps the render
+# insertion-order whether the test runs in isolation or in the workspace.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # NOTE: unlike the rest of the workspace, this crate does NOT set
 # `unsafe_code = "forbid"`: the C ABI boundary requires unsafe (raw pointers,
