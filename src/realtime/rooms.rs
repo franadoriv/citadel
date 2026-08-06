@@ -445,6 +445,28 @@ impl RoomRegistry {
         true
     }
 
+    /// Close a whole room server-side: remove the room (and its matchmaking
+    /// name) and clear every member's membership in one step. Returns the
+    /// local members that were in the room, ascending, or `None` if no such
+    /// room exists. Used by the match-closure flow: the gateway informs the
+    /// members and returns them to matchmaking after the prune.
+    pub(crate) fn close(&self, room_id: RoomId) -> Option<Vec<ParticipantId>> {
+        let mut g = self.lock();
+        let room = g.rooms.remove(&room_id)?;
+        if let Some(name) = &room.name {
+            g.names.remove(name);
+        }
+        for member in &room.members {
+            g.membership.remove(member);
+        }
+        for remote in &room.remote_members {
+            g.remote_membership.remove(remote);
+        }
+        let mut members: Vec<ParticipantId> = room.members.into_iter().collect();
+        members.sort_unstable();
+        Some(members)
+    }
+
     fn remove_member(g: &mut Inner, participant: ParticipantId, room_id: RoomId) {
         let (empty, name) = if let Some(room) = g.rooms.get_mut(&room_id) {
             room.members.remove(&participant);
@@ -724,6 +746,27 @@ mod tests {
             r.join_bound(pid(3), placeholder, Some(&v1)),
             Err(JoinError::StaleScript)
         );
+    }
+
+    #[test]
+    fn close_removes_room_membership_and_name() {
+        let r = RoomRegistry::new();
+        let (id, _) = r
+            .join_or_create(pid(1), "arena", || RoomLabel::with_map("M"))
+            .unwrap();
+        r.join(pid(2), id).unwrap();
+        let members = r.close(id).expect("room exists");
+        assert_eq!(members, vec![pid(1), pid(2)], "members reported, sorted");
+        assert_eq!(r.room_count(), 0);
+        assert_eq!(r.room_of(pid(1)), None);
+        assert_eq!(r.room_of(pid(2)), None);
+        // The matchmaking name is freed: re-creating "arena" makes a fresh room.
+        let (id2, _) = r
+            .join_or_create(pid(3), "arena", || RoomLabel::with_map("M2"))
+            .unwrap();
+        assert_ne!(id, id2);
+        // Closing a nonexistent room is a no-op.
+        assert_eq!(r.close(id), None);
     }
 
     #[test]

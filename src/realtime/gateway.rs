@@ -5547,6 +5547,73 @@ impl Gateway {
         usize::from(self.send_reliable(sender, citadel_wire::protocol::KIND_ROOM_REJECT, body))
     }
 
+    /// Close one authoritative match server-side.
+    ///
+    /// Every member receives a reliable `KIND_MATCH_CLOSED` — a server-error
+    /// close carrying a requeue hint — and the room is pruned from the
+    /// registry. The requeue model is client-prompted: the hinted client
+    /// re-submits its own matchmaker ticket; the server retains no ticket on
+    /// the member's behalf, so nothing can resume the dead match. Returns the
+    /// number of notifications delivered (0 when no such room exists).
+    pub fn close_match(&self, room_id: RoomId) -> usize {
+        let Some(members) = self.rooms.close(room_id) else {
+            return 0;
+        };
+        // Let a process-hosting runtime adapter release the match's execution
+        // context (a no-op for embedded adapters, and for a worker-initiated
+        // close whose context is already gone).
+        if let Some(runtime) = &self.runtime {
+            runtime.on_match_closed(room_id);
+        }
+        tracing::warn!(
+            room_id,
+            members = members.len(),
+            "match closed server-side; members returned to matchmaking"
+        );
+        let body = citadel_wire::room::MatchClosed {
+            room_id,
+            reason: citadel_wire::room::MATCH_CLOSE_REASON_SERVER_ERROR,
+            requeue_hint: true,
+        }
+        .encode();
+        let mut sent = 0;
+        for member in members {
+            if self.send_reliable(
+                member,
+                citadel_wire::protocol::KIND_MATCH_CLOSED,
+                body.clone(),
+            ) {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    /// Close every live match via [`Self::close_match`].
+    ///
+    /// The worker-death flow: when the supervised GameScript worker crashes,
+    /// every dependent match is closed the same match-local way — members
+    /// informed and returned to matchmaking, rooms pruned — before the
+    /// replacement worker (which never resumes old matches) starts serving.
+    pub fn close_all_matches(&self) -> usize {
+        self.rooms
+            .snapshot()
+            .into_iter()
+            .map(|room| self.close_match(room.id))
+            .sum()
+    }
+
+    /// Apply one external match's command batch, room-scoped exactly like an
+    /// embedded dispatch result (no excluded sender: the worker's fan-out
+    /// semantics are its own).
+    pub fn apply_external_match_commands(
+        &self,
+        room_id: RoomId,
+        commands: Vec<OutboundCommand>,
+    ) -> usize {
+        self.apply_commands_scoped(None, Some(room_id), commands)
+    }
+
     /// Route a room frame (kinds 21-25).
     ///
     /// Phase A1: `ROOM_CREATE` interprets its params as the desired map name (Phase
@@ -5696,6 +5763,18 @@ impl Gateway {
         let Some((room_id, remaining)) = self.rooms.leave(sender) else {
             return 0;
         };
+        // A leave that empties the room prunes it from the registry. Let a
+        // process-hosting runtime adapter release the match's execution
+        // context, exactly like [`Self::close_match`] does (embedded adapters
+        // no-op); without this, an exodus-abandoned match ticks until worker
+        // restart. Room ids are never reused, so a pruned id observed here
+        // cannot belong to a later room.
+        if remaining.is_empty()
+            && self.rooms.label(room_id).is_none()
+            && let Some(runtime) = &self.runtime
+        {
+            runtime.on_match_closed(room_id);
+        }
         let body = citadel_wire::room::RoomLeave { room_id }.encode();
         let mut sent = 0;
         for peer in remaining {
@@ -6126,6 +6205,25 @@ impl Default for Gateway {
 #[must_use]
 pub fn shared() -> Arc<Gateway> {
     Arc::new(Gateway::new())
+}
+
+/// The gateway is where an external worker's match results land: command
+/// batches apply with room-scoped semantics, a worker-side closure becomes
+/// the standard server-side match close (requeue-hinted member notification +
+/// room prune). Every close reason maps to the same client-facing outcome by
+/// design; the distinct reasons stay in worker diagnostics.
+impl crate::runtime::external_worker::MatchCommandSink for Gateway {
+    fn apply_match_commands(&self, room_id: u64, commands: Vec<OutboundCommand>) -> usize {
+        self.apply_external_match_commands(room_id, commands)
+    }
+
+    fn on_match_closed(
+        &self,
+        room_id: u64,
+        _reason: crate::runtime::worker_data_protocol::MatchCloseReason,
+    ) {
+        self.close_match(room_id);
+    }
 }
 
 impl PlayerNotificationDelivery for Gateway {
@@ -6646,6 +6744,285 @@ mod transform_tests {
         );
         assert_eq!(sent, 0, "no such room -> nothing sent");
         assert_eq!(gw.rooms().room_of(a), None);
+    }
+
+    #[tokio::test]
+    async fn server_error_match_close_notifies_members_and_prunes_room() {
+        use citadel_wire::protocol::KIND_MATCH_CLOSED;
+        use citadel_wire::room::{
+            MATCH_CLOSE_REASON_SERVER_ERROR, MatchClosed, RoomCreate, RoomJoin, RoomJoined,
+        };
+        let gw = Gateway::new();
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"M".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
+            .unwrap()
+            .room_id;
+        let (b, mut rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+        );
+        let _ = rb.recv().await; // B's ROOM_JOINED
+
+        // The match fails server-side: both members are informed with a
+        // server-error close carrying the client-prompted requeue hint, and
+        // the room is pruned.
+        assert_eq!(gw.close_match(room_id), 2);
+        for receiver in [&mut ra, &mut rb] {
+            let outbound = receiver.recv().await.expect("MATCH_CLOSED delivered");
+            assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
+            let closed = MatchClosed::decode(&outbound.envelope.body).unwrap();
+            assert_eq!(closed.room_id, room_id);
+            assert_eq!(closed.reason, MATCH_CLOSE_REASON_SERVER_ERROR);
+            assert!(closed.requeue_hint, "members are returned to matchmaking");
+        }
+        assert_eq!(gw.rooms().room_count(), 0, "the room is pruned");
+        assert_eq!(gw.rooms().room_of(a), None);
+        assert_eq!(gw.rooms().room_of(b), None);
+        // Closing an already-closed match delivers nothing.
+        assert_eq!(gw.close_match(room_id), 0);
+    }
+
+    /// Records every match-closure notification the gateway sends its runtime.
+    /// Every other surface is inert, mirroring [`Runtime`]'s defaults.
+    #[derive(Default)]
+    struct ClosureProbeRuntime {
+        closed: Mutex<Vec<u64>>,
+    }
+
+    impl Runtime for ClosureProbeRuntime {
+        fn dispatch(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _kind: u16,
+            _body: &[u8],
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn dispatch_lifecycle(
+            &self,
+            _hook: LifecycleHook,
+            _sender: u64,
+            _user_id: Option<&str>,
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn tick(
+            &self,
+            _dt: std::time::Duration,
+            _budget: std::time::Duration,
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn on_match_closed(&self, room_id: u64) {
+            self.closed.lock().expect("closed lock").push(room_id);
+        }
+
+        fn call_rpc(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _method: &str,
+            _body: &[u8],
+        ) -> RpcOutcome {
+            RpcOutcome::Err("no rpc handlers".to_owned())
+        }
+
+        fn call_room_create(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _params: &[u8],
+        ) -> Option<crate::runtime::RoomSpec> {
+            None
+        }
+
+        fn call_room_join(&self, _sender: u64, _user_id: Option<&str>, _room_id: u64) -> bool {
+            true
+        }
+
+        fn has_tick_handler(&self) -> bool {
+            false
+        }
+
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_millis(50)
+        }
+
+        fn introspect(&self) -> crate::runtime::RuntimeIntrospection {
+            crate::runtime::RuntimeIntrospection {
+                source: "closure-probe".to_owned(),
+                reloadable: false,
+                deadline_ms: 50,
+                rpcs: Vec::new(),
+                message_kinds: Vec::new(),
+                hooks: Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn member_exodus_notifies_runtime_of_match_closure() {
+        use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined, RoomLeave};
+
+        let runtime = Arc::new(ClosureProbeRuntime::default());
+        let gw = Gateway::with_metrics_and_runtime(
+            Arc::new(NodeMetrics::new()),
+            Some(Arc::clone(&runtime) as Arc<dyn Runtime>),
+        );
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"M".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
+            .unwrap()
+            .room_id;
+        let (b, _rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+        );
+
+        // A leaves explicitly: B remains, so the match is still live and the
+        // runtime must keep its execution context.
+        gw.handle_inbound(
+            a,
+            &Envelope::new(KIND_ROOM_LEAVE, RoomLeave { room_id }.encode()),
+        );
+        assert!(
+            runtime.closed.lock().expect("closed lock").is_empty(),
+            "a leave that does not empty the room is not a match closure"
+        );
+
+        // B disconnects: the room empties and is pruned. The runtime must be
+        // told to release the match's execution context, exactly like a
+        // server-side close — otherwise a process-hosting adapter leaks the
+        // worker-side context (thread + engine state) until worker restart.
+        gw.unregister_session(b);
+        assert_eq!(gw.rooms().room_count(), 0, "the emptied room is pruned");
+        assert_eq!(
+            runtime.closed.lock().expect("closed lock").as_slice(),
+            &[room_id],
+            "emptying the room must notify the runtime exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_worker_sink_applies_room_scoped_commands_and_closes() {
+        use crate::runtime::external_worker::MatchCommandSink;
+        use citadel_wire::protocol::KIND_MATCH_CLOSED;
+        use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined};
+
+        let gw = Gateway::new();
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"M".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
+            .unwrap()
+            .room_id;
+        let (b, mut rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+        );
+        let _ = rb.recv().await; // B's ROOM_JOINED
+        // A third participant outside the room must not see the broadcast.
+        let (_c, mut rc) = register(&gw);
+
+        // A worker command batch applies with room-scoped semantics.
+        let delivered = MatchCommandSink::apply_match_commands(
+            &gw,
+            room_id,
+            vec![OutboundCommand::Broadcast {
+                kind: 40,
+                body: b"state".to_vec(),
+                unreliable: false,
+            }],
+        );
+        assert_eq!(delivered, 2, "both room members receive the broadcast");
+        for receiver in [&mut ra, &mut rb] {
+            let outbound = receiver.recv().await.expect("room broadcast delivered");
+            assert_eq!(outbound.envelope.kind, 40);
+            assert_eq!(outbound.envelope.body.as_ref(), b"state");
+        }
+        assert!(rc.try_recv().is_err(), "outsiders receive nothing");
+
+        // A worker-side closure becomes the standard server-side close.
+        MatchCommandSink::on_match_closed(
+            &gw,
+            room_id,
+            crate::runtime::worker_data_protocol::MatchCloseReason::ServerError,
+        );
+        for receiver in [&mut ra, &mut rb] {
+            let outbound = receiver.recv().await.expect("MATCH_CLOSED delivered");
+            assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
+        }
+        assert_eq!(gw.rooms().room_count(), 0, "the room is pruned");
+    }
+
+    #[tokio::test]
+    async fn worker_death_closes_all_dependent_matches() {
+        use citadel_wire::protocol::KIND_MATCH_CLOSED;
+        use citadel_wire::room::{MatchClosed, RoomCreate, RoomJoined};
+        let gw = Gateway::new();
+        // Two independent live matches, one member each. Distinct create
+        // params: same-named creates land in one shared room by design.
+        let mut members = Vec::new();
+        for name in [b"M1".to_vec(), b"M2".to_vec()] {
+            let (p, mut rp) = register(&gw);
+            gw.handle_inbound(
+                p,
+                &Envelope::new(KIND_ROOM_CREATE, RoomCreate { params: name }.encode()),
+            );
+            let room_id = RoomJoined::decode(&rp.recv().await.unwrap().envelope.body)
+                .unwrap()
+                .room_id;
+            members.push((room_id, rp));
+        }
+        assert_eq!(gw.rooms().room_count(), 2);
+
+        // The worker died: every dependent match closes the same way.
+        assert_eq!(gw.close_all_matches(), 2);
+        for (room_id, receiver) in &mut members {
+            let outbound = receiver.recv().await.expect("MATCH_CLOSED delivered");
+            assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
+            assert_eq!(
+                MatchClosed::decode(&outbound.envelope.body)
+                    .unwrap()
+                    .room_id,
+                *room_id
+            );
+        }
+        assert_eq!(gw.rooms().room_count(), 0, "all rooms are pruned");
     }
 
     #[tokio::test]

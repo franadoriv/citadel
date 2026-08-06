@@ -1222,6 +1222,18 @@ outside the main VM state the deadline hook watches, and `debug.sethook`
 could remove the hook outright — both would let a script evade its time
 budget.
 
+:::caution[Cooperative yielding required]
+Handlers and ticks must **yield by returning**. The per-invocation deadline
+is enforced by an instruction hook, so a pure-Lua `while true do end` is
+interrupted — but the platform cannot safely terminate non-cooperative code
+in-thread, and a handler wedged inside a blocking native call is beyond the
+hook's reach. A match whose script stops yielding is closed server-side: its
+members receive a server-error close and are prompted to requeue. If the
+stuck thread cannot be reclaimed, the hosting worker process is restarted,
+which closes every match it was hosting. Write handlers that return quickly
+and never busy-wait for game state.
+:::
+
 ---
 
 ## Hot reload
