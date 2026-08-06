@@ -36,7 +36,13 @@ use crate::runtime::worker_data_protocol::{
     RxCounters, decode_commands,
 };
 
-use super::Runtime;
+use super::{BridgeCommandSink, NormalizedEventBatch, Runtime, ScriptCommandBatch};
+
+/// Marker `kind` on a [`DataFrame::MatchEvent`] whose `body` is an encoded
+/// [`NormalizedEventBatch`] rather than a raw wire envelope. `u16::MAX` is never
+/// a real wire kind (the registry lives far below it), so the worker can tell a
+/// bridge batch from a legacy per-message dispatch without a new frame variant.
+pub const BRIDGE_EVENT_MARKER_KIND: u16 = u16::MAX;
 
 /// PROVISIONAL round cadence used when `runtime.tick_hz` is disabled: the
 /// worker still needs a scheduler cadence to drain match mailboxes and run
@@ -142,6 +148,10 @@ pub struct ExternalWorkerRuntime {
     identity: String,
     budget: Duration,
     sink: Mutex<Option<Weak<dyn MatchCommandSink>>>,
+    /// Where a bridge match's fenced `ScriptCommandBatch` answers land (the
+    /// gateway). Distinct from `sink` (legacy `OutboundCommand` batches);
+    /// `MatchCommands` frames that decode as a `ScriptCommandBatch` route here.
+    bridge_sink: Mutex<Option<Weak<dyn BridgeCommandSink>>>,
     state: Mutex<GenerationState>,
     counters: AdapterCounters,
     /// Last worker heartbeat, for observability.
@@ -168,6 +178,7 @@ impl ExternalWorkerRuntime {
             identity,
             budget,
             sink: Mutex::new(None),
+            bridge_sink: Mutex::new(None),
             state: Mutex::new(GenerationState::default()),
             counters: AdapterCounters::default(),
             last_heartbeat: Mutex::new(None),
@@ -190,6 +201,45 @@ impl ExternalWorkerRuntime {
     /// the gateway already owns this runtime).
     pub fn attach_sink(&self, sink: Weak<dyn MatchCommandSink>) {
         *self.sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    /// Attach the gateway-side authoritative-bridge sink (weakly).
+    pub fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        *self.bridge_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    fn bridge_sink(&self) -> Option<Arc<dyn BridgeCommandSink>> {
+        self.bridge_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// Forward one authoritative match's normalized-event batch to the worker.
+    ///
+    /// Encoded into a [`DataFrame::MatchEvent`] body under
+    /// [`BRIDGE_EVENT_MARKER_KIND`] and sent on the active generation (opening
+    /// the match first if needed). The worker answers asynchronously with a
+    /// `MatchCommands` frame carrying the encoded [`ScriptCommandBatch`], which
+    /// the receive pump routes to the bridge sink. A drop (no generation,
+    /// oversized batch, saturated connection) is fail-closed: the match simply
+    /// receives no answer.
+    pub fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        let match_id = batch.match_id;
+        let body = match batch.encode() {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    match_id,
+                    ?error,
+                    "bridge batch too large to forward; dropped"
+                );
+                self.counters.dropped_sends.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        self.send_match_event(match_id, 0, None, BRIDGE_EVENT_MARKER_KIND, &body);
     }
 
     /// Adapter-level drop counters.
@@ -341,6 +391,17 @@ impl ExternalWorkerRuntime {
             DataFrame::MatchCommands {
                 header, commands, ..
             } => {
+                // A bridge match answers with an encoded `ScriptCommandBatch`
+                // (a JSON object); a legacy match answers with an
+                // `OutboundCommand` array. The two are structurally disjoint, so
+                // try the bridge decode first when a bridge sink is attached and
+                // fall back to the legacy path otherwise.
+                if let Some(bridge_sink) = self.bridge_sink()
+                    && let Ok(answer) = ScriptCommandBatch::decode(&commands)
+                {
+                    bridge_sink.deliver_command_batch(answer);
+                    return;
+                }
                 let Ok(commands) = decode_commands(&commands) else {
                     tracing::warn!(
                         match_id = header.match_id,
@@ -530,6 +591,14 @@ impl Runtime for ExternalWorkerRuntime {
         // Results arrive asynchronously as fenced MatchCommands frames and
         // are applied through the MatchCommandSink.
         Vec::new()
+    }
+
+    fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        ExternalWorkerRuntime::attach_bridge_sink(self, sink);
+    }
+
+    fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        ExternalWorkerRuntime::deliver_event_batch(self, batch);
     }
 
     fn dispatch_lifecycle(
@@ -1031,5 +1100,127 @@ mod tests {
         let introspection = runtime.introspect();
         assert!(introspection.source.contains("external worker"));
         assert_eq!(introspection.deadline_ms, 50);
+    }
+
+    // ---- authoritative-bridge data-plane surface ----
+
+    struct RecordingBridgeSink(Mutex<Vec<ScriptCommandBatch>>);
+
+    impl RecordingBridgeSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(Vec::new())))
+        }
+    }
+
+    impl BridgeCommandSink for RecordingBridgeSink {
+        fn deliver_command_batch(&self, answer: ScriptCommandBatch) {
+            self.0.lock().expect("bridge sink lock").push(answer);
+        }
+    }
+
+    #[test]
+    fn deliver_event_batch_forwards_an_encoded_marker_event_frame() {
+        let (runtime, _dir) = runtime_with_script();
+        let sender = CapturingSender::new();
+        let epoch = runtime.allocate_epoch();
+        runtime.install_generation(epoch, sender.clone());
+
+        let batch = NormalizedEventBatch::new(3, 4, 9, 100, 1);
+        runtime.deliver_event_batch(batch.clone());
+
+        let frames = sender.frames();
+        // open + the bridge event.
+        assert_eq!(frames.len(), 2, "open + event: {frames:?}");
+        match &frames[1] {
+            DataFrame::MatchEvent {
+                header, kind, body, ..
+            } => {
+                assert_eq!(header.match_id, 4);
+                assert_eq!(*kind, BRIDGE_EVENT_MARKER_KIND);
+                assert_eq!(
+                    NormalizedEventBatch::decode(body).expect("decode"),
+                    batch,
+                    "the body round-trips the exact batch"
+                );
+            }
+            other => panic!("expected a MatchEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deliver_event_batch_without_a_generation_is_fail_closed() {
+        let (runtime, _dir) = runtime_with_script();
+        runtime.deliver_event_batch(NormalizedEventBatch::new(1, 4, 0, 0, 1));
+        assert_eq!(runtime.counters().dropped_sends.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn worker_bridge_answer_reaches_the_bridge_sink() {
+        let (runtime, _dir) = runtime_with_script();
+        let bridge_sink = RecordingBridgeSink::new();
+        runtime.attach_bridge_sink(Arc::downgrade(&bridge_sink) as Weak<dyn BridgeCommandSink>);
+        let sender = CapturingSender::new();
+        let epoch = runtime.allocate_epoch();
+        runtime.install_generation(epoch, sender);
+
+        // Open match 4 on the receive side.
+        let batch = NormalizedEventBatch::new(3, 4, 9, 100, 1);
+        runtime.deliver_event_batch(batch.clone());
+
+        let answer = ScriptCommandBatch::answering(&batch);
+        let rx = active_rx(&runtime);
+        runtime.handle_worker_frame(
+            epoch,
+            &rx,
+            DataFrame::MatchCommands {
+                protocol_version: DATA_PROTOCOL_VERSION,
+                header: FrameHeader {
+                    match_id: 4,
+                    epoch,
+                    seq: 1,
+                },
+                commands: answer.encode().expect("encode"),
+            },
+        );
+        let got = bridge_sink.0.lock().expect("bridge sink");
+        assert_eq!(got.as_slice(), &[answer]);
+    }
+
+    #[test]
+    fn legacy_command_batch_bypasses_the_bridge_sink() {
+        // With both sinks attached, a legacy OutboundCommand array (not a
+        // ScriptCommandBatch object) routes to the MatchCommandSink, never the
+        // bridge sink — the two encodings are structurally disjoint.
+        let (runtime, _dir) = runtime_with_script();
+        let sink = RecordingSink::new();
+        let bridge_sink = RecordingBridgeSink::new();
+        runtime.attach_sink(Arc::downgrade(&sink) as Weak<dyn MatchCommandSink>);
+        runtime.attach_bridge_sink(Arc::downgrade(&bridge_sink) as Weak<dyn BridgeCommandSink>);
+        let sender = CapturingSender::new();
+        let epoch = runtime.allocate_epoch();
+        runtime.install_generation(epoch, sender);
+        runtime.dispatch_in_room(7, None, 4, 9, b"x");
+
+        let commands = vec![OutboundCommand::Broadcast {
+            kind: 40,
+            body: b"pong".to_vec(),
+            unreliable: false,
+        }];
+        let rx = active_rx(&runtime);
+        runtime.handle_worker_frame(
+            epoch,
+            &rx,
+            DataFrame::MatchCommands {
+                protocol_version: DATA_PROTOCOL_VERSION,
+                header: FrameHeader {
+                    match_id: 4,
+                    epoch,
+                    seq: 1,
+                },
+                commands: encode_commands(&commands).expect("encode"),
+            },
+        );
+        assert_eq!(sink.commands.lock().expect("commands").len(), 1);
+        assert!(bridge_sink.0.lock().expect("bridge sink").is_empty());
     }
 }
