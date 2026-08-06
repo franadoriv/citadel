@@ -309,26 +309,6 @@ async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
 
-    // Known WSL host anomaly, not a data-plane defect: outbound envelopes
-    // queued by a non-runtime thread (`SessionRegistry::send_to` returns
-    // true) are not flushed to an otherwise idle WebSocket connection —
-    // the parked runtime is not woken — so the client-side waits below stall
-    // even though the worker produced every asserted frame (verified via a
-    // recording sink and adapter counters). The same binary passes this test
-    // on native Windows, and the four sink-level live-IPC tests in this file
-    // pass on WSL because they poll instead of depending on waker delivery.
-    // Skip only on WSL so native-Linux CI keeps full signal.
-    #[cfg(unix)]
-    if std::fs::read_to_string("/proc/version")
-        .is_ok_and(|version| version.to_lowercase().contains("microsoft"))
-    {
-        eprintln!(
-            "skipping full-stack data-plane test on WSL: cross-thread waker \
-             delivery to idle connections stalls on this host"
-        );
-        return;
-    }
-
     let script = ScriptDir::create("data-plane-full-stack", COUNTER_SCRIPT);
     let runtime = Arc::new(
         ExternalWorkerRuntime::load(WorkerScriptSpec {
@@ -403,13 +383,10 @@ async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
     };
 
     // Wait for `wanted`, sending a periodic keepalive between short receive
-    // windows. Real game clients emit steady input; a fully idle test client
-    // is the one shape production traffic never has, and on one observed
-    // environment (WSL) an outbound queued by the worker's receive pump while
-    // the connection was completely idle was not flushed until the next
-    // socket event even though the gateway had queued it. The keepalive keeps
-    // the connection event-driven without touching any assertion: every
-    // asserted frame is still produced by the worker process.
+    // windows so the connection stays event-driven, the way a real game
+    // client's steady input keeps it. (Reliable delivery to an idle
+    // connection is correct on its own; the keepalive is robustness, not a
+    // correctness crutch.)
     async fn recv_with_keepalive(
         ws: &mut common::Ws,
         keepalive: Envelope,
@@ -454,20 +431,45 @@ async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
         "the per-match Lua counter answers over the full stack"
     );
 
-    // Now wedge the match: enough non-yielding invocations to exhaust the
-    // overrun policy (limit 3; a keepalive quantum would reset the streak,
-    // so the poison kind itself doubles as the keepalive — extras after the
-    // closure are dropped as unknown-match traffic). The member must receive
-    // the requeue-hinted close.
-    for _ in 0..3 {
-        ws.send(Message::Binary(
-            Envelope::new(2, Vec::new()).encode_framed().to_vec(),
-        ))
-        .await
-        .expect("send poison event");
+    // Now wedge the match. The worker closes a match after a run of
+    // *consecutive* per-invocation deadline overruns; any healthy quantum —
+    // including an idle tick on an empty mailbox — resets that run. A few
+    // network-spaced poison events therefore do not reliably wedge it: the
+    // fair scheduler slips idle-tick quanta between them and resets the
+    // streak, so the match closes deterministically only when the poison
+    // arrives densely enough to occupy consecutive quanta. (This host-timing
+    // sensitivity, not any waker anomaly, is why sparse poison wedged the
+    // match on some hosts and not others.) Keep the worker's mailbox
+    // continuously non-empty with non-yielding invocations until the
+    // authoritative, requeue-hinted close arrives.
+    let mut closed = None;
+    'wedge: for _ in 0..200 {
+        for _ in 0..16 {
+            ws.send(Message::Binary(
+                Envelope::new(2, Vec::new()).encode_framed().to_vec(),
+            ))
+            .await
+            .expect("send poison event");
+        }
+        let window = tokio::time::sleep(Duration::from_millis(50));
+        tokio::pin!(window);
+        loop {
+            tokio::select! {
+                () = &mut window => break,
+                msg = futures_util::StreamExt::next(&mut ws) => {
+                    let msg = msg.expect("stream open").expect("message ok");
+                    if let Message::Binary(data) = msg {
+                        let envelope = common::decode_one(&data);
+                        if envelope.kind == KIND_MATCH_CLOSED {
+                            closed = Some(envelope);
+                            break 'wedge;
+                        }
+                    }
+                }
+            }
+        }
     }
-    let closed =
-        recv_with_keepalive(&mut ws, Envelope::new(2, Vec::new()), KIND_MATCH_CLOSED).await;
+    let closed = closed.expect("member receives the authoritative match close");
     let closed = MatchClosed::decode(&closed.body).expect("match closed decodes");
     assert_eq!(closed.room_id, joined.room_id);
     assert_eq!(closed.reason, MATCH_CLOSE_REASON_SERVER_ERROR);
