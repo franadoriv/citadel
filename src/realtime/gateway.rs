@@ -2261,9 +2261,13 @@ pub struct Handshake {
 /// [`with_metrics`]: Gateway::with_metrics
 #[derive(Debug, Clone, Copy)]
 struct NpcEntry {
+    /// Globally unique transform-world id delivered to room members.
+    object_id: u32,
     archetype_id: u16,
     room_id: Option<RoomId>,
 }
+
+type NpcKey = (Option<RoomId>, u32);
 
 pub struct Gateway {
     registry: SessionRegistry,
@@ -2285,11 +2289,15 @@ pub struct Gateway {
     /// Server-owned room membership (, Phase A). Always present: the
     /// gateway routes `KIND_ROOM_*` through it (create/join/leave/map-ready).
     rooms: RoomRegistry,
-    /// Server-owned networked actors (NPCs, ): object id -> archetype and
-    /// optional authoritative room.
+    /// Server-owned networked actors (NPCs, ): `(room, script id)` ->
+    /// globally unique transform-world identity and metadata.
     /// Populated by the Lua `spawn_actor` command; used to spawn them for a client
     /// that announces presence (so late joiners see existing NPCs).
-    npcs: Mutex<HashMap<u32, NpcEntry>>,
+    npcs: Mutex<HashMap<NpcKey, NpcEntry>>,
+    /// Monotonic allocation cursor for room-scoped actor identities. The high
+    /// range avoids ordinary player-slot ids while retaining global object-id
+    /// uniqueness in the shared transform world.
+    next_scoped_actor_id: Mutex<u32>,
     /// Loaded `.map` level geometry. A room's `map` name resolves
     /// against this catalog on create; empty when no maps are cooked/loaded.
     maps: Arc<MapCatalog>,
@@ -2646,6 +2654,7 @@ impl Gateway {
             rep: None,
             rooms: RoomRegistry::new(),
             npcs: Mutex::new(HashMap::new()),
+            next_scoped_actor_id: Mutex::new(0x8000_0000),
             maps: Arc::new(MapCatalog::empty()),
             domain: None,
             matchmaker: Matchmaker::new(),
@@ -5450,7 +5459,7 @@ impl Gateway {
                 // Add visible server-owned NPCs so a late joiner instantiates
                 // its room's actors without receiving another match's state.
                 if let Ok(npcs) = self.npcs.lock() {
-                    for (&object_id, npc) in npcs.iter() {
+                    for npc in npcs.values() {
                         if npc
                             .room_id
                             .is_some_and(|room_id| self.rooms.room_of(sender) != Some(room_id))
@@ -5460,7 +5469,7 @@ impl Gateway {
                         let transform = self
                             .transform
                             .as_ref()
-                            .and_then(|h| h.get_transform(object_id))
+                            .and_then(|h| h.get_transform(npc.object_id))
                             .map(|s| citadel_wire::na::NaTransform {
                                 position: s.position,
                                 rotation: s.rotation,
@@ -5468,7 +5477,7 @@ impl Gateway {
                             })
                             .unwrap_or_else(citadel_wire::na::NaTransform::identity);
                         batch_spawns.push(citadel_wire::na::NaSpawn {
-                            object_id,
+                            object_id: npc.object_id,
                             archetype_id: npc.archetype_id,
                             owner: 0,
                             transform,
@@ -6085,7 +6094,9 @@ impl Gateway {
                     rotation,
                     velocity,
                 } => {
-                    if let Some(hub) = &self.transform {
+                    if let (Some(object_id), Some(hub)) =
+                        (self.actor_object_id(room_id, object_id), &self.transform)
+                    {
                         hub.set_transform(
                             object_id,
                             crate::realtime::transform::TransformState {
@@ -6097,7 +6108,9 @@ impl Gateway {
                     }
                 }
                 OutboundCommand::SetPhysics { object_id, opts } => {
-                    if let Some(hub) = &self.transform {
+                    if let (Some(object_id), Some(hub)) =
+                        (self.actor_object_id(room_id, object_id), &self.transform)
+                    {
                         if opts.is_some_and(|opts| opts.enabled) {
                             self.select_physics_map(hub, room_id);
                         }
@@ -6105,17 +6118,21 @@ impl Gateway {
                     }
                 }
                 OutboundCommand::ApplyImpulse { object_id, impulse } => {
-                    if let Some(hub) = &self.transform {
+                    if let (Some(object_id), Some(hub)) =
+                        (self.actor_object_id(room_id, object_id), &self.transform)
+                    {
                         hub.apply_impulse(object_id, impulse);
                     }
                 }
                 OutboundCommand::SetMoveIntent { object_id, intent } => {
-                    if let Some(hub) = &self.transform {
+                    if let (Some(object_id), Some(hub)) =
+                        (self.actor_object_id(room_id, object_id), &self.transform)
+                    {
                         hub.set_move_intent(object_id, intent);
                     }
                 }
                 OutboundCommand::DespawnActor { object_id } => {
-                    delivered_total += self.despawn_server_actor(object_id);
+                    delivered_total += self.despawn_server_actor(object_id, room_id);
                 }
             }
         }
@@ -6153,26 +6170,46 @@ impl Gateway {
         let Some(hub) = &self.transform else {
             return 0;
         };
-        hub.set_object_room(object_id, room_id);
+        let key = (room_id, object_id);
+        let actual_object_id = {
+            let Ok(mut npcs) = self.npcs.lock() else {
+                return 0;
+            };
+            if let Some(existing) = npcs.get_mut(&key) {
+                existing.archetype_id = archetype;
+                existing.object_id
+            } else {
+                let identity_conflicts = npcs.values().any(|npc| npc.object_id == object_id);
+                let actual_object_id = if room_id.is_some() || identity_conflicts {
+                    let Some(id) = self.allocate_scoped_actor_id(&npcs) else {
+                        return 0;
+                    };
+                    id
+                } else {
+                    object_id
+                };
+                npcs.insert(
+                    key,
+                    NpcEntry {
+                        object_id: actual_object_id,
+                        archetype_id: archetype,
+                        room_id,
+                    },
+                );
+                actual_object_id
+            }
+        };
+        hub.set_object_room(actual_object_id, room_id);
         hub.set_transform(
-            object_id,
+            actual_object_id,
             crate::realtime::transform::TransformState {
                 position,
                 rotation: [0.0, 0.0, 0.0, 1.0],
                 velocity: [0.0; 3],
             },
         );
-        if let Ok(mut npcs) = self.npcs.lock() {
-            npcs.insert(
-                object_id,
-                NpcEntry {
-                    archetype_id: archetype,
-                    room_id,
-                },
-            );
-        }
         let spawn = citadel_wire::na::NaSpawn {
-            object_id,
+            object_id: actual_object_id,
             archetype_id: archetype,
             owner: 0,
             transform: citadel_wire::na::NaTransform {
@@ -6193,24 +6230,58 @@ impl Gateway {
 
     /// Despawn a server-owned NPC: drop it from the world + registry and fan out an
     /// `NA_DESPAWN` to every client.
-    fn despawn_server_actor(&self, object_id: u32) -> usize {
+    fn despawn_server_actor(&self, script_object_id: u32, room_id: Option<RoomId>) -> usize {
         let room_id = self
             .npcs
             .lock()
             .ok()
-            .and_then(|mut npcs| npcs.remove(&object_id))
-            .and_then(|npc| npc.room_id);
+            .and_then(|mut npcs| npcs.remove(&(room_id, script_object_id)));
+        let Some(npc) = room_id else {
+            return 0;
+        };
         if let Some(hub) = &self.transform {
-            hub.despawn(object_id);
+            hub.despawn(npc.object_id);
         }
-        let body = citadel_wire::na::NaDespawn { object_id }.encode();
+        let body = citadel_wire::na::NaDespawn {
+            object_id: npc.object_id,
+        }
+        .encode();
         let outbound = Outbound::reliable(Envelope::new(KIND_NA_DESPAWN, body));
-        match room_id {
+        match npc.room_id {
             Some(room_id) => {
                 self.registry
                     .broadcast_members(&self.rooms.members(room_id), None, &outbound)
             }
             None => self.registry.broadcast_all(&outbound),
+        }
+    }
+
+    /// Resolve one script-visible actor id inside the command's room scope.
+    /// Commands without a matching scoped actor are ignored rather than allowed
+    /// to mutate a same-numbered actor belonging to another room.
+    fn actor_object_id(&self, room_id: Option<RoomId>, script_object_id: u32) -> Option<u32> {
+        self.npcs
+            .lock()
+            .ok()
+            .and_then(|npcs| npcs.get(&(room_id, script_object_id)).map(|npc| npc.object_id))
+    }
+
+    fn allocate_scoped_actor_id(&self, npcs: &HashMap<NpcKey, NpcEntry>) -> Option<u32> {
+        let mut next = self.next_scoped_actor_id.lock().ok()?;
+        let first = *next;
+        loop {
+            let candidate = *next;
+            *next = if candidate == u32::MAX {
+                0x8000_0000
+            } else {
+                candidate + 1
+            };
+            if !npcs.values().any(|npc| npc.object_id == candidate) {
+                return Some(candidate);
+            }
+            if *next == first {
+                return None;
+            }
         }
     }
 }
@@ -6919,6 +6990,106 @@ mod transform_tests {
             "a client in another room must never receive A's replicated transform"
         );
         assert_eq!(sent, 1, "only the same-room peer receives the delta");
+    }
+
+    #[tokio::test]
+    async fn room_scoped_actor_ids_keep_move_commands_independent() {
+        use crate::runtime::lua::OutboundCommand;
+        use citadel_wire::na::NaSpawn;
+        use citadel_wire::room::{RoomCreate, RoomJoined};
+
+        let (gw, hub) = gateway_with_hub();
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"R1".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_one = RoomJoined::decode(&ra.recv().await.expect("R1 joined").envelope.body)
+            .expect("R1 joined decodes")
+            .room_id;
+
+        let (b, mut rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"R2".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_two = RoomJoined::decode(&rb.recv().await.expect("R2 joined").envelope.body)
+            .expect("R2 joined decodes")
+            .room_id;
+
+        let script_actor_id = 0x4000_002Au32;
+        assert_eq!(
+            gw.apply_external_match_commands(
+                room_one,
+                vec![OutboundCommand::SpawnActor {
+                    object_id: script_actor_id,
+                    archetype: 9,
+                    position: [1.0, 0.0, 0.0],
+                }],
+            ),
+            1
+        );
+        let room_one_actor = NaSpawn::decode(&ra.recv().await.expect("R1 spawn").envelope.body)
+            .expect("R1 spawn decodes")
+            .object_id;
+
+        assert_eq!(
+            gw.apply_external_match_commands(
+                room_two,
+                vec![OutboundCommand::SpawnActor {
+                    object_id: script_actor_id,
+                    archetype: 9,
+                    position: [2.0, 0.0, 0.0],
+                }],
+            ),
+            1
+        );
+        let room_two_actor = NaSpawn::decode(&rb.recv().await.expect("R2 spawn").envelope.body)
+            .expect("R2 spawn decodes")
+            .object_id;
+
+        assert_ne!(
+            room_one_actor, room_two_actor,
+            "the same script actor id in separate rooms needs independent transforms"
+        );
+        assert_eq!(
+            gw.apply_external_match_commands(
+                room_one,
+                vec![OutboundCommand::MoveActor {
+                    object_id: script_actor_id,
+                    position: [11.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    velocity: [0.0; 3],
+                }],
+            ),
+            0
+        );
+        assert_eq!(
+            hub.get_transform(room_one_actor)
+                .expect("R1 actor exists")
+                .position,
+            [11.0, 0.0, 0.0],
+            "MoveActor in R1 moves R1's actor"
+        );
+        assert_eq!(
+            hub.get_transform(room_two_actor)
+                .expect("R2 actor exists")
+                .position,
+            [2.0, 0.0, 0.0],
+            "MoveActor in R1 must not mutate R2's actor"
+        );
     }
 
     #[tokio::test]
