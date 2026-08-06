@@ -55,6 +55,7 @@ pub mod python;
 #[cfg(feature = "runtime-python")]
 mod python_bundle;
 pub mod python_payload;
+pub mod readiness;
 pub mod shared_cache;
 pub(crate) mod static_data;
 #[cfg(unix)]
@@ -104,6 +105,13 @@ pub use python_bundle::{
 };
 pub use python_payload::{
     PayloadCache, PayloadFile, PayloadManifest, PythonPayloadError, VerifiedPayload,
+};
+#[cfg(any(unix, windows))]
+pub use readiness::SupervisedWorkerSource;
+pub use readiness::{
+    DEFAULT_DEGRADED_HOLD, GameScriptReadiness, InProcessRuntimeSource, ReadinessSnapshot,
+    ReadinessSource, RecoveryView, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding, ScriptReadinessState,
+    script_content_identity,
 };
 pub use shared_cache::{
     RuntimeCachePublisher, RuntimeSharedCache, RuntimeSharedCacheError, RuntimeSharedCacheHandle,

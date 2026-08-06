@@ -488,6 +488,189 @@ async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
     .expect("worker shutdown");
 }
 
+/// The readiness gate and the match scheduler compose, end to end: under
+/// `runtime.require_script` with the external-worker adapter the node boots
+/// NOT ready — a room create is refused on the wire with the reliable
+/// `KIND_ROOM_REJECT` — the gate opens only when the live worker process
+/// reports its script identity through the supervisor, and the room created
+/// after that is bound to exactly the worker-reported revision and has its
+/// match executed inside the worker over the real IPC transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_script_external_worker_boots_not_ready_then_binds_and_executes() {
+    use citadel::observability::NodeMetrics;
+    use citadel::realtime::{Authenticator, Gateway};
+    use citadel::runtime::{
+        GameScriptReadiness, SCRIPT_UNAVAILABLE_MESSAGE, SupervisedWorkerSource,
+    };
+    use citadel::time::{Clock, SystemClock};
+    use citadel::transport::codec::Envelope;
+    use citadel::transport::websocket::WebSocketServer;
+    use citadel_wire::protocol::{KIND_ROOM_CREATE, KIND_ROOM_JOINED, KIND_ROOM_REJECT};
+    use citadel_wire::room::{RoomCreate, RoomJoined, RoomReject};
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Same WSL host anomaly as the full-stack close test above: outbound
+    // envelopes queued for an idle connection are not flushed. Skip only on
+    // WSL; native Windows and native Linux keep full signal.
+    #[cfg(unix)]
+    if std::fs::read_to_string("/proc/version")
+        .is_ok_and(|version| version.to_lowercase().contains("microsoft"))
+    {
+        eprintln!(
+            "skipping readiness-composition data-plane test on WSL: cross-thread \
+             waker delivery to idle connections stalls on this host"
+        );
+        return;
+    }
+
+    let script = ScriptDir::create("data-plane-readiness", COUNTER_SCRIPT);
+    let runtime = Arc::new(
+        ExternalWorkerRuntime::load(WorkerScriptSpec {
+            language: RuntimeLanguage::Lua,
+            entrypoint: script.entrypoint(),
+            deadline_ms: 100,
+            tick_ms: 10,
+        })
+        .expect("load adapter"),
+    );
+    // `runtime.require_script` + external worker: the authority is created
+    // before any worker exists and nothing records Ready at build time.
+    let readiness = Arc::new(GameScriptReadiness::new(SystemClock.now()));
+    assert_eq!(
+        readiness.gate(),
+        Err(SCRIPT_UNAVAILABLE_MESSAGE),
+        "an external-worker node under require_script boots not-ready"
+    );
+    let gateway = Arc::new(
+        Gateway::with_metrics_runtime_auth(
+            Arc::new(NodeMetrics::new()),
+            Some(Arc::clone(&runtime) as Arc<dyn Runtime>),
+            Authenticator::guest_only(),
+        )
+        .with_script_readiness(Arc::clone(&readiness)),
+    );
+    runtime.attach_sink(Arc::downgrade(&gateway) as Weak<dyn MatchCommandSink>);
+
+    let ws_server = WebSocketServer::bind_with_gateway(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        Arc::clone(&gateway),
+    )
+    .await
+    .expect("bind ws");
+    let ws_addr = ws_server.local_addr();
+    let mut supervisor = citadel::lifecycle::Supervisor::new();
+    supervisor.spawn(ws_server);
+
+    let (mut ws, _resp) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(format!("ws://{ws_addr}/")),
+    )
+    .await
+    .expect("ws connect did not time out")
+    .expect("ws connected");
+    common::ws_guest_handshake(&mut ws).await;
+
+    let room_create = Envelope::new(
+        KIND_ROOM_CREATE,
+        RoomCreate {
+            params: b"Arena".to_vec(),
+        }
+        .encode(),
+    );
+
+    // Before the worker boots, the create is refused on the wire — the
+    // stable client-safe reject, never a silently relayed room.
+    ws.send(Message::Binary(room_create.encode_framed().to_vec()))
+        .await
+        .expect("send gated room create");
+    let reject = loop {
+        let envelope = common::decode_one(&common::ws_next_binary(&mut ws).await);
+        if envelope.kind == KIND_ROOM_REJECT {
+            break RoomReject::decode(&envelope.body).expect("room reject decodes");
+        }
+        assert_ne!(
+            envelope.kind, KIND_ROOM_JOINED,
+            "a not-ready node must never admit a room"
+        );
+    };
+    assert_eq!(reject.request_kind, KIND_ROOM_CREATE);
+    assert_eq!(reject.reason, SCRIPT_UNAVAILABLE_MESSAGE);
+
+    // Boot the real worker process; its `WorkerReady.script_identity`
+    // travels through the supervisor's readiness source and opens the gate.
+    let controller_runtime = Arc::clone(&runtime);
+    let controller_readiness = Arc::clone(&readiness);
+    let (controller, mut worker) = tokio::task::spawn_blocking(move || {
+        let mut controller = RestartController::new(
+            PathBuf::from(env!("CARGO_BIN_EXE_citadel")),
+            std::env::temp_dir(),
+            WorkerSupervisionPolicy::default().with_restart_limit(3),
+        )
+        .with_data_plane(WorkerDataPlaneBridge::new(controller_runtime))
+        .with_readiness(SupervisedWorkerSource::new(controller_readiness));
+        let worker = controller.start().expect("boot script worker");
+        (controller, worker)
+    })
+    .await
+    .expect("worker boots");
+    let binding = readiness
+        .gate()
+        .expect("the worker-reported script identity opens the gate");
+    assert_eq!(
+        binding.revision_id,
+        runtime.identity(),
+        "the gate binds to the revision the live worker reported"
+    );
+
+    // The same create now passes the gate; the room is born bound to the
+    // admitted revision.
+    ws.send(Message::Binary(room_create.encode_framed().to_vec()))
+        .await
+        .expect("send admitted room create");
+    let joined = loop {
+        let envelope = common::decode_one(&common::ws_next_binary(&mut ws).await);
+        if envelope.kind == KIND_ROOM_JOINED {
+            break RoomJoined::decode(&envelope.body).expect("room joined decodes");
+        }
+    };
+    assert_eq!(
+        gateway.rooms().binding(joined.room_id),
+        Some(binding),
+        "the admitted room carries the gating snapshot's binding"
+    );
+
+    // And the bound room's match executes inside the worker process: the
+    // per-match Lua counter answers through the whole stack.
+    ws.send(Message::Binary(
+        Envelope::new(1, b"ping".to_vec()).encode_framed().to_vec(),
+    ))
+    .await
+    .expect("send counter event");
+    let answer = loop {
+        let envelope = common::decode_one(&common::ws_next_binary(&mut ws).await);
+        if envelope.kind == 99 {
+            break envelope;
+        }
+    };
+    assert_eq!(
+        answer.body.as_ref(),
+        b"1",
+        "the in-worker Lua counter answers the bound room's member"
+    );
+
+    ws.close(None).await.ok();
+    supervisor.shutdown().await.expect("ws shutdown");
+    tokio::task::spawn_blocking(move || {
+        worker
+            .shutdown(Duration::from_secs(5))
+            .expect("orderly worker shutdown");
+        drop(controller);
+    })
+    .await
+    .expect("worker shutdown");
+}
+
 #[test]
 fn broken_script_fails_the_worker_bootstrap() {
     let mut harness = harness("data-plane-broken", "this is not lua(", 100);

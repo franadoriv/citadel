@@ -371,16 +371,30 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // install its synchronous `physics_state` read handle. The gateway receives
     // the same shared hub below.
     let transform_hub = build_transform_hub(&cfg.transform_sync);
+    // GameScript readiness gate (`runtime.require_script`): the authority is
+    // created before the runtime loads so a missing entrypoint boots the node
+    // not-ready instead of silently falling back to the relay. `None` keeps
+    // ungated deployments byte-identical.
+    let script_readiness = app.config().runtime.require_script.then(|| {
+        Arc::new(
+            crate::runtime::GameScriptReadiness::new(SystemClock.now())
+                .with_metrics(Arc::clone(app.metrics())),
+        )
+    });
+    let readiness_source = script_readiness
+        .as_ref()
+        .map(|authority| crate::runtime::InProcessRuntimeSource::new(Arc::clone(authority)));
     let BuiltRuntime {
         runtime,
         external: external_runtime,
-    } = build_runtime(
+    } = build_runtime_with_readiness(
         app.config(),
         Some(domain_host),
         Arc::clone(&maps),
         transform_hub.as_ref().map(|(hub, _, _)| Arc::clone(hub)),
         Arc::clone(app.runtime_event_bus()),
         Arc::clone(app.runtime_shared_cache()),
+        readiness_source.as_ref(),
     )?;
     // Build the realtime authenticator from the node's session service and the
     // configured auth stance: the handshake validates a presented
@@ -399,6 +413,9 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         runtime.clone(),
         authenticator,
     );
+    if let Some(readiness) = &script_readiness {
+        gateway = gateway.with_script_readiness(Arc::clone(readiness));
+    }
 
     gateway = gateway.with_maps(maps);
     if let Some(rep) = build_network_peer(&cfg.network_peer) {
@@ -763,7 +780,12 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
 
     // Spawn the script hot-reload watcher only when opt-in via
     // `runtime.hot_reload` and a reloadable on-disk script is actually loaded.
-    maybe_spawn_reload(&mut supervisor, runtime.as_ref(), &app.config().runtime);
+    maybe_spawn_reload(
+        &mut supervisor,
+        runtime.as_ref(),
+        &app.config().runtime,
+        readiness_source.as_ref(),
+    );
 
     // Supervise the external GameScript worker process when the operator
     // opted into the external-worker adapter (unix and windows; config
@@ -815,6 +837,13 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             service = service.with_data_plane(
                 crate::runtime::worker_supervisor::WorkerDataPlaneBridge::new(Arc::clone(external)),
             );
+        }
+        if let Some(authority) = &script_readiness {
+            // Worker boot (WorkerReady.script_identity), health loss, and
+            // restart-circuit posture drive the readiness gate.
+            service = service.with_readiness(crate::runtime::SupervisedWorkerSource::new(
+                Arc::clone(authority),
+            ));
         }
         supervisor.spawn(service);
     }
@@ -1024,6 +1053,7 @@ fn maybe_spawn_reload(
     supervisor: &mut Supervisor,
     runtime: Option<&Arc<dyn Runtime>>,
     rc: &crate::config::RuntimeConfig,
+    readiness: Option<&crate::runtime::InProcessRuntimeSource>,
 ) {
     let Some(interval) = rc.hot_reload_interval() else {
         return; // hot_reload disabled (the default).
@@ -1050,11 +1080,13 @@ fn maybe_spawn_reload(
         poll_ms = interval.as_millis() as u64,
         "starting embedded script hot-reload watcher"
     );
-    supervisor.spawn(crate::realtime::LuaReloadService::new(
-        Arc::clone(runtime),
-        path,
-        interval,
-    ));
+    let mut service = crate::realtime::LuaReloadService::new(Arc::clone(runtime), path, interval);
+    if let Some(source) = readiness {
+        // Successful reloads adopt the new content identity and bump the
+        // gate generation; rejected reloads keep the serving script Ready.
+        service = service.with_readiness(source.clone());
+    }
+    supervisor.spawn(service);
 }
 
 /// Build the embedded script runtime from config, or `None` for the built-in
@@ -1180,8 +1212,42 @@ fn build_runtime(
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
 ) -> AppResult<BuiltRuntime> {
+    build_runtime_with_readiness(
+        config,
+        domain,
+        maps,
+        transform_hub,
+        event_bus,
+        shared_cache,
+        None,
+    )
+}
+
+/// [`build_runtime`] plus GameScript readiness reporting.
+///
+/// With a `readiness` source attached (`runtime.require_script`), a missing or
+/// disappeared entrypoint records `NoScript` — the node boots **not-ready**
+/// and refuses match surfaces instead of silently serving the relay — and a
+/// successful load records the entrypoint's content identity as `Ready`. A
+/// present-but-broken script remains the same hard startup error as before.
+/// The external-worker adapter returns before the in-process recording: its
+/// readiness is driven by the supervised worker's boot
+/// (`WorkerReady.script_identity`) via `SupervisedWorkerSource`, so the node
+/// boots not-ready and opens the gate only when the worker reports in.
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_readiness(
+    config: &Config,
+    domain: Option<Arc<dyn crate::runtime::DomainHost>>,
+    maps: Arc<crate::maps::MapCatalog>,
+    transform_hub: Option<Arc<TransformHub>>,
+    event_bus: Arc<crate::runtime::RuntimeEventBus>,
+    shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    readiness: Option<&crate::runtime::InProcessRuntimeSource>,
+) -> AppResult<BuiltRuntime> {
     let rc = &config.runtime;
     if !rc.enabled {
+        // Config validation rejects require_script without an enabled
+        // runtime, so this arm is always ungated.
         tracing::info!("embedded runtime disabled; using the built-in relay");
         return Ok(BuiltRuntime::none());
     }
@@ -1192,7 +1258,15 @@ fn build_runtime(
         );
     }
     let Some(selection) = rc.resolve_selection()? else {
-        if let Some(language) = rc.language {
+        if let Some(source) = readiness {
+            // Never a silent relay under require_script: the node boots
+            // not-ready and refuses match surfaces until a script loads.
+            source.record_missing_entrypoint(SystemClock.now());
+            tracing::warn!(
+                scripts_dir = %rc.scripts_dir,
+                "runtime.require_script is enabled but no game entrypoint was found; booting NOT READY — matches are refused until a valid script loads"
+            );
+        } else if let Some(language) = rc.language {
             tracing::info!(
                 scripts_dir = %rc.scripts_dir,
                 language = language.as_str(),
@@ -1218,7 +1292,7 @@ fn build_runtime(
         source = selection.source.as_str(),
         "selected embedded game runtime"
     );
-    match selection.language {
+    let built = match selection.language {
         RuntimeLanguage::Lua => {
             match LuaRuntime::load_with_static_data_and_mode_and_capability_policies(
                 Path::new(&rc.scripts_dir),
@@ -1277,7 +1351,25 @@ fn build_runtime(
                 None => BuiltRuntime::none(),
             },
         ),
+    }?;
+    if let Some(source) = readiness {
+        match &built.runtime {
+            // The gate opens on the loaded entrypoint's content identity —
+            // the in-process analogue of `WorkerReady.script_identity`.
+            Some(_) => source.record_initial_load(&selection.entrypoint, SystemClock.now()),
+            // One of the per-language "entrypoint disappeared before load"
+            // arms fired: not-ready, never a silent relay.
+            None => {
+                source.record_missing_entrypoint(SystemClock.now());
+                tracing::warn!(
+                    scripts_dir = %rc.scripts_dir,
+                    entrypoint = %selection.entrypoint.display(),
+                    "runtime.require_script is enabled and the selected entrypoint disappeared before load; booting NOT READY — matches are refused until a valid script loads"
+                );
+            }
+        }
     }
+    Ok(built)
 }
 
 #[cfg(feature = "runtime-python")]

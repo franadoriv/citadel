@@ -432,6 +432,12 @@ pub fn run_first_run_wizard<P: Prompt>(
             let language = languages.get(idx).copied().unwrap_or(ScriptLanguage::Lua);
             let written = write_starter_script(&paths.scripts_dir, language)?;
             report.created_script = Some(written);
+            // A scripted project is GameScript-dependent: matches must not
+            // exist without the script, so the strict readiness gate is
+            // enabled and persisted alongside the scaffold.
+            config.runtime.require_script = true;
+            config.write_to(&paths.config_path)?;
+            report.persisted_config = true;
         }
     }
 
@@ -825,6 +831,12 @@ mod tests {
         assert!(body.contains("citadel.on_message"), "starter has the relay");
         // Database was already set, so no DB prompt was asked.
         assert!(report.selected_database.is_none());
+        // A scripted project is GameScript-dependent: the readiness gate is
+        // enabled and persisted so the next run enforces it non-interactively.
+        assert!(config.runtime.require_script, "wizard enables the gate");
+        assert!(report.persisted_config, "gate choice is persisted");
+        let persisted = Config::from_file(&paths.config_path).expect("read persisted config");
+        assert!(persisted.runtime.require_script);
         std::fs::remove_dir_all(&base).ok();
     }
 

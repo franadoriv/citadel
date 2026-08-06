@@ -40,6 +40,9 @@ pub struct ErrorBody {
 pub struct ApiError {
     error: AppError,
     retry_after_seconds: Option<u64>,
+    /// Renders as the stable, fail-closed readiness-gate rejection (503 with
+    /// the client-safe message) instead of the generic internal 500.
+    script_gate: bool,
 }
 
 impl From<AppError> for ApiError {
@@ -47,6 +50,7 @@ impl From<AppError> for ApiError {
         Self {
             error,
             retry_after_seconds: None,
+            script_gate: false,
         }
     }
 }
@@ -55,6 +59,17 @@ impl ApiError {
     /// Map the wrapped error to an HTTP status, a stable code, and a sanitized
     /// client-facing message.
     fn parts(&self) -> (StatusCode, &'static str, String) {
+        if self.script_gate {
+            // The GameScript readiness gate: one deliberate, stable shape on
+            // every gated surface. 503 (not 500) because the node is healthy
+            // and explicitly refusing; the message never carries revision
+            // ids, paths, or worker detail.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_unavailable",
+                crate::runtime::SCRIPT_UNAVAILABLE_MESSAGE.to_string(),
+            );
+        }
         if self.retry_after_seconds.is_some() {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -119,6 +134,21 @@ impl ApiError {
         Self {
             error: AppError::permission("authentication rate limited"),
             retry_after_seconds: Some(retry_after_seconds.max(1)),
+            script_gate: false,
+        }
+    }
+
+    /// Build the fail-closed GameScript readiness-gate rejection: HTTP `503`
+    /// with the stable `runtime_unavailable` code and client-safe message.
+    #[must_use]
+    pub fn script_unavailable() -> Self {
+        Self {
+            error: AppError::new(
+                crate::error::ErrorCategory::Runtime,
+                crate::runtime::SCRIPT_UNAVAILABLE_MESSAGE,
+            ),
+            retry_after_seconds: None,
+            script_gate: true,
         }
     }
 }
@@ -129,7 +159,11 @@ impl IntoResponse for ApiError {
         // Log server-side. 5xx is an operator-visible failure; log the full
         // operator line (which may carry internal detail) at error level. Client
         // (4xx) failures are logged at debug and never include the raw request.
-        if status.is_server_error() {
+        if self.script_gate {
+            // A deliberate policy refusal, not a server fault: keep it out of
+            // the error journal and log at debug like other rejections.
+            tracing::debug!("script readiness gate refused an HTTP surface");
+        } else if status.is_server_error() {
             tracing::error!(error = %self.error.operator_log(), "auth request failed");
             error_reporting::report_app_error("http.api", &self.error);
         } else {
@@ -212,6 +246,14 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(body(AppError::permission("no")).0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn script_gate_renders_a_stable_503_without_detail() {
+        let (status, code, message) = ApiError::script_unavailable().parts();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "runtime_unavailable");
+        assert_eq!(message, crate::runtime::SCRIPT_UNAVAILABLE_MESSAGE);
     }
 
     #[test]

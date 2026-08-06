@@ -186,6 +186,15 @@ pub const KIND_TSYNC_V2_INPUT: u16 = 31;
 /// the client re-submits its own matchmaker ticket — the server retains none.
 pub const KIND_MATCH_CLOSED: u16 = 32;
 
+/// Room/matchmaking policy rejection (`S→C`, reliable): `{request_kind, reason}`.
+/// Sent when a server-side policy gate (e.g. the GameScript readiness gate)
+/// refuses a `KIND_ROOM_CREATE`/`KIND_ROOM_JOIN` request that would otherwise
+/// be silently dropped. The reason is a stable, client-safe string; it never
+/// carries revision ids, paths, or worker detail. Kind 33 sits outside the
+/// contiguous room range (21-25), which is pinned by SDKs and cannot grow (32
+/// is taken by [`KIND_MATCH_CLOSED`]).
+pub const KIND_ROOM_REJECT: u16 = 33;
+
 // Compile-time guarantees that the reserved ranges are disjoint and sit above the
 // legacy kinds (1..=6). A future edit that overlaps them fails to build rather
 // than silently colliding on the wire.
@@ -208,6 +217,10 @@ const _: () = assert!(KIND_CHAT_EVENT == CHAT_KIND_MIN && CHAT_KIND_MIN == CHAT_
 // The match-closed notification sits above the transform-sync v2 block; a
 // future edit that collides with the v2 kinds fails to build.
 const _: () = assert!(KIND_MATCH_CLOSED > KIND_TSYNC_V2_INPUT);
+// The room-reject kind postdates the pinned room range (21-25) and must never
+// collide with the transform-sync v2 kinds (29-31) or the match-closed
+// notification (32), which was merged first and keeps its discriminant.
+const _: () = assert!(KIND_ROOM_REJECT > KIND_MATCH_CLOSED);
 
 /// [`KIND_AUTH_RESULT`] status: the token validated; the connection is bound to
 /// the `user_id` that follows in the body.
@@ -569,6 +582,9 @@ mod tests {
         assert_eq!(KIND_NOTIFICATION, 27);
         assert_eq!(KIND_CHAT_EVENT, 28);
         assert_eq!(KIND_MATCH_CLOSED, 32);
+        // Room policy rejection (post-range; the room range 21-25 is pinned and
+        // 32 belongs to the match-closed notification, merged first).
+        assert_eq!(KIND_ROOM_REJECT, 33);
         // Range bounds.
         assert_eq!((TSYNC_KIND_MIN, TSYNC_KIND_MAX), (7, 12));
         assert_eq!((REP_KIND_MIN, REP_KIND_MAX), (13, 15));

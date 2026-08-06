@@ -350,6 +350,9 @@ pub struct RestartController {
     parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     breaker: RestartCircuitBreaker,
+    /// GameScript readiness source fed by boot/health/recovery outcomes.
+    /// `None` on ungated nodes (`runtime.require_script` off).
+    readiness: Option<crate::runtime::SupervisedWorkerSource>,
     generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
     data_plane: Option<WorkerDataPlaneBridge>,
 }
@@ -364,8 +367,27 @@ impl RestartController {
                 policy.restart_limit(),
                 policy.breaker_rearm_healthy_cycles(),
             ),
+            readiness: None,
             generation_observer: None,
             data_plane: None,
+        }
+    }
+
+    /// Publish supervision outcomes into the GameScript readiness authority.
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: crate::runtime::SupervisedWorkerSource) -> Self {
+        self.readiness = Some(readiness);
+        self
+    }
+
+    /// Mirror the current breaker posture (and any boot/health verdict) into
+    /// the readiness authority, when one is attached.
+    fn publish_readiness_recovery(&self) {
+        if let Some(readiness) = &self.readiness {
+            readiness.record_recovery(
+                &self.breaker.snapshot(),
+                crate::time::Clock::now(&crate::time::SystemClock),
+            );
         }
     }
 
@@ -420,6 +442,11 @@ impl RestartController {
             self.breaker.record_healthy();
             Ok(true)
         } else {
+            // Readiness: a missed/invalid health frame degrades the gate
+            // before any recovery attempt; new matches stop immediately.
+            if let Some(readiness) = &self.readiness {
+                readiness.record_health_lost(crate::time::Clock::now(&crate::time::SystemClock));
+            }
             self.recover_after_health_failure(active)
         }
     }
@@ -456,13 +483,19 @@ impl RestartController {
 
     pub fn restart_after_failure(&mut self) -> io::Result<Option<SupervisedWorker>> {
         let Some(delay) = self.breaker.next_restart_delay() else {
+            // The restart budget is exhausted: the circuit is open, which the
+            // readiness source escalates to a hard Unavailable.
+            self.publish_readiness_recovery();
             return Ok(None);
         };
+        self.publish_readiness_recovery();
         std::thread::sleep(delay);
         // A restarted worker is indistinguishable from a first boot: it gets
         // a fresh secret and must complete the same authenticated bootstrap,
         // so recovery can never hand back an unauthenticated worker.
-        self.boot().map(Some)
+        let worker = self.boot()?;
+        self.publish_worker_ready(&worker);
+        Ok(Some(worker))
     }
 
     /// Boot the initial worker without charging the restart circuit breaker.
@@ -472,7 +505,19 @@ impl RestartController {
     pub fn start(&mut self) -> io::Result<SupervisedWorker> {
         let worker = self.boot()?;
         self.breaker.record_healthy();
+        self.publish_worker_ready(&worker);
         Ok(worker)
+    }
+
+    /// Report an authenticated, ready worker (and its `script_identity`)
+    /// into the readiness authority, when one is attached.
+    fn publish_worker_ready(&self, worker: &SupervisedWorker) {
+        if let Some(readiness) = &self.readiness {
+            readiness.record_worker_ready(
+                worker.script_identity(),
+                crate::time::Clock::now(&crate::time::SystemClock),
+            );
+        }
     }
 
     fn boot(&mut self) -> io::Result<SupervisedWorker> {
@@ -599,6 +644,7 @@ pub struct WorkerLifecycleService {
     socket_parent: PathBuf,
     policy: WorkerSupervisionPolicy,
     healthy_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    readiness: Option<crate::runtime::SupervisedWorkerSource>,
     generation_observer: Option<std::sync::Arc<dyn WorkerGenerationObserver>>,
     data_plane: Option<WorkerDataPlaneBridge>,
 }
@@ -615,9 +661,18 @@ impl WorkerLifecycleService {
             socket_parent,
             policy,
             healthy_cycles: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            readiness: None,
             generation_observer: None,
             data_plane: None,
         }
+    }
+
+    /// Publish worker readiness/health/recovery into the GameScript
+    /// readiness authority (`runtime.require_script` deployments).
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: crate::runtime::SupervisedWorkerSource) -> Self {
+        self.readiness = Some(readiness);
+        self
     }
 
     /// Attach the observer notified when a worker generation ends abruptly
@@ -676,10 +731,14 @@ impl crate::lifecycle::AsyncService for WorkerLifecycleService {
         let socket_parent = self.socket_parent;
         let policy = self.policy;
         let healthy_cycles = Arc::clone(&self.healthy_cycles);
+        let readiness = self.readiness;
         let generation_observer = self.generation_observer;
         let data_plane = self.data_plane;
         let result = tokio::task::spawn_blocking(move || {
             let mut controller = RestartController::new(executable, socket_parent, policy);
+            if let Some(readiness) = readiness {
+                controller = controller.with_readiness(readiness);
+            }
             if let Some(observer) = generation_observer {
                 controller = controller.with_generation_observer(observer);
             }
@@ -715,7 +774,7 @@ pub struct SupervisedWorker {
     process_group_id: Option<i32>,
     /// Private data-plane endpoint, present when this worker hosts a script.
     data_endpoint: Option<(PrivateUnixEndpoint, UnixListener)>,
-    /// Script revision the worker reported in its readiness frame.
+    /// Content identity the worker reported in `WorkerReady` (readiness gate).
     script_identity: Option<String>,
 }
 
@@ -913,8 +972,8 @@ impl SupervisedWorker {
                     protocol_version,
                     script_identity,
                 } if protocol_version == PROTOCOL_VERSION => {
-                    self.script_identity = script_identity;
                     self.stream = Some(stream);
+                    self.script_identity = script_identity;
                     Ok(())
                 }
                 _ => Err(io::Error::new(
@@ -1102,7 +1161,7 @@ pub struct SupervisedWorker {
     /// Data-plane pump, present when this worker hosts a script. Its thread
     /// owns the pipe server (bound before the child spawned).
     data_plane: Option<super::worker_data_plane::WindowsDataPlane>,
-    /// Script revision the worker reported in its readiness frame.
+    /// Content identity the worker reported in `WorkerReady` (readiness gate).
     script_identity: Option<String>,
 }
 

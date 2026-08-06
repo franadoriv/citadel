@@ -173,7 +173,8 @@ Point-in-time snapshots of the realtime gateway's room registry — the same
 rooms clients create with `join_or_create`:
 
 - `GET /console/v1/matches?filter&limit` — every live room, id-ordered:
-  `{ id, name, map, mode, players, max_players, open }`, plus an optional
+  `{ id, name, map, mode, players, max_players, open, script_revision,
+  script_generation }`, plus an optional
   `matchmaker` telemetry object when realtime is attached. It contains only
   aggregate `queued_tickets`, evaluation count/duration, formed-match/ticket,
   cancelled-ticket, and expired-ticket totals — never ticket properties, IDs, or
@@ -185,6 +186,13 @@ rooms clients create with `join_or_create`:
   `members: [{ participant, user_id }]`, where `user_id` is present for
   participants that authenticated their socket and `null` for guests. `404`
   for an unknown id.
+
+`script_revision`/`script_generation` name the GameScript load a room was born
+bound to on a `runtime.require_script` node (`null` on ungated nodes). On a
+gated node whose script is **not** ready, both endpoints fail closed with
+`503 { "code": "runtime_unavailable", "message": "game script unavailable" }` —
+the same stable message game clients see — and the Runtime section below
+explains why.
 
 Snapshots are read-only copies; polling the console never blocks the realtime
 hot path.
@@ -205,6 +213,14 @@ the loaded script registered:
   "tier": "trusted",
   "attached": true,
   "tick_hz": 20,
+  "require_script": true,
+  "readiness": {
+    "state": "ready",
+    "revision_id": "sha256:2c26b46b…",
+    "generation": 3,
+    "since_unix_millis": 1754500000000,
+    "recovery": { "circuit_open": false, "consecutive_failures": 0, "restart_limit": 3 }
+  },
   "script": {
     "source": "./game/main.lua", "reloadable": true, "deadline_ms": 100,
     "rpcs": ["ping"], "message_kinds": [1], "hooks": ["on_join", "on_tick"]
@@ -214,6 +230,16 @@ the loaded script registered:
 
 `attached: false` (with no `script`) means no script is loaded — the node is
 running the built-in relay — or the realtime transports have not started.
+
+`require_script` reports whether this node gates matches on GameScript
+readiness. When it does, `readiness` mirrors the gate authority once the
+transports start: `state` is one of `no_script`, `validating`, `ready`,
+`activating`, `degraded`, or `unavailable`; `revision_id`/`generation`
+identify the loaded script (matches are born bound to exactly this pair); and
+`recovery` reflects the supervised worker's restart posture when the
+external-worker adapter is in use. Only `ready` opens the gate — every other
+state refuses match listing, creation, and admission with the stable
+`game script unavailable` error.
 
 The language fields show whether `[runtime] language` was explicit or
 autodetected, the selected entrypoint path, and the adapter/tier currently in
