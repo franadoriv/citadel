@@ -5459,85 +5459,18 @@ impl Gateway {
         };
         match env.kind {
             KIND_NA_PRESENCE => {
+                // Authoritative match: the presence/spawn request becomes a
+                // normalized event; registration + spawn fan-out (bypass B5)
+                // happen only on the script's accept/correct. Non-authoritative
+                // deployments register + fan out directly, unchanged.
+                if let Some((room_id, binding)) = self.authoritative_match(sender) {
+                    return self.route_bridge_presence(sender, env, room_id, &binding);
+                }
                 let Ok(presence) = citadel_wire::na::NaPresence::decode(&env.body) else {
                     tracing::debug!(%sender, "gateway dropped a malformed NA_PRESENCE");
                     return 0;
                 };
-                let Some(reg) =
-                    hub.register_presence(sender.get(), presence.archetype_id, presence.transform)
-                else {
-                    return 0;
-                };
-                tracing::info!(
-                    participant = sender.get(),
-                    object_id = reg.object_id,
-                    archetype = presence.archetype_id,
-                    predicted_authoritative = reg.owner_role.is_some(),
-                    "networked-actors: presence registered"
-                );
-                // Room dimension: a newcomer only sees, and is seen by,
-                // participants in its own room (both roomless counts as one scope).
-                let mut sent = 0;
-                // 1) The owner's own spawn FIRST (tells it its object id).
-                if self.send_reliable(sender, KIND_NA_SPAWN, reg.self_spawn.encode()) {
-                    sent += 1;
-                }
-                // 2) A predicted owner receives its role only after its own spawn:
-                // the engine can now bind the native pawn to object_id before the
-                // existing input/prediction component sees the assignment.
-                if let Some(role) = reg.owner_role
-                    && self.send_reliable(sender, KIND_TSYNC_ROLE, role.encode())
-                {
-                    sent += 1;
-                }
-                // 3) Everyone already present IN THE SAME ROOM, so the newcomer sees
-                //    its room's world (not players in other rooms sharing the world).
-                let mut batch_spawns: Vec<citadel_wire::na::NaSpawn> = reg
-                    .batch
-                    .spawns
-                    .into_iter()
-                    .filter(|s| self.same_room(sender, ParticipantId::from_raw(s.owner)))
-                    .collect();
-                // Add server-owned NPCs (; MVP: global) so a late joiner
-                // instantiates the NPCs already walking the world.
-                if let Ok(npcs) = self.npcs.lock() {
-                    for (&object_id, &archetype_id) in npcs.iter() {
-                        let transform = self
-                            .transform
-                            .as_ref()
-                            .and_then(|h| h.get_transform(object_id))
-                            .map(|s| citadel_wire::na::NaTransform {
-                                position: s.position,
-                                rotation: s.rotation,
-                                velocity: s.velocity,
-                            })
-                            .unwrap_or_else(citadel_wire::na::NaTransform::identity);
-                        batch_spawns.push(citadel_wire::na::NaSpawn {
-                            object_id,
-                            archetype_id,
-                            owner: 0,
-                            transform,
-                        });
-                    }
-                }
-                let batch = citadel_wire::na::NaSpawnBatch {
-                    spawns: batch_spawns,
-                };
-                if self.send_reliable(sender, KIND_NA_SPAWN_BATCH, batch.encode()) {
-                    sent += 1;
-                }
-                // 4) Tell every same-room participant to spawn the newcomer.
-                let peer_body = reg.peer_spawn.encode();
-                for peer in reg.peers {
-                    let peer_id = ParticipantId::from_raw(peer);
-                    if !self.same_room(sender, peer_id) {
-                        continue;
-                    }
-                    if self.send_reliable(peer_id, KIND_NA_SPAWN, peer_body.clone()) {
-                        sent += 1;
-                    }
-                }
-                sent
+                self.do_register_presence(sender, presence.archetype_id, presence.transform)
             }
             KIND_NA_STATE => {
                 // Authoritative match: the owner report becomes a normalized
@@ -5556,6 +5489,95 @@ impl Gateway {
             }
             _ => 0,
         }
+    }
+
+    /// Register a networked-actor presence for `sender` and drive the spawn
+    /// fan-out (self spawn first, optional owner role, same-room present batch +
+    /// server NPCs, then the newcomer's spawn to same-room peers). Returns the
+    /// number of frames delivered. This is the presence executor shared by the
+    /// direct (non-authoritative) path and the bridge's accepted `SpawnRequest`.
+    fn do_register_presence(
+        &self,
+        sender: ParticipantId,
+        archetype_id: u16,
+        transform: citadel_wire::na::NaTransform,
+    ) -> usize {
+        let Some(hub) = &self.transform else {
+            return 0;
+        };
+        let Some(reg) = hub.register_presence(sender.get(), archetype_id, transform) else {
+            return 0;
+        };
+        tracing::info!(
+            participant = sender.get(),
+            object_id = reg.object_id,
+            archetype = archetype_id,
+            predicted_authoritative = reg.owner_role.is_some(),
+            "networked-actors: presence registered"
+        );
+        // Room dimension: a newcomer only sees, and is seen by, participants in
+        // its own room (both roomless counts as one scope).
+        let mut sent = 0;
+        // 1) The owner's own spawn FIRST (tells it its object id).
+        if self.send_reliable(sender, KIND_NA_SPAWN, reg.self_spawn.encode()) {
+            sent += 1;
+        }
+        // 2) A predicted owner receives its role only after its own spawn: the
+        // engine can now bind the native pawn to object_id before the existing
+        // input/prediction component sees the assignment.
+        if let Some(role) = reg.owner_role
+            && self.send_reliable(sender, KIND_TSYNC_ROLE, role.encode())
+        {
+            sent += 1;
+        }
+        // 3) Everyone already present IN THE SAME ROOM, so the newcomer sees its
+        //    room's world (not players in other rooms sharing the world).
+        let mut batch_spawns: Vec<citadel_wire::na::NaSpawn> = reg
+            .batch
+            .spawns
+            .into_iter()
+            .filter(|s| self.same_room(sender, ParticipantId::from_raw(s.owner)))
+            .collect();
+        // Add server-owned NPCs (MVP: global) so a late joiner instantiates the
+        // NPCs already walking the world.
+        if let Ok(npcs) = self.npcs.lock() {
+            for (&object_id, &npc_archetype) in npcs.iter() {
+                let transform = self
+                    .transform
+                    .as_ref()
+                    .and_then(|h| h.get_transform(object_id))
+                    .map(|s| citadel_wire::na::NaTransform {
+                        position: s.position,
+                        rotation: s.rotation,
+                        velocity: s.velocity,
+                    })
+                    .unwrap_or_else(citadel_wire::na::NaTransform::identity);
+                batch_spawns.push(citadel_wire::na::NaSpawn {
+                    object_id,
+                    archetype_id: npc_archetype,
+                    owner: 0,
+                    transform,
+                });
+            }
+        }
+        let batch = citadel_wire::na::NaSpawnBatch {
+            spawns: batch_spawns,
+        };
+        if self.send_reliable(sender, KIND_NA_SPAWN_BATCH, batch.encode()) {
+            sent += 1;
+        }
+        // 4) Tell every same-room participant to spawn the newcomer.
+        let peer_body = reg.peer_spawn.encode();
+        for peer in reg.peers {
+            let peer_id = ParticipantId::from_raw(peer);
+            if !self.same_room(sender, peer_id) {
+                continue;
+            }
+            if self.send_reliable(peer_id, KIND_NA_SPAWN, peer_body.clone()) {
+                sent += 1;
+            }
+        }
+        sent
     }
 
     /// Send one reliable envelope to a single participant, recording the outbound
@@ -6440,6 +6462,39 @@ impl Gateway {
         0
     }
 
+    /// Structural stage for an authoritative `KIND_NA_PRESENCE`: decode +
+    /// sanitize the requested transform, then issue a `SpawnRequest` normalized
+    /// event. No object is registered and nothing is fanned out here — that
+    /// happens only on the script's accept/correct. Returns 0.
+    fn route_bridge_presence(
+        &self,
+        sender: ParticipantId,
+        env: &Envelope,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+    ) -> usize {
+        let Some(hub) = &self.transform else {
+            return 0;
+        };
+        let Ok(presence) = citadel_wire::na::NaPresence::decode(&env.body) else {
+            tracing::debug!(%sender, "bridge dropped a malformed NA_PRESENCE");
+            return 0;
+        };
+        let Some(transform) = hub.sanitize_report(presence.transform) else {
+            return 0;
+        };
+        let draft = EventDraft {
+            participant: sender.get(),
+            user_id: self.registry.user_id_of(sender),
+            payload: NormalizedPayload::SpawnRequest {
+                archetype_id: presence.archetype_id,
+                transform: transform.into(),
+            },
+        };
+        self.deliver_bridge_batch(room_id, binding, vec![draft]);
+        0
+    }
+
     /// Structural stage for authoritative owner input: for each frame the sender
     /// owns (ownership + epoch + finite move), issue a `TransformInput`
     /// normalized event. Nothing integrates here — `apply_owner_input` runs only
@@ -6514,9 +6569,11 @@ impl Gateway {
             Decision::Accept => {
                 self.materialize_accept(&outcome.event.payload, outcome.event.participant)
             }
-            Decision::Correct { correction } => {
-                self.materialize_correction(&outcome.event.payload, correction)
-            }
+            Decision::Correct { correction } => self.materialize_correction(
+                &outcome.event.payload,
+                outcome.event.participant,
+                correction,
+            ),
             Decision::Reject { .. } => 0,
         }
         // NOTE: InputOutcome::reply delivery is deferred — it needs a dedicated
@@ -6575,6 +6632,14 @@ impl Gateway {
                 }
                 sent
             }
+            NormalizedPayload::SpawnRequest {
+                archetype_id,
+                transform,
+            } => self.do_register_presence(
+                ParticipantId::from_raw(participant),
+                *archetype_id,
+                (*transform).into(),
+            ),
             // Other protected kinds are not yet routed through the bridge, so
             // their accepted effect is materialized where they are wired in a
             // later step. Reaching here is defensive.
@@ -6589,6 +6654,7 @@ impl Gateway {
     fn materialize_correction(
         &self,
         payload: &NormalizedPayload,
+        participant: u64,
         correction: &Correction,
     ) -> usize {
         let Some(hub) = &self.transform else {
@@ -6603,6 +6669,17 @@ impl Gateway {
                 hub.set_transform(*object_id, na_to_transform_state(*transform));
                 0
             }
+            (
+                NormalizedPayload::SpawnRequest { .. },
+                Correction::Spawn {
+                    archetype_id,
+                    transform,
+                },
+            ) => self.do_register_presence(
+                ParticipantId::from_raw(participant),
+                *archetype_id,
+                (*transform).into(),
+            ),
             _ => {
                 tracing::debug!("bridge correction for an unrouted payload; no effect applied");
                 0
@@ -8054,6 +8131,65 @@ mod transform_tests {
         assert!(
             hub.get_transform(foreign).is_none(),
             "input for an unowned object never becomes an event or mutates"
+        );
+    }
+
+    // ---- authoritative bridge: KIND_NA_PRESENCE flows through the validator ----
+
+    async fn authoritative_room_member(gw: &Arc<Gateway>) -> (ParticipantId, TestOutboundReceiver) {
+        let (p, rp) = register(gw);
+        let binding = ScriptBinding {
+            revision_id: "sha256:test".to_owned(),
+            generation: 1,
+        };
+        gw.rooms()
+            .join_or_create_bound(p, "arena", Some(binding), || RoomLabel::with_map("arena"))
+            .expect("bound room");
+        (p, rp)
+    }
+
+    fn presence_frame() -> Envelope {
+        use citadel_wire::na::{NaPresence, NaTransform};
+        Envelope::new(
+            KIND_NA_PRESENCE,
+            NaPresence {
+                archetype_id: 0,
+                transform: NaTransform::identity(),
+            }
+            .encode(),
+        )
+    }
+
+    #[tokio::test]
+    async fn authoritative_presence_does_not_spawn_without_a_script_answer() {
+        let (gw, hub) = authoritative_gateway("-- no on_input handler");
+        let (a, _ra) = authoritative_room_member(&gw).await;
+        gw.handle_inbound(a, &presence_frame());
+        assert!(
+            hub.relay_owned_object(a.get()).is_none(),
+            "no answer must not register a presence or fan out a spawn (bypass B5 closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_presence_spawns_only_after_accept() {
+        let (gw, hub) = authoritative_gateway("citadel.on_input(function(e) return nil end)");
+        let (a, _ra) = authoritative_room_member(&gw).await;
+        gw.handle_inbound(a, &presence_frame());
+        assert!(
+            hub.relay_owned_object(a.get()).is_some(),
+            "an accepted spawn request registers the avatar"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_presence_reject_spawns_nothing() {
+        let (gw, hub) = authoritative_gateway("citadel.on_input(function(e) return false end)");
+        let (a, _ra) = authoritative_room_member(&gw).await;
+        gw.handle_inbound(a, &presence_frame());
+        assert!(
+            hub.relay_owned_object(a.get()).is_none(),
+            "a rejected spawn request registers nothing"
         );
     }
 
