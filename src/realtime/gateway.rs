@@ -57,8 +57,11 @@ use crate::realtime::registry::{
 use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
-    GameScriptReadiness, LifecycleHook, OutboundCommand, RealtimeAfterOutcome,
+    BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepValue, BridgeTransform,
+    Capability, Correction, Decision, EventDraft, GameScriptReadiness, LifecycleHook,
+    NormalizedPayload, OutboundCommand, PendingBatchLedger, RealtimeAfterOutcome,
     RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
+    ScriptCommand, ScriptCommandBatch, ValidatedBatch, ValidatedOutcome,
 };
 use crate::services::party_directory::{
     PartyOwnerResolution, PartyQueueFreeze, StoragePartyDirectory,
@@ -2313,6 +2316,13 @@ pub struct Gateway {
     /// to that snapshot's `(revision, generation)`. `None` preserves ungated
     /// behavior byte for byte.
     script_readiness: Option<Arc<GameScriptReadiness>>,
+    /// The authoritative-gameplay bridge. Present only when the deployment runs
+    /// authoritative matches (attached alongside the readiness gate). While
+    /// present, a match participant's protected gameplay frames route through
+    /// the per-match pending-batch ledger + validator instead of the direct
+    /// executors. `None` preserves the non-authoritative relay path byte for
+    /// byte, so every existing (bridge-less) deployment and test is unchanged.
+    bridge: Option<Arc<GatewayBridge>>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -2335,6 +2345,7 @@ impl std::fmt::Debug for Gateway {
             .field("live_matchmaker", &self.live_matchmaker.is_some())
             .field("handoffs", &"[redacted]")
             .field("script_readiness", &self.script_readiness.is_some())
+            .field("bridge", &self.bridge.is_some())
             .finish()
     }
 }
@@ -2649,6 +2660,7 @@ impl Gateway {
             live_matchmaker: None,
             handoffs: Mutex::new(MatchmakerHandoffs::default()),
             script_readiness: None,
+            bridge: None,
         }
     }
 
@@ -2665,6 +2677,34 @@ impl Gateway {
     #[must_use]
     pub fn script_readiness(&self) -> Option<&Arc<GameScriptReadiness>> {
         self.script_readiness.as_ref()
+    }
+
+    /// Enable the authoritative-gameplay bridge (builder style, before the
+    /// gateway is shared as `Arc<Gateway>`). `quotas` bounds every match's
+    /// per-batch effects. Once enabled, a match participant's protected
+    /// gameplay frames route through the per-match validator; leaving it unset
+    /// preserves the non-authoritative relay path byte for byte.
+    #[must_use]
+    pub fn with_bridge(mut self, quotas: BridgeQuotas) -> Self {
+        self.bridge = Some(Arc::new(GatewayBridge::new(quotas)));
+        self
+    }
+
+    /// Whether the authoritative bridge is enabled on this node.
+    #[must_use]
+    pub fn bridge_enabled(&self) -> bool {
+        self.bridge.is_some()
+    }
+
+    /// Wire this gateway as its runtime's bridge command sink (weakly — the
+    /// gateway owns the runtime, so a strong reference would leak the cycle).
+    /// A no-op when no runtime is attached; safe even when the bridge is
+    /// disabled, since the sink then rejects every answer early.
+    pub fn attach_bridge_sink(self: &Arc<Self>) {
+        if let Some(runtime) = &self.runtime {
+            runtime
+                .attach_bridge_sink(Arc::downgrade(self) as std::sync::Weak<dyn BridgeCommandSink>);
+        }
     }
 
     /// Attach the persisted domain-feature services, consuming and returning
@@ -5482,6 +5522,14 @@ impl Gateway {
                 sent
             }
             KIND_NA_STATE => {
+                // Authoritative match: the owner report becomes a normalized
+                // event routed through the validator; the direct verbatim write
+                // (bypass B4 — the worst, since Relay is the default movement
+                // mode) is unreachable here. Non-authoritative (relay)
+                // deployments keep the direct owner-state write unchanged.
+                if let Some((room_id, binding)) = self.authoritative_match(sender) {
+                    return self.route_bridge_na_state(sender, env, room_id, &binding);
+                }
                 let Ok(state) = citadel_wire::na::NaState::decode(&env.body) else {
                     return 0;
                 };
@@ -5565,6 +5613,9 @@ impl Gateway {
         if let Some(runtime) = &self.runtime {
             runtime.on_match_closed(room_id);
         }
+        // Drop the match's pending-batch ledger so a late script answer for it
+        // is rejected as an unknown batch, never resurrecting a dead match.
+        self.drop_bridge_match(room_id);
         tracing::warn!(
             room_id,
             members = members.len(),
@@ -6205,6 +6256,394 @@ impl Default for Gateway {
 #[must_use]
 pub fn shared() -> Arc<Gateway> {
     Arc::new(Gateway::new())
+}
+
+/// Per-node authoritative-bridge state: one [`PendingBatchLedger`] per live
+/// authoritative match plus the per-batch quotas. Held behind the gateway's
+/// optional `bridge` field; absent on non-authoritative deployments.
+struct GatewayBridge {
+    /// One ledger per authoritative match (keyed by `RoomId`). Created lazily on
+    /// the match's first protected frame, dropped when the match closes.
+    ledgers: Mutex<HashMap<RoomId, PendingBatchLedger>>,
+    /// Per-batch quotas the validator enforces (PROVISIONAL defaults; surfaced
+    /// in `citadel.toml` by a later step).
+    quotas: BridgeQuotas,
+}
+
+impl GatewayBridge {
+    fn new(quotas: BridgeQuotas) -> Self {
+        Self {
+            ledgers: Mutex::new(HashMap::new()),
+            quotas,
+        }
+    }
+}
+
+/// One match's view of the facts the validator queries, backed by the live
+/// `RoomRegistry`/`TransformHub`. Constructed per validation; borrows the
+/// gateway read-only.
+struct GatewayBridgeContext<'a> {
+    gateway: &'a Gateway,
+    room_id: RoomId,
+}
+
+impl BridgeMatchContext for GatewayBridgeContext<'_> {
+    fn is_member(&self, participant: u64) -> bool {
+        self.gateway
+            .rooms
+            .members(self.room_id)
+            .contains(&ParticipantId::from_raw(participant))
+    }
+
+    fn object_in_match(&self, object_id: u32) -> bool {
+        // v1: the transform world is node-global, so an object "belongs to the
+        // match" if the world knows it at all. Per-room object binding (spec
+        // F29/F33) tightens this in the structural-stage follow-up; until then
+        // scope for messaging is enforced exactly (is_member), and object scope
+        // is this coarse existence check.
+        self.gateway
+            .transform
+            .as_ref()
+            .and_then(|hub| hub.get_transform(object_id))
+            .is_some()
+    }
+
+    fn rep_value_in_bounds(
+        &self,
+        _object_id: u32,
+        _field_id: u16,
+        _value: &BridgeRepValue,
+    ) -> bool {
+        // v1: replicated-field bounds are not yet queryable from the bridge, so
+        // a script rep write cannot be proven in-bounds and is rejected
+        // fail-closed. Wired to `RepAuthority` bounds by a later step; until
+        // then the (unrouted) rep path never materializes through the bridge.
+        false
+    }
+
+    fn has_capability(&self, _capability: Capability) -> bool {
+        // v1: the revision manifest does not yet declare bridge capabilities, so
+        // no capability-gated command family (Persist/Schedule/Physics) is
+        // permitted — fail-closed. Wired to revision capabilities by a later
+        // step.
+        false
+    }
+}
+
+impl Gateway {
+    /// The authoritative match `sender` participates in, with its script
+    /// binding, or `None` when the bridge is disabled or the room is not bound
+    /// to a script (a non-authoritative deployment or roomless participant).
+    fn authoritative_match(&self, sender: ParticipantId) -> Option<(RoomId, ScriptBinding)> {
+        self.bridge.as_ref()?;
+        let room_id = self.rooms.room_of(sender)?;
+        let binding = self.rooms.binding(room_id)?;
+        Some((room_id, binding))
+    }
+
+    /// Issue `drafts` to `room_id`'s ledger (bound to `binding`) and deliver the
+    /// fenced batch to the script. The ledger lock is released before delivery,
+    /// because an embedded runtime answers inline on this same call stack and
+    /// re-enters the ledger through [`BridgeCommandSink::deliver_command_batch`].
+    fn deliver_bridge_batch(
+        &self,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+        drafts: Vec<EventDraft>,
+    ) {
+        let Some(bridge) = &self.bridge else {
+            return;
+        };
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let (clock_epoch, tick) = self
+            .transform
+            .as_ref()
+            .and_then(|hub| hub.gameplay_clock())
+            .map(|clock| (clock.epoch, clock.tick))
+            .unwrap_or((0, 0));
+        let batch = {
+            let mut ledgers = bridge.ledgers.lock().unwrap_or_else(|e| e.into_inner());
+            let ledger = ledgers.entry(room_id).or_insert_with(|| {
+                PendingBatchLedger::new(room_id, binding.generation, clock_epoch)
+            });
+            // A reload (new generation) or a clock reset clears any batch the
+            // superseded turn was still waiting on, so a stale answer can never
+            // resurrect it.
+            if ledger.generation() != binding.generation {
+                ledger.advance_generation(binding.generation);
+            }
+            if ledger.clock_epoch() != clock_epoch {
+                ledger.set_clock_epoch(clock_epoch);
+            }
+            ledger.issue(drafts, tick)
+        };
+        runtime.deliver_event_batch(batch);
+    }
+
+    /// Structural stage for an authoritative `KIND_NA_STATE` report: decode,
+    /// verify the sender owns the object in relay mode, sanitize the transform,
+    /// then issue an `ActorStateReport` normalized event. Nothing mutates here —
+    /// the write happens only if the script's validated answer accepts/corrects
+    /// it. Returns 0 (no synchronous reply).
+    fn route_bridge_na_state(
+        &self,
+        sender: ParticipantId,
+        env: &Envelope,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+    ) -> usize {
+        let Some(hub) = &self.transform else {
+            return 0;
+        };
+        let Ok(state) = citadel_wire::na::NaState::decode(&env.body) else {
+            tracing::debug!(%sender, "bridge dropped a malformed NA_STATE");
+            return 0;
+        };
+        // Structural ownership: only the owner's own object becomes an event.
+        if hub.relay_owned_object(sender.get()) != Some(state.object_id) {
+            return 0;
+        }
+        // Structural sanitize: a non-finite/degenerate report never reaches the
+        // script (F30).
+        let Some(transform) = hub.sanitize_report(state.transform) else {
+            return 0;
+        };
+        let draft = EventDraft {
+            participant: sender.get(),
+            user_id: self.registry.user_id_of(sender),
+            payload: NormalizedPayload::ActorStateReport {
+                object_id: state.object_id,
+                transform: transform.into(),
+            },
+        };
+        self.deliver_bridge_batch(room_id, binding, vec![draft]);
+        0
+    }
+
+    /// Materialize one fully validated batch: apply each accepted/corrected
+    /// outcome's canonical effect, then apply the script-originated commands
+    /// room-scoped. Called only from [`BridgeCommandSink::deliver_command_batch`]
+    /// after the validator accepted the whole batch. Returns deliveries.
+    fn materialize_validated_batch(&self, room_id: RoomId, batch: ValidatedBatch) -> usize {
+        let mut delivered = 0;
+        for outcome in batch.outcomes {
+            delivered += self.materialize_outcome(&outcome);
+        }
+        let mut commands = Vec::new();
+        for command in batch.commands {
+            push_outbound_from_script_command(&mut commands, command);
+        }
+        delivered += self.apply_commands_scoped(None, Some(room_id), commands);
+        delivered
+    }
+
+    /// Materialize one validated per-event outcome. `Reject` mutates nothing.
+    fn materialize_outcome(&self, outcome: &ValidatedOutcome) -> usize {
+        match &outcome.decision {
+            Decision::Accept => {
+                self.materialize_accept(&outcome.event.payload, outcome.event.participant)
+            }
+            Decision::Correct { correction } => {
+                self.materialize_correction(&outcome.event.payload, correction)
+            }
+            Decision::Reject { .. } => 0,
+        }
+        // NOTE: InputOutcome::reply delivery is deferred — it needs a dedicated
+        // reply wire kind (a citadel-wire + contract-manifest change), tracked
+        // for a later step. The validator already bounds reply size.
+    }
+
+    /// Apply the client's own canonical effect for an accepted event.
+    fn materialize_accept(&self, payload: &NormalizedPayload, participant: u64) -> usize {
+        let Some(hub) = &self.transform else {
+            return 0;
+        };
+        match payload {
+            NormalizedPayload::ActorStateReport {
+                object_id,
+                transform,
+            } => {
+                hub.apply_owner_state(participant, *object_id, (*transform).into());
+                0
+            }
+            // Other protected kinds are not yet routed through the bridge, so
+            // their accepted effect is materialized where they are wired in a
+            // later step. Reaching here is defensive.
+            _ => {
+                tracing::debug!("bridge accept for an unrouted payload; no effect applied");
+                0
+            }
+        }
+    }
+
+    /// Apply the script's substituted value for a corrected event.
+    fn materialize_correction(
+        &self,
+        payload: &NormalizedPayload,
+        correction: &Correction,
+    ) -> usize {
+        let Some(hub) = &self.transform else {
+            return 0;
+        };
+        match (payload, correction) {
+            (
+                NormalizedPayload::ActorStateReport { object_id, .. },
+                Correction::Transform(transform),
+            ) => {
+                hub.set_transform(*object_id, na_to_transform_state(*transform));
+                0
+            }
+            _ => {
+                tracing::debug!("bridge correction for an unrouted payload; no effect applied");
+                0
+            }
+        }
+    }
+
+    /// Drop a match's ledger (on close), so a late answer for it is rejected as
+    /// an unknown batch rather than resurrecting a dead match.
+    fn drop_bridge_match(&self, room_id: RoomId) {
+        if let Some(bridge) = &self.bridge {
+            bridge
+                .ledgers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&room_id);
+        }
+    }
+}
+
+/// Convert a validated bridge transform into the hub's transform state.
+fn na_to_transform_state(t: BridgeTransform) -> crate::realtime::transform::TransformState {
+    crate::realtime::transform::TransformState {
+        position: t.position,
+        rotation: t.rotation,
+        velocity: t.velocity,
+    }
+}
+
+/// Map one validated [`ScriptCommand`] to the [`OutboundCommand`](crate::runtime::OutboundCommand)s
+/// the scoped applier executes. Multicasts expand to one send per recipient;
+/// rep-writes have no `OutboundCommand` twin yet and are skipped (the validator
+/// already rejects them without the bounds wiring).
+fn push_outbound_from_script_command(out: &mut Vec<OutboundCommand>, command: ScriptCommand) {
+    match command {
+        ScriptCommand::BroadcastMatch {
+            kind,
+            body,
+            unreliable,
+            exclude: _,
+        } => out.push(OutboundCommand::Broadcast {
+            kind,
+            body,
+            unreliable,
+        }),
+        ScriptCommand::SendTo {
+            participant,
+            kind,
+            body,
+            unreliable,
+        } => out.push(OutboundCommand::Send {
+            session: participant,
+            kind,
+            body,
+            unreliable,
+        }),
+        ScriptCommand::SendToMany {
+            participants,
+            kind,
+            body,
+            unreliable,
+        } => {
+            for participant in participants {
+                out.push(OutboundCommand::Send {
+                    session: participant,
+                    kind,
+                    body: body.clone(),
+                    unreliable,
+                });
+            }
+        }
+        ScriptCommand::ApplyTransform {
+            object_id,
+            transform,
+        } => out.push(OutboundCommand::MoveActor {
+            object_id,
+            position: transform.position,
+            rotation: transform.rotation,
+            velocity: transform.velocity,
+        }),
+        ScriptCommand::SpawnActor {
+            object_id,
+            archetype,
+            position,
+        } => out.push(OutboundCommand::SpawnActor {
+            object_id,
+            archetype,
+            position,
+        }),
+        ScriptCommand::DespawnActor { object_id } => {
+            out.push(OutboundCommand::DespawnActor { object_id })
+        }
+        ScriptCommand::SetPhysics { object_id, opts } => out.push(OutboundCommand::SetPhysics {
+            object_id,
+            opts: opts.map(Into::into),
+        }),
+        ScriptCommand::ApplyImpulse { object_id, impulse } => {
+            out.push(OutboundCommand::ApplyImpulse { object_id, impulse })
+        }
+        ScriptCommand::SetMoveIntent { object_id, intent } => {
+            out.push(OutboundCommand::SetMoveIntent { object_id, intent })
+        }
+        // No OutboundCommand twin yet: rep writes go through RepAuthority, and
+        // persist/schedule through the DomainHost seam — both wired in a later
+        // step. The validator rejects these until then, so this is defensive.
+        ScriptCommand::SetReplicatedVars { .. }
+        | ScriptCommand::Persist { .. }
+        | ScriptCommand::Schedule { .. } => {
+            tracing::debug!("bridge command has no executor yet; skipped");
+        }
+    }
+}
+
+/// The gateway is where an authoritative match's script answers land: a
+/// validated batch materializes, an invalid one materializes nothing (batch
+/// atomic), and a never-delivered answer (timeout/worker death) leaves the
+/// match unmutated until it is closed.
+impl BridgeCommandSink for Gateway {
+    fn deliver_command_batch(&self, answer: ScriptCommandBatch) {
+        let Some(bridge) = &self.bridge else {
+            return;
+        };
+        let room_id = answer.match_id;
+        let validated = {
+            let context = GatewayBridgeContext {
+                gateway: self,
+                room_id,
+            };
+            let mut ledgers = bridge.ledgers.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(ledger) = ledgers.get_mut(&room_id) else {
+                tracing::debug!(room_id, "bridge answer for an unknown match; dropped");
+                return;
+            };
+            match ledger.validate(&context, &bridge.quotas, &answer) {
+                Ok(validated) => validated,
+                Err(rejection) => {
+                    tracing::debug!(
+                        room_id,
+                        ?rejection,
+                        "bridge batch rejected; nothing materialized"
+                    );
+                    return;
+                }
+            }
+        };
+        // The ledger lock is released before materialization, which locks the
+        // transform hub / registry (a different lock order).
+        self.materialize_validated_batch(room_id, validated);
+    }
 }
 
 /// The gateway is where an external worker's match results land: command
@@ -7223,6 +7662,150 @@ mod transform_tests {
         assert!(
             hub.get_transform(2).expect("obj 2").position[0].abs() < 1e-3,
             "a client cannot move another player's object"
+        );
+    }
+
+    // ---- authoritative bridge: KIND_NA_STATE flows through the validator ----
+
+    fn authoritative_gateway(on_input_src: &str) -> (Arc<Gateway>, Arc<TransformHub>) {
+        let hub = Arc::new(TransformHub::new(TransformHubConfig::default()).expect("hub"));
+        let runtime: Arc<dyn Runtime> = Arc::new(
+            crate::runtime::LuaRuntime::from_source(
+                on_input_src,
+                "bridge-test",
+                crate::runtime::DEFAULT_DEADLINE_MS,
+            )
+            .expect("lua runtime"),
+        );
+        let gw = Arc::new(
+            Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
+                .with_transform_hub(Arc::clone(&hub))
+                .with_bridge(BridgeQuotas::default()),
+        );
+        gw.attach_bridge_sink();
+        (gw, hub)
+    }
+
+    /// Register a participant, give it a relay-owned object (NA_PRESENCE), and
+    /// bind it into an authoritative room. Returns the participant and its
+    /// owned object id.
+    fn authoritative_member(gw: &Arc<Gateway>) -> (ParticipantId, u32, TestOutboundReceiver) {
+        use citadel_wire::na::{NaPresence, NaTransform};
+        let (p, rp) = register(gw);
+        gw.handle_inbound(
+            p,
+            &Envelope::new(
+                KIND_NA_PRESENCE,
+                NaPresence {
+                    archetype_id: 0,
+                    transform: NaTransform::identity(),
+                }
+                .encode(),
+            ),
+        );
+        let object_id = gw
+            .transform
+            .as_ref()
+            .and_then(|h| h.relay_owned_object(p.get()))
+            .expect("relay-owned object");
+        let binding = ScriptBinding {
+            revision_id: "sha256:test".to_owned(),
+            generation: 1,
+        };
+        gw.rooms()
+            .join_or_create_bound(p, "arena", Some(binding), || RoomLabel::with_map("arena"))
+            .expect("bound room");
+        (p, object_id, rp)
+    }
+
+    fn na_state_frame(object_id: u32, x: f32) -> Envelope {
+        use citadel_wire::na::{NaState, NaTransform};
+        Envelope::new(
+            KIND_NA_STATE,
+            NaState {
+                object_id,
+                transform: NaTransform {
+                    position: [x, 0.0, 0.0],
+                    ..NaTransform::identity()
+                },
+            }
+            .encode(),
+        )
+    }
+
+    #[tokio::test]
+    async fn authoritative_na_state_is_not_applied_without_a_script_answer() {
+        // A1/A6/D-policy: a script that never answers (no on_input handler)
+        // must not let the owner's report mutate authoritative state. This is
+        // the closure of bypass B4 — the default relay movement mode no longer
+        // writes verbatim.
+        let (gw, hub) = authoritative_gateway("-- no on_input handler");
+        let (p, object_id, _rp) = authoritative_member(&gw);
+        gw.handle_inbound(p, &na_state_frame(object_id, 5.0));
+        assert!(
+            hub.get_transform(object_id).expect("object").position[0].abs() < 1e-3,
+            "no answer must not mutate authoritative state"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_na_state_applies_only_after_accept() {
+        let (gw, hub) = authoritative_gateway("citadel.on_input(function(e) return nil end)");
+        let (p, object_id, _rp) = authoritative_member(&gw);
+        gw.handle_inbound(p, &na_state_frame(object_id, 5.0));
+        assert!(
+            (hub.get_transform(object_id).expect("object").position[0] - 5.0).abs() < 1e-3,
+            "an accepted owner report materializes the reported transform"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_na_state_correction_overrides_the_client_value() {
+        let (gw, hub) = authoritative_gateway(
+            r#"citadel.on_input(function(e)
+                return {
+                    decision = "correct",
+                    transform = {
+                        position = { x = 1, y = 2, z = 3 },
+                        rotation = { x = 0, y = 0, z = 0, w = 1 },
+                        velocity = { x = 0, y = 0, z = 0 },
+                    },
+                }
+            end)"#,
+        );
+        let (p, object_id, _rp) = authoritative_member(&gw);
+        gw.handle_inbound(p, &na_state_frame(object_id, 5.0));
+        let pos = hub.get_transform(object_id).expect("object").position;
+        assert!(
+            (pos[0] - 1.0).abs() < 1e-3
+                && (pos[1] - 2.0).abs() < 1e-3
+                && (pos[2] - 3.0).abs() < 1e-3,
+            "the authoritative state carries the script's value, never the client's: {pos:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_na_state_reject_leaves_state_unchanged() {
+        let (gw, hub) = authoritative_gateway("citadel.on_input(function(e) return false end)");
+        let (p, object_id, _rp) = authoritative_member(&gw);
+        gw.handle_inbound(p, &na_state_frame(object_id, 5.0));
+        assert!(
+            hub.get_transform(object_id).expect("object").position[0].abs() < 1e-3,
+            "a rejected report mutates nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_na_state_for_a_foreign_object_is_dropped_structurally() {
+        // The structural stage admits only the owner's own object as an event;
+        // a report for another id never reaches the script or the world.
+        let (gw, hub) = authoritative_gateway("citadel.on_input(function(e) return nil end)");
+        let (p, object_id, _rp) = authoritative_member(&gw);
+        let foreign = object_id + 1;
+        gw.handle_inbound(p, &na_state_frame(foreign, 9.0));
+        assert!(
+            hub.get_transform(foreign).is_none(),
+            "a foreign-object report is dropped before it becomes an event"
         );
     }
 

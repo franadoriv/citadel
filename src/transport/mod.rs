@@ -415,6 +415,11 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     );
     if let Some(readiness) = &script_readiness {
         gateway = gateway.with_script_readiness(Arc::clone(readiness));
+        // A require_script node runs authoritative matches: enable the
+        // gameplay bridge so a bound match's protected frames route through the
+        // per-match validator. PROVISIONAL quota defaults (measure-first);
+        // surfaced in citadel.toml by a later step.
+        gateway = gateway.with_bridge(crate::runtime::BridgeQuotas::default());
     }
 
     gateway = gateway.with_maps(maps);
@@ -655,6 +660,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         external.attach_sink(Arc::downgrade(&gateway)
             as std::sync::Weak<dyn crate::runtime::external_worker::MatchCommandSink>);
     }
+    // Wire the gateway as the authoritative-bridge command sink for whichever
+    // runtime is attached (embedded or external worker): a bound match's
+    // script answers land here for validation + materialization.
+    gateway.attach_bridge_sink();
     let mut chat_delivery_dispatcher = None;
     if let (Some(directory), Some(router), Some(local_node)) = (
         chat_cluster_directory,

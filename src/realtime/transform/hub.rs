@@ -667,6 +667,30 @@ impl TransformHub {
         }
     }
 
+    /// The object a participant owns in relay mode, if any.
+    ///
+    /// The authoritative bridge's structural stage uses this to admit only an
+    /// owner's own `KIND_NA_STATE` report as a normalized event: a report for a
+    /// foreign or unknown object never becomes one, so the script sees only
+    /// ownership-verified intents.
+    #[must_use]
+    pub fn relay_owned_object(&self, participant: u64) -> Option<ObjectId> {
+        let g = self.inner.lock().ok()?;
+        g.na_presence
+            .get(&participant)
+            .filter(|entry| entry.mode == OwnerMovementMode::Relay)
+            .map(|entry| entry.object_id)
+    }
+
+    /// Structural sanitize for an owner-reported transform (finite floats +
+    /// normalized rotation), exposed so the bridge's structural stage can clean
+    /// a report before it becomes a normalized event. `None` for a non-finite or
+    /// degenerate transform (F30).
+    #[must_use]
+    pub fn sanitize_report(&self, transform: NaTransform) -> Option<NaTransform> {
+        sanitize_owner_transform(transform)
+    }
+
     /// Release a participant's networked-actor presence (on disconnect),
     /// despawning its object. Returns the freed object id so the gateway can
     /// broadcast a `KIND_NA_DESPAWN`, or `None` if it had no presence.
@@ -1222,7 +1246,10 @@ mod tests {
         };
         let sanitized = sanitize_owner_transform(unnormalized).expect("finite quat normalizes");
         let norm: f32 = sanitized.rotation.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "rotation normalized: norm={norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "rotation normalized: norm={norm}"
+        );
 
         // Non-finite position / velocity / rotation are dropped.
         for bad in [
@@ -1267,7 +1294,10 @@ mod tests {
         };
         assert!(!hub.apply_owner_state(1, r.object_id, poisoned));
         let after = hub.get_transform(r.object_id).expect("still exists");
-        assert_eq!(before.position, after.position, "state unchanged after drop");
+        assert_eq!(
+            before.position, after.position,
+            "state unchanged after drop"
+        );
     }
 
     #[test]
