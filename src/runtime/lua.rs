@@ -29,10 +29,10 @@ use crate::runtime::{
     RealtimeAfterOutcome, RealtimeInterception, Runtime, RuntimeEvent, RuntimeEventBus,
     RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint,
     RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest,
-    RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommand,
-    ScriptCommandBatch, append_runtime_event_commands, disabled_runtime_event_bus_handle,
+    RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
+    append_runtime_event_commands, disabled_runtime_event_bus_handle,
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
-    set_runtime_event_bus, set_runtime_shared_cache,
+    script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use crate::storage::StorageIndexName;
@@ -2114,72 +2114,6 @@ fn parse_transform(t: &Table) -> mlua::Result<BridgeTransform> {
     })
 }
 
-/// Map one drained [`OutboundCommand`] to its fenced [`ScriptCommand`] twin.
-///
-/// The embedded bridge reuses the existing `citadel.broadcast`/`send`/actor
-/// command surface so a script's batch-level effects flow through the validator
-/// unchanged; direct sends become scope-validated `SendTo`, broadcasts become
-/// match-scoped `BroadcastMatch`. Rep/persist/schedule/multicast commands have
-/// no `OutboundCommand` today and are emitted through dedicated APIs later.
-fn script_command_from_outbound(command: OutboundCommand) -> ScriptCommand {
-    match command {
-        OutboundCommand::Broadcast {
-            kind,
-            body,
-            unreliable,
-        } => ScriptCommand::BroadcastMatch {
-            kind,
-            body,
-            unreliable,
-            exclude: None,
-        },
-        OutboundCommand::Send {
-            session,
-            kind,
-            body,
-            unreliable,
-        } => ScriptCommand::SendTo {
-            participant: session,
-            kind,
-            body,
-            unreliable,
-        },
-        OutboundCommand::SpawnActor {
-            object_id,
-            archetype,
-            position,
-        } => ScriptCommand::SpawnActor {
-            object_id,
-            archetype,
-            position,
-        },
-        OutboundCommand::MoveActor {
-            object_id,
-            position,
-            rotation,
-            velocity,
-        } => ScriptCommand::ApplyTransform {
-            object_id,
-            transform: BridgeTransform {
-                position,
-                rotation,
-                velocity,
-            },
-        },
-        OutboundCommand::SetPhysics { object_id, opts } => ScriptCommand::SetPhysics {
-            object_id,
-            opts: opts.map(Into::into),
-        },
-        OutboundCommand::ApplyImpulse { object_id, impulse } => {
-            ScriptCommand::ApplyImpulse { object_id, impulse }
-        }
-        OutboundCommand::SetMoveIntent { object_id, intent } => {
-            ScriptCommand::SetMoveIntent { object_id, intent }
-        }
-        OutboundCommand::DespawnActor { object_id } => ScriptCommand::DespawnActor { object_id },
-    }
-}
-
 /// Build the `ctx` table handed to a lifecycle handler: `sender` plus `user_id`.
 fn build_lifecycle_ctx(lua: &Lua, sender: u64, user_id: Option<&str>) -> mlua::Result<Table> {
     let ctx = lua.create_table()?;
@@ -4165,7 +4099,7 @@ mod tests {
         assert_eq!(answer.commands.len(), 1);
         assert_eq!(
             answer.commands[0],
-            ScriptCommand::BroadcastMatch {
+            crate::runtime::ScriptCommand::BroadcastMatch {
                 kind: 100,
                 body: b"hi".to_vec(),
                 unreliable: true,

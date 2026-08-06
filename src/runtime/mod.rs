@@ -170,6 +170,234 @@ fn outbound_command_body_bytes(command: &OutboundCommand) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-engine authoritative-bridge marshaling.
+//
+// The embedded Lua adapter marshals normalized events into native tables and
+// parses on_input decisions directly. The JS and Python adapters share one JSON
+// bridge instead: the event is serialized here (a flat object whose field names
+// match the Lua event table, so game code reads the same shape in every engine),
+// handed to the engine's on_input dispatcher, and the handler's normalized
+// decision comes back as JSON parsed here. All three adapters map the drained
+// OutboundCommand sink to the fenced ScriptCommand twins with the one function
+// below, so batch-level effects flow through the validator identically.
+// ---------------------------------------------------------------------------
+
+/// Serialize one normalized event into the flat JSON object handed to a JS or
+/// Python `on_input` handler.
+#[cfg(any(feature = "runtime-js", feature = "runtime-python"))]
+pub(crate) fn bridge_event_json(batch: &NormalizedEventBatch, event: &NormalizedEvent) -> String {
+    use serde_json::json;
+    let mut value = json!({
+        "event_id": event.event_id,
+        "participant": event.participant,
+        "user_id": event.user_id,
+        "match_id": batch.match_id,
+        "tick": batch.tick,
+    });
+    let map = value.as_object_mut().expect("json object");
+    match &event.payload {
+        NormalizedPayload::TransformInput {
+            object_id,
+            ownership_epoch,
+            input_seq,
+            sim_tick,
+            dt,
+            move_velocity,
+            payload,
+            fire,
+        } => {
+            map.insert("kind".into(), json!("transform_input"));
+            map.insert("object_id".into(), json!(*object_id));
+            map.insert("ownership_epoch".into(), json!(*ownership_epoch));
+            map.insert("input_seq".into(), json!(*input_seq));
+            map.insert("sim_tick".into(), json!(*sim_tick));
+            map.insert("dt".into(), json!(*dt));
+            map.insert("move_velocity".into(), json!(move_velocity));
+            map.insert("payload".into(), json!(payload));
+            map.insert("has_fire".into(), json!(fire.is_some()));
+            if let Some(fire) = fire {
+                map.insert(
+                    "fire".into(),
+                    json!({
+                        "origin": fire.origin,
+                        "direction": fire.direction,
+                        "weapon": fire.weapon,
+                    }),
+                );
+            }
+        }
+        NormalizedPayload::ActorStateReport {
+            object_id,
+            transform,
+        } => {
+            map.insert("kind".into(), json!("actor_state"));
+            map.insert("object_id".into(), json!(*object_id));
+            map.insert("transform".into(), bridge_transform_json(transform));
+        }
+        NormalizedPayload::ReplicatedVarWrite {
+            object_id,
+            class_id,
+            result_id,
+            fields,
+            ..
+        } => {
+            map.insert("kind".into(), json!("replicated_var"));
+            map.insert("object_id".into(), json!(*object_id));
+            map.insert("class_id".into(), json!(*class_id));
+            map.insert("result_id".into(), json!(*result_id));
+            map.insert("field_count".into(), json!(fields.len()));
+        }
+        NormalizedPayload::SpawnRequest {
+            archetype_id,
+            transform,
+        } => {
+            map.insert("kind".into(), json!("spawn_request"));
+            map.insert("archetype_id".into(), json!(*archetype_id));
+            map.insert("transform".into(), bridge_transform_json(transform));
+        }
+        NormalizedPayload::MatchMessage { kind, body } => {
+            map.insert("kind".into(), json!("message"));
+            map.insert("message_kind".into(), json!(*kind));
+            map.insert("body".into(), json!(body));
+        }
+        NormalizedPayload::ParticipantJoined => {
+            map.insert("kind".into(), json!("join"));
+        }
+        NormalizedPayload::ParticipantLeft => {
+            map.insert("kind".into(), json!("leave"));
+        }
+    }
+    value.to_string()
+}
+
+#[cfg(any(feature = "runtime-js", feature = "runtime-python"))]
+fn bridge_transform_json(transform: &BridgeTransform) -> serde_json::Value {
+    serde_json::json!({
+        "position": transform.position,
+        "rotation": transform.rotation,
+        "velocity": transform.velocity,
+    })
+}
+
+/// Parse the normalized decision JSON a JS/Python `on_input` dispatcher returns
+/// into an [`InputOutcome`]. The engine bootstrap normalizes the handler's
+/// return (nil/true/"accept" ⇒ accept, false/"reject" ⇒ reject, object ⇒
+/// verbatim) into `{ decision, reason_code?, reply?, transform? }` with an
+/// array-based transform. Any parse failure fails the whole batch closed.
+#[cfg(any(feature = "runtime-js", feature = "runtime-python"))]
+pub(crate) fn bridge_input_outcome_from_json(
+    event_id: u64,
+    decision_json: &str,
+) -> Result<InputOutcome, String> {
+    #[derive(serde::Deserialize)]
+    struct DecisionJson {
+        decision: String,
+        #[serde(default)]
+        reason_code: u16,
+        #[serde(default)]
+        reply: Option<String>,
+        #[serde(default)]
+        transform: Option<TransformJson>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TransformJson {
+        position: [f32; 3],
+        rotation: [f32; 4],
+        #[serde(default)]
+        velocity: [f32; 3],
+    }
+    let parsed: DecisionJson = serde_json::from_str(decision_json).map_err(|e| e.to_string())?;
+    let reply = parsed.reply.map(String::into_bytes);
+    let decision = match parsed.decision.as_str() {
+        "accept" => Decision::Accept,
+        "reject" => Decision::Reject {
+            reason_code: parsed.reason_code,
+        },
+        "correct" => {
+            let transform = parsed
+                .transform
+                .ok_or_else(|| "a correct decision requires a transform".to_string())?;
+            Decision::Correct {
+                correction: Correction::Transform(BridgeTransform {
+                    position: transform.position,
+                    rotation: transform.rotation,
+                    velocity: transform.velocity,
+                }),
+            }
+        }
+        other => return Err(format!("on_input returned an unknown decision {other:?}")),
+    };
+    Ok(InputOutcome {
+        event_id,
+        decision,
+        reply,
+    })
+}
+
+/// Map one drained [`OutboundCommand`] to its fenced [`ScriptCommand`] twin, so
+/// every adapter's batch-level effects (broadcast/send/actor) flow through the
+/// validator. Rep/persist/schedule/multicast have no `OutboundCommand` today and
+/// are emitted through dedicated APIs later.
+pub(crate) fn script_command_from_outbound(command: OutboundCommand) -> ScriptCommand {
+    match command {
+        OutboundCommand::Broadcast {
+            kind,
+            body,
+            unreliable,
+        } => ScriptCommand::BroadcastMatch {
+            kind,
+            body,
+            unreliable,
+            exclude: None,
+        },
+        OutboundCommand::Send {
+            session,
+            kind,
+            body,
+            unreliable,
+        } => ScriptCommand::SendTo {
+            participant: session,
+            kind,
+            body,
+            unreliable,
+        },
+        OutboundCommand::SpawnActor {
+            object_id,
+            archetype,
+            position,
+        } => ScriptCommand::SpawnActor {
+            object_id,
+            archetype,
+            position,
+        },
+        OutboundCommand::MoveActor {
+            object_id,
+            position,
+            rotation,
+            velocity,
+        } => ScriptCommand::ApplyTransform {
+            object_id,
+            transform: BridgeTransform {
+                position,
+                rotation,
+                velocity,
+            },
+        },
+        OutboundCommand::SetPhysics { object_id, opts } => ScriptCommand::SetPhysics {
+            object_id,
+            opts: opts.map(Into::into),
+        },
+        OutboundCommand::ApplyImpulse { object_id, impulse } => {
+            ScriptCommand::ApplyImpulse { object_id, impulse }
+        }
+        OutboundCommand::SetMoveIntent { object_id, intent } => {
+            ScriptCommand::SetMoveIntent { object_id, intent }
+        }
+        OutboundCommand::DespawnActor { object_id } => ScriptCommand::DespawnActor { object_id },
+    }
+}
+
 /// Decision returned by a runtime's pre-dispatch realtime interceptor.
 ///
 /// The gateway fails closed when an embedded runtime cannot produce a valid
