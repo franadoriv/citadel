@@ -36,6 +36,10 @@ result.
 
 ### Server-side game rules
 
+Your server rules are **GameScript** — written in Lua, Python, or JavaScript and
+made the authoritative law of the match by Citadel. Players propose; your script
+decides. See [GameScript](/gamescript/) for the whole story.
+
 - Run Lua in the default build.
 - Enable embedded CPython with `runtime-python` when trusted server code needs
   normal Python modules.

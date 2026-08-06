@@ -20,6 +20,15 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 
 *Players propose actions. Citadel applies the rules and returns one shared world.*
 
+## GameScript: write your rules, keep them fair
+
+Citadel's signature move: write your game's rules — movement, damage, loot, win
+conditions — in **Lua, Python, or JavaScript**, and the server makes them the
+authoritative law. Players can only *propose*; your script decides what actually
+happens. Easy to write and hot-reload, impossible to cheat.
+
+[Meet GameScript →](/gamescript/)
+
 ## Start with a win
 
 You do not need to understand networking theory before seeing Citadel work.
@@ -64,10 +73,11 @@ The first quest is intentionally small:
 		[Connect a web game →](/guides/web-client/)
 	</Card>
 	<Card title="I write the server rules" icon="rocket">
-		Start with Lua, or enable embedded Python or JavaScript. All three follow one
-		language-neutral host contract; the runtime reference calls out scoped gaps.
+		Write your game's rules in **GameScript** — Lua, Python, or JavaScript — and
+		let the server make them authoritative. All three follow one language-neutral
+		host contract.
 
-		[Meet the runtime guild →](/concepts/game-logic/)
+		[Meet GameScript →](/gamescript/)
 	</Card>
 </CardGrid>
 

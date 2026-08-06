@@ -8,7 +8,8 @@ the final word. A player can ask to swing a sword. Your server script checks the
 range, cooldown, permissions, and current monster HP before it changes the
 shared world.
 
-That is Citadel's central game-logic model.
+That is Citadel's central game-logic model — the rules you write are
+**[GameScript](/gamescript/)**. This page is the deeper mental model behind it.
 
 ![Lua, Python, and JavaScript game logic use one host API before reaching the Citadel core, with a future hardened tier separated by a boundary.](../../../assets/docs/runtime-guild-shared-contract.svg)
 
@@ -53,6 +54,24 @@ The exact name, argument shape, return value, and language caveats live in the
 [Lua](/reference/server-sdk/lua-runtime/),
 [Python](/reference/server-sdk/python-runtime/), and
 [JavaScript](/reference/server-sdk/js-runtime/) reference pages.
+
+## Authoritative gameplay: the input bridge
+
+Hooks like `on_message` cover the custom game envelopes you invent. **Protected
+gameplay** — transform-sync input, owner state, script-marked replicated
+variables, and avatar spawns — takes a stronger path. In an *authoritative match*
+(a node with `runtime.require_script = true` whose room is bound to a loaded
+script), each of those client actions is decoded and ownership-verified by Rust,
+then delivered to your `citadel.on_input` handler as a **normalized event**. Your
+script answers **accept**, **reject**, or **correct**, and only then does Citadel
+change state or replicate to peers. Nothing protected changes before your script
+decides, and the answer is fenced and applied all-or-nothing.
+
+See [Authoritative gameplay bridge](/reference/server-sdk/authoritative-gameplay-bridge/)
+for the event shapes, the fire/hit `rewind_query` host API, and the fencing rules.
+
+When `require_script = false` (the default), there is no bridge: the built-in relay
+applies owner state directly for fast prototyping. Choose authority when it counts.
 
 ## Actions change the world
 
