@@ -378,6 +378,18 @@ impl Validated {
     pub fn object_id(&self) -> u32 {
         self.object_id
     }
+
+    /// The target object's class id (for the normalized event the bridge emits).
+    #[must_use]
+    pub fn class_id(&self) -> u32 {
+        self.class_id
+    }
+
+    /// The client's bunch/result id (idempotency echo for the normalized event).
+    #[must_use]
+    pub fn result_id(&self) -> u64 {
+        self.result_id
+    }
 }
 
 /// The `NetworkPeer` server authority: the untrusted-input trust boundary. Cheap to

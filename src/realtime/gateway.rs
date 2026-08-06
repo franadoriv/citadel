@@ -49,7 +49,7 @@ use crate::party_presence::{
 use crate::realtime::auth::{AuthOutcome, Authenticator, PresentedCredential};
 use crate::realtime::chat_presence::{ChatPresenceRegistry, ChatSubscription};
 use crate::realtime::netpeer::layout::RepLayout;
-use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot};
+use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot, Validated};
 use crate::realtime::registry::{
     CloseDisposition, LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen,
     SessionHandle, SessionRegistry,
@@ -57,11 +57,11 @@ use crate::realtime::registry::{
 use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
-    BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepValue, BridgeTransform,
-    Capability, Correction, Decision, EventDraft, FireIntent, GameScriptReadiness, LifecycleHook,
-    NormalizedPayload, OutboundCommand, PendingBatchLedger, RealtimeAfterOutcome,
-    RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
-    ScriptCommand, ScriptCommandBatch, ValidatedBatch, ValidatedOutcome,
+    BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepField, BridgeRepValue,
+    BridgeTransform, Capability, Correction, Decision, EventDraft, FireIntent, GameScriptReadiness,
+    LifecycleHook, NormalizedEventBatch, NormalizedPayload, OutboundCommand, PendingBatchLedger,
+    RealtimeAfterOutcome, RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE,
+    ScriptBinding, ScriptCommand, ScriptCommandBatch, ValidatedBatch, ValidatedOutcome,
 };
 use crate::services::party_directory::{
     PartyOwnerResolution, PartyQueueFreeze, StoragePartyDirectory,
@@ -76,7 +76,7 @@ use crate::session::SessionTokenSecret;
 use crate::session::{NodeId, OwnershipGeneration};
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 use crate::transport::{Delivery, Envelope};
-use citadel_wire::netpeer::RepSchema;
+use citadel_wire::netpeer::{FieldDelta, RepSchema};
 
 pub use citadel_wire::protocol::{
     KIND_AUTH, KIND_AUTH_RESULT, KIND_CHAT_EVENT, KIND_MATCHMAKER_MATCHED, KIND_NA_DESPAWN,
@@ -5963,6 +5963,13 @@ impl Gateway {
             rep.handle_ack(sender.get(), &env.body);
             return 0;
         }
+        // Authoritative match: a delta runs the structural validate stage and
+        // becomes a ReplicatedVarWrite event; apply + rebroadcast (bypass B6)
+        // happen only on the script's accept. Non-authoritative deployments keep
+        // the direct validate -> apply -> rebroadcast pipeline unchanged.
+        if let Some((room_id, binding)) = self.authoritative_match(sender) {
+            return self.route_bridge_rep(sender, env, room_id, &binding);
+        }
         let now_ms = SystemClock.now().unix_millis();
         let mut delivered = 0;
         for out in rep.handle_delta(sender.get(), &env.body, now_ms) {
@@ -6308,6 +6315,14 @@ struct GatewayBridge {
     /// Per-batch quotas the validator enforces (PROVISIONAL defaults; surfaced
     /// in `citadel.toml` by a later step).
     quotas: BridgeQuotas,
+    /// Replicated-delta writes awaiting a script answer, keyed by `(RoomId,
+    /// event_id)`. A `KIND_REP_DELTA` validates to a non-serializable
+    /// [`Validated`] proposal that only [`RepAuthority::apply_and_rebroadcast`]
+    /// can materialize, so the proposal is stashed here (on the gateway, never
+    /// crossing the worker boundary) and applied on the matching `Accept`. Only
+    /// the decoded field values ride the normalized event. Dropped on any other
+    /// outcome and when the match closes.
+    pending_rep: Mutex<HashMap<(RoomId, u64), Validated>>,
 }
 
 impl GatewayBridge {
@@ -6315,6 +6330,7 @@ impl GatewayBridge {
         Self {
             ledgers: Mutex::new(HashMap::new()),
             quotas,
+            pending_rep: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -6391,35 +6407,112 @@ impl Gateway {
         binding: &ScriptBinding,
         drafts: Vec<EventDraft>,
     ) {
-        let Some(bridge) = &self.bridge else {
+        let Some(batch) = self.issue_bridge_batch(room_id, binding, drafts) else {
             return;
         };
-        let Some(runtime) = &self.runtime else {
-            return;
-        };
+        if let Some(runtime) = &self.runtime {
+            runtime.deliver_event_batch(batch);
+        }
+    }
+
+    /// Issue `drafts` to `room_id`'s ledger (bound to `binding`) and return the
+    /// fenced batch, without delivering it. Callers that must correlate extra
+    /// per-event state to the assigned event ids (the replicated-delta stash)
+    /// issue here, record their state, then deliver. The ledger lock is released
+    /// before this returns.
+    fn issue_bridge_batch(
+        &self,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+        drafts: Vec<EventDraft>,
+    ) -> Option<NormalizedEventBatch> {
+        let bridge = self.bridge.as_ref()?;
         let (clock_epoch, tick) = self
             .transform
             .as_ref()
             .and_then(|hub| hub.gameplay_clock())
             .map(|clock| (clock.epoch, clock.tick))
             .unwrap_or((0, 0));
-        let batch = {
-            let mut ledgers = bridge.ledgers.lock().unwrap_or_else(|e| e.into_inner());
-            let ledger = ledgers.entry(room_id).or_insert_with(|| {
-                PendingBatchLedger::new(room_id, binding.generation, clock_epoch)
-            });
-            // A reload (new generation) or a clock reset clears any batch the
-            // superseded turn was still waiting on, so a stale answer can never
-            // resurrect it.
-            if ledger.generation() != binding.generation {
-                ledger.advance_generation(binding.generation);
-            }
-            if ledger.clock_epoch() != clock_epoch {
-                ledger.set_clock_epoch(clock_epoch);
-            }
-            ledger.issue(drafts, tick)
+        let mut ledgers = bridge.ledgers.lock().unwrap_or_else(|e| e.into_inner());
+        let ledger = ledgers
+            .entry(room_id)
+            .or_insert_with(|| PendingBatchLedger::new(room_id, binding.generation, clock_epoch));
+        // A reload (new generation) or a clock reset clears any batch the
+        // superseded turn was still waiting on, so a stale answer can never
+        // resurrect it.
+        if ledger.generation() != binding.generation {
+            ledger.advance_generation(binding.generation);
+        }
+        if ledger.clock_epoch() != clock_epoch {
+            ledger.set_clock_epoch(clock_epoch);
+        }
+        Some(ledger.issue(drafts, tick))
+    }
+
+    /// Structural stage for an authoritative `KIND_REP_DELTA`: run the rep
+    /// authority's validate stage (schema, ownership, bounds, rate — no state
+    /// mutation), issue a `ReplicatedVarWrite` normalized event carrying the
+    /// decoded scalar field values, and stash the non-serializable validated
+    /// proposal by event id. Apply + rebroadcast happen only on the script's
+    /// accept. A structural reject produces no event and no output (the coarse,
+    /// no-oracle outcome). Returns 0.
+    fn route_bridge_rep(
+        &self,
+        sender: ParticipantId,
+        env: &Envelope,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+    ) -> usize {
+        let Some(rep) = &self.rep else {
+            return 0;
         };
-        runtime.deliver_event_batch(batch);
+        let Some(bridge) = &self.bridge else {
+            return 0;
+        };
+        let now_ms = SystemClock.now().unix_millis();
+        let Ok(validated) = rep.validate(sender.get(), &env.body, now_ms) else {
+            return 0;
+        };
+        let fields: Vec<BridgeRepField> = validated
+            .fields()
+            .iter()
+            .filter_map(|(field_id, delta)| match delta {
+                FieldDelta::Value(value) => Some(BridgeRepField {
+                    field_id: *field_id,
+                    value: value.clone().into(),
+                }),
+                // Collection deltas are opaque to the script in v1; they still
+                // apply via the stashed proposal on accept.
+                FieldDelta::Collection(_) => None,
+            })
+            .collect();
+        let draft = EventDraft {
+            participant: sender.get(),
+            user_id: self.registry.user_id_of(sender),
+            payload: NormalizedPayload::ReplicatedVarWrite {
+                object_id: validated.object_id(),
+                class_id: validated.class_id(),
+                // PROVISIONAL: the exact 128-bit schema hash is not yet surfaced
+                // from Validated; the script keys on class_id/object_id in v1.
+                schema_hash: [0u8; 16],
+                result_id: validated.result_id(),
+                fields,
+            },
+        };
+        let Some(batch) = self.issue_bridge_batch(room_id, binding, vec![draft]) else {
+            return 0;
+        };
+        if let Some(event) = batch.events.first() {
+            bridge
+                .pending_rep
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((room_id, event.event_id), validated);
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.deliver_event_batch(batch);
+        }
+        0
     }
 
     /// Structural stage for an authoritative `KIND_NA_STATE` report: decode,
@@ -6553,7 +6646,7 @@ impl Gateway {
     fn materialize_validated_batch(&self, room_id: RoomId, batch: ValidatedBatch) -> usize {
         let mut delivered = 0;
         for outcome in batch.outcomes {
-            delivered += self.materialize_outcome(&outcome);
+            delivered += self.materialize_outcome(room_id, &outcome);
         }
         let mut commands = Vec::new();
         for command in batch.commands {
@@ -6564,9 +6657,15 @@ impl Gateway {
     }
 
     /// Materialize one validated per-event outcome. `Reject` mutates nothing.
-    fn materialize_outcome(&self, outcome: &ValidatedOutcome) -> usize {
+    fn materialize_outcome(&self, room_id: RoomId, outcome: &ValidatedOutcome) -> usize {
+        // A replicated-delta event carries a stashed, non-serializable proposal
+        // keyed by event id: take it now (dropped unless this outcome accepts).
+        let pending_rep = self.take_pending_rep(room_id, outcome.event.event_id);
         match &outcome.decision {
             Decision::Accept => {
+                if let Some(validated) = pending_rep {
+                    return self.materialize_rep_apply(validated);
+                }
                 self.materialize_accept(&outcome.event.payload, outcome.event.participant)
             }
             Decision::Correct { correction } => self.materialize_correction(
@@ -6579,6 +6678,48 @@ impl Gateway {
         // NOTE: InputOutcome::reply delivery is deferred — it needs a dedicated
         // reply wire kind (a citadel-wire + contract-manifest change), tracked
         // for a later step. The validator already bounds reply size.
+    }
+
+    /// Take (and remove) the stashed replicated-delta proposal for one event.
+    fn take_pending_rep(&self, room_id: RoomId, event_id: u64) -> Option<Validated> {
+        self.bridge
+            .as_ref()?
+            .pending_rep
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(room_id, event_id))
+    }
+
+    /// Apply an accepted replicated-delta proposal and fan out the server's
+    /// authoritative rebroadcast (never the client's bytes). Returns deliveries.
+    fn materialize_rep_apply(&self, validated: Validated) -> usize {
+        let Some(rep) = &self.rep else {
+            return 0;
+        };
+        let outs = match rep.apply_and_rebroadcast(validated) {
+            Ok(outs) => outs,
+            Err(_) => return 0,
+        };
+        let mut delivered = 0;
+        for out in outs {
+            let outbound = Outbound::new(
+                if out.reliable {
+                    Delivery::Reliable
+                } else {
+                    Delivery::Unreliable
+                },
+                Envelope::new(out.kind, out.body),
+            );
+            let out_bytes = outbound.envelope.body.len() as u64;
+            if self
+                .registry
+                .send_to(ParticipantId::from_raw(out.participant), &outbound)
+            {
+                self.metrics.record_message_out(out_bytes);
+                delivered += 1;
+            }
+        }
+        delivered
     }
 
     /// Apply the client's own canonical effect for an accepted event.
@@ -6696,6 +6837,13 @@ impl Gateway {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&room_id);
+            // Drop any replicated-delta proposals still awaiting an answer for
+            // this match, so a late answer cannot resurrect a dead match.
+            bridge
+                .pending_rep
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(rid, _), _| *rid != room_id);
         }
     }
 }
@@ -8190,6 +8338,134 @@ mod transform_tests {
         assert!(
             hub.relay_owned_object(a.get()).is_none(),
             "a rejected spawn request registers nothing"
+        );
+    }
+
+    // ---- authoritative bridge: KIND_REP_DELTA flows through the validator ----
+
+    const REP_CLASS: u32 = 42;
+    const REP_OBJ: u32 = 500;
+    const REP_MATCH: u64 = 1;
+    const REP_HEALTH: u16 = 0;
+
+    fn rep_layout() -> &'static RepLayout {
+        use crate::realtime::netpeer::{FieldAuthority, FieldBounds, RepCondition, TypeTag};
+        use citadel_wire::codec::codec_id;
+        static L: std::sync::OnceLock<RepLayout> = std::sync::OnceLock::new();
+        L.get_or_init(|| {
+            crate::realtime::netpeer::RepLayoutBuilder::new(REP_CLASS, 1)
+                .field(
+                    "health",
+                    TypeTag::Int,
+                    codec_id::SCALAR_QUANT,
+                    RepCondition::None,
+                    FieldAuthority::ClientOwned,
+                    FieldBounds::IntRange { min: 0, max: 100 },
+                    true,
+                )
+                .build()
+                .expect("layout builds")
+        })
+    }
+
+    fn rep_schema() -> RepSchema {
+        RepSchema::new(
+            *rep_layout().schema_hash(),
+            vec![citadel_wire::netpeer::RepFieldCodec::IntRange { min: 0, max: 100 }],
+        )
+        .expect("schema builds")
+    }
+
+    fn client_health_bunch(result_id: u64, health: i64) -> Vec<u8> {
+        let mut b = citadel_wire::netpeer::DeltaBunch::new(REP_OBJ, true, result_id, 0);
+        b.set(
+            REP_HEALTH,
+            FieldDelta::Value(citadel_wire::netpeer::RepValue::Int(health)),
+        );
+        b.encode(&rep_schema()).expect("client encodes")
+    }
+
+    async fn authoritative_rep_gateway(
+        on_input_src: &str,
+    ) -> (Arc<Gateway>, Arc<RepAuthority>, ParticipantId) {
+        let rep = Arc::new(RepAuthority::new(
+            crate::realtime::netpeer::RateLimits::default(),
+        ));
+        let runtime: Arc<dyn Runtime> = Arc::new(
+            crate::runtime::LuaRuntime::from_source(
+                on_input_src,
+                "bridge-test",
+                crate::runtime::DEFAULT_DEADLINE_MS,
+            )
+            .expect("lua runtime"),
+        );
+        let gw = Arc::new(
+            Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
+                .with_rep_authority(Arc::clone(&rep))
+                .with_bridge(BridgeQuotas::default()),
+        );
+        gw.attach_bridge_sink();
+        gw.register_rep_class(REP_CLASS, rep_layout(), rep_schema())
+            .expect("class registers");
+        let (owner, _ro) = register(&gw);
+        let mut initial = crate::realtime::netpeer::RepSnapshot::new();
+        initial.set_scalar(REP_HEALTH, citadel_wire::netpeer::RepValue::Int(10));
+        gw.spawn_rep_object(REP_OBJ, REP_MATCH, REP_CLASS, Some(owner), false, initial)
+            .expect("trusted lifecycle spawns object");
+        gw.join_rep_match(owner, REP_MATCH, false);
+        let binding = ScriptBinding {
+            revision_id: "sha256:test".to_owned(),
+            generation: 1,
+        };
+        gw.rooms()
+            .join_or_create_bound(owner, "arena", Some(binding), || {
+                RoomLabel::with_map("arena")
+            })
+            .expect("bound room");
+        (gw, rep, owner)
+    }
+
+    #[tokio::test]
+    async fn authoritative_rep_delta_is_not_applied_without_a_script_answer() {
+        let (gw, rep, owner) = authoritative_rep_gateway("-- no on_input handler").await;
+        gw.handle_inbound(
+            owner,
+            &Envelope::new(KIND_REP_DELTA, client_health_bunch(1, 37)),
+        );
+        assert_eq!(
+            rep.authoritative_scalar(REP_OBJ, REP_HEALTH),
+            Some(citadel_wire::netpeer::RepValue::Int(10)),
+            "no answer must not apply the client's rep write (bypass B6 closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_rep_delta_applies_only_after_accept() {
+        let (gw, rep, owner) =
+            authoritative_rep_gateway("citadel.on_input(function(e) return nil end)").await;
+        gw.handle_inbound(
+            owner,
+            &Envelope::new(KIND_REP_DELTA, client_health_bunch(1, 37)),
+        );
+        assert_eq!(
+            rep.authoritative_scalar(REP_OBJ, REP_HEALTH),
+            Some(citadel_wire::netpeer::RepValue::Int(37)),
+            "an accepted rep write applies + rebroadcasts authoritatively"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_rep_delta_reject_applies_nothing() {
+        let (gw, rep, owner) =
+            authoritative_rep_gateway("citadel.on_input(function(e) return false end)").await;
+        gw.handle_inbound(
+            owner,
+            &Envelope::new(KIND_REP_DELTA, client_health_bunch(1, 37)),
+        );
+        assert_eq!(
+            rep.authoritative_scalar(REP_OBJ, REP_HEALTH),
+            Some(citadel_wire::netpeer::RepValue::Int(10)),
+            "a rejected rep write applies nothing"
         );
     }
 
