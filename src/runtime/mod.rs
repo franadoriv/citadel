@@ -78,10 +78,10 @@ use crate::error::AppResult;
 use crate::leaderboard_scheduler::{ResetEpoch, SchedulerFencingToken};
 
 pub use bridge_protocol::{
-    BridgePhysicsOptions, BridgeRepField, BridgeRepValue, BridgeShape, BridgeTransform, Correction,
-    Decision, FireIntent, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome, MAX_BRIDGE_PAYLOAD_BYTES,
-    NormalizedEvent, NormalizedEventBatch, NormalizedPayload, PersistOp, RewindHit, RewindQuery,
-    RewindResult, ScriptCommand, ScriptCommandBatch,
+    BridgeCommandSink, BridgePhysicsOptions, BridgeRepField, BridgeRepValue, BridgeShape,
+    BridgeTransform, Correction, Decision, FireIntent, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome,
+    MAX_BRIDGE_PAYLOAD_BYTES, NormalizedEvent, NormalizedEventBatch, NormalizedPayload, PersistOp,
+    RewindHit, RewindQuery, RewindResult, ScriptCommand, ScriptCommandBatch,
 };
 pub use bridge_validator::{
     BatchRejection, BridgeMatchContext, BridgeQuotas, Capability, EventDraft, MAX_RESERVED_KIND,
@@ -241,6 +241,29 @@ pub trait Runtime: Send + Sync + 'static {
         body: &[u8],
     ) -> Vec<OutboundCommand>;
 
+    /// Attach the sink where this runtime's authoritative-bridge answers land.
+    ///
+    /// Held weakly to avoid an `Arc` cycle: the gateway owns both the runtime
+    /// and the sink. The default ignores it — an adapter that has not
+    /// implemented the bridge never produces a [`ScriptCommandBatch`], so the
+    /// sink would never be called anyway (fail-closed).
+    fn attach_bridge_sink(&self, sink: std::sync::Weak<dyn BridgeCommandSink>) {
+        let _ = sink;
+    }
+
+    /// Deliver one authoritative match's normalized-event batch to the script.
+    ///
+    /// The bridge is asynchronous (see [`BridgeCommandSink`]): this returns
+    /// nothing. Embedded adapters evaluate the batch inline and hand the fenced
+    /// [`ScriptCommandBatch`] to the attached sink before returning; the worker
+    /// adapter forwards the batch over the data plane and the answer arrives on
+    /// the worker's cadence. The default drops the batch — an adapter that has
+    /// not implemented the bridge never materializes protected gameplay, the
+    /// fail-closed owner failure policy.
+    fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        let _ = batch;
+    }
+
     /// Run a message handler in the scope of one authoritative match.
     ///
     /// The default preserves adapters that do not need a room-aware context.
@@ -354,5 +377,83 @@ pub trait Runtime: Send + Sync + 'static {
     /// introduces filesystem I/O on a message or tick path.
     fn reload_watch_paths(&self) -> Vec<std::path::PathBuf> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod bridge_seam_tests {
+    use std::sync::{Arc, Mutex, Weak};
+
+    use super::*;
+
+    /// A runtime that overrides nothing bridge-related: it inherits the
+    /// fail-closed default `deliver_event_batch` and `attach_bridge_sink`.
+    struct FailClosedRuntime;
+
+    impl Runtime for FailClosedRuntime {
+        fn dispatch(&self, _: u64, _: Option<&str>, _: u16, _: &[u8]) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+        fn dispatch_lifecycle(
+            &self,
+            _: LifecycleHook,
+            _: u64,
+            _: Option<&str>,
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+        fn tick(&self, _: Duration, _: Duration) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+        fn call_rpc(&self, _: u64, _: Option<&str>, _: &str, _: &[u8]) -> RpcOutcome {
+            RpcOutcome::Err("no rpc".to_string())
+        }
+        fn call_room_create(&self, _: u64, _: Option<&str>, _: &[u8]) -> Option<RoomSpec> {
+            None
+        }
+        fn call_room_join(&self, _: u64, _: Option<&str>, _: u64) -> bool {
+            true
+        }
+        fn has_tick_handler(&self) -> bool {
+            false
+        }
+        fn budget(&self) -> Duration {
+            Duration::from_millis(1)
+        }
+        fn introspect(&self) -> RuntimeIntrospection {
+            RuntimeIntrospection {
+                source: "fail-closed".to_string(),
+                reloadable: false,
+                deadline_ms: 1,
+                rpcs: Vec::new(),
+                message_kinds: Vec::new(),
+                hooks: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<ScriptCommandBatch>>);
+
+    impl BridgeCommandSink for RecordingSink {
+        fn deliver_command_batch(&self, answer: ScriptCommandBatch) {
+            self.0.lock().expect("sink lock").push(answer);
+        }
+    }
+
+    #[test]
+    fn default_runtime_never_answers_a_delivered_batch() {
+        // The fail-closed failure policy: an adapter that has not implemented
+        // the bridge materializes nothing. A batch delivered to it produces no
+        // answer at the sink, ever — so the gateway would time the match out
+        // rather than apply a default-accept.
+        let runtime = FailClosedRuntime;
+        let sink = Arc::new(RecordingSink::default());
+        runtime.attach_bridge_sink(Arc::downgrade(&sink) as Weak<dyn BridgeCommandSink>);
+        runtime.deliver_event_batch(NormalizedEventBatch::new(1, 42, 9, 100, 1));
+        assert!(
+            sink.0.lock().expect("sink lock").is_empty(),
+            "the default bridge surface must never answer"
+        );
     }
 }

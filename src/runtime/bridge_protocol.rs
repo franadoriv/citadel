@@ -664,6 +664,37 @@ pub struct RewindResult {
     pub hits: Vec<RewindHit>,
 }
 
+// ---------------------------------------------------------------------------
+// Asynchronous delivery seam.
+// ---------------------------------------------------------------------------
+
+/// Where a script's fenced answer to a delivered [`NormalizedEventBatch`] lands.
+///
+/// The authoritative bridge is asynchronous by construction. The key reason is
+/// the external worker: [`ExternalWorkerRuntime`](super::external_worker::ExternalWorkerRuntime)
+/// schedules matches fairly on its own cadence, so a delivered batch produces
+/// no answer inline — the answer returns later as a fenced data-plane frame.
+/// [`Runtime::deliver_event_batch`](super::Runtime::deliver_event_batch)
+/// therefore returns nothing; the script's [`ScriptCommandBatch`] arrives here,
+/// resolved inline for the embedded adapters and over the data plane for the
+/// worker. Unifying both behind one sink keeps the gateway path identical
+/// regardless of where the script runs.
+///
+/// The gateway implements this: it validates the answer against the answered
+/// match's [`PendingBatchLedger`](super::bridge_validator::PendingBatchLedger)
+/// and materializes state, replication, or delivery only when every §3.5 check
+/// passes. A never-delivered answer (timeout, worker death) materializes
+/// nothing — the fail-closed failure policy.
+pub trait BridgeCommandSink: Send + Sync + 'static {
+    /// Hand one script answer to the gateway for validation + materialization.
+    ///
+    /// The batch's own fencing (`match_id`, `generation`, `clock_epoch`,
+    /// `batch_id`) selects the pending batch; a foreign, stale, duplicate, or
+    /// otherwise invalid answer is rejected whole by the validator and
+    /// materializes nothing (owner decision 2, batch-atomic).
+    fn deliver_command_batch(&self, answer: ScriptCommandBatch);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
