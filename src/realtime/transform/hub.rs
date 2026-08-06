@@ -124,6 +124,9 @@ struct HubInner {
     /// Participant -> its networked-actor presence (relay mode). Populated when a
     /// client announces `KIND_NA_PRESENCE`; empty otherwise.
     na_presence: HashMap<u64, NaEntry>,
+    /// Server-owned object -> authoritative room. Absent entries are legacy
+    /// node-global objects, retained for relay compatibility.
+    object_rooms: HashMap<ObjectId, u64>,
     /// Aggregate-only v2 input-hint diagnostics. These intentionally carry no
     /// participant, epoch, tick, or hint values, so telemetry cannot become an
     /// input-derived label/cardinality sink.
@@ -232,6 +235,7 @@ impl TransformHub {
                 clients: HashMap::new(),
                 assigned_slots: HashMap::new(),
                 na_presence: HashMap::new(),
+                object_rooms: HashMap::new(),
                 input_hint_metrics: InputHintMetrics::default(),
             }),
         })
@@ -362,6 +366,22 @@ impl TransformHub {
     pub fn despawn(&self, id: ObjectId) {
         if let Ok(mut g) = self.inner.lock() {
             g.world.despawn(id);
+            g.object_rooms.remove(&id);
+        }
+    }
+
+    /// Associate a server-owned object with its authoritative room. `None`
+    /// restores the legacy node-global visibility used by relay-only deployments.
+    pub fn set_object_room(&self, id: ObjectId, room_id: Option<u64>) {
+        if let Ok(mut g) = self.inner.lock() {
+            match room_id {
+                Some(room_id) => {
+                    g.object_rooms.insert(id, room_id);
+                }
+                None => {
+                    g.object_rooms.remove(&id);
+                }
+            }
         }
     }
 
@@ -898,19 +918,46 @@ impl TransformHub {
         self.inner.lock().ok().map(|g| g.gameplay_clock.snapshot())
     }
 
-    /// Build one delta snapshot per client from the latched frame. Returns the
-    /// unreliable snapshot envelopes for the gateway to fan out. Encoding errors
-    /// for a single client are skipped (never poison the whole tick).
+    /// Build one delta snapshot per client from the latched frame using the
+    /// legacy node-global scope. The gateway uses
+    /// [`Self::snapshot_tick_scoped`] when room membership is available.
     #[must_use]
     pub fn snapshot_tick(&self) -> Vec<HubOutbound> {
+        self.snapshot_tick_scoped(|_| None)
+    }
+
+    /// Build one delta snapshot per client from the latched frame, restricting
+    /// each to objects in its room. `room_of` comes from the gateway's room
+    /// registry; both roomless participants share the relay-compatible scope.
+    /// Returns unreliable snapshot envelopes for the gateway to fan out.
+    /// Encoding errors for a single client are skipped (never poison the whole
+    /// tick).
+    #[must_use]
+    pub fn snapshot_tick_scoped(
+        &self,
+        mut room_of: impl FnMut(u64) -> Option<u64>,
+    ) -> Vec<HubOutbound> {
         let mut out = Vec::new();
         let Ok(mut g) = self.inner.lock() else {
             return out;
         };
         let frame = Arc::clone(&g.latest);
+        let object_rooms = g.object_rooms.clone();
         let gameplay_clock = g.gameplay_clock.snapshot();
         let hard_cap = self.config.budget;
+        let mut room_frames = HashMap::new();
         for (&participant, client) in g.clients.iter_mut() {
+            let viewer_room = room_of(participant);
+            let scoped_frame = room_frames.entry(viewer_room).or_insert_with(|| {
+                Arc::new(frame.filtered(|object| {
+                    match object.owner {
+                        0 => object_rooms
+                            .get(&object.object_id)
+                            .is_none_or(|room_id| Some(*room_id) == viewer_room),
+                        owner => room_of(owner) == viewer_room,
+                    }
+                }))
+            });
             // The adaptive controller owns the per-client budget + coarse send
             // rate (design §6.5); an optional hub-level hard cap tightens it.
             let adaptive_budget = client.congestion.budget();
@@ -920,11 +967,13 @@ impl TransformHub {
                 (b, cap) => b.min(cap),
             };
             let send_rate = client.congestion.send_rate_hz();
-            let Some(snapshot) =
-                client
-                    .builder
-                    .build(&frame, participant, client.viewer_pos, budget, send_rate)
-            else {
+            let Some(snapshot) = client.builder.build(
+                scoped_frame,
+                participant,
+                client.viewer_pos,
+                budget,
+                send_rate,
+            ) else {
                 continue;
             };
             let encoded = if client.v2_clock {
@@ -1016,6 +1065,33 @@ mod tests {
         // The reply decodes to the server's negotiation.
         let hello = Hello::decode(&reply.body).expect("hello decodes");
         assert_eq!(hello, TransformHubConfig::default().hello);
+    }
+
+    #[test]
+    fn scoped_snapshot_matches_legacy_output_for_single_room() {
+        let legacy = hub();
+        let scoped = hub();
+        for hub in [&legacy, &scoped] {
+            let _ = hub.handle_hello(1);
+            let _ = hub.handle_hello(2);
+            hub.spawn_server_simulated(1, TransformState::at([10.0, 0.0, 0.0]));
+            hub.spawn_server_simulated(2, TransformState::at([20.0, 0.0, 0.0]));
+            let _ = hub.assign_owner(1, 1);
+            let _ = hub.assign_owner(2, 2);
+            hub.sim_tick();
+        }
+
+        let mut legacy_outbound = legacy.snapshot_tick();
+        let mut scoped_outbound = scoped.snapshot_tick_scoped(|_| Some(7));
+        legacy_outbound.sort_by_key(|out| out.participant);
+        scoped_outbound.sort_by_key(|out| out.participant);
+
+        assert_eq!(scoped_outbound.len(), legacy_outbound.len());
+        for (scoped, legacy) in scoped_outbound.iter().zip(&legacy_outbound) {
+            assert_eq!(scoped.participant, legacy.participant);
+            assert_eq!(scoped.kind, legacy.kind);
+            assert_eq!(scoped.body, legacy.body);
+        }
     }
 
     #[test]

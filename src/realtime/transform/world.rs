@@ -85,6 +85,26 @@ impl Frame {
     pub fn object(&self, id: ObjectId) -> Option<&FrameObject> {
         self.objects.iter().find(|o| o.object_id == id)
     }
+
+    /// Return a frame containing only objects accepted by `retain`. Its interest
+    /// grid is rebuilt from that same subset, preserving AOI coherence.
+    #[must_use]
+    pub(crate) fn filtered(&self, mut retain: impl FnMut(&FrameObject) -> bool) -> Self {
+        let mut grid = self.grid.clone();
+        let mut objects = Vec::with_capacity(self.objects.len());
+        for object in &self.objects {
+            if retain(object) {
+                objects.push(*object);
+            } else {
+                grid.remove(u64::from(object.object_id));
+            }
+        }
+        Self {
+            tick: self.tick,
+            objects,
+            grid,
+        }
+    }
 }
 
 /// The authoritative transform world: the set of [`TransformAuthority`] plus the

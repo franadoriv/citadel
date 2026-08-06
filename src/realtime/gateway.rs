@@ -2259,6 +2259,12 @@ pub struct Handshake {
 ///
 /// [`new`]: Gateway::new
 /// [`with_metrics`]: Gateway::with_metrics
+#[derive(Debug, Clone, Copy)]
+struct NpcEntry {
+    archetype_id: u16,
+    room_id: Option<RoomId>,
+}
+
 pub struct Gateway {
     registry: SessionRegistry,
     ids: ParticipantIdGen,
@@ -2279,10 +2285,11 @@ pub struct Gateway {
     /// Server-owned room membership (, Phase A). Always present: the
     /// gateway routes `KIND_ROOM_*` through it (create/join/leave/map-ready).
     rooms: RoomRegistry,
-    /// Server-owned networked actors (NPCs, ): object id -> archetype id.
+    /// Server-owned networked actors (NPCs, ): object id -> archetype and
+    /// optional authoritative room.
     /// Populated by the Lua `spawn_actor` command; used to spawn them for a client
     /// that announces presence (so late joiners see existing NPCs).
-    npcs: Mutex<HashMap<u32, u16>>,
+    npcs: Mutex<HashMap<u32, NpcEntry>>,
     /// Loaded `.map` level geometry. A room's `map` name resolves
     /// against this catalog on create; empty when no maps are cooked/loaded.
     maps: Arc<MapCatalog>,
@@ -5440,10 +5447,16 @@ impl Gateway {
                     .into_iter()
                     .filter(|s| self.same_room(sender, ParticipantId::from_raw(s.owner)))
                     .collect();
-                // Add server-owned NPCs (; MVP: global) so a late joiner
-                // instantiates the NPCs already walking the world.
+                // Add visible server-owned NPCs so a late joiner instantiates
+                // its room's actors without receiving another match's state.
                 if let Ok(npcs) = self.npcs.lock() {
-                    for (&object_id, &archetype_id) in npcs.iter() {
+                    for (&object_id, npc) in npcs.iter() {
+                        if npc
+                            .room_id
+                            .is_some_and(|room_id| self.rooms.room_of(sender) != Some(room_id))
+                        {
+                            continue;
+                        }
                         let transform = self
                             .transform
                             .as_ref()
@@ -5456,7 +5469,7 @@ impl Gateway {
                             .unwrap_or_else(citadel_wire::na::NaTransform::identity);
                         batch_spawns.push(citadel_wire::na::NaSpawn {
                             object_id,
-                            archetype_id,
+                            archetype_id: npc.archetype_id,
                             owner: 0,
                             transform,
                         });
@@ -5927,7 +5940,9 @@ impl Gateway {
             return 0;
         };
         let mut delivered = 0;
-        for out in hub.snapshot_tick() {
+        for out in hub.snapshot_tick_scoped(|participant| {
+            self.rooms.room_of(ParticipantId::from_raw(participant))
+        }) {
             let outbound = Outbound::new(
                 if out.unreliable {
                     Delivery::Unreliable
@@ -6051,7 +6066,8 @@ impl Gateway {
                     archetype,
                     position,
                 } => {
-                    delivered_total += self.spawn_server_actor(object_id, archetype, position);
+                    delivered_total +=
+                        self.spawn_server_actor(object_id, archetype, position, room_id);
                 }
                 OutboundCommand::MoveActor {
                     object_id,
@@ -6115,12 +6131,19 @@ impl Gateway {
     }
 
     /// Spawn a server-owned NPC: place it in the transform world, remember its
-    /// archetype, and fan out an `NA_SPAWN` (owner `0` = server) to every client so
-    /// each instantiates the proxy. Movement then flows through the snapshot path.
-    fn spawn_server_actor(&self, object_id: u32, archetype: u16, position: [f32; 3]) -> usize {
+    /// room scope, and fan out an `NA_SPAWN` (owner `0` = server) to clients in
+    /// that scope. Movement then flows through the snapshot path.
+    fn spawn_server_actor(
+        &self,
+        object_id: u32,
+        archetype: u16,
+        position: [f32; 3],
+        room_id: Option<RoomId>,
+    ) -> usize {
         let Some(hub) = &self.transform else {
             return 0;
         };
+        hub.set_object_room(object_id, room_id);
         hub.set_transform(
             object_id,
             crate::realtime::transform::TransformState {
@@ -6130,7 +6153,13 @@ impl Gateway {
             },
         );
         if let Ok(mut npcs) = self.npcs.lock() {
-            npcs.insert(object_id, archetype);
+            npcs.insert(
+                object_id,
+                NpcEntry {
+                    archetype_id: archetype,
+                    room_id,
+                },
+            );
         }
         let spawn = citadel_wire::na::NaSpawn {
             object_id,
@@ -6143,21 +6172,36 @@ impl Gateway {
             },
         };
         let outbound = Outbound::reliable(Envelope::new(KIND_NA_SPAWN, spawn.encode()));
-        self.registry.broadcast_all(&outbound)
+        match room_id {
+            Some(room_id) => {
+                self.registry
+                    .broadcast_members(&self.rooms.members(room_id), None, &outbound)
+            }
+            None => self.registry.broadcast_all(&outbound),
+        }
     }
 
     /// Despawn a server-owned NPC: drop it from the world + registry and fan out an
     /// `NA_DESPAWN` to every client.
     fn despawn_server_actor(&self, object_id: u32) -> usize {
-        if let Ok(mut npcs) = self.npcs.lock() {
-            npcs.remove(&object_id);
-        }
+        let room_id = self
+            .npcs
+            .lock()
+            .ok()
+            .and_then(|mut npcs| npcs.remove(&object_id))
+            .and_then(|npc| npc.room_id);
         if let Some(hub) = &self.transform {
             hub.despawn(object_id);
         }
         let body = citadel_wire::na::NaDespawn { object_id }.encode();
         let outbound = Outbound::reliable(Envelope::new(KIND_NA_DESPAWN, body));
-        self.registry.broadcast_all(&outbound)
+        match room_id {
+            Some(room_id) => {
+                self.registry
+                    .broadcast_members(&self.rooms.members(room_id), None, &outbound)
+            }
+            None => self.registry.broadcast_all(&outbound),
+        }
     }
 }
 
@@ -6677,6 +6721,141 @@ mod transform_tests {
         let _ = rc.recv().await; // C self spawn
         let batch_c = NaSpawnBatch::decode(&rc.recv().await.unwrap().envelope.body).unwrap();
         assert!(batch_c.spawns.is_empty(), "C sees nobody (different room)");
+    }
+
+    #[tokio::test]
+    async fn transform_snapshots_are_scoped_to_each_room() {
+        use citadel_wire::na::{NaPresence, NaTransform};
+        use citadel_wire::room::RoomCreate;
+
+        let (gw, hub) = gateway_with_hub();
+        let presence = |position| {
+            Envelope::new(
+                KIND_NA_PRESENCE,
+                NaPresence {
+                    archetype_id: 0,
+                    transform: NaTransform {
+                        position,
+                        ..NaTransform::identity()
+                    },
+                }
+                .encode(),
+            )
+        };
+
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"R1".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let _ = ra.recv().await.expect("A room joined");
+        gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = ra.recv().await.expect("A hello");
+        gw.handle_inbound(a, &presence([10.0, 0.0, 0.0]));
+        let _ = ra.recv().await.expect("A self spawn");
+        let _ = ra.recv().await.expect("A spawn batch");
+
+        let (b, mut rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"R2".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let _ = rb.recv().await.expect("B room joined");
+        gw.handle_inbound(b, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = rb.recv().await.expect("B hello");
+        gw.handle_inbound(b, &presence([20.0, 0.0, 0.0]));
+        let _ = rb.recv().await.expect("B self spawn");
+        let _ = rb.recv().await.expect("B spawn batch");
+
+        assert_eq!(gw.transform_tick(), 2, "one snapshot per room member");
+        let codec = *hub.codec();
+        let mut view_a = RemoteWorldView::new(codec, 60, 20);
+        let mut view_b = RemoteWorldView::new(codec, 60, 20);
+        assert!(view_a.apply_datagram(&ra.recv().await.expect("A snapshot").envelope.body));
+        assert!(view_b.apply_datagram(&rb.recv().await.expect("B snapshot").envelope.body));
+
+        assert!(view_a.object(1).is_some(), "A receives A's object");
+        assert!(view_a.object(2).is_none(), "A must not receive B's object");
+        assert!(view_b.object(1).is_none(), "B must not receive A's object");
+        assert!(view_b.object(2).is_some(), "B receives B's object");
+    }
+
+    #[tokio::test]
+    async fn transform_snapshots_keep_same_room_objects_visible() {
+        use citadel_wire::na::{NaPresence, NaTransform};
+        use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined};
+
+        let (gw, hub) = gateway_with_hub();
+        let presence = |position| {
+            Envelope::new(
+                KIND_NA_PRESENCE,
+                NaPresence {
+                    archetype_id: 0,
+                    transform: NaTransform {
+                        position,
+                        ..NaTransform::identity()
+                    },
+                }
+                .encode(),
+            )
+        };
+
+        let (a, mut ra) = register(&gw);
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"R1".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&ra.recv().await.expect("A room joined").envelope.body)
+            .expect("room joined decodes")
+            .room_id;
+        gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = ra.recv().await.expect("A hello");
+        gw.handle_inbound(a, &presence([10.0, 0.0, 0.0]));
+        let _ = ra.recv().await.expect("A self spawn");
+        let _ = ra.recv().await.expect("A spawn batch");
+
+        let (b, mut rb) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+        );
+        let _ = rb.recv().await.expect("B room joined");
+        gw.handle_inbound(b, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = rb.recv().await.expect("B hello");
+        gw.handle_inbound(b, &presence([20.0, 0.0, 0.0]));
+        let _ = rb.recv().await.expect("B self spawn");
+        let _ = rb.recv().await.expect("B spawn batch");
+        let _ = ra.recv().await.expect("A learns B's spawn");
+
+        assert_eq!(gw.transform_tick(), 2, "one snapshot per room member");
+        let codec = *hub.codec();
+        let mut view_a = RemoteWorldView::new(codec, 60, 20);
+        let mut view_b = RemoteWorldView::new(codec, 60, 20);
+        assert!(view_a.apply_datagram(&ra.recv().await.expect("A snapshot").envelope.body));
+        assert!(view_b.apply_datagram(&rb.recv().await.expect("B snapshot").envelope.body));
+
+        for view in [&view_a, &view_b] {
+            assert!(view.object(1).is_some(), "same-room A object is visible");
+            assert!(view.object(2).is_some(), "same-room B object is visible");
+        }
     }
 
     #[tokio::test]
