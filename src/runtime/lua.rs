@@ -2062,7 +2062,12 @@ fn parse_input_decision(value: Value) -> mlua::Result<(Decision, Option<Vec<u8>>
                     let reason_code = t.get::<Option<u16>>("reason_code")?.unwrap_or(0);
                     Ok((Decision::Reject { reason_code }, reply))
                 }
-                Some("correct") => Ok((Decision::Correct { correction: parse_correction(&t)? }, reply)),
+                Some("correct") => Ok((
+                    Decision::Correct {
+                        correction: parse_correction(&t)?,
+                    },
+                    reply,
+                )),
                 Some(other) => Err(mlua::Error::RuntimeError(format!(
                     "on_input returned an unknown decision {other:?}"
                 ))),
@@ -4113,7 +4118,10 @@ mod tests {
             answer.input_outcomes[0].decision,
             Decision::Reject { reason_code: 7 }
         );
-        assert_eq!(answer.input_outcomes[0].reply.as_deref(), Some(b"no".as_ref()));
+        assert_eq!(
+            answer.input_outcomes[0].reply.as_deref(),
+            Some(b"no".as_ref())
+        );
     }
 
     #[test]

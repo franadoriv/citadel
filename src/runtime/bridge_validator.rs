@@ -552,10 +552,19 @@ fn validate_correction(
 ) -> Result<(), BatchRejection> {
     let compatible = matches!(
         (&event.payload, correction),
-        (NormalizedPayload::TransformInput { .. }, Correction::Transform(_))
-            | (NormalizedPayload::ActorStateReport { .. }, Correction::Transform(_))
-            | (NormalizedPayload::ReplicatedVarWrite { .. }, Correction::ReplicatedVars { .. })
-            | (NormalizedPayload::SpawnRequest { .. }, Correction::Spawn { .. })
+        (
+            NormalizedPayload::TransformInput { .. },
+            Correction::Transform(_)
+        ) | (
+            NormalizedPayload::ActorStateReport { .. },
+            Correction::Transform(_)
+        ) | (
+            NormalizedPayload::ReplicatedVarWrite { .. },
+            Correction::ReplicatedVars { .. }
+        ) | (
+            NormalizedPayload::SpawnRequest { .. },
+            Correction::Spawn { .. }
+        )
     );
     if !compatible {
         return Err(BatchRejection::IncompatibleCorrection {
@@ -717,7 +726,11 @@ mod tests {
                 members: None,
                 objects: None,
                 out_of_bounds: Vec::new(),
-                capabilities: vec![Capability::Persist, Capability::Schedule, Capability::Physics],
+                capabilities: vec![
+                    Capability::Persist,
+                    Capability::Schedule,
+                    Capability::Physics,
+                ],
             }
         }
     }
@@ -782,7 +795,11 @@ mod tests {
         let batch = ledger.issue(vec![input_draft(1001, 7)], 100);
         let answer = accept_all(&batch);
         let validated = ledger
-            .validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer)
+            .validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer,
+            )
             .expect("well-formed batch accepted");
         assert_eq!(validated.outcomes.len(), 1);
         assert_eq!(validated.batch_id, batch.batch_id);
@@ -797,12 +814,20 @@ mod tests {
         let mut answer = accept_all(&batch);
         answer.protocol_version = GS_BRIDGE_PROTOCOL_VERSION + 1;
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::UnsupportedProtocol {
                 got: GS_BRIDGE_PROTOCOL_VERSION + 1
             })
         );
-        assert_eq!(ledger.pending_len(), 1, "fencing failure leaves batch pending");
+        assert_eq!(
+            ledger.pending_len(),
+            1,
+            "fencing failure leaves batch pending"
+        );
     }
 
     // ---- B10 stale generation ----
@@ -814,7 +839,11 @@ mod tests {
         // A reload activates generation 6 and clears the pending batch.
         ledger.advance_generation(6);
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::StaleGeneration { got: 5, active: 6 })
         );
     }
@@ -827,7 +856,11 @@ mod tests {
         let mut answer = accept_all(&batch);
         answer.match_id = 2;
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::CrossMatch {
                 got: 2,
                 expected: 1
@@ -845,7 +878,11 @@ mod tests {
         // A clock reset bumps the epoch between issue and answer.
         ledger.set_clock_epoch(10);
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::CrossEpoch {
                 got: 9,
                 expected: 10
@@ -861,13 +898,23 @@ mod tests {
         let answer = accept_all(&batch);
         assert!(
             ledger
-                .validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer)
+                .validate(
+                    &TestContext::permissive(),
+                    &BridgeQuotas::default(),
+                    &answer
+                )
                 .is_ok()
         );
         // Second delivery of the same batch is rejected; effects never double.
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
-            Err(BatchRejection::UnknownOrDuplicateBatch { got: batch.batch_id })
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
+            Err(BatchRejection::UnknownOrDuplicateBatch {
+                got: batch.batch_id
+            })
         );
     }
 
@@ -890,7 +937,11 @@ mod tests {
             exclude: None,
         });
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::MissingOutcome {
                 event_id: batch.events[1].event_id
             })
@@ -909,7 +960,11 @@ mod tests {
             reply: None,
         });
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::ForeignEventId { event_id: 99_999 })
         );
     }
@@ -925,7 +980,11 @@ mod tests {
             reply: None,
         });
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::DuplicateOutcome {
                 event_id: batch.events[0].event_id
             })
@@ -988,7 +1047,11 @@ mod tests {
             exclude: None,
         });
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::ReservedKind { kind: 9 })
         );
     }
@@ -1160,7 +1223,11 @@ mod tests {
             reply: None,
         });
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::IncompatibleCorrection {
                 event_id: batch.events[0].event_id
             })
@@ -1180,7 +1247,11 @@ mod tests {
             reply: None,
         });
         let validated = ledger
-            .validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer)
+            .validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer,
+            )
             .expect("transform correction on input is compatible");
         assert!(matches!(
             validated.outcomes[0].decision,
@@ -1200,7 +1271,11 @@ mod tests {
             exclude: None,
         });
         let validated = ledger
-            .validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer)
+            .validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer,
+            )
             .expect("a tick-only batch may carry zero outcomes");
         assert!(validated.outcomes.is_empty());
         assert_eq!(validated.commands.len(), 1);
@@ -1213,7 +1288,11 @@ mod tests {
         let mut answer = accept_all(&batch);
         answer.tick = 99;
         assert_eq!(
-            ledger.validate(&TestContext::permissive(), &BridgeQuotas::default(), &answer),
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
             Err(BatchRejection::StaleTick {
                 got: 99,
                 expected: 100
