@@ -402,8 +402,11 @@ mod tests {
     enum Behavior {
         /// Answers every event with a `Send` carrying its running count.
         Echoes,
-        /// Blows its per-invocation budget on every quantum.
+        /// Blows its per-invocation budget on every quantum (event and tick).
         Overruns,
+        /// Blows its budget on every event but ticks healthily — a poison
+        /// message handler paired with a fine game loop (or no tick handler).
+        OverrunsOnEvent,
         /// Kills the whole engine on its first event.
         DiesOnEvent,
     }
@@ -428,13 +431,15 @@ mod tests {
                         unreliable: false,
                     }])
                 }
-                Behavior::Overruns => Err(MatchFault::Overrun),
+                Behavior::Overruns | Behavior::OverrunsOnEvent => Err(MatchFault::Overrun),
                 Behavior::DiesOnEvent => Err(MatchFault::EngineDead),
             }
         }
 
         fn tick(&mut self, _dt: Duration) -> Result<Vec<OutboundCommand>, MatchFault> {
             match self.behavior {
+                // `OverrunsOnEvent` ticks healthily: only its message handler
+                // is poison.
                 Behavior::Overruns => Err(MatchFault::Overrun),
                 _ => Ok(Vec::new()),
             }
@@ -635,6 +640,61 @@ mod tests {
             }
         )));
         assert_eq!(sent_bodies(&frames, 2), vec![b"1".to_vec(), b"2".to_vec()]);
+        assert!(engine_loop.is_healthy(), "the worker stays healthy");
+        // Late traffic for the closed match is dropped and counted.
+        assert!(engine_loop.handle_frame(event(1, 5, 9)).is_empty());
+        assert_eq!(engine_loop.rx_counters().unknown_match, 1);
+    }
+
+    #[test]
+    fn sparsely_fed_overrunning_match_is_culled_over_the_wire() {
+        // The over-the-wire analogue of the engine-host regression: match 1's
+        // handler overruns on every message, but the messages arrive spaced
+        // apart with an idle scheduling round between them (the network-spaced
+        // timing that defeated the old policy on WSL). Match 1 ticks healthily
+        // on its empty mailbox in those idle rounds, so the old single streak
+        // reset and the match was never closed. With the message-overrun
+        // streak tracked apart from the idle-tick streak, match 1 is still
+        // culled after `overrun_limit` overrunning messages.
+        let mut engine_loop = EngineLoop::new(
+            Box::new(FakeEngine {
+                behaviors: |match_id| {
+                    if match_id == 1 {
+                        Behavior::OverrunsOnEvent
+                    } else {
+                        Behavior::Echoes
+                    }
+                },
+            }),
+            MatchSchedulerPolicy::default().with_overrun_limit(2),
+            5,
+            "sha256:test",
+        );
+        engine_loop.handle_frame(open(1, 5, 1));
+        engine_loop.handle_frame(open(2, 5, 1));
+        let mut frames = Vec::new();
+        // Two poison messages to match 1, each followed by an idle round in
+        // which its mailbox is empty (the old policy reset the streak here).
+        for seq in 2..4 {
+            engine_loop.handle_frame(event(1, 5, seq));
+            frames.extend(engine_loop.run_round(Duration::from_millis(16))); // overruns
+            frames.extend(engine_loop.run_round(Duration::from_millis(16))); // idle tick
+        }
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                DataFrame::MatchClosed {
+                    header: FrameHeader {
+                        match_id: 1,
+                        epoch: 5,
+                        ..
+                    },
+                    reason: MatchCloseReason::ServerError,
+                    ..
+                }
+            )),
+            "match 1 must be culled despite the interleaved idle ticks: {frames:?}"
+        );
         assert!(engine_loop.is_healthy(), "the worker stays healthy");
         // Late traffic for the closed match is dropped and counted.
         assert!(engine_loop.handle_frame(event(1, 5, 9)).is_empty());
