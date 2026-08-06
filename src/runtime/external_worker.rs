@@ -1143,7 +1143,7 @@ mod tests {
                     "the body round-trips the exact batch"
                 );
             }
-            other => panic!("expected a MatchEvent, got {other:?}"),
+            other => unreachable!("expected a MatchEvent, got {other:?}"),
         }
     }
 
