@@ -25,8 +25,11 @@
 //! 1. **Per-invocation deadline** — enforced inside the engine (instruction
 //!    hooks / interrupt handlers), reused as the quantum bound.
 //! 2. **Per-match overrun policy** — a match whose invocations blow the
-//!    deadline repeatedly is closed with a server error; neighbors keep
-//!    running.
+//!    per-invocation deadline on a run of consecutive same-kind quanta is
+//!    closed with a server error; neighbors keep running. Message-handling
+//!    and idle-tick overruns are tracked as independent streaks (see
+//!    [`DEFAULT_MATCH_OVERRUN_LIMIT`]) so a healthy game-loop tick can never
+//!    mask a poison message handler, nor vice versa.
 //! 3. **Stuck-thread quarantine** — a context wedged inside a
 //!    non-reclaimable native call is quarantined (the match closes, the
 //!    thread is written off) and the host self-reports unhealthy after a
@@ -53,8 +56,23 @@ use crate::runtime::{OutboundCommand, Runtime};
 pub const DEFAULT_MATCH_MAILBOX_CAPACITY: usize = 1_024;
 
 /// PROVISIONAL overrun budget: how many consecutive blown per-invocation
-/// deadlines close a match. Replace once the distribution of consecutive
-/// deadline overruns produced by healthy production matches is measured.
+/// deadlines of a *single kind* close a match. Message-handling (event) and
+/// idle-tick overruns are counted as two independent streaks: a healthy
+/// quantum resets only its own kind's streak. This keeps the "consecutive"
+/// promise faithful across the round-robin scheduler, where a match receives
+/// one quantum per round — a queued event if present, otherwise an idle tick
+/// on its empty mailbox. Two consequences:
+///
+/// - A poison message handler is culled after `overrun_limit` overrunning
+///   messages *regardless of how far apart the messages arrive*: the idle
+///   ticks that run between them are healthy tick quanta and reset only the
+///   tick streak, never the event streak.
+/// - A healthy game-loop tick is credited as legitimate progress (it resets
+///   the tick streak, so a flaky tick handler that overruns occasionally is
+///   forgiven) yet can never mask an unhealthy message handler.
+///
+/// Replace once the distribution of consecutive deadline overruns produced by
+/// healthy production matches is measured.
 pub const DEFAULT_MATCH_OVERRUN_LIMIT: u32 = 3;
 
 /// PROVISIONAL quarantine budget (`K`): how many quarantined threads flip the
@@ -256,6 +274,15 @@ enum ExecutorRequest {
     Tick(Duration),
 }
 
+/// Which kind of quantum a round dispatched to a match. Determines which
+/// per-kind overrun streak a settled result touches: an event quantum handles
+/// real inbound work; a tick quantum runs the game loop on an empty mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuantumKind {
+    Event,
+    Tick,
+}
+
 /// A match's dedicated executor thread.
 ///
 /// Every quantum runs on this thread, never on the host's scheduler thread,
@@ -332,7 +359,24 @@ impl MatchExecutor {
 struct MatchSlot {
     executor: MatchExecutor,
     mailbox: VecDeque<MatchInvocation>,
-    consecutive_overruns: u32,
+    /// Consecutive overrunning message (event) quanta, reset by a healthy
+    /// event. Tracked apart from `consecutive_tick_overruns` so an idle tick
+    /// on an empty mailbox can never reset a poison message handler's streak.
+    consecutive_event_overruns: u32,
+    /// Consecutive overrunning idle-tick quanta, reset by a healthy tick.
+    /// Tracked apart from `consecutive_event_overruns` so a healthy message
+    /// can never reset a poison tick handler's streak.
+    consecutive_tick_overruns: u32,
+}
+
+impl MatchSlot {
+    /// The overrun streak this settled quantum's kind charges against.
+    fn overrun_streak(&mut self, kind: QuantumKind) -> &mut u32 {
+        match kind {
+            QuantumKind::Event => &mut self.consecutive_event_overruns,
+            QuantumKind::Tick => &mut self.consecutive_tick_overruns,
+        }
+    }
 }
 
 /// The worker's match table + fair scheduler + layered watchdog.
@@ -427,7 +471,8 @@ impl EngineHost {
                     MatchSlot {
                         executor: MatchExecutor::spawn(match_id, context),
                         mailbox: VecDeque::with_capacity(self.policy.mailbox_capacity()),
-                        consecutive_overruns: 0,
+                        consecutive_event_overruns: 0,
+                        consecutive_tick_overruns: 0,
                     },
                 );
                 self.order.push_back(match_id);
@@ -484,12 +529,12 @@ impl EngineHost {
             let Some(slot) = self.matches.get_mut(&match_id) else {
                 continue;
             };
-            let request = match slot.mailbox.pop_front() {
-                Some(invocation) => ExecutorRequest::Event(invocation),
-                None => ExecutorRequest::Tick(dt),
+            let (request, kind) = match slot.mailbox.pop_front() {
+                Some(invocation) => (ExecutorRequest::Event(invocation), QuantumKind::Event),
+                None => (ExecutorRequest::Tick(dt), QuantumKind::Tick),
             };
             let result = slot.executor.run(request, grace);
-            self.settle_quantum(match_id, result);
+            self.settle_quantum(match_id, kind, result);
             if self.engine_dead {
                 break;
             }
@@ -529,11 +574,20 @@ impl EngineHost {
         std::mem::take(&mut self.outputs)
     }
 
-    fn settle_quantum(&mut self, match_id: u64, result: Result<Vec<OutboundCommand>, MatchFault>) {
+    fn settle_quantum(
+        &mut self,
+        match_id: u64,
+        kind: QuantumKind,
+        result: Result<Vec<OutboundCommand>, MatchFault>,
+    ) {
         match result {
             Ok(commands) => {
                 if let Some(slot) = self.matches.get_mut(&match_id) {
-                    slot.consecutive_overruns = 0;
+                    // A healthy quantum resets only its own kind's streak: a
+                    // healthy game-loop tick credits tick progress but must
+                    // not mask a poison message handler, and a healthy message
+                    // must not mask a poison tick handler.
+                    *slot.overrun_streak(kind) = 0;
                 }
                 if !commands.is_empty() {
                     self.outputs
@@ -543,8 +597,9 @@ impl EngineHost {
             Err(MatchFault::Overrun) => {
                 self.counters.deadline_overruns += 1;
                 let close = if let Some(slot) = self.matches.get_mut(&match_id) {
-                    slot.consecutive_overruns = slot.consecutive_overruns.saturating_add(1);
-                    slot.consecutive_overruns >= self.policy.overrun_limit()
+                    let streak = slot.overrun_streak(kind);
+                    *streak = streak.saturating_add(1);
+                    *streak >= self.policy.overrun_limit()
                 } else {
                     false
                 };
@@ -749,8 +804,11 @@ mod tests {
     enum Behavior {
         /// Counts events and ticks; never faults.
         Counts,
-        /// Blows its per-invocation budget on every quantum.
+        /// Blows its per-invocation budget on every quantum (event and tick).
         Overruns,
+        /// Blows its budget on every event but ticks healthily — a poison
+        /// message handler paired with a fine game loop (or no tick handler).
+        OverrunsOnEvent,
         /// Wedges in a non-reclaimable call on its first event.
         Wedges,
         /// Kills the whole engine on its first event.
@@ -776,7 +834,7 @@ mod tests {
             self.stats.events.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
                 Behavior::Counts => Ok(Vec::new()),
-                Behavior::Overruns => Err(MatchFault::Overrun),
+                Behavior::Overruns | Behavior::OverrunsOnEvent => Err(MatchFault::Overrun),
                 Behavior::Wedges => Err(MatchFault::Wedged),
                 Behavior::DiesOnEvent => Err(MatchFault::EngineDead),
             }
@@ -785,6 +843,8 @@ mod tests {
         fn tick(&mut self, _dt: Duration) -> Result<Vec<OutboundCommand>, MatchFault> {
             self.stats.ticks.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
+                // `OverrunsOnEvent` ticks healthily: only its message handler
+                // is poison.
                 Behavior::Overruns => Err(MatchFault::Overrun),
                 _ => Ok(Vec::new()),
             }
@@ -904,6 +964,66 @@ mod tests {
         );
         assert_eq!(host.counters().deadline_overruns, 3);
         assert_eq!(b.ticks.load(Ordering::SeqCst), 6, "B keeps ticking");
+        assert!(host.is_healthy(), "the worker stays Ready");
+    }
+
+    #[test]
+    fn sparsely_fed_overrunning_match_is_culled_despite_idle_ticks() {
+        // The robustness gap the per-kind streak closes: match A's *message*
+        // handler blows the deadline on every message, but its messages arrive
+        // spaced further apart than the tick cadence, so idle-tick quanta run
+        // on its empty mailbox between messages. A ticks healthily (only its
+        // message handler is poison), so under the old single-streak policy
+        // each idle tick reset the streak and A escaped the overrun policy
+        // forever while burning a full deadline on every message. With the
+        // event streak tracked apart from the tick streak, A is culled after
+        // exactly `overrun_limit` overrunning messages regardless of the idle
+        // ticks interleaved between them.
+        let engine = FakeEngine::new("fake")
+            .with_match(1, Behavior::OverrunsOnEvent)
+            .with_match(2, Behavior::Counts);
+        let a = engine.stats(1);
+        let b = engine.stats(2);
+        let mut host = EngineHost::new(
+            Box::new(engine),
+            MatchSchedulerPolicy::default().with_overrun_limit(3),
+        );
+        host.open_match(1).expect("open A");
+        host.open_match(2).expect("open B");
+        // Three poison messages to A, each followed by two idle rounds: A's
+        // mailbox is empty in those rounds, so it takes a healthy idle tick
+        // (which used to reset its streak) while B keeps ticking.
+        for _ in 0..3 {
+            assert_eq!(
+                host.enqueue_event(1, invocation(1)),
+                EnqueueOutcome::Accepted
+            );
+            host.run_round(Duration::from_millis(16)); // message quantum: overruns
+            host.run_round(Duration::from_millis(16)); // idle tick on empty mailbox
+            host.run_round(Duration::from_millis(16)); // idle tick on empty mailbox
+        }
+        assert_eq!(
+            host.live_match_ids(),
+            vec![2],
+            "A must be culled after 3 overrunning messages, not saved by idle ticks"
+        );
+        assert!(
+            host.drain_outputs().contains(&HostOutput::Closed {
+                match_id: 1,
+                reason: MatchCloseReason::ServerError,
+            }),
+            "A closes as a server error once its message-overrun streak fills"
+        );
+        assert_eq!(
+            a.events.load(Ordering::SeqCst),
+            3,
+            "A overran exactly its three messages"
+        );
+        assert_eq!(host.counters().deadline_overruns, 3);
+        assert!(
+            b.ticks.load(Ordering::SeqCst) >= 6,
+            "B keeps ticking through every round"
+        );
         assert!(host.is_healthy(), "the worker stays Ready");
     }
 
