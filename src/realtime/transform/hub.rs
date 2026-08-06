@@ -287,6 +287,15 @@ impl TransformHub {
             .and_then(|g| g.world.get_transform(id))
     }
 
+    /// Whether an object id is already occupied in the shared transform world.
+    #[must_use]
+    pub fn contains_object(&self, id: ObjectId) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|g| g.world.get_transform(id).is_some())
+    }
+
     /// Select the collision mesh for physics bodies in the active transform
     /// world. A BVH is built once per map key and then reused for later
     /// selections; `None` keeps bodies in free-fall mode.

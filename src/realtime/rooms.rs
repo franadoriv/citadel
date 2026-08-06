@@ -366,6 +366,32 @@ impl RoomRegistry {
         (g.membership.get(&participant).copied() == expected_room).then(f)
     }
 
+    /// Run `f` only while both participants remain in the same room scope.
+    /// Roomless participants share the legacy relay-compatible scope. The check
+    /// and `f` are one membership-lock critical section, so a move cannot turn
+    /// a validated cross-participant delivery into a stale-room enqueue.
+    pub fn while_same_room<R>(
+        &self,
+        first: ParticipantId,
+        second: ParticipantId,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let g = self.lock();
+        (g.membership.get(&first) == g.membership.get(&second)).then(f)
+    }
+
+    /// Run `f` while `room_id` remains live and expose its current local members.
+    /// This holds the membership lock through nonblocking session queue writes,
+    /// making a room-scoped fan-out atomic with respect to member moves.
+    pub fn while_members_in<R>(
+        &self,
+        room_id: RoomId,
+        f: impl FnOnce(&HashSet<ParticipantId>) -> R,
+    ) -> Option<R> {
+        let g = self.lock();
+        g.rooms.get(&room_id).map(|room| f(&room.members))
+    }
+
     /// The current members of a room (empty if it does not exist).
     #[must_use]
     pub fn members(&self, room_id: RoomId) -> Vec<ParticipantId> {

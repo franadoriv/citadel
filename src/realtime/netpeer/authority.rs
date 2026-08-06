@@ -247,6 +247,10 @@ pub struct RepVetoContext<'a> {
 pub struct RepOutbound {
     /// Target participant (raw id).
     pub participant: u64,
+    /// The replicated object carried by this frame. Schema-table frames carry
+    /// `None`; every `KIND_REP_DELTA` carries its authoritative object id so
+    /// the gateway can apply room visibility before client delivery.
+    pub object_id: Option<u32>,
     /// Envelope kind (`KIND_REP_DELTA`).
     pub kind: u16,
     /// Server-encoded body (never the client's bytes).
@@ -610,6 +614,7 @@ impl RepAuthority {
         };
         let mut out = vec![RepOutbound {
             participant: conn,
+            object_id: None,
             kind: KIND_REP_SCHEMA,
             body: schema_body,
             reliable: true,
@@ -646,6 +651,7 @@ impl RepAuthority {
             {
                 out.push(RepOutbound {
                     participant: conn,
+                    object_id: Some(object_id),
                     kind: KIND_REP_DELTA,
                     body,
                     reliable: true,
@@ -809,6 +815,17 @@ impl RepAuthority {
         g.objects
             .get(&object_id)
             .and_then(|o| o.authoritative.scalars.get(&field_id).cloned())
+    }
+
+    /// The trusted room/match scope and optional owning participant for an
+    /// authoritative object. The gateway uses this metadata only to fence
+    /// client-facing bootstrap delivery; untrusted clients cannot query it.
+    #[must_use]
+    pub fn object_scope(&self, object_id: u32) -> Option<(u64, Option<u64>)> {
+        let g = self.inner.lock().ok()?;
+        g.objects
+            .get(&object_id)
+            .map(|object| (object.match_id, object.owner))
     }
 
     /// Snapshot NetworkPeer object and fan-out telemetry. This samples the maps
@@ -1304,6 +1321,7 @@ impl RepAuthority {
                         }
                         out.push(RepOutbound {
                             participant: peer,
+                            object_id: Some(v.object_id),
                             kind: KIND_REP_DELTA,
                             body,
                             reliable: true,
@@ -1354,6 +1372,7 @@ impl RepAuthority {
                 }
                 out.push(RepOutbound {
                     participant: v.conn,
+                    object_id: Some(v.object_id),
                     kind: KIND_REP_DELTA,
                     body,
                     reliable: true,

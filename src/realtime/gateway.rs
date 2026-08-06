@@ -3116,7 +3116,7 @@ impl Gateway {
             return;
         };
         rep.join_match(id.get(), match_id, is_guest);
-        self.send_rep_bootstrap(id);
+        let _ = self.send_rep_bootstrap(id);
     }
 
     /// Whether an embedded script runtime is driving message dispatch.
@@ -3334,7 +3334,7 @@ impl Gateway {
             if !rep.is_joined(id.get()) {
                 rep.join_match(id.get(), 0, !authenticated);
             }
-            self.send_rep_bootstrap(id);
+            let _ = self.send_rep_bootstrap(id);
         }
         self.dispatch_lifecycle(LifecycleHook::Join, id);
         unreliable
@@ -3348,19 +3348,38 @@ impl Gateway {
         self.registry.accepts_work(id)
     }
 
-    fn send_rep_bootstrap(&self, id: ParticipantId) {
+    fn send_rep_bootstrap(&self, id: ParticipantId) -> usize {
         let Some(rep) = &self.rep else {
-            return;
+            return 0;
         };
+        let mut sent = 0;
         for out in rep.bootstrap(id.get()) {
             let bytes = out.body.len() as u64;
-            if self.registry.send_to(
-                ParticipantId::from_raw(out.participant),
-                &Outbound::reliable(Envelope::new(out.kind, out.body)),
-            ) {
+            let outbound = Outbound::reliable(Envelope::new(out.kind, out.body));
+            let delivered = match out
+                .object_id
+                .and_then(|object_id| rep.object_scope(object_id))
+            {
+                Some((_, Some(owner))) => self
+                    .rooms
+                    .while_same_room(ParticipantId::from_raw(owner), id, || {
+                        self.registry.send_to(id, &outbound)
+                    })
+                    .unwrap_or(false),
+                Some((match_id, None)) => self
+                    .rooms
+                    .while_member_in(id, (match_id != 0).then_some(match_id), || {
+                        self.registry.send_to(id, &outbound)
+                    })
+                    .unwrap_or(false),
+                None => self.registry.send_to(id, &outbound),
+            };
+            if delivered {
                 self.metrics.record_message_out(bytes);
+                sent += 1;
             }
         }
+        sent
     }
 
     /// Unregister a session on disconnect and drop the `sessions_active` gauge.
@@ -5436,15 +5455,26 @@ impl Gateway {
                 // Room dimension: a newcomer only sees, and is seen by,
                 // participants in its own room (both roomless counts as one scope).
                 let mut sent = 0;
+                let sender_room = self.rooms.room_of(sender);
                 // 1) The owner's own spawn FIRST (tells it its object id).
-                if self.send_reliable(sender, KIND_NA_SPAWN, reg.self_spawn.encode()) {
+                if self.send_reliable_in_scope(
+                    sender,
+                    sender_room,
+                    KIND_NA_SPAWN,
+                    reg.self_spawn.encode(),
+                ) {
                     sent += 1;
                 }
                 // 2) A predicted owner receives its role only after its own spawn:
                 // the engine can now bind the native pawn to object_id before the
                 // existing input/prediction component sees the assignment.
                 if let Some(role) = reg.owner_role
-                    && self.send_reliable(sender, KIND_TSYNC_ROLE, role.encode())
+                    && self.send_reliable_in_scope(
+                        sender,
+                        sender_room,
+                        KIND_TSYNC_ROLE,
+                        role.encode(),
+                    )
                 {
                     sent += 1;
                 }
@@ -5487,17 +5517,24 @@ impl Gateway {
                 let batch = citadel_wire::na::NaSpawnBatch {
                     spawns: batch_spawns,
                 };
-                if self.send_reliable(sender, KIND_NA_SPAWN_BATCH, batch.encode()) {
+                if self.send_reliable_in_scope(
+                    sender,
+                    sender_room,
+                    KIND_NA_SPAWN_BATCH,
+                    batch.encode(),
+                ) {
                     sent += 1;
                 }
                 // 4) Tell every same-room participant to spawn the newcomer.
                 let peer_body = reg.peer_spawn.encode();
                 for peer in reg.peers {
                     let peer_id = ParticipantId::from_raw(peer);
-                    if !self.same_room(sender, peer_id) {
-                        continue;
-                    }
-                    if self.send_reliable(peer_id, KIND_NA_SPAWN, peer_body.clone()) {
+                    if self.send_reliable_same_room(
+                        sender,
+                        peer_id,
+                        KIND_NA_SPAWN,
+                        peer_body.clone(),
+                    ) {
                         sent += 1;
                     }
                 }
@@ -5525,6 +5562,64 @@ impl Gateway {
         } else {
             false
         }
+    }
+
+    fn send_reliable_in_scope(
+        &self,
+        target: ParticipantId,
+        room_id: Option<RoomId>,
+        kind: u16,
+        body: Vec<u8>,
+    ) -> bool {
+        let outbound = Outbound::reliable(Envelope::new(kind, body));
+        let bytes = outbound.envelope.body.len() as u64;
+        let delivered = self
+            .rooms
+            .while_member_in(target, room_id, || self.registry.send_to(target, &outbound))
+            .unwrap_or(false);
+        if delivered {
+            self.metrics.record_message_out(bytes);
+        }
+        delivered
+    }
+
+    fn send_reliable_same_room(
+        &self,
+        source: ParticipantId,
+        target: ParticipantId,
+        kind: u16,
+        body: Vec<u8>,
+    ) -> bool {
+        let outbound = Outbound::reliable(Envelope::new(kind, body));
+        let bytes = outbound.envelope.body.len() as u64;
+        let delivered = self
+            .rooms
+            .while_same_room(source, target, || self.registry.send_to(target, &outbound))
+            .unwrap_or(false);
+        if delivered {
+            self.metrics.record_message_out(bytes);
+        }
+        delivered
+    }
+
+    /// Fan out one already-built frame while holding the room membership lock.
+    /// `SessionRegistry::send_to` is nonblocking, so this closes the move-versus-
+    /// enqueue race without waiting on transport I/O under the room lock.
+    fn send_to_room_members(
+        &self,
+        room_id: RoomId,
+        exclude: Option<ParticipantId>,
+        outbound: &Outbound,
+    ) -> usize {
+        self.rooms
+            .while_members_in(room_id, |members| {
+                members
+                    .iter()
+                    .filter(|&&member| Some(member) != exclude)
+                    .filter(|&&member| self.registry.send_to(member, outbound))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// The room registry (membership state). Exposed for tests/metrics.
@@ -5902,11 +5997,6 @@ impl Gateway {
             // the client-facing boundary: a delta proposed by a room member may
             // only cross that member's current RoomRegistry scope. Roomless
             // sessions intentionally remain one relay-compatible scope.
-            if out.kind == KIND_REP_DELTA
-                && !self.same_room(sender, ParticipantId::from_raw(out.participant))
-            {
-                continue;
-            }
             let outbound = Outbound::new(
                 if out.reliable {
                     Delivery::Reliable
@@ -5916,10 +6006,16 @@ impl Gateway {
                 Envelope::new(out.kind, out.body),
             );
             let out_bytes = outbound.envelope.body.len() as u64;
-            if self
-                .registry
-                .send_to(ParticipantId::from_raw(out.participant), &outbound)
-            {
+            let target = ParticipantId::from_raw(out.participant);
+            let is_delta = out.kind == KIND_REP_DELTA;
+            let accepted = if is_delta {
+                self.rooms
+                    .while_same_room(sender, target, || self.registry.send_to(target, &outbound))
+                    .unwrap_or(false)
+            } else {
+                self.registry.send_to(target, &outbound)
+            };
+            if accepted {
                 self.metrics.record_message_out(out_bytes);
                 delivered += 1;
             }
@@ -6058,11 +6154,7 @@ impl Gateway {
                         Outbound::new(delivery_for(unreliable), Envelope::new(kind, body));
                     let out_bytes = outbound.envelope.body.len() as u64;
                     let delivered = match room_id {
-                        Some(room_id) => self.registry.broadcast_members(
-                            &self.rooms.members(room_id),
-                            exclude,
-                            &outbound,
-                        ),
+                        Some(room_id) => self.send_to_room_members(room_id, exclude, &outbound),
                         None => match exclude {
                             Some(sender) => self.registry.broadcast_except(sender, &outbound),
                             None => self.registry.broadcast_all(&outbound),
@@ -6082,10 +6174,17 @@ impl Gateway {
                     let outbound =
                         Outbound::new(delivery_for(unreliable), Envelope::new(kind, body));
                     let out_bytes = outbound.envelope.body.len() as u64;
-                    if self
-                        .registry
-                        .send_to(ParticipantId::from_raw(session), &outbound)
-                    {
+                    let target = ParticipantId::from_raw(session);
+                    let delivered = match room_id {
+                        Some(room_id) => self
+                            .rooms
+                            .while_member_in(target, Some(room_id), || {
+                                self.registry.send_to(target, &outbound)
+                            })
+                            .unwrap_or(false),
+                        None => self.registry.send_to(target, &outbound),
+                    };
+                    if delivered {
                         self.metrics.record_message_out(out_bytes);
                         delivered_total += 1;
                     }
@@ -6191,7 +6290,7 @@ impl Gateway {
             } else {
                 let identity_conflicts = npcs.values().any(|npc| npc.object_id == object_id);
                 let actual_object_id = if room_id.is_some() || identity_conflicts {
-                    let Some(id) = self.allocate_scoped_actor_id(&npcs) else {
+                    let Some(id) = self.allocate_scoped_actor_id(&npcs, hub) else {
                         return 0;
                     };
                     id
@@ -6230,10 +6329,7 @@ impl Gateway {
         };
         let outbound = Outbound::reliable(Envelope::new(KIND_NA_SPAWN, spawn.encode()));
         match room_id {
-            Some(room_id) => {
-                self.registry
-                    .broadcast_members(&self.rooms.members(room_id), None, &outbound)
-            }
+            Some(room_id) => self.send_to_room_members(room_id, None, &outbound),
             None => self.registry.broadcast_all(&outbound),
         }
     }
@@ -6258,10 +6354,7 @@ impl Gateway {
         .encode();
         let outbound = Outbound::reliable(Envelope::new(KIND_NA_DESPAWN, body));
         match npc.room_id {
-            Some(room_id) => {
-                self.registry
-                    .broadcast_members(&self.rooms.members(room_id), None, &outbound)
-            }
+            Some(room_id) => self.send_to_room_members(room_id, None, &outbound),
             None => self.registry.broadcast_all(&outbound),
         }
     }
@@ -6270,10 +6363,10 @@ impl Gateway {
     /// Commands without a matching scoped actor are ignored rather than allowed
     /// to mutate a same-numbered actor belonging to another room.
     fn actor_object_id(&self, room_id: Option<RoomId>, script_object_id: u32) -> Option<u32> {
-        self.npcs
-            .lock()
-            .ok()
-            .and_then(|npcs| npcs.get(&(room_id, script_object_id)).map(|npc| npc.object_id))
+        self.npcs.lock().ok().and_then(|npcs| {
+            npcs.get(&(room_id, script_object_id))
+                .map(|npc| npc.object_id)
+        })
     }
 
     /// Resolve a command target without changing the legacy unscoped path for
@@ -6285,7 +6378,11 @@ impl Gateway {
             .or_else(|| room_id.is_none().then_some(script_object_id))
     }
 
-    fn allocate_scoped_actor_id(&self, npcs: &HashMap<NpcKey, NpcEntry>) -> Option<u32> {
+    fn allocate_scoped_actor_id(
+        &self,
+        npcs: &HashMap<NpcKey, NpcEntry>,
+        hub: &TransformHub,
+    ) -> Option<u32> {
         let mut next = self.next_scoped_actor_id.lock().ok()?;
         let first = *next;
         loop {
@@ -6295,7 +6392,9 @@ impl Gateway {
             } else {
                 candidate + 1
             };
-            if !npcs.values().any(|npc| npc.object_id == candidate) {
+            if !npcs.values().any(|npc| npc.object_id == candidate)
+                && !hub.contains_object(candidate)
+            {
                 return Some(candidate);
             }
             if *next == first {
@@ -6948,8 +7047,8 @@ mod transform_tests {
     #[tokio::test]
     async fn rep_delta_with_transform_fields_stays_in_the_sender_room() {
         use crate::realtime::netpeer::{
-            FieldAuthority, FieldBounds, RepAuthority, RepCondition, RepLayoutBuilder,
-            RepSnapshot, TypeTag,
+            FieldAuthority, FieldBounds, RepAuthority, RepCondition, RepLayoutBuilder, RepSnapshot,
+            TypeTag,
         };
         use citadel_wire::codec::{DEFAULT_WORLD_BOUNDS, QuatMode, VectorQuant, codec_id};
         use citadel_wire::netpeer::{DeltaBunch, FieldDelta, RepFieldCodec, RepSchema, RepValue};
@@ -7006,9 +7105,18 @@ mod transform_tests {
         let room_one = RoomJoined::decode(&ra.recv().await.expect("A room joined").envelope.body)
             .expect("room joined decodes")
             .room_id;
+        rep.spawn_object(701, 0, 91, Some(a.get()), false, RepSnapshot::new())
+            .expect("object spawns in the legacy replication scope");
 
         let (same_room, mut same_room_rx) = register_session(&gw);
-        let _ = same_room_rx.recv().await.expect("same-room schema bootstrap");
+        let _ = same_room_rx
+            .recv()
+            .await
+            .expect("same-room schema bootstrap");
+        assert!(
+            same_room_rx.try_recv().is_err(),
+            "a roomless registration cannot receive an existing room object's baseline"
+        );
         gw.handle_inbound(
             same_room,
             &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id: room_one }.encode()),
@@ -7016,7 +7124,14 @@ mod transform_tests {
         let _ = same_room_rx.recv().await.expect("same-room joined");
 
         let (other_room, mut other_room_rx) = register_session(&gw);
-        let _ = other_room_rx.recv().await.expect("other-room schema bootstrap");
+        let _ = other_room_rx
+            .recv()
+            .await
+            .expect("other-room schema bootstrap");
+        assert!(
+            other_room_rx.try_recv().is_err(),
+            "a future member of another room cannot receive an existing baseline"
+        );
         gw.handle_inbound(
             other_room,
             &Envelope::new(
@@ -7029,8 +7144,6 @@ mod transform_tests {
         );
         let _ = other_room_rx.recv().await.expect("other-room joined");
 
-        rep.spawn_object(701, 0, 91, Some(a.get()), false, RepSnapshot::new())
-            .expect("object spawns in the legacy replication scope");
         let mut delta = DeltaBunch::new(701, true, 1, 0);
         delta.set(0, FieldDelta::Value(RepValue::Vector3([12.0, 4.0, 1.0])));
         delta.set(1, FieldDelta::Value(RepValue::Quat([0.0, 0.0, 0.0, 1.0])));
