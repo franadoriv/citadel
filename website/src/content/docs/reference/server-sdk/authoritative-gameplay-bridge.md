@@ -242,3 +242,14 @@ mutates** — the match is closed match-locally with a requeue hint rather than
 applying a default. Per-batch effects are bounded by measure-first
 `BridgeQuotas` (command count, body bytes, reply bytes, recipients, persist and
 schedule ops).
+
+:::caution[Known limitation: transform snapshots are node-global]
+Authoritative *writes* are fenced per match, but the transform **snapshot** that
+fans out to clients is still node-global today: `snapshot_tick` reads one shared
+transform world with no per-room filter. Running two or more concurrent
+authoritative matches on a single node can therefore leak transform state across
+matches — a client in match A can receive snapshots of match B's objects
+(cross-match visibility). This is a known limitation, not a feature: per-room
+snapshot scoping is required before any multi-match-per-node authoritative
+deployment. Until it lands, run a single authoritative match per node.
+:::
