@@ -9,7 +9,7 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
@@ -28,14 +28,16 @@ use crate::runtime::outbound_http::{
 };
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::{
-    DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, OutboundCommand, PhysicsOptions,
-    RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
-    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
+    BridgeCommandSink, DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION,
+    NormalizedEventBatch, OutboundCommand, PhysicsOptions, RealtimeAfterOutcome,
+    RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime, RuntimeEvent,
+    RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
     RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
     RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
-    RuntimeSharedCacheHandle, StorageWriteInput, append_runtime_event_commands,
-    disabled_runtime_event_bus_handle, disabled_runtime_shared_cache_handle, runtime_event_bus,
-    runtime_shared_cache, set_runtime_event_bus, set_runtime_shared_cache,
+    RuntimeSharedCacheHandle, ScriptCommandBatch, StorageWriteInput, append_runtime_event_commands,
+    bridge_event_json, bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
+    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
+    script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
 use citadel_physics::{PhysicsConfig, Shape};
 
@@ -139,6 +141,7 @@ const JS_HOST_PRELUDE: &str = r#"
   let onRoomJoin = null;
   let beforeRealtime = null;
   let afterRealtime = null;
+  let onInput = null;
   let commands = [];
   let logs = [];
   let totalBytes = 0;
@@ -341,6 +344,9 @@ const JS_HOST_PRELUDE: &str = r#"
     },
     before_realtime(handler) {
       return singleRegistration((fn) => { beforeRealtime = fn; }, handler);
+    },
+    on_input(handler) {
+      return singleRegistration((fn) => { onInput = fn; }, handler);
     },
     after_realtime(handler) {
       return singleRegistration((fn) => { afterRealtime = fn; }, handler);
@@ -723,6 +729,41 @@ const JS_HOST_PRELUDE: &str = r#"
     return true;
   };
 
+  function __citadel_normalize_decision(ret) {
+    if (ret === undefined || ret === null || ret === true || ret === "accept") {
+      return { decision: "accept" };
+    }
+    if (ret === false || ret === "reject") {
+      return { decision: "reject", reason_code: 0 };
+    }
+    if (typeof ret === "object") {
+      const decision = ret.decision === undefined ? "accept" : String(ret.decision);
+      const out = { decision };
+      if (ret.reason_code !== undefined) out.reason_code = Number(ret.reason_code);
+      if (ret.reply !== undefined && ret.reply !== null) out.reply = String(ret.reply);
+      if (decision === "correct") {
+        if (!ret.transform) throw new TypeError("a correct decision requires a transform");
+        out.transform = ret.transform;
+      }
+      return out;
+    }
+    throw new TypeError("on_input must return undefined, a boolean, a string, or an object");
+  }
+
+  // Evaluate the authoritative-bridge per-input handler for one normalized
+  // event (a JSON string), returning its normalized decision as JSON, or null
+  // when no on_input handler is registered (fail-closed: the whole batch then
+  // produces no answer).
+  globalThis.__citadel_dispatch_input = function (eventJson) {
+    if (!onInput) return null;
+    const decision = __citadel_normalize_decision(onInput(JSON.parse(eventJson)));
+    return JSON.stringify(decision);
+  };
+
+  globalThis.__citadel_has_on_input = function () {
+    return onInput !== null;
+  };
+
   globalThis.__citadel_dispatch_lifecycle = function (hook, ctx) {
     const handler = hook === "on_join" ? onJoin : onLeave;
     if (!handler) {
@@ -939,6 +980,10 @@ pub struct JsRuntime {
     maps: Option<Arc<MapCatalog>>,
     /// Transform hub retained across hot reload for `citadel.physics_state`.
     transform_hub: Option<Arc<TransformHub>>,
+    /// Where this runtime's authoritative-bridge answers land (the gateway),
+    /// held weakly to avoid an `Arc` cycle. Lives on the runtime so it survives
+    /// a hot-reload's whole-context swap.
+    bridge_sink: Mutex<Option<Weak<dyn BridgeCommandSink>>>,
 }
 
 impl fmt::Debug for JsRuntime {
@@ -1045,6 +1090,7 @@ impl JsRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            bridge_sink: Mutex::new(None),
         }))
     }
 
@@ -1086,6 +1132,7 @@ impl JsRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            bridge_sink: Mutex::new(None),
         })
     }
 
@@ -1128,6 +1175,7 @@ impl JsRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            bridge_sink: Mutex::new(None),
         })
     }
 
@@ -1332,6 +1380,105 @@ impl JsRuntime {
             let body = caught(&ctx, TypedArray::<u8>::new_copy(ctx.clone(), body))?;
             caught(&ctx, func.call((u32::from(kind), js_ctx, body)))
         })
+    }
+
+    /// Attach the gateway's authoritative-bridge sink (weakly).
+    pub fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        *lock_mutex(&self.bridge_sink) = Some(sink);
+    }
+
+    fn bridge_sink(&self) -> Option<Arc<dyn BridgeCommandSink>> {
+        lock_mutex(&self.bridge_sink)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// Evaluate one delivered batch inline and deliver the fenced answer to the
+    /// attached sink. No answer (no `on_input` handler, or a fault) delivers
+    /// nothing — the fail-closed failure policy.
+    pub fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        let Some(answer) = self.evaluate_event_batch(&batch) else {
+            return;
+        };
+        if let Some(sink) = self.bridge_sink() {
+            sink.deliver_command_batch(answer);
+        }
+    }
+
+    /// Evaluate a normalized-event batch and build the script's fenced answer.
+    ///
+    /// Runs `citadel.on_input` once per event (via the JSON bridge) under the
+    /// same VM lock, deadline, and error/panic isolation as every other handler,
+    /// then maps the drained command sink to the batch-level [`ScriptCommand`]s.
+    /// Returns `None` — no answer, fail-closed — when no `on_input` handler is
+    /// registered or the invocation errors, times out, or panics.
+    pub fn evaluate_event_batch(&self, batch: &NormalizedEventBatch) -> Option<ScriptCommandBatch> {
+        let guard = self.lock_vm();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_with_js_deadline(&guard.runtime, self.budget, || {
+                guard.context.with(|ctx| {
+                    clear_commands(&ctx);
+                    set_realtime_interceptor_mode(&ctx, false)?;
+                    let globals = ctx.globals();
+                    let has_handler: Function =
+                        caught(&ctx, globals.get("__citadel_has_on_input"))?;
+                    let present: bool = caught(&ctx, has_handler.call(()))?;
+                    if !present {
+                        clear_commands(&ctx);
+                        return Ok(None);
+                    }
+                    let dispatch: Function = caught(&ctx, globals.get("__citadel_dispatch_input"))?;
+                    let mut outcomes = Vec::with_capacity(batch.events.len());
+                    for event in &batch.events {
+                        let event_json = bridge_event_json(batch, event);
+                        let decision_json: Option<String> =
+                            caught(&ctx, dispatch.call((event_json,)))?;
+                        let Some(decision_json) = decision_json else {
+                            // Handler vanished mid-batch: fail closed.
+                            clear_commands(&ctx);
+                            return Ok(None);
+                        };
+                        let outcome =
+                            bridge_input_outcome_from_json(event.event_id, &decision_json)?;
+                        outcomes.push(outcome);
+                    }
+                    let commands = take_commands(&ctx, &guard.source_label, "on_input")?;
+                    Ok(Some((outcomes, commands)))
+                })
+            })
+        }));
+        clear_vm_realtime_interceptor_mode(&guard);
+        match outcome {
+            Ok(Ok(Some((outcomes, commands)))) => {
+                let mut answer = ScriptCommandBatch::answering(batch);
+                answer.input_outcomes = outcomes;
+                answer.commands = commands
+                    .into_iter()
+                    .map(script_command_from_outbound)
+                    .collect();
+                Some(answer)
+            }
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "on_input",
+                    ?error,
+                    "javascript on_input failed; batch fails closed (no answer)"
+                );
+                clear_vm_commands(&guard);
+                None
+            }
+            Err(_) => {
+                tracing::error!(
+                    script = %guard.source_label,
+                    handler = "on_input",
+                    "javascript on_input panicked; batch fails closed (no answer)"
+                );
+                clear_vm_commands(&guard);
+                None
+            }
+        }
     }
 
     /// Run the optional before-realtime interceptor. A `false` result vetoes the
@@ -1903,6 +2050,14 @@ impl Runtime for JsRuntime {
         body: &[u8],
     ) -> RealtimeInterception {
         JsRuntime::before_realtime(self, sender, user_id, room_id, kind, body)
+    }
+
+    fn attach_bridge_sink(&self, sink: Weak<dyn BridgeCommandSink>) {
+        JsRuntime::attach_bridge_sink(self, sink);
+    }
+
+    fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
+        JsRuntime::deliver_event_batch(self, batch);
     }
 
     fn after_realtime(
@@ -3721,6 +3876,138 @@ mod tests {
 
     fn runtime(src: &str) -> JsRuntime {
         JsRuntime::from_source(src, "test.js", 100).expect("javascript runtime loads")
+    }
+
+    // ---- authoritative bridge: citadel.on_input parity ----
+
+    #[derive(Default)]
+    struct RecordingBridgeSink(Mutex<Vec<ScriptCommandBatch>>);
+
+    impl BridgeCommandSink for RecordingBridgeSink {
+        fn deliver_command_batch(&self, answer: ScriptCommandBatch) {
+            self.0.lock().unwrap().push(answer);
+        }
+    }
+
+    fn input_event(event_id: u64, object_id: u32) -> crate::runtime::NormalizedEvent {
+        crate::runtime::NormalizedEvent {
+            event_id,
+            participant: 1001,
+            user_id: None,
+            payload: crate::runtime::NormalizedPayload::TransformInput {
+                object_id,
+                ownership_epoch: 1,
+                input_seq: 1,
+                sim_tick: 1,
+                dt: 0.016,
+                move_velocity: [1.0, 0.0, 0.0],
+                payload: Vec::new(),
+                fire: None,
+            },
+        }
+    }
+
+    fn batch_with(events: Vec<crate::runtime::NormalizedEvent>) -> NormalizedEventBatch {
+        let mut batch = NormalizedEventBatch::new(5, 42, 9, 100, 1);
+        batch.events = events;
+        batch
+    }
+
+    #[test]
+    fn on_input_accepts_on_undefined_return() {
+        let rt = runtime("citadel.on_input((e) => undefined);");
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.input_outcomes.len(), 1);
+        assert_eq!(
+            answer.input_outcomes[0].decision,
+            crate::runtime::Decision::Accept
+        );
+        assert_eq!(answer.generation, 5);
+        assert_eq!(answer.batch_id, 1);
+    }
+
+    #[test]
+    fn on_input_reject_object_carries_reason_and_reply() {
+        let rt = runtime(
+            r#"citadel.on_input((e) => ({ decision: "reject", reason_code: 7, reply: "no" }));"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.input_outcomes[0].decision,
+            crate::runtime::Decision::Reject { reason_code: 7 }
+        );
+        assert_eq!(
+            answer.input_outcomes[0].reply.as_deref(),
+            Some(b"no".as_ref())
+        );
+    }
+
+    #[test]
+    fn on_input_correct_returns_a_transform_correction() {
+        let rt = runtime(
+            r#"citadel.on_input((e) => ({
+                decision: "correct",
+                transform: { position: [1, 2, 3], rotation: [0, 0, 0, 1], velocity: [4, 5, 6] },
+            }));"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        match &answer.input_outcomes[0].decision {
+            crate::runtime::Decision::Correct {
+                correction: crate::runtime::Correction::Transform(t),
+            } => {
+                assert_eq!(t.position, [1.0, 2.0, 3.0]);
+                assert_eq!(t.velocity, [4.0, 5.0, 6.0]);
+            }
+            other => panic!("expected a transform correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_input_broadcast_maps_to_a_match_broadcast_command() {
+        let rt = runtime(r#"citadel.on_input((e) => { citadel.broadcast(100, "hi", true); });"#);
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.commands.len(), 1);
+        assert_eq!(
+            answer.commands[0],
+            crate::runtime::ScriptCommand::BroadcastMatch {
+                kind: 100,
+                body: b"hi".to_vec(),
+                unreliable: true,
+                exclude: None,
+            }
+        );
+    }
+
+    #[test]
+    fn no_on_input_handler_fails_closed() {
+        let rt = runtime("citadel.on_message(1, (ctx, body) => {});");
+        let batch = batch_with(vec![input_event(1, 7)]);
+        assert!(rt.evaluate_event_batch(&batch).is_none());
+    }
+
+    #[test]
+    fn on_input_error_fails_the_whole_batch_closed() {
+        let rt = runtime(r#"citadel.on_input((e) => { throw new Error("boom"); });"#);
+        let batch = batch_with(vec![input_event(1, 7), input_event(2, 8)]);
+        assert!(rt.evaluate_event_batch(&batch).is_none());
+    }
+
+    #[test]
+    fn deliver_event_batch_reaches_the_attached_sink() {
+        let rt = runtime("citadel.on_input((e) => undefined);");
+        let sink = Arc::new(RecordingBridgeSink::default());
+        rt.attach_bridge_sink(Arc::downgrade(&sink) as Weak<dyn BridgeCommandSink>);
+        rt.deliver_event_batch(batch_with(vec![input_event(1, 7)]));
+        let got = sink.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].input_outcomes[0].decision,
+            crate::runtime::Decision::Accept
+        );
     }
 
     #[test]
