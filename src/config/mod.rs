@@ -884,6 +884,9 @@ pub struct RuntimeConfig {
     /// `hot_reload` is enabled. Defaults to 500ms. Ignored when `hot_reload` is
     /// off.
     pub hot_reload_poll_ms: u64,
+    /// Authoritative gameplay bridge quotas + capabilities. Applied only when
+    /// `require_script` is enabled (authoritative matches); ignored otherwise.
+    pub bridge: BridgeConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -905,6 +908,7 @@ impl Default for RuntimeConfig {
             tick_deadline_ms: None,
             hot_reload: false,
             hot_reload_poll_ms: 500,
+            bridge: BridgeConfig::default(),
         }
     }
 }
@@ -928,6 +932,56 @@ pub struct RuntimeCapabilitiesConfig {
     pub events: RuntimeEventsCapabilityConfig,
     /// Mutable shared runtime state is opt-in.
     pub shared_cache: SharedCacheCapabilityConfig,
+}
+
+/// Authoritative gameplay bridge quotas + capabilities (`[runtime.bridge]`).
+///
+/// Quota defaults are **PROVISIONAL** — measure-first values that mirror the
+/// existing per-invocation command-sink precedents (`MAX_OUTBOUND_COMMANDS`,
+/// the 1 MiB aggregate cap, `MAX_OUTBOUND_BODY_BYTES`); the bench harness fixes
+/// the real numbers. Every capability defaults **off** (opt-in), matching the
+/// runtime capability policy: a script may only emit Persist/Schedule/physics
+/// commands in an authoritative match when the operator grants the capability
+/// here. This is deployment-wide until the revision store declares capabilities
+/// per revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BridgeConfig {
+    /// Max script commands per batch.
+    pub max_commands: usize,
+    /// Max aggregate command body bytes per batch.
+    pub max_command_body_bytes: usize,
+    /// Max bytes for one input-outcome reply.
+    pub max_reply_bytes: usize,
+    /// Max recipients in one multicast.
+    pub max_recipients: usize,
+    /// Max persistence ops per batch.
+    pub max_persist_ops: usize,
+    /// Max schedule ops per batch.
+    pub max_schedule_ops: usize,
+    /// Permit `Persist` commands (storage writes).
+    pub allow_persist: bool,
+    /// Permit `Schedule` commands (deferred re-entry).
+    pub allow_schedule: bool,
+    /// Permit kinematic-body commands (`SetPhysics`/`ApplyImpulse`/`SetMoveIntent`).
+    pub allow_physics: bool,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        // PROVISIONAL — measure first; these mirror `BridgeQuotas::default()`.
+        Self {
+            max_commands: 1_024,
+            max_command_body_bytes: 1 << 20,
+            max_reply_bytes: 64 << 10,
+            max_recipients: 1_024,
+            max_persist_ops: 64,
+            max_schedule_ops: 64,
+            allow_persist: false,
+            allow_schedule: false,
+            allow_physics: false,
+        }
+    }
 }
 
 /// Quotas for the existing outbound HTTP capability.
@@ -2666,6 +2720,33 @@ mod tests {
         assert_eq!(config.runtime.tier, RuntimeTier::Trusted);
         assert_eq!(config.runtime.scripts_dir, "/srv/game");
         assert_eq!(config.runtime.deadline_ms, 250);
+    }
+
+    #[test]
+    fn bridge_config_parses_and_defaults_capabilities_off() {
+        // Defaults: capabilities off (opt-in), quotas mirror BridgeQuotas.
+        let defaults = BridgeConfig::default();
+        assert!(!defaults.allow_persist);
+        assert!(!defaults.allow_schedule);
+        assert!(!defaults.allow_physics);
+        assert_eq!(defaults.max_commands, 1_024);
+
+        let toml_src = r#"
+            [runtime.bridge]
+            max_commands = 256
+            allow_physics = true
+        "#;
+        let config: Config = toml::from_str(toml_src).expect("bridge toml parses");
+        assert_eq!(config.runtime.bridge.max_commands, 256);
+        assert!(config.runtime.bridge.allow_physics);
+        assert!(
+            !config.runtime.bridge.allow_persist,
+            "unlisted keys keep the off default"
+        );
+        assert_eq!(
+            config.runtime.bridge.max_reply_bytes,
+            BridgeConfig::default().max_reply_bytes
+        );
     }
 
     #[test]

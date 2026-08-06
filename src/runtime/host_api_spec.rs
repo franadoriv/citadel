@@ -99,6 +99,14 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         since: "unreleased",
     },
     HostApiFn {
+        name: "on_input",
+        category: HostApiCategory::RealtimeHook,
+        params: &["handler:fn(event)->outcome"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
         name: "on_join",
         category: HostApiCategory::LifecycleHook,
         params: &["handler:fn(ctx)"],
@@ -236,6 +244,19 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "{grounded:bool,position:[f32;3],velocity:[f32;3]}?",
         status: HostApiStatus::Shipped,
         since: "pre-1.0",
+    },
+    HostApiFn {
+        name: "rewind_query",
+        category: HostApiCategory::Action,
+        params: &[
+            "shooter:u64",
+            "origin:[f32;3]",
+            "direction:[f32;3]",
+            "tick:u64",
+        ],
+        returns: "{hits:[{object_id:u32,participant:u64,point:[f32;3],distance:f32}]}",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
     },
     HostApiFn {
         name: "map_info",

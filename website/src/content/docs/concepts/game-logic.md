@@ -8,7 +8,8 @@ the final word. A player can ask to swing a sword. Your server script checks the
 range, cooldown, permissions, and current monster HP before it changes the
 shared world.
 
-That is Citadel's central game-logic model.
+That is Citadel's central game-logic model — the rules you write are
+**[GameScript](/gamescript/)**. This page is the deeper mental model behind it.
 
 ![Lua, Python, and JavaScript game logic use one host API before reaching the Citadel core, with a future hardened tier separated by a boundary.](../../../assets/docs/runtime-guild-shared-contract.svg)
 
@@ -54,6 +55,24 @@ The exact name, argument shape, return value, and language caveats live in the
 [Python](/reference/server-sdk/python-runtime/), and
 [JavaScript](/reference/server-sdk/js-runtime/) reference pages.
 
+## Authoritative gameplay: the input bridge
+
+Hooks like `on_message` cover the custom game envelopes you invent. **Protected
+gameplay** — transform-sync input, owner state, script-marked replicated
+variables, and avatar spawns — takes a stronger path. In an *authoritative match*
+(a node with `runtime.require_script = true` whose room is bound to a loaded
+script), each of those client actions is decoded and ownership-verified by Rust,
+then delivered to your `citadel.on_input` handler as a **normalized event**. Your
+script answers **accept**, **reject**, or **correct**, and only then does Citadel
+change state or replicate to peers. Nothing protected changes before your script
+decides, and the answer is fenced and applied all-or-nothing.
+
+See [Authoritative gameplay bridge](/reference/server-sdk/authoritative-gameplay-bridge/)
+for the event shapes, the fire/hit `rewind_query` host API, and the fencing rules.
+
+When `require_script = false` (the default), there is no bridge: the built-in relay
+applies owner state directly for fast prototyping. Choose authority when it counts.
+
 ## Actions change the world
 
 Handlers can broadcast or send messages, log, spawn/move/despawn replicated
@@ -79,6 +98,15 @@ and reject a join before the player enters.
 
 Cross-node authoritative match ownership and failover remain planned. Do not
 store the only copy of durable progression in an in-memory room table.
+
+:::caution[Known limitation: transform snapshots are node-global]
+The transform snapshot that fans out to clients is currently node-global — it is
+not yet scoped per room. Two or more concurrent authoritative matches on one node
+can leak transform state across matches (a client in one match can receive
+another match's objects). This is a known limitation, not a feature: per-room
+snapshot scoping is required before running multiple authoritative matches per
+node. Until then, run a single authoritative match per node.
+:::
 
 ## Server physics is optional
 

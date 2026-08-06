@@ -344,6 +344,23 @@ impl TransformWorld {
         released
     }
 
+    /// Read-only structural ownership check for an owner input frame: the
+    /// participant must currently own `object_id` at `ownership_epoch`. Mirrors
+    /// the gate inside [`apply_owner_input`](Self::apply_owner_input) without
+    /// mutating anything, so the authoritative bridge can admit only an owner's
+    /// own input as a normalized event.
+    #[must_use]
+    pub fn input_ownership_ok(
+        &self,
+        sender: u64,
+        object_id: ObjectId,
+        ownership_epoch: u32,
+    ) -> bool {
+        self.objects
+            .get(&object_id)
+            .is_some_and(|a| a.is_owned_by(sender) && ownership_epoch == a.ownership_epoch)
+    }
+
     /// Sample a hit-eligible object's rewound transform at fractional `tick`.
     #[must_use]
     pub fn sample_rewind(&self, id: ObjectId, tick: f64) -> Option<TransformState> {

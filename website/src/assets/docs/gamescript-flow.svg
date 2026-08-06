@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">GameScript: you write the rules, Citadel makes them law</title>
+  <desc id="desc">A player proposes an action; Citadel checks it structurally; your GameScript in Lua, Python or JavaScript decides the outcome; Citadel applies and replicates it; every player sees one shared world. Nothing changes until the script says yes.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#1a1835"/><stop offset="1" stop-color="#12293b"/></linearGradient>
+    <linearGradient id="hero" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#6a4fa6"/><stop offset="1" stop-color="#4a3a7d"/></linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5"><stop stop-color="#cab8ff" stop-opacity="0.45"/><stop offset="1" stop-color="#cab8ff" stop-opacity="0"/></radialGradient>
+    <style>
+      text{font-family:Inter,ui-sans-serif,system-ui,sans-serif;fill:#f7f3ff}
+      .title{font-size:34px;font-weight:750}
+      .kicker{font-size:17px;font-weight:700;fill:#8cc8ff;letter-spacing:2px}
+      .label{font-size:20px;font-weight:700}
+      .herolabel{font-size:22px;font-weight:750}
+      .small{font-size:14px;fill:#c8bfdc}
+      .chip{font-size:14px;font-weight:700;fill:#1a1835}
+      .card{fill:#21213c;stroke:#77708e;stroke-width:2}
+      .tag{font-size:19px;font-weight:700;fill:#f7f3ff}
+    </style>
+  </defs>
+
+  <rect width="1200" height="675" rx="28" fill="url(#bg)"/>
+  <text x="600" y="62" text-anchor="middle" class="kicker">GAMESCRIPT</text>
+  <text x="600" y="104" text-anchor="middle" class="title">You write the rules. Citadel makes them law.</text>
+
+  <!-- flow arrows behind nodes -->
+  <g stroke="#edc76b" stroke-width="5" fill="none">
+    <path d="M214 335h44"/><path d="M258 335l-14-8v16z" fill="#edc76b" stroke="none"/>
+    <path d="M430 320h44"/><path d="M474 320l-14-8v16z" fill="#edc76b" stroke="none"/>
+    <path d="M676 320h44"/><path d="M720 320l-14-8v16z" fill="#edc76b" stroke="none"/>
+    <path d="M892 335h44"/><path d="M936 335l-14-8v16z" fill="#edc76b" stroke="none"/>
+  </g>
+
+  <!-- 1 player asks -->
+  <g transform="translate(44 265)">
+    <rect width="170" height="140" rx="18" class="card"/>
+    <text x="85" y="42" text-anchor="middle" class="label">Player asks</text>
+    <rect x="34" y="62" width="102" height="34" rx="17" fill="#2d2b4d" stroke="#8cc8ff" stroke-width="1.5"/>
+    <text x="85" y="85" text-anchor="middle" class="small" style="fill:#8cc8ff;font-weight:700">"Attack!"</text>
+    <text x="85" y="120" text-anchor="middle" class="small">a request, not a result</text>
+  </g>
+
+  <!-- 2 citadel checks -->
+  <g transform="translate(258 265)">
+    <rect width="172" height="140" rx="18" fill="#3a2f63" stroke="#cab8ff" stroke-width="2.5"/>
+    <text x="86" y="42" text-anchor="middle" class="label">Citadel checks</text>
+    <text x="86" y="74" text-anchor="middle" class="small">auth · room · scope</text>
+    <text x="86" y="96" text-anchor="middle" class="small">size · rate · replay</text>
+    <text x="86" y="122" text-anchor="middle" class="small" style="fill:#a99fd0">the guardrails</text>
+  </g>
+
+  <!-- 3 GameScript decides (hero) -->
+  <ellipse cx="574" cy="315" rx="150" ry="150" fill="url(#glow)"/>
+  <g transform="translate(474 224)">
+    <rect width="200" height="192" rx="24" fill="url(#hero)" stroke="#e6d8ff" stroke-width="3"/>
+    <text x="100" y="46" text-anchor="middle" class="herolabel">GameScript</text>
+    <text x="100" y="72" text-anchor="middle" class="small" style="fill:#e6d8ff">decides the outcome</text>
+    <!-- language chips -->
+    <g>
+      <rect x="20" y="92" width="72" height="30" rx="15" fill="#8cc8ff"/><text x="56" y="112" text-anchor="middle" class="chip">Lua</text>
+      <rect x="108" y="92" width="72" height="30" rx="15" fill="#f0c674"/><text x="144" y="112" text-anchor="middle" class="chip">Python</text>
+      <rect x="52" y="130" width="96" height="30" rx="15" fill="#9fe0a0"/><text x="100" y="150" text-anchor="middle" class="chip">JavaScript</text>
+    </g>
+    <text x="100" y="180" text-anchor="middle" class="small" style="fill:#f7f3ff;font-weight:700">your rules run here</text>
+  </g>
+
+  <!-- 4 citadel applies -->
+  <g transform="translate(720 265)">
+    <rect width="172" height="140" rx="18" fill="#3a2f63" stroke="#cab8ff" stroke-width="2.5"/>
+    <text x="86" y="42" text-anchor="middle" class="label">Citadel applies</text>
+    <text x="86" y="74" text-anchor="middle" class="small">mutate · replicate</text>
+    <text x="86" y="96" text-anchor="middle" class="small">deliver messages</text>
+    <text x="86" y="122" text-anchor="middle" class="small" style="fill:#a99fd0">only what's allowed</text>
+  </g>
+
+  <!-- 5 shared world -->
+  <g transform="translate(936 265)">
+    <rect width="176" height="140" rx="18" fill="#274858" stroke="#78d3e6" stroke-width="3"/>
+    <text x="88" y="42" text-anchor="middle" class="label">One world</text>
+    <circle cx="60" cy="82" r="13" fill="#8cc8ff"/><circle cx="116" cy="82" r="13" fill="#9fe0a0"/>
+    <text x="88" y="122" text-anchor="middle" class="small">everyone agrees</text>
+  </g>
+
+  <!-- tagline ribbon -->
+  <rect x="210" y="512" width="780" height="60" rx="30" fill="#21213c" stroke="#edc76b" stroke-width="2"/>
+  <text x="600" y="550" text-anchor="middle" class="tag">Nothing moves, fires, or changes until your script says <tspan fill="#9fe0a0">yes</tspan>.</text>
+</svg>

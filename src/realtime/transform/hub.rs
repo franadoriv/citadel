@@ -183,6 +183,112 @@ fn state_to_na(s: TransformState) -> NaTransform {
     }
 }
 
+/// Structural sanitization for a client-reported owner transform.
+///
+/// The relay-mode `KIND_NA_STATE` path (and presence spawn) historically wrote
+/// the decoded transform verbatim into authoritative state — no finite-float
+/// check and no quaternion normalization (the §2.2 gap; F30). This closes the
+/// structural half of that gap regardless of scripts: any non-finite component
+/// or degenerate rotation is rejected (`None`, the caller drops it before it
+/// can mutate the world), and a valid rotation is normalized so downstream
+/// state and replication always carry a unit quaternion.
+///
+/// Speed/world-bounds clamping is intentionally not applied here: those are
+/// config-sourced limits handled on the validated-input path and (for the
+/// authoritative bridge) by the batch validator, not by structural decode.
+fn sanitize_owner_transform(t: NaTransform) -> Option<NaTransform> {
+    if t.position.iter().any(|v| !v.is_finite()) || t.velocity.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    if t.rotation.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let norm_sq: f32 = t.rotation.iter().map(|v| v * v).sum();
+    if !norm_sq.is_finite() || norm_sq <= 1e-12 {
+        // A zero-length or non-finite quaternion has no valid orientation.
+        return None;
+    }
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    Some(NaTransform {
+        position: t.position,
+        rotation: [
+            t.rotation[0] * inv_norm,
+            t.rotation[1] * inv_norm,
+            t.rotation[2] * inv_norm,
+            t.rotation[3] * inv_norm,
+        ],
+        velocity: t.velocity,
+    })
+}
+
+/// Resolve the lag-compensated fire (if any) carried by one applied input
+/// frame into a `KIND_TSYNC_REWIND` reply. Shared by the relay input path
+/// ([`TransformHub::handle_input`]) and the authoritative-bridge executor
+/// ([`TransformHub::apply_validated_input`]) so both compute the identical,
+/// server-clamped rewind (the client's time is never trusted).
+fn resolve_fire_reply(
+    g: &HubInner,
+    participant: u64,
+    applied: &tsync::InputFrame,
+    current_tick: u32,
+    rewind_cfg: &RewindConfig,
+) -> Option<HubOutbound> {
+    let fire = applied.fire?;
+    let lag = g
+        .clients
+        .get(&participant)
+        .map(|c| c.lag)
+        .unwrap_or(LagProfile {
+            owd_ticks: 0.0,
+            interp_delay_ticks: 0.0,
+            rtt_ms: 0.0,
+        });
+    let rewind_tick = if lag_comp_enabled(&lag, rewind_cfg) {
+        compute_rewind_tick(current_tick, &lag, rewind_cfg)
+    } else {
+        f64::from(current_tick) // above the cutoff: resolve at present
+    };
+    let ray = HitRay {
+        origin: fire.origin,
+        direction: fire.direction,
+    };
+    let shooter_object = applied.object_id;
+    let radius = rewind_cfg.hit_radius_cm;
+    let targets = g
+        .world
+        .rewind_centers(rewind_tick)
+        .into_iter()
+        .filter(|&(id, _)| id != shooter_object)
+        .map(|(id, center)| HitTarget {
+            object_id: id,
+            center,
+            radius,
+        });
+    let result = match rewind::resolve_hit(&ray, targets) {
+        Some(h) => RewindResult {
+            input_seq: applied.input_seq,
+            hit: true,
+            object_id: h.object_id,
+            hit_point: h.point,
+            rewind_tick: rewind_tick.round().max(0.0) as u32,
+        },
+        None => RewindResult {
+            input_seq: applied.input_seq,
+            hit: false,
+            object_id: 0,
+            hit_point: [0.0; 3],
+            rewind_tick: rewind_tick.round().max(0.0) as u32,
+        },
+    };
+    Some(HubOutbound {
+        participant,
+        room_scope: None,
+        kind: citadel_wire::protocol::KIND_TSYNC_REWIND,
+        body: result.encode(),
+        unreliable: false,
+    })
+}
+
 /// One outbound transform-sync frame the gateway must deliver.
 #[derive(Debug, Clone)]
 pub struct HubOutbound {
@@ -528,6 +634,10 @@ impl TransformHub {
         transform: NaTransform,
     ) -> Option<PresenceRegistration> {
         let mut g = self.inner.lock().ok()?;
+        // Structural stage: drop a presence whose transform is non-finite or
+        // degenerate; normalize a valid rotation (F30). Both the spawn write
+        // and the spawn fan-out then carry the sanitized transform.
+        let transform = sanitize_owner_transform(transform)?;
         let state = na_to_state(transform);
         let mode = if self
             .config
@@ -638,6 +748,11 @@ impl TransformHub {
         object_id: ObjectId,
         transform: NaTransform,
     ) -> bool {
+        // Structural stage: a non-finite or degenerate transform never mutates
+        // authoritative state (F30). Valid rotations are normalized.
+        let Some(transform) = sanitize_owner_transform(transform) else {
+            return false;
+        };
         let Ok(mut g) = self.inner.lock() else {
             return false;
         };
@@ -650,6 +765,30 @@ impl TransformHub {
             }
             _ => false,
         }
+    }
+
+    /// The object a participant owns in relay mode, if any.
+    ///
+    /// The authoritative bridge's structural stage uses this to admit only an
+    /// owner's own `KIND_NA_STATE` report as a normalized event: a report for a
+    /// foreign or unknown object never becomes one, so the script sees only
+    /// ownership-verified intents.
+    #[must_use]
+    pub fn relay_owned_object(&self, participant: u64) -> Option<ObjectId> {
+        let g = self.inner.lock().ok()?;
+        g.na_presence
+            .get(&participant)
+            .filter(|entry| entry.mode == OwnerMovementMode::Relay)
+            .map(|entry| entry.object_id)
+    }
+
+    /// Structural sanitize for an owner-reported transform (finite floats +
+    /// normalized rotation), exposed so the bridge's structural stage can clean
+    /// a report before it becomes a normalized event. `None` for a non-finite or
+    /// degenerate transform (F30).
+    #[must_use]
+    pub fn sanitize_report(&self, transform: NaTransform) -> Option<NaTransform> {
+        sanitize_owner_transform(transform)
     }
 
     /// Release a participant's networked-actor presence (on disconnect),
@@ -809,66 +948,137 @@ impl TransformHub {
             // resolve a fire per released frame (each exactly once, in seq order).
             let released = g.world.apply_owner_input(participant, f);
             for applied in &released {
-                let Some(fire) = applied.fire else {
-                    continue;
-                };
-                // Server-computed, clamped rewind time (client time never trusted).
-                let lag = g
-                    .clients
-                    .get(&participant)
-                    .map(|c| c.lag)
-                    .unwrap_or(LagProfile {
-                        owd_ticks: 0.0,
-                        interp_delay_ticks: 0.0,
-                        rtt_ms: 0.0,
-                    });
-                let rewind_tick = if lag_comp_enabled(&lag, &rewind_cfg) {
-                    compute_rewind_tick(current_tick, &lag, &rewind_cfg)
-                } else {
-                    f64::from(current_tick) // above the cutoff: resolve at present
-                };
-                let ray = HitRay {
-                    origin: fire.origin,
-                    direction: fire.direction,
-                };
-                let shooter_object = applied.object_id;
-                let radius = rewind_cfg.hit_radius_cm;
-                let targets = g
-                    .world
-                    .rewind_centers(rewind_tick)
-                    .into_iter()
-                    .filter(|&(id, _)| id != shooter_object)
-                    .map(|(id, center)| HitTarget {
-                        object_id: id,
-                        center,
-                        radius,
-                    });
-                let result = match rewind::resolve_hit(&ray, targets) {
-                    Some(h) => RewindResult {
-                        input_seq: applied.input_seq,
-                        hit: true,
-                        object_id: h.object_id,
-                        hit_point: h.point,
-                        rewind_tick: rewind_tick.round().max(0.0) as u32,
-                    },
-                    None => RewindResult {
-                        input_seq: applied.input_seq,
-                        hit: false,
-                        object_id: 0,
-                        hit_point: [0.0; 3],
-                        rewind_tick: rewind_tick.round().max(0.0) as u32,
-                    },
-                };
-                out.push(HubOutbound {
-                    participant,
-                    room_scope: None,
-                    kind: citadel_wire::protocol::KIND_TSYNC_REWIND,
-                    body: result.encode(),
-                    unreliable: false,
-                });
+                if let Some(reply) =
+                    resolve_fire_reply(&g, participant, applied, current_tick, &rewind_cfg)
+                {
+                    out.push(reply);
+                }
             }
         }
         out
+    }
+
+    /// Apply one script-validated owner input frame — the authoritative-bridge
+    /// executor for an accepted `TransformInput`. It runs the same
+    /// `world.apply_owner_input` gate (ownership, epoch, contiguous-seq dedup)
+    /// as [`handle_input`](Self::handle_input), so an out-of-order, replayed, or
+    /// foreign frame still mutates nothing.
+    ///
+    /// Unlike the relay path it does **not** resolve any fire carried by the
+    /// frame: owner decision 1 keeps lag-compensated hit detection a
+    /// script-invoked bounded host API ([`rewind_query`](Self::rewind_query)),
+    /// and the script's batch decides the consequence.
+    pub fn apply_validated_input(&self, participant: u64, frame: &tsync::InputFrame) {
+        if let Ok(mut g) = self.inner.lock() {
+            let _ = g.world.apply_owner_input(participant, frame);
+        }
+    }
+
+    /// Bounded lag-compensated hit query (owner decision 1). The server computes
+    /// the rewind tick from the shooter's measured lag and the hub's
+    /// [`RewindConfig`] (`max_unlag_ticks` bounds the window, `rtt_cutoff_ms`
+    /// gates it); the client's `_client_tick` is accepted for API completeness
+    /// but never trusted. Returns the nearest candidate hit (favor-the-shooter),
+    /// excluding the shooter's own object. Rust owns the geometry; the script
+    /// decides the consequence.
+    #[must_use]
+    pub fn rewind_query(
+        &self,
+        shooter: u64,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        _client_tick: u64,
+    ) -> Vec<crate::runtime::RewindHit> {
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let current_tick = g.world.tick();
+        let rewind_cfg = self.config.rewind;
+        let lag = g
+            .clients
+            .get(&shooter)
+            .map(|c| c.lag)
+            .unwrap_or(LagProfile {
+                owd_ticks: 0.0,
+                interp_delay_ticks: 0.0,
+                rtt_ms: 0.0,
+            });
+        let rewind_tick = if lag_comp_enabled(&lag, &rewind_cfg) {
+            compute_rewind_tick(current_tick, &lag, &rewind_cfg)
+        } else {
+            f64::from(current_tick)
+        };
+        let shooter_object = g.na_presence.get(&shooter).map(|entry| entry.object_id);
+        let ray = HitRay { origin, direction };
+        let radius = rewind_cfg.hit_radius_cm;
+        let targets = g
+            .world
+            .rewind_centers(rewind_tick)
+            .into_iter()
+            .filter(|&(id, _)| Some(id) != shooter_object)
+            .map(|(id, center)| HitTarget {
+                object_id: id,
+                center,
+                radius,
+            });
+        match rewind::resolve_hit(&ray, targets) {
+            Some(hit) => {
+                let participant = g
+                    .na_presence
+                    .iter()
+                    .find(|(_, entry)| entry.object_id == hit.object_id)
+                    .map(|(&p, _)| p)
+                    .unwrap_or(0);
+                vec![crate::runtime::RewindHit {
+                    object_id: hit.object_id,
+                    participant,
+                    point: hit.point,
+                    distance: hit.distance,
+                }]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Read-only structural ownership check for the bridge: `participant` must
+    /// own `object_id` at `ownership_epoch`. Nothing mutates.
+    #[must_use]
+    pub fn input_ownership_ok(
+        &self,
+        participant: u64,
+        object_id: ObjectId,
+        ownership_epoch: u32,
+    ) -> bool {
+        self.inner.lock().ok().is_some_and(|g| {
+            g.world
+                .input_ownership_ok(participant, object_id, ownership_epoch)
+        })
+    }
+
+    /// Decode + epoch-validate a `KIND_TSYNC_V2_INPUT` body, returning the inner
+    /// bundle only when the participant's v2 clock epoch matches. Shared by
+    /// [`handle_v2_input`](Self::handle_v2_input) and the bridge input route so
+    /// the epoch fence is enforced identically on both paths.
+    #[must_use]
+    pub fn decode_v2_input(&self, participant: u64, body: &[u8]) -> Option<tsync::InputBundle> {
+        let Ok((epoch, _hint, bundle)) = tsync::InputDiagnosticHint::decode_v2(body) else {
+            if let Ok(mut g) = self.inner.lock() {
+                g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
+            }
+            return None;
+        };
+        let mut g = self.inner.lock().ok()?;
+        let valid = g.clients.get(&participant).is_some_and(|c| c.v2_clock)
+            && g.gameplay_clock.snapshot().epoch == epoch;
+        if valid {
+            g.input_hint_metrics.accepted = g.input_hint_metrics.accepted.saturating_add(1);
+            // The authority decision is counted separately from decode: no hint
+            // field is retained or passed into gameplay.
+            g.input_hint_metrics.ignored = g.input_hint_metrics.ignored.saturating_add(1);
+        } else {
+            g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
+        }
+        valid.then_some(bundle)
     }
 
     /// Handle an epoch-fenced v2 input. Hints are decoded only to bound and
@@ -876,29 +1086,9 @@ impl TransformHub {
     /// scheduling, authorization, latency, or rewind calculations.
     #[must_use]
     pub fn handle_v2_input(&self, participant: u64, body: &[u8]) -> Vec<HubOutbound> {
-        let Ok((epoch, _hint, bundle)) = tsync::InputDiagnosticHint::decode_v2(body) else {
-            if let Ok(mut g) = self.inner.lock() {
-                g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
-            }
+        let Some(bundle) = self.decode_v2_input(participant, body) else {
             return Vec::new();
         };
-        let Ok(mut g) = self.inner.lock() else {
-            return Vec::new();
-        };
-        let valid = g.clients.get(&participant).is_some_and(|c| c.v2_clock)
-            && g.gameplay_clock.snapshot().epoch == epoch;
-        if valid {
-            g.input_hint_metrics.accepted = g.input_hint_metrics.accepted.saturating_add(1);
-            // Deliberately count the authority decision separately from decode:
-            // no hint field is retained or passed into gameplay.
-            g.input_hint_metrics.ignored = g.input_hint_metrics.ignored.saturating_add(1);
-        } else {
-            g.input_hint_metrics.rejected = g.input_hint_metrics.rejected.saturating_add(1);
-        }
-        drop(g);
-        if !valid {
-            return Vec::new();
-        }
         self.handle_input(participant, &bundle.encode())
     }
 
@@ -1250,6 +1440,89 @@ mod tests {
         assert!(!hub.apply_owner_state(2, r1.object_id, t));
         // An unknown object is rejected too.
         assert!(!hub.apply_owner_state(1, 999, t));
+    }
+
+    #[test]
+    fn sanitize_owner_transform_drops_non_finite_and_normalizes() {
+        // A finite, already-normalized transform is preserved.
+        let good = NaTransform {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [4.0, 5.0, 6.0],
+        };
+        assert_eq!(sanitize_owner_transform(good), Some(good));
+
+        // A non-normalized (but finite) quaternion is normalized in place.
+        let unnormalized = NaTransform {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 2.0],
+            velocity: [0.0; 3],
+        };
+        let sanitized = sanitize_owner_transform(unnormalized).expect("finite quat normalizes");
+        let norm: f32 = sanitized.rotation.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "rotation normalized: norm={norm}"
+        );
+
+        // Non-finite position / velocity / rotation are dropped.
+        for bad in [
+            NaTransform {
+                position: [f32::NAN, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [0.0; 3],
+            },
+            NaTransform {
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                velocity: [f32::INFINITY, 0.0, 0.0],
+            },
+            NaTransform {
+                position: [0.0; 3],
+                rotation: [f32::NAN, 0.0, 0.0, 1.0],
+                velocity: [0.0; 3],
+            },
+            // A degenerate (zero-length) quaternion has no orientation.
+            NaTransform {
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 0.0],
+                velocity: [0.0; 3],
+            },
+        ] {
+            assert_eq!(sanitize_owner_transform(bad), None);
+        }
+    }
+
+    #[test]
+    fn na_owner_state_drops_non_finite_report() {
+        let hub = hub();
+        let r = hub
+            .register_presence(1, 0, NaTransform::identity())
+            .expect("presence");
+        let before = hub.get_transform(r.object_id).expect("spawned");
+        // A NaN report is dropped structurally — authoritative state is untouched.
+        let poisoned = NaTransform {
+            position: [f32::NAN, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [0.0; 3],
+        };
+        assert!(!hub.apply_owner_state(1, r.object_id, poisoned));
+        let after = hub.get_transform(r.object_id).expect("still exists");
+        assert_eq!(
+            before.position, after.position,
+            "state unchanged after drop"
+        );
+    }
+
+    #[test]
+    fn na_presence_with_non_finite_transform_is_dropped() {
+        let hub = hub();
+        let poisoned = NaTransform {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 0.0], // degenerate
+            velocity: [0.0; 3],
+        };
+        assert!(hub.register_presence(1, 0, poisoned).is_none());
     }
 
     #[test]
