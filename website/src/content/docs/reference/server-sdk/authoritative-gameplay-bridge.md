@@ -28,6 +28,11 @@ loaded script. For those matches:
 - Transform input, `KIND_NA_STATE`, `KIND_NA_PRESENCE`, and `KIND_REP_DELTA`
   route through `on_input`; the direct apply paths are unreachable.
 - A player-slot grant is refused inside a bound match (the script owns spawns).
+- Custom message kinds and `KIND_POSITION` are **not** relayed inside a bound
+  match. The legacy `on_message` relay path is closed there, so a script cannot
+  reach `move_actor`/`set_transform` or an unscoped cross-room send outside the
+  validator. Delivering custom kinds through the fenced batch (the `message`
+  event) is planned; until then such frames are dropped fail-closed.
 
 When `require_script = false` (the default unzip-and-run mode) there is **no
 bridge**: the built-in relay applies owner state, integrates input, and fans out

@@ -3621,6 +3621,22 @@ impl Gateway {
             self.handle_room(sender, env)
         } else if env.kind == KIND_REP_DELTA || env.kind == KIND_REP_ACK {
             self.handle_rep_frame(sender, env)
+        } else if self.authoritative_match(sender).is_some() {
+            // Owner decision 3: no relay/passthrough to mutation or replication
+            // inside an authoritative match. Unreserved kinds (custom kinds and
+            // `KIND_POSITION`) would otherwise route to the legacy
+            // `dispatch`/`apply_commands_scoped` path, where a script
+            // `on_message` can reach `set_transform` and unscoped cross-room
+            // sends — bypassing the bridge validator for a whole traffic class.
+            // Fenced delivery of custom message kinds (the `message` event) is a
+            // planned follow-up; until it lands these frames are dropped
+            // fail-closed rather than applied outside the validator.
+            tracing::debug!(
+                %sender,
+                kind = env.kind,
+                "gateway dropped an unreserved-kind frame on the legacy path inside an authoritative match"
+            );
+            0
         } else if let Some(runtime) = runtime {
             let user_id = self.registry.user_id_of(sender);
             let commands = match room_id {
@@ -8154,6 +8170,87 @@ mod transform_tests {
         assert!(
             hub.get_transform(foreign).is_none(),
             "a foreign-object report is dropped before it becomes an event"
+        );
+    }
+
+    // ---- M1 / owner decision 3: no legacy relay passthrough in a bound match ----
+
+    /// A script that mutates a transform from `on_message`, for both a custom
+    /// kind and `KIND_POSITION`. The message body carries the target object id
+    /// (u32, big-endian) so the handler knows which actor to move.
+    const LEGACY_MUTATION_SCRIPT: &str = r#"
+        local function jump(body)
+            citadel.move_actor(string.unpack(">I4", body), 42, 0, 0)
+        end
+        citadel.on_message(1, function(_ctx, body) jump(body) end)
+        citadel.on_message(40, function(_ctx, body) jump(body) end)
+    "#;
+
+    /// Same script + transform hub as `authoritative_gateway`, but with no
+    /// bridge attached: a non-authoritative deployment where the legacy relay /
+    /// dispatch path stays live.
+    fn non_authoritative_gateway(src: &str) -> (Arc<Gateway>, Arc<TransformHub>) {
+        let hub = Arc::new(TransformHub::new(TransformHubConfig::default()).expect("hub"));
+        let runtime: Arc<dyn Runtime> = Arc::new(
+            crate::runtime::LuaRuntime::from_source(
+                src,
+                "relay-test",
+                crate::runtime::DEFAULT_DEADLINE_MS,
+            )
+            .expect("lua runtime"),
+        );
+        let gw = Arc::new(
+            Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
+                .with_transform_hub(Arc::clone(&hub)),
+        );
+        (gw, hub)
+    }
+
+    #[tokio::test]
+    async fn authoritative_match_closes_the_legacy_relay_passthrough() {
+        // Inside a bound match, custom `on_message` and `KIND_POSITION` must not
+        // reach `set_transform` via the legacy `dispatch`/`apply_commands_scoped`
+        // path — that would bypass the bridge validator (owner decision 3: no
+        // relay/passthrough to mutation or replication in an authoritative match).
+        let (gw, hub) = authoritative_gateway(LEGACY_MUTATION_SCRIPT);
+        let (p, object_id, _rp) = authoritative_member(&gw);
+        let body = object_id.to_be_bytes().to_vec();
+
+        gw.handle_inbound(p, &Envelope::new(KIND_POSITION, body.clone()));
+        assert!(
+            hub.get_transform(object_id).expect("object").position[0].abs() < 1e-3,
+            "KIND_POSITION must not reach set_transform inside an authoritative match"
+        );
+
+        gw.handle_inbound(p, &Envelope::new(40, body));
+        assert!(
+            hub.get_transform(object_id).expect("object").position[0].abs() < 1e-3,
+            "a custom-kind on_message must not mutate transform outside the validator"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_authoritative_relay_passthrough_still_mutates() {
+        // Relay parity: with no bridge attached, the same legacy path still
+        // applies the script's transform mutation — closing the bridge must not
+        // change the default unzip-and-run behavior.
+        let (gw, hub) = non_authoritative_gateway(LEGACY_MUTATION_SCRIPT);
+        let (p, _rp) = register(&gw);
+        let object_id = 7u32;
+        let body = object_id.to_be_bytes().to_vec();
+
+        hub.set_transform(object_id, TransformState::at([0.0, 0.0, 0.0]));
+        gw.handle_inbound(p, &Envelope::new(40, body.clone()));
+        assert!(
+            (hub.get_transform(object_id).expect("object").position[0] - 42.0).abs() < 1e-3,
+            "a non-authoritative deployment still applies the legacy transform mutation"
+        );
+
+        hub.set_transform(object_id, TransformState::at([0.0, 0.0, 0.0]));
+        gw.handle_inbound(p, &Envelope::new(KIND_POSITION, body));
+        assert!(
+            (hub.get_transform(object_id).expect("object").position[0] - 42.0).abs() < 1e-3,
+            "KIND_POSITION still drives the legacy path when no bridge is attached"
         );
     }
 
