@@ -246,6 +246,19 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         since: "pre-1.0",
     },
     HostApiFn {
+        name: "rewind_query",
+        category: HostApiCategory::Action,
+        params: &[
+            "shooter:u64",
+            "origin:[f32;3]",
+            "direction:[f32;3]",
+            "tick:u64",
+        ],
+        returns: "{hits:[{object_id:u32,participant:u64,point:[f32;3],distance:f32}]}",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
         name: "map_info",
         category: HostApiCategory::Map,
         params: &["name:string"],

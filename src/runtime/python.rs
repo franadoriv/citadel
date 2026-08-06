@@ -93,6 +93,7 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "apply_impulse",
     "set_move_intent",
     "physics_state",
+    "rewind_query",
     "map_info",
     "map_names",
     "find_path",
@@ -431,6 +432,12 @@ def physics_state(object_id):
     if "_transform_hub_bridge" not in globals():
         return None
     return _transform_hub_bridge.physics_state(int(object_id))
+
+def rewind_query(shooter, origin, direction, tick=0):
+    """Bounded lag-compensated hit query (Rust owns geometry; script decides)."""
+    if "_transform_hub_bridge" not in globals():
+        return {"hits": []}
+    return _transform_hub_bridge.rewind_query(int(shooter), tuple(origin), tuple(direction), int(tick))
 
 def map_info(name):
     """Return a loaded map's bounds and collision counts, or None when absent."""
@@ -1219,6 +1226,34 @@ impl TransformHubHandle {
         dict.set_item("position", state.position)?;
         dict.set_item("velocity", state.velocity)?;
         Ok(Some(dict.unbind()))
+    }
+
+    fn rewind_query(
+        &self,
+        shooter: u64,
+        origin: (f32, f32, f32),
+        direction: (f32, f32, f32),
+        tick: u64,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyDict>> {
+        let hits = self.hub.rewind_query(
+            shooter,
+            [origin.0, origin.1, origin.2],
+            [direction.0, direction.1, direction.2],
+            tick,
+        );
+        let list = PyList::empty(py);
+        for hit in hits {
+            let dict = PyDict::new(py);
+            dict.set_item("object_id", hit.object_id)?;
+            dict.set_item("participant", hit.participant)?;
+            dict.set_item("point", hit.point)?;
+            dict.set_item("distance", hit.distance)?;
+            list.append(dict)?;
+        }
+        let out = PyDict::new(py);
+        out.set_item("hits", list)?;
+        Ok(out.unbind())
     }
 
     fn raycast(
@@ -3608,6 +3643,19 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(
             got[0].input_outcomes[0].decision,
+            crate::runtime::Decision::Accept
+        );
+    }
+
+    #[test]
+    fn on_input_can_call_rewind_query() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    r = citadel.rewind_query(e[\"participant\"], (0, 0, 0), (1, 0, 0), e[\"tick\"])\n    assert isinstance(r[\"hits\"], list)\n    return None\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.input_outcomes[0].decision,
             crate::runtime::Decision::Accept
         );
     }

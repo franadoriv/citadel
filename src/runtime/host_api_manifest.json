@@ -220,6 +220,19 @@
     "since": "pre-1.0"
   },
   {
+    "name": "rewind_query",
+    "category": "action",
+    "params": [
+      "shooter:u64",
+      "origin:[f32;3]",
+      "direction:[f32;3]",
+      "tick:u64"
+    ],
+    "returns": "{hits:[{object_id:u32,participant:u64,point:[f32;3],distance:f32}]}",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "map_info",
     "category": "map",
     "params": [

@@ -85,6 +85,7 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "apply_impulse",
     "set_move_intent",
     "physics_state",
+    "rewind_query",
     "map_info",
     "map_names",
     "find_path",
@@ -501,6 +502,11 @@ const JS_HOST_PRELUDE: &str = r#"
     physics_state(objectId) {
       if (!globalThis.__citadel_physics_state) return null;
       return JSON.parse(globalThis.__citadel_physics_state(Number(objectId)));
+    },
+    rewind_query(shooter, origin, direction, tick) {
+      if (!globalThis.__citadel_rewind_query) return { hits: [] };
+      return JSON.parse(globalThis.__citadel_rewind_query(
+        Number(shooter), origin, direction, Number(tick || 0)));
     },
     map_info(name) {
       if (!globalThis.__citadel_map_info) return null;
@@ -3780,6 +3786,28 @@ fn apply_transform_hub(context: &Context, hub: &Option<Arc<TransformHub>>) {
             ),
         )?;
         caught(&ctx, ctx.globals().set("__citadel_raycast", raycast))?;
+        let rewind_hub = hub.clone();
+        let rewind_query = caught(
+            &ctx,
+            Function::new(
+                ctx.clone(),
+                move |shooter: f64, origin: Vec<f32>, direction: Vec<f32>, tick: f64| -> String {
+                    let (Some(origin), Some(direction)) = (vector3(&origin), vector3(&direction))
+                    else {
+                        return "{\"hits\":[]}".to_owned();
+                    };
+                    let hits =
+                        rewind_hub
+                            .0
+                            .rewind_query(shooter as u64, origin, direction, tick as u64);
+                    serde_json::json!({ "hits": hits }).to_string()
+                },
+            ),
+        )?;
+        caught(
+            &ctx,
+            ctx.globals().set("__citadel_rewind_query", rewind_query),
+        )?;
         let overlap_hub = hub.clone();
         let overlap = caught(
             &ctx,
@@ -4007,6 +4035,22 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(
             got[0].input_outcomes[0].decision,
+            crate::runtime::Decision::Accept
+        );
+    }
+
+    #[test]
+    fn on_input_can_call_rewind_query() {
+        let rt = runtime(
+            r#"citadel.on_input((e) => {
+                const r = citadel.rewind_query(e.participant, [0, 0, 0], [1, 0, 0], e.tick);
+                if (!Array.isArray(r.hits)) throw new Error("hits must be an array");
+            });"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.input_outcomes[0].decision,
             crate::runtime::Decision::Accept
         );
     }

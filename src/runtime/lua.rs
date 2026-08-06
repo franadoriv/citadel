@@ -2937,6 +2937,36 @@ fn install_host_api(
     })?;
     citadel.set("physics_state", physics_state)?;
 
+    // rewind_query(shooter, origin, direction, tick) is the bounded
+    // lag-compensated hit query (owner decision 1). Rust owns the rewind
+    // geometry; the script decides the consequence. Returns { hits = { ... } }.
+    let rewind_query = lua.create_function(
+        |lua, (shooter, origin, direction, tick): (u64, Table, Table, u64)| {
+            let value = lua.create_table()?;
+            let hits_table = lua.create_table()?;
+            if let Some(hub) = lua.app_data_ref::<TransformHubHandle>() {
+                let origin = lua_vector3(origin)?;
+                let direction = lua_vector3(direction)?;
+                for (index, hit) in hub
+                    .0
+                    .rewind_query(shooter, origin, direction, tick)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let entry = lua.create_table()?;
+                    entry.set("object_id", hit.object_id)?;
+                    entry.set("participant", hit.participant)?;
+                    entry.set("point", hit.point)?;
+                    entry.set("distance", hit.distance)?;
+                    hits_table.set(index + 1, entry)?;
+                }
+            }
+            value.set("hits", hits_table)?;
+            Ok(mlua::Value::Table(value))
+        },
+    )?;
+    citadel.set("rewind_query", rewind_query)?;
+
     // map_info(name) returns the loaded CMAP's read-only geometry summary, or
     // nil when the map is not loaded. No catalog mutation is exposed to scripts.
     let map_info = lua.create_function(|lua, name: mlua::String| {
@@ -4149,6 +4179,23 @@ mod tests {
     }
 
     #[test]
+    fn on_input_can_call_rewind_query() {
+        // The fire/hit host API is callable from on_input (owner decision 1).
+        // Without a hub attached it returns an empty hit list, proving the API
+        // is wired and the batch still answers.
+        let rt = runtime(
+            r#"citadel.on_input(function(e)
+                local r = citadel.rewind_query(e.participant, {x=0,y=0,z=0}, {x=1,y=0,z=0}, e.tick)
+                assert(type(r.hits) == "table")
+                return nil
+            end)"#,
+        );
+        let batch = batch_with(vec![input_event(1, 7)]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.input_outcomes[0].decision, Decision::Accept);
+    }
+
+    #[test]
     fn trusted_lua_http_policy_is_applied_at_the_host_boundary() {
         let static_data =
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)
@@ -4894,6 +4941,7 @@ mod tests {
             "apply_impulse",
             "set_move_intent",
             "physics_state",
+            "rewind_query",
             "map_info",
             "map_names",
             "find_path",
