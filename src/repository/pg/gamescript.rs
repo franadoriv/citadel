@@ -3,8 +3,11 @@
 //! Every mutating contract method runs inside one database transaction, so the
 //! state change and its audit/outbox rows commit or disappear together. The
 //! revision id is the content hash and the table's primary key:
-//! `INSERT ... ON CONFLICT DO NOTHING` plus a re-read makes concurrent
-//! submissions of identical content race safely to one row.
+//! `INSERT ... ON CONFLICT DO NOTHING` plus a locked re-read makes concurrent
+//! submissions of identical content race safely to one row, and makes the
+//! dedupe conflict with a concurrent `prune_revisions` delete of that row
+//! (see `SELECT_REVISION_FOR_UPDATE_SQL`) instead of committing against a
+//! revision that no longer exists.
 //!
 //! CockroachDB runs its transactions at `SERIALIZABLE` and asks the client to
 //! retry a transaction that loses a write race. Pooled calls here are
@@ -36,6 +39,20 @@ use super::{PgExecutor, db_err, get, millis_to_ts, ts_to_millis};
 
 const SELECT_DRAFT_SQL: &str = "SELECT * FROM gamescript_drafts WHERE draft_id = $1";
 const SELECT_REVISION_SQL: &str = "SELECT * FROM gamescript_revisions WHERE revision_id = $1";
+
+/// Locked dedupe re-read for `submit_draft`: `ON CONFLICT DO NOTHING` takes no
+/// lock on the *existing* row, so an unlocked re-read could race a concurrent
+/// `prune_revisions` delete and return a revision that no longer exists at
+/// commit time. `FOR UPDATE` (the module-wide row-lock idiom) serializes the
+/// dedupe with that delete; a prune that already committed leaves this read
+/// empty and the submit loop re-inserts the content as a fresh revision.
+const SELECT_REVISION_FOR_UPDATE_SQL: &str =
+    "SELECT * FROM gamescript_revisions WHERE revision_id = $1 FOR UPDATE";
+
+/// Bound on insert → locked-re-read alternation in `submit_draft`. Each extra
+/// iteration needs another prune (or identical submit) to land in the
+/// statement gap, so two passes settle every practical race.
+const SUBMIT_DEDUPE_ATTEMPTS: usize = 8;
 
 /// Counter upsert mirroring the chat access-epoch idiom: the first activation
 /// of a scope creates the row at 1; later ones increment atomically.
@@ -431,35 +448,57 @@ impl GameScriptRepository for PgGameScriptRepository {
                     &draft.entrypoint,
                     &draft.content,
                 );
-                // The hash primary key deduplicates identical content and
-                // resolves the concurrent-submission race to one row.
-                let inserted = sqlx::query(
-                    "INSERT INTO gamescript_revisions (revision_id, language, entrypoint, \
-                     content, size_bytes, created_by, created_at_unix_ms) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                     ON CONFLICT (revision_id) DO NOTHING",
-                )
-                .bind(&revision_id)
-                .bind(draft.language.as_str())
-                .bind(&draft.entrypoint)
-                .bind(&draft.content)
-                .bind(i64::try_from(draft.content.len()).map_err(|_| {
+                let size_bytes = i64::try_from(draft.content.len()).map_err(|_| {
                     AppError::validation("gamescript content exceeds the maximum source size")
-                })?)
-                .bind(&actor)
-                .bind(now)
-                .execute(&mut *conn)
-                .await
-                .map_err(db_err)?
-                .rows_affected()
-                    > 0;
-                let stored = sqlx::query(SELECT_REVISION_SQL)
+                })?;
+                // The hash primary key deduplicates identical content and
+                // resolves the concurrent-submission race to one row. The
+                // dedupe re-read is locked (see
+                // `SELECT_REVISION_FOR_UPDATE_SQL`); when it comes back empty
+                // the conflicting row was pruned in the statement gap and the
+                // loop re-runs the insert against the post-prune state.
+                let mut resolved = None;
+                for _ in 0..SUBMIT_DEDUPE_ATTEMPTS {
+                    let inserted = sqlx::query(
+                        "INSERT INTO gamescript_revisions (revision_id, language, entrypoint, \
+                         content, size_bytes, created_by, created_at_unix_ms) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                         ON CONFLICT (revision_id) DO NOTHING",
+                    )
                     .bind(&revision_id)
-                    .fetch_one(&mut *conn)
+                    .bind(draft.language.as_str())
+                    .bind(&draft.entrypoint)
+                    .bind(&draft.content)
+                    .bind(size_bytes)
+                    .bind(&actor)
+                    .bind(now)
+                    .execute(&mut *conn)
                     .await
-                    .map_err(db_err)?;
-                let revision = parse_revision(&stored)?;
-                let deduplicated = !inserted;
+                    .map_err(db_err)?
+                    .rows_affected()
+                        > 0;
+                    if inserted {
+                        let stored = sqlx::query(SELECT_REVISION_SQL)
+                            .bind(&revision_id)
+                            .fetch_one(&mut *conn)
+                            .await
+                            .map_err(db_err)?;
+                        resolved = Some((parse_revision(&stored)?, false));
+                        break;
+                    }
+                    if let Some(stored) = sqlx::query(SELECT_REVISION_FOR_UPDATE_SQL)
+                        .bind(&revision_id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(db_err)?
+                    {
+                        resolved = Some((parse_revision(&stored)?, true));
+                        break;
+                    }
+                }
+                let (revision, deduplicated) = resolved.ok_or_else(|| {
+                    AppError::internal("gamescript submit dedupe kept racing revision pruning")
+                })?;
                 let details = submit_audit_details(&draft_id, &revision, deduplicated, &context);
                 insert_audit(
                     &mut *conn,
@@ -470,7 +509,7 @@ impl GameScriptRepository for PgGameScriptRepository {
                     now,
                 )
                 .await?;
-                if inserted {
+                if !deduplicated {
                     insert_outbox(
                         &mut *conn,
                         GameScriptOutboxKind::RevisionCreated,

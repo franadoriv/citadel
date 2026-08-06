@@ -836,9 +836,10 @@ pub struct MongoTournamentsRepository {
 /// commit or disappear together. MongoDB has no foreign-key backstop for the
 /// "active revisions are never pruned" rule, and its transactions abort only
 /// on write-write document conflicts, so operations that depend on a revision
-/// surviving (activation, pin, diagnostic append) deliberately WRITE the
-/// revision document (see [`gamescript_touch_revision_in_session`]); pruning
-/// deletes then conflict with those commits instead of skewing past them.
+/// surviving (activation, pin, diagnostic append, and the identical-content
+/// submit dedupe) deliberately WRITE the revision document (see
+/// [`gamescript_touch_revision_in_session`]); pruning deletes then conflict
+/// with those commits instead of skewing past them.
 pub struct MongoGameScriptRepository {
     client: Client,
     database: Database,
@@ -2031,7 +2032,8 @@ async fn next_gamescript_sequence(
 }
 
 /// Existence check *and* write-skew guard for operations that need the
-/// revision to survive their transaction (activation, pin, diagnostics).
+/// revision to survive their transaction (activation, pin, diagnostics, and
+/// the identical-content dedupe branch of draft submission).
 ///
 /// MongoDB transactions abort only on write-write document conflicts — reads
 /// never conflict — so a read-only existence check would let a concurrent
@@ -2256,7 +2258,24 @@ impl GameScriptRepository for MongoGameScriptRepository {
                     .map(mongo_gamescript_revision)
                     .transpose()?;
                 let (revision, deduplicated) = match existing {
-                    Some(revision) => (revision, true),
+                    Some(revision) => {
+                        // A dedupe depends on the existing revision surviving
+                        // this transaction exactly like activation, pin, and
+                        // diagnostic append do, so it joins the same
+                        // retention-fence protocol: the touch WRITES the
+                        // revision document and a concurrent prune's delete
+                        // conflicts instead of committing blindly past the
+                        // dedupe read. The losing side replays; a replay that
+                        // finds the revision pruned takes the insert branch
+                        // below and re-creates the content instead of
+                        // returning a revision that no longer exists.
+                        if !gamescript_touch_revision_in_session(database, session, &revision_id)
+                            .await?
+                        {
+                            return Err(revision_not_found(&revision_id).into());
+                        }
+                        (revision, true)
+                    }
                     None => {
                         // A concurrent identical submission conflicts on the
                         // unique revision_id index; the transient-error retry
@@ -2710,8 +2729,8 @@ impl GameScriptRepository for MongoGameScriptRepository {
                 // alone would NOT close the race — MongoDB transactions abort
                 // only on write-write document conflicts, and there is no
                 // foreign-key backstop — so every operation that must keep its
-                // revision alive (activation, pin, diagnostic append) WRITES
-                // the revision document via
+                // revision alive (activation, pin, diagnostic append, submit
+                // dedupe) WRITES the revision document via
                 // `gamescript_touch_revision_in_session`. The deletes below
                 // therefore conflict with any such concurrent commit; the
                 // losing side replays and observes the other's outcome. That
