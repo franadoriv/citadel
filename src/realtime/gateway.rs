@@ -5888,6 +5888,16 @@ impl Gateway {
         let now_ms = SystemClock.now().unix_millis();
         let mut delivered = 0;
         for out in rep.handle_delta(sender.get(), &env.body, now_ms) {
+            // RepAuthority's match index is a server-side replication seam and
+            // legacy sessions may still share its global match. The gateway is
+            // the client-facing boundary: a delta proposed by a room member may
+            // only cross that member's current RoomRegistry scope. Roomless
+            // sessions intentionally remain one relay-compatible scope.
+            if out.kind == KIND_REP_DELTA
+                && !self.same_room(sender, ParticipantId::from_raw(out.participant))
+            {
+                continue;
+            }
             let outbound = Outbound::new(
                 if out.reliable {
                     Delivery::Reliable
@@ -6364,6 +6374,24 @@ mod transform_tests {
         )
     }
 
+    fn register_session(gw: &Gateway) -> (ParticipantId, TestOutboundReceiver) {
+        let id = gw.next_participant_id();
+        let (tx, rx) = mpsc::channel(64);
+        let unreliable = gw.register_session(SessionHandle {
+            id,
+            kind: TransportKind::Quic,
+            outbound: tx,
+            identity: None,
+        });
+        (
+            id,
+            TestOutboundReceiver {
+                reliable: rx,
+                unreliable,
+            },
+        )
+    }
+
     #[tokio::test]
     async fn hello_over_gateway_replies_and_registers_client() {
         let (gw, hub) = gateway_with_hub();
@@ -6790,6 +6818,107 @@ mod transform_tests {
         assert!(view_a.object(2).is_none(), "A must not receive B's object");
         assert!(view_b.object(1).is_none(), "B must not receive A's object");
         assert!(view_b.object(2).is_some(), "B receives B's object");
+    }
+
+    #[tokio::test]
+    async fn rep_delta_with_transform_fields_stays_in_the_sender_room() {
+        use crate::realtime::netpeer::{
+            FieldAuthority, FieldBounds, RepAuthority, RepCondition, RepLayoutBuilder,
+            RepSnapshot, TypeTag,
+        };
+        use citadel_wire::codec::{DEFAULT_WORLD_BOUNDS, QuatMode, VectorQuant, codec_id};
+        use citadel_wire::netpeer::{DeltaBunch, FieldDelta, RepFieldCodec, RepSchema, RepValue};
+        use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined};
+
+        let layout = Box::leak(Box::new(
+            RepLayoutBuilder::new(91, 1)
+                .field(
+                    "position",
+                    TypeTag::Vector3,
+                    codec_id::VECTOR3_QUANT,
+                    RepCondition::None,
+                    FieldAuthority::ClientOwned,
+                    FieldBounds::None,
+                    true,
+                )
+                .field(
+                    "rotation",
+                    TypeTag::Quat,
+                    codec_id::QUAT_SMALLEST3_10,
+                    RepCondition::None,
+                    FieldAuthority::ClientOwned,
+                    FieldBounds::None,
+                    true,
+                )
+                .build()
+                .expect("transform layout"),
+        ));
+        let schema = RepSchema::new(
+            *layout.schema_hash(),
+            vec![
+                RepFieldCodec::Vector3(VectorQuant::new(DEFAULT_WORLD_BOUNDS).expect("bounds")),
+                RepFieldCodec::Quat(QuatMode::Bits10),
+            ],
+        )
+        .expect("transform schema");
+        let rep = Arc::new(RepAuthority::new(Default::default()));
+        rep.register_class(91, layout, schema.clone())
+            .expect("class registers");
+        let gw = Gateway::new().with_rep_authority(Arc::clone(&rep));
+
+        let (a, mut ra) = register_session(&gw);
+        let _ = ra.recv().await.expect("A schema bootstrap");
+        gw.handle_inbound(
+            a,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"R1".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_one = RoomJoined::decode(&ra.recv().await.expect("A room joined").envelope.body)
+            .expect("room joined decodes")
+            .room_id;
+
+        let (same_room, mut same_room_rx) = register_session(&gw);
+        let _ = same_room_rx.recv().await.expect("same-room schema bootstrap");
+        gw.handle_inbound(
+            same_room,
+            &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id: room_one }.encode()),
+        );
+        let _ = same_room_rx.recv().await.expect("same-room joined");
+
+        let (other_room, mut other_room_rx) = register_session(&gw);
+        let _ = other_room_rx.recv().await.expect("other-room schema bootstrap");
+        gw.handle_inbound(
+            other_room,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"R2".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let _ = other_room_rx.recv().await.expect("other-room joined");
+
+        rep.spawn_object(701, 0, 91, Some(a.get()), false, RepSnapshot::new())
+            .expect("object spawns in the legacy replication scope");
+        let mut delta = DeltaBunch::new(701, true, 1, 0);
+        delta.set(0, FieldDelta::Value(RepValue::Vector3([12.0, 4.0, 1.0])));
+        delta.set(1, FieldDelta::Value(RepValue::Quat([0.0, 0.0, 0.0, 1.0])));
+        let delta = delta.encode(&schema).expect("delta encodes");
+
+        let sent = gw.handle_inbound(a, &Envelope::new(KIND_REP_DELTA, delta));
+        let same_room_delta = same_room_rx.recv().await.expect("same-room receives delta");
+        assert_eq!(same_room_delta.envelope.kind, KIND_REP_DELTA);
+        assert!(
+            other_room_rx.try_recv().is_err(),
+            "a client in another room must never receive A's replicated transform"
+        );
+        assert_eq!(sent, 1, "only the same-room peer receives the delta");
     }
 
     #[tokio::test]
