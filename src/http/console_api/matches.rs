@@ -146,7 +146,7 @@ pub(super) async fn list_handler(
         }));
     };
     console_script_gate(&app, &gateway)?;
-    let snapshot = gateway.rooms().snapshot();
+    let snapshot = gateway.room_snapshot();
     let total = snapshot.len();
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let items = snapshot
@@ -176,8 +176,7 @@ pub(super) async fn detail_handler(
         .ok_or_else(|| AppError::not_found("no realtime gateway is running"))?;
     console_script_gate(&app, &gateway)?;
     let snapshot = gateway
-        .rooms()
-        .snapshot()
+        .room_snapshot()
         .into_iter()
         .find(|room| room.id == id)
         .ok_or_else(|| AppError::not_found("no such match"))?;

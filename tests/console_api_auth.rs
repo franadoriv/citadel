@@ -541,16 +541,14 @@ async fn matches_section_lists_live_rooms_from_the_gateway() {
     let gateway = std::sync::Arc::new(Gateway::new());
     app.attach_realtime_gateway(std::sync::Arc::clone(&gateway));
     let (lobby, _) = gateway
-        .rooms()
-        .join_or_create(ParticipantId::from_raw(1), "lobby", || {
+        .join_or_create_room(ParticipantId::from_raw(1), "lobby", || {
             RoomLabel::with_map("ForestArena")
         })
         .expect("create lobby");
     gateway
-        .rooms()
-        .join(ParticipantId::from_raw(2), lobby)
+        .join_room(ParticipantId::from_raw(2), lobby)
         .expect("second member");
-    gateway.rooms().create(RoomLabel::with_map("DesertMap"));
+    gateway.create_room(RoomLabel::with_map("DesertMap"));
     // (The id-only room has no members, so it exists but stays listable.)
 
     let listed = get(addr, "/console/v1/matches", Some(&token)).await;
@@ -638,8 +636,7 @@ async fn matches_listing_fails_closed_under_the_script_readiness_gate() {
     // carries the binding the room was born with.
     readiness.record_loaded("sha256:console-v1", Clock::now(&SystemClock));
     let (lobby, _) = gateway
-        .rooms()
-        .join_or_create_bound(
+        .join_or_create_room_bound(
             citadel::realtime::ParticipantId::from_raw(1),
             "lobby",
             gateway

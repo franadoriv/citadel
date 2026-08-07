@@ -94,7 +94,7 @@ fn server_simulated_bot_falls_jumps_and_replicates_from_a_loaded_map() {
         Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(Arc::new(runtime)))
             .with_maps(maps)
             .with_transform_hub(Arc::clone(&hub));
-    gateway.rooms().create(RoomLabel::with_map("physics-floor"));
+    gateway.create_room(RoomLabel::with_map("physics-floor"));
 
     // The room-scoped runtime tick traverses the canonical command path:
     // spawn_actor/set_physics -> Gateway -> TransformHub, and selects the map BVH.

@@ -54,7 +54,7 @@ use crate::realtime::registry::{
     CloseDisposition, LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen,
     SessionHandle, SessionRegistry,
 };
-use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
+use crate::realtime::rooms::{JoinError, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
     BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepField, BridgeRepValue,
@@ -2592,12 +2592,13 @@ impl Gateway {
     }
 
     /// Complete a trusted admission that was validated on a remote match node.
-    /// The session node never inserts its local participant id into the remote
-    /// room; the remote node already recorded a `RemoteRoomMember`.
     ///
-    /// Fails closed under the readiness gate with the stable client-safe
-    /// reply: this session node must not confirm membership in a match it
-    /// could not itself have started.
+    /// A remote owner currently has no authenticated state/intent data-plane to
+    /// this session node. Confirming the admission would therefore create a
+    /// roomless local socket: protected input could bypass the owner's
+    /// validator, and owner state could not be delivered with a scope fence.
+    /// Keep this path fail-closed until that transport carries a globally unique
+    /// match key, a local proxy membership, and owner-validated state.
     pub(crate) fn live_matchmaker_finish_remote_accept(
         &self,
         sender: ParticipantId,
@@ -2616,20 +2617,14 @@ impl Gateway {
             );
             return Err(());
         }
-        let label = RoomLabel {
-            map: "default".to_owned(),
-            mode: "matchmaker".to_owned(),
-            max_players: 0,
-            open: false,
-        };
-        {
-            let _scope = self.lock_room_scope();
-            self.bind_rep_connection_to_room_under_scope(sender, room_id);
-        }
-        let body = serde_json::json!({ "accepted": true, "match_id": room_id }).to_string();
-        let _ = self.reply_rpc(sender, request_id, protocol::RPC_STATUS_OK, body.as_bytes());
-        let _ = self.reply_joined_with_rep_bootstrap(sender, room_id, label);
-        Ok(())
+        let _ = room_id;
+        let _ = self.reply_rpc(
+            sender,
+            request_id,
+            protocol::RPC_STATUS_ERROR,
+            b"remote match state routing is unavailable",
+        );
+        Err(())
     }
 
     /// Admit a member whose socket belongs to another session node after the
@@ -2643,19 +2638,13 @@ impl Gateway {
         user_id: String,
         room_id: RoomId,
     ) -> Result<(), ()> {
-        let binding = self.script_gate(ScriptGateSurface::LiveAdmitRemote)?;
-        let admission = {
-            let _scope = self.lock_room_scope();
-            self.rooms.admit_remote_match_bound(
-                RemoteRoomMember {
-                    node_id: requester_node,
-                    user_id,
-                },
-                room_id,
-                binding.as_ref(),
-            )
-        };
-        admission.map(|_| ()).map_err(|_| ())
+        // Remote membership is a control-plane record only until the session
+        // node can receive authenticated owner state and route protected input
+        // back through the owner validator. Do not consume room capacity or
+        // create a half-admission before that data plane exists.
+        let _ = self.script_gate(ScriptGateSurface::LiveAdmitRemote)?;
+        let _ = (requester_node, user_id, room_id);
+        Err(())
     }
 
     /// Shard-owner-side validation after a party ticket crossed the
@@ -3269,8 +3258,8 @@ impl Gateway {
         let Some(rep) = &self.rep else {
             return;
         };
+        let _scope = self.lock_room_scope();
         let room_bound = {
-            let _scope = self.lock_room_scope();
             if let Some(room_id) = self.rooms.room_of(id) {
                 self.bind_rep_connection_to_room_under_scope(id, room_id);
                 true
@@ -3279,10 +3268,12 @@ impl Gateway {
             }
         };
         if room_bound {
+            drop(_scope);
             let _ = self.send_rep_bootstrap(id);
             return;
         }
         rep.join_match(id.get(), match_id, is_guest);
+        drop(_scope);
         let _ = self.send_rep_bootstrap(id);
     }
 
@@ -3342,9 +3333,6 @@ impl Gateway {
     /// Callers that also mutate [`RoomRegistry`] must use this variant in the
     /// same critical section as that mutation.
     fn bind_rep_connection_to_room_under_scope(&self, id: ParticipantId, room_id: RoomId) {
-        let Some(rep) = &self.rep else {
-            return;
-        };
         let match_id = {
             let Ok(mut bindings) = self.rep_rooms.lock() else {
                 return;
@@ -3352,6 +3340,9 @@ impl Gateway {
             let match_id = *bindings.room_matches.entry(room_id).or_insert(room_id);
             bindings.connections.insert(id, room_id);
             match_id
+        };
+        let Some(rep) = &self.rep else {
+            return;
         };
         rep.join_match(id.get(), match_id, self.registry.user_id_of(id).is_none());
         // Preserve the existing room-join wire ordering while still allocating
@@ -3618,10 +3609,9 @@ impl Gateway {
                 self.sync_party_presence_for_session(user_id, id);
             }
         }
-        // A newly connected client receives schema metadata but does not enter
-        // the global replication match. Room state becomes reachable only after
-        // one atomic room/binding admission; this also prevents reconnects from
-        // briefly resuming in match 0.
+        // Preserve the roomless/non-authoritative match-0 lifecycle byte for
+        // byte. Authoritative gateways deliberately remain schema-only until a
+        // room admission atomically binds both membership and replication.
         if let Some(rep) = &self.rep {
             let room_bound = {
                 let _scope = self.lock_room_scope();
@@ -3639,8 +3629,11 @@ impl Gateway {
             };
             if room_bound {
                 let _ = self.send_rep_bootstrap(id);
-            } else if !rep.is_joined(id.get()) {
+            } else if self.bridge.is_some() && !rep.is_joined(id.get()) {
                 let _ = self.send_rep_schema(id);
+            } else if self.bridge.is_none() {
+                rep.join_match(id.get(), 0, self.registry.user_id_of(id).is_none());
+                let _ = self.send_rep_bootstrap(id);
             }
         }
         self.dispatch_lifecycle(LifecycleHook::Join, id);
@@ -3689,7 +3682,9 @@ impl Gateway {
                         // A room-bound receiver never accepts an object that
                         // lacks a trusted object binding. This fails closed for
                         // stale/despawned state and forbids match-id inference.
-                        Some((None, None)) => self.registry.send_to(id, &outbound),
+                        Some((None, None)) if self.rooms.room_of(id).is_none() => {
+                            self.registry.send_to(id, &outbound)
+                        }
                         _ => false,
                     }
                 }
@@ -3845,9 +3840,13 @@ impl Gateway {
     /// by the handler deadline, exactly like [`handle_inbound`](Gateway::handle_inbound).
     fn dispatch_lifecycle(&self, hook: LifecycleHook, id: ParticipantId) {
         if let Some(runtime) = &self.runtime {
+            let room_id = {
+                let _scope = self.lock_room_scope();
+                self.rooms.room_of(id)
+            };
             let user_id = self.registry.user_id_of(id);
             let commands = runtime.dispatch_lifecycle(hook, id.get(), user_id.as_deref());
-            self.apply_commands(Some(id), commands);
+            self.apply_commands_scoped(Some(id), room_id, commands);
         }
     }
 
@@ -3865,8 +3864,17 @@ impl Gateway {
         // Preserve the global tick for server-wide work, then advance each live
         // match independently. A match command fan-outs only to that match's
         // current presence snapshot.
-        let mut delivered = self.apply_commands(None, runtime.tick(dt, budget));
-        for room in self.rooms.snapshot() {
+        let rooms = self.rooms.snapshot();
+        // A process-global tick has no match identity. Once multiple matches
+        // coexist, applying its arbitrary game commands would create an
+        // unscoped client-facing path; per-room ticks below remain available.
+        let mut delivered = if rooms.len() <= 1 {
+            self.apply_commands(None, runtime.tick(dt, budget))
+        } else {
+            let _ = runtime.tick(dt, budget);
+            0
+        };
+        for room in rooms {
             let commands = runtime.tick_in_room(room.id, dt, budget);
             delivered += self.apply_commands_scoped(None, Some(room.id), commands);
         }
@@ -5575,40 +5583,15 @@ impl Gateway {
                 request.requester_node,
             ));
         };
-        // Readiness gate on the match-owner node: the control-plane admission
-        // transport fails closed like every local surface. The requester sees
-        // the same opaque rejection as any other refused admission.
-        let binding = self
+        // The control plane has no authenticated owner-to-session state relay.
+        // Reject before claiming admission or consuming a remote room slot;
+        // otherwise the requester would be acknowledged by a node that cannot
+        // retain the bridge/room-scope invariant.
+        let _ = self
             .script_gate(ScriptGateSurface::ClusterAdmitRemote)
             .map_err(|()| MatchmakerRouterError::Rejected(cluster.node_id.clone()))?;
-        let now = SystemClock.now();
-        let handoff = self
-            .handoff_for(&request.ticket_id, &request.user_id, now)
-            .ok_or_else(|| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
-        if handoff.token.as_str() != request.join_token || request.formation_lease != cluster.lease
-        {
-            return Err(MatchmakerRouterError::UnknownDestination(
-                cluster.node_id.clone(),
-            ));
-        }
-        cluster
-            .authority
-            .claim_admission(&request.ticket_id, &request.user_id, &cluster.lease, now)
-            .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
-        let admission = {
-            let _scope = self.lock_room_scope();
-            self.rooms.admit_remote_match_bound(
-                RemoteRoomMember {
-                    node_id: request.requester_node,
-                    user_id: request.user_id,
-                },
-                handoff.room_id,
-                binding.as_ref(),
-            )
-        };
-        admission
-            .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
-        Ok(handoff.room_id)
+        let _ = request;
+        Err(MatchmakerRouterError::Rejected(cluster.node_id.clone()))
     }
 
     /// Send one reliable, correlated RPC response to its caller.
@@ -5870,9 +5853,27 @@ impl Gateway {
         archetype_id: u16,
         transform: citadel_wire::na::NaTransform,
     ) -> usize {
+        let _scope = self.lock_room_scope();
+        let room_id = self.rooms.room_of(sender);
+        self.do_register_presence_under_scope(sender, room_id, archetype_id, transform)
+    }
+
+    /// Register presence while the caller holds the room transaction gate.
+    /// `room_id` is captured before the hub changes, so every self/batch/peer
+    /// enqueue shares a linearization point with the sender's membership.
+    fn do_register_presence_under_scope(
+        &self,
+        sender: ParticipantId,
+        sender_room: Option<RoomId>,
+        archetype_id: u16,
+        transform: citadel_wire::na::NaTransform,
+    ) -> usize {
         let Some(hub) = &self.transform else {
             return 0;
         };
+        if self.rooms.room_of(sender) != sender_room {
+            return 0;
+        }
         let Some(reg) = hub.register_presence(sender.get(), archetype_id, transform) else {
             return 0;
         };
@@ -5884,17 +5885,25 @@ impl Gateway {
             "networked-actors: presence registered"
         );
         let mut sent = 0;
-        let sender_room = self.rooms.room_of(sender);
         // 1) The owner's own spawn FIRST (tells it its object id).
-        if self.send_reliable_in_scope(sender, sender_room, KIND_NA_SPAWN, reg.self_spawn.encode())
-        {
+        if self.send_reliable_in_scope_under_scope(
+            sender,
+            sender_room,
+            KIND_NA_SPAWN,
+            reg.self_spawn.encode(),
+        ) {
             sent += 1;
         }
         // 2) A predicted owner receives its role only after its own spawn: the
         // engine can now bind the native pawn to object_id before the existing
         // input/prediction component sees the assignment.
         if let Some(role) = reg.owner_role
-            && self.send_reliable_in_scope(sender, sender_room, KIND_TSYNC_ROLE, role.encode())
+            && self.send_reliable_in_scope_under_scope(
+                sender,
+                sender_room,
+                KIND_TSYNC_ROLE,
+                role.encode(),
+            )
         {
             sent += 1;
         }
@@ -5904,7 +5913,7 @@ impl Gateway {
             .batch
             .spawns
             .into_iter()
-            .filter(|s| self.same_room(sender, ParticipantId::from_raw(s.owner)))
+            .filter(|s| self.rooms.room_of(ParticipantId::from_raw(s.owner)) == sender_room)
             .collect();
         let mut batch_owners: Vec<u64> = batch_spawns
             .iter()
@@ -5943,7 +5952,7 @@ impl Gateway {
         };
         batch_owners.sort_unstable();
         batch_owners.dedup();
-        if self.send_reliable_in_scope_with_owners(
+        if self.send_reliable_in_scope_with_owners_under_scope(
             sender,
             sender_room,
             &batch_owners,
@@ -5956,7 +5965,12 @@ impl Gateway {
         let peer_body = reg.peer_spawn.encode();
         for peer in reg.peers {
             let peer_id = ParticipantId::from_raw(peer);
-            if self.send_reliable_same_room(sender, peer_id, KIND_NA_SPAWN, peer_body.clone()) {
+            if self.send_reliable_same_room_under_scope(
+                sender,
+                peer_id,
+                KIND_NA_SPAWN,
+                peer_body.clone(),
+            ) {
                 sent += 1;
             }
         }
@@ -5976,19 +5990,32 @@ impl Gateway {
         }
     }
 
-    fn send_reliable_in_scope(
+    /// Send a room-scoped frame only after rechecking both the recipient and
+    /// every captured source owner under the room transaction gate.
+    #[cfg(test)]
+    fn send_reliable_in_scope_with_owners(
+        &self,
+        target: ParticipantId,
+        room_id: Option<RoomId>,
+        owners: &[u64],
+        kind: u16,
+        body: Vec<u8>,
+    ) -> bool {
+        let _scope = self.lock_room_scope();
+        self.send_reliable_in_scope_with_owners_under_scope(target, room_id, owners, kind, body)
+    }
+
+    fn send_reliable_in_scope_under_scope(
         &self,
         target: ParticipantId,
         room_id: Option<RoomId>,
         kind: u16,
         body: Vec<u8>,
     ) -> bool {
-        self.send_reliable_in_scope_with_owners(target, room_id, &[], kind, body)
+        self.send_reliable_in_scope_with_owners_under_scope(target, room_id, &[], kind, body)
     }
 
-    /// Send a room-scoped frame only after rechecking both the recipient and
-    /// every captured source owner under the room transaction gate.
-    fn send_reliable_in_scope_with_owners(
+    fn send_reliable_in_scope_with_owners_under_scope(
         &self,
         target: ParticipantId,
         room_id: Option<RoomId>,
@@ -5998,7 +6025,6 @@ impl Gateway {
     ) -> bool {
         let outbound = Outbound::reliable(Envelope::new(kind, body));
         let bytes = outbound.envelope.body.len() as u64;
-        let _scope = self.lock_room_scope();
         let delivered = self
             .rooms
             .while_member_and_owners_in(target, room_id, owners, || {
@@ -6018,9 +6044,19 @@ impl Gateway {
         kind: u16,
         body: Vec<u8>,
     ) -> bool {
+        let _scope = self.lock_room_scope();
+        self.send_reliable_same_room_under_scope(source, target, kind, body)
+    }
+
+    fn send_reliable_same_room_under_scope(
+        &self,
+        source: ParticipantId,
+        target: ParticipantId,
+        kind: u16,
+        body: Vec<u8>,
+    ) -> bool {
         let outbound = Outbound::reliable(Envelope::new(kind, body));
         let bytes = outbound.envelope.body.len() as u64;
-        let _scope = self.lock_room_scope();
         let delivered = self
             .rooms
             .while_same_room(source, target, || self.registry.send_to(target, &outbound))
@@ -6042,6 +6078,16 @@ impl Gateway {
         outbound: &Outbound,
     ) -> usize {
         let _scope = self.lock_room_scope();
+        self.send_to_room_members_under_scope(room_id, source, exclude, outbound)
+    }
+
+    fn send_to_room_members_under_scope(
+        &self,
+        room_id: RoomId,
+        source: Option<ParticipantId>,
+        exclude: Option<ParticipantId>,
+        outbound: &Outbound,
+    ) -> usize {
         self.rooms
             .while_members_in(room_id, |members| {
                 if source.is_some_and(|participant| !members.contains(&participant)) {
@@ -6056,10 +6102,77 @@ impl Gateway {
             .unwrap_or(0)
     }
 
-    /// The room registry (membership state), visible only inside this crate for
-    /// read-only diagnostics and tests. Production membership changes must use
-    /// the gateway transition methods so they share the replication transaction
-    /// gate.
+    /// Snapshot local match metadata for diagnostics and console queries.
+    #[must_use]
+    pub fn room_snapshot(&self) -> Vec<crate::realtime::rooms::RoomSnapshot> {
+        self.rooms.snapshot()
+    }
+
+    /// Return a match's immutable script binding, if it is still live.
+    #[must_use]
+    pub fn room_binding(&self, room_id: RoomId) -> Option<ScriptBinding> {
+        self.rooms.binding(room_id)
+    }
+
+    /// Create an empty trusted room. Membership admission remains a separate
+    /// gateway operation so it can atomically install its replication binding.
+    pub fn create_room(&self, label: RoomLabel) -> RoomId {
+        let _scope = self.lock_room_scope();
+        self.rooms.create(label)
+    }
+
+    /// Atomically admit a trusted local participant and bind its replication
+    /// connection to the same room. Server-side integrations use this instead
+    /// of mutating `RoomRegistry` directly.
+    pub fn join_room(
+        &self,
+        participant: ParticipantId,
+        room_id: RoomId,
+    ) -> Result<RoomLabel, JoinError> {
+        let _scope = self.lock_room_scope();
+        let label = self.rooms.join(participant, room_id)?;
+        self.bind_rep_connection_to_room_under_scope(participant, room_id);
+        Ok(label)
+    }
+
+    /// Atomically join a named trusted room or create it and bind the caller.
+    pub fn join_or_create_room(
+        &self,
+        participant: ParticipantId,
+        name: &str,
+        make_label: impl FnOnce() -> RoomLabel,
+    ) -> Result<(RoomId, RoomLabel), JoinError> {
+        self.join_or_create_room_bound(participant, name, None, make_label)
+    }
+
+    /// Trusted named-room admission with an explicit script binding. The
+    /// binding is checked by `RoomRegistry` and the replication connection is
+    /// committed in the same room transaction.
+    pub fn join_or_create_room_bound(
+        &self,
+        participant: ParticipantId,
+        name: &str,
+        binding: Option<ScriptBinding>,
+        make_label: impl FnOnce() -> RoomLabel,
+    ) -> Result<(RoomId, RoomLabel), JoinError> {
+        let _scope = self.lock_room_scope();
+        let (room_id, label) =
+            self.rooms
+                .join_or_create_bound(participant, name, binding, make_label)?;
+        self.bind_rep_connection_to_room_under_scope(participant, room_id);
+        Ok((room_id, label))
+    }
+
+    /// Drop a room that never admitted a member. Matchmaker failure cleanup is
+    /// serialized with admissions so an expired handoff cannot race a bind.
+    pub(crate) fn discard_empty_room(&self, room_id: RoomId) -> bool {
+        let _scope = self.lock_room_scope();
+        self.rooms.discard_empty(room_id)
+    }
+
+    /// Unit tests use the concrete registry to construct deliberate stale
+    /// snapshots. Production code cannot obtain this mutable transition bypass.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn rooms(&self) -> &RoomRegistry {
         &self.rooms
@@ -6118,6 +6231,10 @@ impl Gateway {
             for member in &members {
                 self.unbind_rep_connection_under_scope(*member);
             }
+            // A late validator answer must not observe the room as closed but
+            // still find a live ledger. Remove both identities in the same
+            // transaction as the membership/binding transition.
+            self.drop_bridge_match(room_id);
             members
         };
         // Let a process-hosting runtime adapter release the match's execution
@@ -6126,9 +6243,6 @@ impl Gateway {
         if let Some(runtime) = &self.runtime {
             runtime.on_match_closed(room_id);
         }
-        // Drop the match's pending-batch ledger so a late script answer for it
-        // is rejected as an unknown batch, never resurrecting a dead match.
-        self.drop_bridge_match(room_id);
         tracing::warn!(
             room_id,
             members = members.len(),
@@ -6444,13 +6558,6 @@ impl Gateway {
         }
     }
 
-    /// Whether two participants share a room scope (both roomless = same scope).
-    /// Networked-Actors visibility is gated on this: players in
-    /// different rooms share one `TransformWorld` but never spawn each other.
-    fn same_room(&self, a: ParticipantId, b: ParticipantId) -> bool {
-        self.rooms.room_of(a) == self.rooms.room_of(b)
-    }
-
     /// Handle a `NetworkPeer` replication frame (`KIND_REP_DELTA` /
     /// `KIND_REP_ACK`, ).
     ///
@@ -6682,6 +6789,14 @@ impl Gateway {
         room_id: Option<RoomId>,
         commands: Vec<OutboundCommand>,
     ) -> usize {
+        // A command stream without a room identity is legacy global work. Once
+        // more than one room is live, arbitrary script commands must not become
+        // a client-facing state broadcast; match-local handlers use `Some` and
+        // retain the normal scoped path below. The one-room/roomless behavior is
+        // intentionally unchanged.
+        if room_id.is_none() && self.rooms.room_count() > 1 {
+            return 0;
+        }
         let mut delivered_total = 0;
         for command in commands {
             match command {
@@ -7094,20 +7209,24 @@ impl Gateway {
         Some((room_id, binding))
     }
 
-    /// Issue `drafts` to `room_id`'s ledger (bound to `binding`) and deliver the
-    /// fenced batch to the script. The ledger lock is released before delivery,
-    /// because an embedded runtime answers inline on this same call stack and
-    /// re-enters the ledger through [`BridgeCommandSink::deliver_command_batch`].
-    fn deliver_bridge_batch(
+    /// Issue a protected event only while its local originator is still bound
+    /// to the match. The lock is released before the runtime callback, because
+    /// an embedded validator may answer inline; materialization repeats the
+    /// same test under the gate before it mutates state.
+    fn deliver_bridge_batch_for_member(
         &self,
+        sender: ParticipantId,
         room_id: RoomId,
         binding: &ScriptBinding,
         drafts: Vec<EventDraft>,
     ) {
-        let Some(batch) = self.issue_bridge_batch(room_id, binding, drafts) else {
+        let scope = self.lock_room_scope();
+        if self.rooms.room_of(sender) != Some(room_id) {
             return;
-        };
-        if let Some(runtime) = &self.runtime {
+        }
+        let batch = self.issue_bridge_batch(room_id, binding, drafts);
+        drop(scope);
+        if let (Some(batch), Some(runtime)) = (batch, &self.runtime) {
             runtime.deliver_event_batch(batch);
         }
     }
@@ -7257,7 +7376,7 @@ impl Gateway {
                 transform: transform.into(),
             },
         };
-        self.deliver_bridge_batch(room_id, binding, vec![draft]);
+        self.deliver_bridge_batch_for_member(sender, room_id, binding, vec![draft]);
         0
     }
 
@@ -7290,7 +7409,7 @@ impl Gateway {
                 transform: transform.into(),
             },
         };
-        self.deliver_bridge_batch(room_id, binding, vec![draft]);
+        self.deliver_bridge_batch_for_member(sender, room_id, binding, vec![draft]);
         0
     }
 
@@ -7341,7 +7460,7 @@ impl Gateway {
         if drafts.is_empty() {
             return 0;
         }
-        self.deliver_bridge_batch(room_id, binding, drafts);
+        self.deliver_bridge_batch_for_member(sender, room_id, binding, drafts);
         0
     }
 
@@ -7378,7 +7497,12 @@ impl Gateway {
                 if let Some(validated) = pending_rep {
                     return self.materialize_rep_apply(room_id, validated);
                 }
-                self.materialize_accept(&outcome.event.payload, outcome.event.participant)
+                let _scope = self.lock_room_scope();
+                self.materialize_accept_under_scope(
+                    room_id,
+                    &outcome.event.payload,
+                    outcome.event.participant,
+                )
             }
             Decision::Correct { correction } => {
                 if let (Some(validated), Correction::ReplicatedVars { fields }) =
@@ -7394,7 +7518,9 @@ impl Gateway {
                         ),
                     );
                 }
-                self.materialize_correction(
+                let _scope = self.lock_room_scope();
+                self.materialize_correction_under_scope(
+                    room_id,
                     &outcome.event.payload,
                     outcome.event.participant,
                     correction,
@@ -7468,11 +7594,23 @@ impl Gateway {
         delivered
     }
 
-    /// Apply the client's own canonical effect for an accepted event.
-    fn materialize_accept(&self, payload: &NormalizedPayload, participant: u64) -> usize {
+    /// Apply the client's own canonical effect while the room transaction gate
+    /// is held. A delayed validator answer is discarded unless its originator
+    /// is still in the exact issuing room; this prevents an A input becoming B
+    /// state after a move, leave, or close.
+    fn materialize_accept_under_scope(
+        &self,
+        room_id: RoomId,
+        payload: &NormalizedPayload,
+        participant: u64,
+    ) -> usize {
         let Some(hub) = &self.transform else {
             return 0;
         };
+        let participant_id = ParticipantId::from_raw(participant);
+        if self.rooms.room_of(participant_id) != Some(room_id) {
+            return 0;
+        }
         match payload {
             NormalizedPayload::ActorStateReport {
                 object_id,
@@ -7516,8 +7654,9 @@ impl Gateway {
             NormalizedPayload::SpawnRequest {
                 archetype_id,
                 transform,
-            } => self.do_register_presence(
-                ParticipantId::from_raw(participant),
+            } => self.do_register_presence_under_scope(
+                participant_id,
+                Some(room_id),
                 *archetype_id,
                 (*transform).into(),
             ),
@@ -7531,9 +7670,11 @@ impl Gateway {
         }
     }
 
-    /// Apply the script's substituted value for a corrected event.
-    fn materialize_correction(
+    /// Apply the script's substituted value while the originating participant
+    /// still belongs to the issuing room.
+    fn materialize_correction_under_scope(
         &self,
+        room_id: RoomId,
         payload: &NormalizedPayload,
         participant: u64,
         correction: &Correction,
@@ -7541,6 +7682,10 @@ impl Gateway {
         let Some(hub) = &self.transform else {
             return 0;
         };
+        let participant_id = ParticipantId::from_raw(participant);
+        if self.rooms.room_of(participant_id) != Some(room_id) {
+            return 0;
+        }
         match (payload, correction) {
             (
                 NormalizedPayload::ActorStateReport { object_id, .. }
@@ -7556,8 +7701,9 @@ impl Gateway {
                     archetype_id,
                     transform,
                 },
-            ) => self.do_register_presence(
-                ParticipantId::from_raw(participant),
+            ) => self.do_register_presence_under_scope(
+                participant_id,
+                Some(room_id),
                 *archetype_id,
                 (*transform).into(),
             ),
@@ -8554,7 +8700,7 @@ mod transform_tests {
     }
 
     #[tokio::test]
-    async fn rep_registration_sends_only_schema_until_room_admission() {
+    async fn rep_registration_preserves_legacy_roomless_match_without_bridge() {
         use crate::realtime::netpeer::RepAuthority;
 
         let rep = Arc::new(RepAuthority::new(Default::default()));
@@ -8564,11 +8710,11 @@ mod transform_tests {
         assert_eq!(
             receiver.recv().await.expect("schema frame").envelope.kind,
             citadel_wire::protocol::KIND_REP_SCHEMA,
-            "pre-admission registration still advertises schemas"
+            "legacy registration still advertises schemas"
         );
         assert!(
-            !rep.is_joined(participant.get()),
-            "a reconnect must not briefly resume in replication match 0"
+            rep.is_joined(participant.get()),
+            "a bridge-less gateway preserves the legacy match-0 lifecycle"
         );
 
         gw.handle_inbound(
@@ -8584,7 +8730,7 @@ mod transform_tests {
         let _ = receiver.recv().await.expect("room joined");
         assert!(
             rep.is_joined(participant.get()),
-            "the atomic room admission establishes the only replication match"
+            "atomic room admission rebinds the legacy receiver to its room"
         );
     }
 
@@ -8626,7 +8772,7 @@ mod transform_tests {
         let gw = Gateway::new().with_rep_authority(Arc::clone(&rep));
 
         let (owner, mut owner_rx) = register_session(&gw);
-        let _ = owner_rx.recv().await.expect("owner initial schema");
+        while owner_rx.try_recv().is_ok() {}
         gw.handle_inbound(
             owner,
             &Envelope::new(
@@ -8643,7 +8789,7 @@ mod transform_tests {
                 .room_id;
 
         let (peer, mut peer_rx) = register_session(&gw);
-        let _ = peer_rx.recv().await.expect("peer initial schema");
+        while peer_rx.try_recv().is_ok() {}
         gw.handle_inbound(
             peer,
             &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id: room_a }.encode()),
@@ -8732,8 +8878,20 @@ mod transform_tests {
             .expect("class registers");
         let gw = Gateway::new().with_rep_authority(rep);
 
+        // This object exists before any room and is therefore intentionally
+        // roomless legacy state. A later direct registry drift must never make
+        // that state reachable from a room member.
+        let (legacy, mut legacy_rx) = register_session(&gw);
+        let _ = legacy_rx.recv().await.expect("legacy initial schema");
+        gw.spawn_rep_object(704, 0, CLASS, None, false, {
+            let mut initial = RepSnapshot::new();
+            initial.set_scalar(0, RepValue::Int(11));
+            initial
+        })
+        .expect("roomless object spawn");
+
         let (owner, mut owner_rx) = register_session(&gw);
-        let _ = owner_rx.recv().await.expect("owner initial schema");
+        while owner_rx.try_recv().is_ok() {}
         gw.handle_inbound(
             owner,
             &Envelope::new(
@@ -8751,7 +8909,7 @@ mod transform_tests {
         assert_ne!(MATCH, room_id, "test requires distinct match and room ids");
 
         let (peer, mut peer_rx) = register_session(&gw);
-        let _ = peer_rx.recv().await.expect("peer initial schema");
+        while peer_rx.try_recv().is_ok() {}
         gw.handle_inbound(
             peer,
             &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
@@ -8810,6 +8968,23 @@ mod transform_tests {
         assert!(
             peer_rx.try_recv().is_err(),
             "a bound-A object must never bootstrap to a bound-B connection"
+        );
+
+        // Deliberately bypass the gateway's trusted join API to model a stale
+        // extension built against the old public RoomRegistry accessor. The
+        // participant remains joined to RepAuthority match 0 but has no room
+        // binding; bootstrap must not use the `(None, None)` fallback.
+        gw.rooms()
+            .join(legacy, room_id)
+            .expect("test-only registry drift");
+        assert_eq!(gw.send_rep_bootstrap(legacy), 1);
+        assert_eq!(
+            legacy_rx.recv().await.expect("schema only").envelope.kind,
+            citadel_wire::protocol::KIND_REP_SCHEMA
+        );
+        assert!(
+            legacy_rx.try_recv().is_err(),
+            "an unbound object cannot bootstrap to a room member"
         );
     }
 
@@ -9842,6 +10017,40 @@ mod transform_tests {
     }
 
     #[tokio::test]
+    async fn accepted_bridge_input_after_room_move_is_dropped() {
+        let (gw, hub) = authoritative_gateway_slots("-- deferred validator", 1);
+        let (participant, object_id, ownership_epoch) = authoritative_slot_member(&gw).await;
+        let room_a = gw.rooms().room_of(participant).expect("member starts in A");
+        let room_b = gw.create_room(RoomLabel::with_map("B"));
+        gw.join_room(participant, room_b)
+            .expect("trusted move to B");
+
+        let payload = NormalizedPayload::TransformInput {
+            object_id,
+            ownership_epoch,
+            input_seq: 1,
+            sim_tick: 0,
+            dt: 0.1,
+            move_velocity: [100.0, 0.0, 0.0],
+            payload: Vec::new(),
+            fire: None,
+        };
+        let start = hub.get_transform(object_id).expect("object").position;
+        let scope = gw.lock_room_scope();
+        assert_eq!(
+            gw.materialize_accept_under_scope(room_a, &payload, participant.get()),
+            0,
+            "a delayed A acceptance is dropped after the participant moves to B"
+        );
+        drop(scope);
+        assert_eq!(
+            hub.get_transform(object_id).expect("object").position,
+            start,
+            "the old-room input cannot become transform state in B"
+        );
+    }
+
+    #[tokio::test]
     async fn authoritative_input_reject_integrates_nothing() {
         let (gw, hub) =
             authoritative_gateway_slots("citadel.on_input(function(e) return false end)", 1);
@@ -9925,6 +10134,32 @@ mod transform_tests {
         assert!(
             hub.relay_owned_object(a.get()).is_none(),
             "no answer must not register a presence or fan out a spawn (bypass B5 closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_bridge_presence_after_room_move_is_dropped() {
+        let (gw, hub) = authoritative_gateway("-- deferred validator");
+        let (participant, _receiver) = authoritative_room_member(&gw).await;
+        let room_a = gw.rooms().room_of(participant).expect("member starts in A");
+        let room_b = gw.create_room(RoomLabel::with_map("B"));
+        gw.join_room(participant, room_b)
+            .expect("trusted move to B");
+
+        let payload = NormalizedPayload::SpawnRequest {
+            archetype_id: 0,
+            transform: BridgeTransform::identity(),
+        };
+        let scope = gw.lock_room_scope();
+        assert_eq!(
+            gw.materialize_accept_under_scope(room_a, &payload, participant.get()),
+            0,
+            "a delayed A spawn request is dropped after the participant moves"
+        );
+        drop(scope);
+        assert!(
+            hub.relay_owned_object(participant.get()).is_none(),
+            "the stale acceptance cannot spawn a B-visible networked actor"
         );
     }
 
@@ -13435,7 +13670,7 @@ mod script_gate_tests {
     }
 
     #[tokio::test]
-    async fn live_remote_admission_binds_replication_before_room_joined() {
+    async fn live_remote_admission_fails_closed_without_owner_state_routing() {
         let readiness = boot_readiness();
         readiness.record_loaded("sha256:v1", now());
         let gw = gated_gateway(&readiness).with_rep_authority(Arc::new(
@@ -13443,8 +13678,11 @@ mod script_gate_tests {
         ));
         let (alice, mut ra) = register(&gw, Some("alice"));
 
-        gw.live_matchmaker_finish_remote_accept(alice, 8, 42)
-            .expect("ready remote admission succeeds");
+        assert_eq!(
+            gw.live_matchmaker_finish_remote_accept(alice, 8, 42),
+            Err(()),
+            "a remote owner cannot be confirmed without scoped state routing"
+        );
 
         assert_eq!(
             gw.rep_rooms
@@ -13453,13 +13691,17 @@ mod script_gate_tests {
                 .connections
                 .get(&alice)
                 .copied(),
-            Some(42),
-            "the requester must be bound before it can observe ROOM_JOINED"
+            None,
+            "a refused remote admission cannot leave a replication binding"
         );
-        let _ = recv_rpc(&mut ra).await;
         assert_eq!(
-            ra.recv().await.expect("room joined").envelope.kind,
-            KIND_ROOM_JOINED
+            recv_rpc(&mut ra).await.0,
+            protocol::RPC_STATUS_ERROR,
+            "the requester receives an explicit admission failure"
+        );
+        assert!(
+            ra.try_recv().is_err(),
+            "no ROOM_JOINED or baseline is emitted"
         );
     }
 
@@ -13580,11 +13822,15 @@ mod script_gate_tests {
             formation_lease: lease.clone(),
         };
 
-        // Control probe: while Ready the owner node admits the remote member.
-        let match_id = router
-            .admit_remote(&node_a, admission(&alice_handoff, "alice"))
-            .expect("ready owner admits");
-        assert_eq!(gw.rooms().snapshot()[0].remote_member_count, 1);
+        // The owner refuses before consuming capacity: it cannot route scoped
+        // state or protected intents back to the requesting session node.
+        assert!(
+            router
+                .admit_remote(&node_a, admission(&alice_handoff, "alice"))
+                .is_err(),
+            "remote control admission is fail-closed without the data plane"
+        );
+        assert_eq!(gw.rooms().snapshot()[0].remote_member_count, 0);
 
         // Owner loses script readiness: the same control-plane path refuses.
         readiness.record_degraded(now());
@@ -13594,9 +13840,11 @@ mod script_gate_tests {
                 .is_err(),
             "owner node fails closed on NodeCommand::AdmitRemote"
         );
-        let rooms = gw.rooms().snapshot();
-        let room = rooms.iter().find(|room| room.id == match_id).expect("room");
-        assert_eq!(room.remote_member_count, 1, "no admission while degraded");
+        assert_eq!(
+            gw.rooms().snapshot()[0].remote_member_count,
+            0,
+            "no admission is recorded while degraded"
+        );
         assert_eq!(
             gw.metrics
                 .snapshot()

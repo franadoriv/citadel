@@ -637,7 +637,7 @@ async fn require_script_external_worker_boots_not_ready_then_binds_and_executes(
         }
     };
     assert_eq!(
-        gateway.rooms().binding(joined.room_id),
+        gateway.room_binding(joined.room_id),
         Some(binding),
         "the admitted room carries the gating snapshot's binding"
     );

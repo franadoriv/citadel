@@ -696,7 +696,7 @@ async fn form_matches(
             .claim_formations(&formed.tickets, lease, now)
             .await
         {
-            let _ = gateway.rooms().discard_empty(room_id);
+            let _ = gateway.discard_empty_room(room_id);
             return Err(MatchmakerRouterError::Rejected(
                 inner.config.node_id.clone(),
             ));
@@ -705,7 +705,7 @@ async fn form_matches(
             .index
             .commit_formations(std::slice::from_ref(&formed), now)
         {
-            let _ = gateway.rooms().discard_empty(room_id);
+            let _ = gateway.discard_empty_room(room_id);
             return Err(MatchmakerRouterError::Rejected(
                 inner.config.node_id.clone(),
             ));
@@ -1046,6 +1046,13 @@ async fn admit_remote(
                     .has_same_fence_as(&request.formation_lease)
         })
         .ok_or_else(|| MatchmakerRouterError::Rejected(inner.config.node_id.clone()))?;
+    // A cross-node match has no authoritative state/intent relay yet. Refuse
+    // before claiming durable admission or changing owner room capacity.
+    if request.requester_node != inner.config.node_id {
+        return Err(MatchmakerRouterError::Rejected(
+            inner.config.node_id.clone(),
+        ));
+    }
     inner
         .config
         .directory
