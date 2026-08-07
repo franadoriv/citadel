@@ -12913,7 +12913,12 @@ mod domain_rpc_tests {
                     }),
                 ),
             );
-            assert_eq!(recv(&mut charlie_rx).await.1, protocol::RPC_STATUS_ERROR);
+            let (_, status, _) = recv(&mut charlie_rx).await;
+            assert_eq!(status, protocol::RPC_STATUS_ERROR);
+            assert!(
+                charlie_rx.try_recv().is_err(),
+                "a stale remote acceptance must not emit ROOM_JOINED"
+            );
         }
     }
 
