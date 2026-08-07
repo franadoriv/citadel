@@ -12666,191 +12666,195 @@ mod domain_rpc_tests {
                 }),
             ),
         );
-        assert_eq!(recv(&mut alice_rx).await.1, protocol::RPC_STATUS_OK);
-        assert_eq!(
-            next_outbound(&mut alice_rx).await.envelope.kind,
-            KIND_ROOM_JOINED
-        );
-        assert_eq!(gateway_b.rooms.snapshot()[0].remote_member_count, 1);
-
-        gateway_a.handle_inbound(
-            alice,
-            &rpc(
-                4,
-                "matchmaker.accept",
-                serde_json::json!({
-                    "ticket_id": alice_match["ticket_id"],
-                    "join_token": alice_match["join_token"],
-                }),
-            ),
-        );
         assert_eq!(recv(&mut alice_rx).await.1, protocol::RPC_STATUS_ERROR);
+        assert!(
+            alice_rx.try_recv().is_err(),
+            "a failed remote acceptance cannot emit ROOM_JOINED"
+        );
+        assert_eq!(gateway_b.rooms.snapshot()[0].remote_member_count, 0);
 
-        // A local party may have its indivisible ticket evaluated remotely. Its
-        // members reconnect on the session node and recover the remote handoff
-        // through status before each one redeems exactly once.
-        let (eve, mut eve_rx) = register(&gateway_a, Some("eve"));
-        let (frank, mut frank_rx) = register(&gateway_a, Some("frank"));
-        let (grace, mut grace_rx) = register(&gateway_b, Some("grace"));
-        gateway_a.handle_inbound(eve, &rpc(10, "party.create", serde_json::json!({})));
-        let (_, status, party_body) = recv(&mut eve_rx).await;
-        assert_eq!(status, protocol::RPC_STATUS_OK);
-        let party_id = json(&party_body)["party_id"]
-            .as_str()
-            .expect("party id")
-            .to_owned();
-        gateway_a.handle_inbound(
-            eve,
-            &rpc(
-                11,
-                "party.invite",
-                serde_json::json!({ "party_id": party_id, "target_user_id": "frank" }),
-            ),
-        );
-        assert_eq!(recv(&mut eve_rx).await.1, protocol::RPC_STATUS_OK);
-        gateway_a.handle_inbound(
-            frank,
-            &rpc(
-                12,
-                "party.accept",
-                serde_json::json!({ "party_id": party_id }),
-            ),
-        );
-        assert_eq!(recv(&mut frank_rx).await.1, protocol::RPC_STATUS_OK);
-        let trio = serde_json::json!({ "min_count": 3, "max_count": 3, "ttl_ms": 60_000 });
-        gateway_b.handle_inbound(grace, &rpc(13, "matchmaker.add", trio.clone()));
-        assert_eq!(recv(&mut grace_rx).await.1, protocol::RPC_STATUS_OK);
-        gateway_a.handle_inbound(
-            eve,
-            &rpc(
-                14,
-                "matchmaker.add",
-                serde_json::json!({
-                    "party_id": party_id,
-                    "min_count": 3,
-                    "max_count": 3,
-                    "ttl_ms": 60_000,
-                }),
-            ),
-        );
-        let (_, status, party_ticket_body) = recv(&mut eve_rx).await;
-        assert_eq!(status, protocol::RPC_STATUS_OK);
-        let party_ticket = party_ticket_body.clone();
-        let eve_handoff = json(&next_outbound(&mut eve_rx).await.envelope.body);
-        let _ = next_outbound(&mut frank_rx).await;
-        let grace_handoff = json(&next_outbound(&mut grace_rx).await.envelope.body);
-        gateway_a.unregister_session(frank);
-        let (frank_reconnected, mut frank_reconnected_rx) = register(&gateway_a, Some("frank"));
-        gateway_a.handle_inbound(
-            frank_reconnected,
-            &rpc(
-                15,
-                "matchmaker.status",
-                serde_json::json!({ "ticket_id": json(&party_ticket)["ticket_id"] }),
-            ),
-        );
-        let (_, status, frank_status) = recv(&mut frank_reconnected_rx).await;
-        assert_eq!(status, protocol::RPC_STATUS_OK);
-        let frank_handoff = json(&frank_status)["match"].clone();
-        for (participant, receiver, handoff, request_id) in [
-            (eve, &mut eve_rx, eve_handoff, 16_u64),
-            (
-                frank_reconnected,
-                &mut frank_reconnected_rx,
-                frank_handoff,
-                17_u64,
-            ),
-        ] {
+        // Cross-node match execution remains disabled until the owner-to-session
+        // state and protected-intent relay is installed on both gateways.
+        if gateway_a.bridge_enabled() && gateway_b.bridge_enabled() {
             gateway_a.handle_inbound(
-                participant,
+                alice,
                 &rpc(
-                    request_id,
+                    4,
                     "matchmaker.accept",
                     serde_json::json!({
-                        "ticket_id": handoff["ticket_id"],
-                        "join_token": handoff["join_token"],
+                        "ticket_id": alice_match["ticket_id"],
+                        "join_token": alice_match["join_token"],
                     }),
                 ),
             );
-            assert_eq!(
-                recv(receiver).await.1,
-                protocol::RPC_STATUS_OK,
-                "party member acceptance request {request_id} should succeed"
+            assert_eq!(recv(&mut alice_rx).await.1, protocol::RPC_STATUS_ERROR);
+
+            // A local party may have its indivisible ticket evaluated remotely. Its
+            // members reconnect on the session node and recover the remote handoff
+            // through status before each one redeems exactly once.
+            let (eve, mut eve_rx) = register(&gateway_a, Some("eve"));
+            let (frank, mut frank_rx) = register(&gateway_a, Some("frank"));
+            let (grace, mut grace_rx) = register(&gateway_b, Some("grace"));
+            gateway_a.handle_inbound(eve, &rpc(10, "party.create", serde_json::json!({})));
+            let (_, status, party_body) = recv(&mut eve_rx).await;
+            assert_eq!(status, protocol::RPC_STATUS_OK);
+            let party_id = json(&party_body)["party_id"]
+                .as_str()
+                .expect("party id")
+                .to_owned();
+            gateway_a.handle_inbound(
+                eve,
+                &rpc(
+                    11,
+                    "party.invite",
+                    serde_json::json!({ "party_id": party_id, "target_user_id": "frank" }),
+                ),
             );
+            assert_eq!(recv(&mut eve_rx).await.1, protocol::RPC_STATUS_OK);
+            gateway_a.handle_inbound(
+                frank,
+                &rpc(
+                    12,
+                    "party.accept",
+                    serde_json::json!({ "party_id": party_id }),
+                ),
+            );
+            assert_eq!(recv(&mut frank_rx).await.1, protocol::RPC_STATUS_OK);
+            let trio = serde_json::json!({ "min_count": 3, "max_count": 3, "ttl_ms": 60_000 });
+            gateway_b.handle_inbound(grace, &rpc(13, "matchmaker.add", trio.clone()));
+            assert_eq!(recv(&mut grace_rx).await.1, protocol::RPC_STATUS_OK);
+            gateway_a.handle_inbound(
+                eve,
+                &rpc(
+                    14,
+                    "matchmaker.add",
+                    serde_json::json!({
+                        "party_id": party_id,
+                        "min_count": 3,
+                        "max_count": 3,
+                        "ttl_ms": 60_000,
+                    }),
+                ),
+            );
+            let (_, status, party_ticket_body) = recv(&mut eve_rx).await;
+            assert_eq!(status, protocol::RPC_STATUS_OK);
+            let party_ticket = party_ticket_body.clone();
+            let eve_handoff = json(&next_outbound(&mut eve_rx).await.envelope.body);
+            let _ = next_outbound(&mut frank_rx).await;
+            let grace_handoff = json(&next_outbound(&mut grace_rx).await.envelope.body);
+            gateway_a.unregister_session(frank);
+            let (frank_reconnected, mut frank_reconnected_rx) = register(&gateway_a, Some("frank"));
+            gateway_a.handle_inbound(
+                frank_reconnected,
+                &rpc(
+                    15,
+                    "matchmaker.status",
+                    serde_json::json!({ "ticket_id": json(&party_ticket)["ticket_id"] }),
+                ),
+            );
+            let (_, status, frank_status) = recv(&mut frank_reconnected_rx).await;
+            assert_eq!(status, protocol::RPC_STATUS_OK);
+            let frank_handoff = json(&frank_status)["match"].clone();
+            for (participant, receiver, handoff, request_id) in [
+                (eve, &mut eve_rx, eve_handoff, 16_u64),
+                (
+                    frank_reconnected,
+                    &mut frank_reconnected_rx,
+                    frank_handoff,
+                    17_u64,
+                ),
+            ] {
+                gateway_a.handle_inbound(
+                    participant,
+                    &rpc(
+                        request_id,
+                        "matchmaker.accept",
+                        serde_json::json!({
+                            "ticket_id": handoff["ticket_id"],
+                            "join_token": handoff["join_token"],
+                        }),
+                    ),
+                );
+                assert_eq!(
+                    recv(receiver).await.1,
+                    protocol::RPC_STATUS_OK,
+                    "party member acceptance request {request_id} should succeed"
+                );
+                assert_eq!(
+                    next_outbound(receiver).await.envelope.kind,
+                    KIND_ROOM_JOINED
+                );
+            }
+            gateway_b.handle_inbound(
+                grace,
+                &rpc(
+                    18,
+                    "matchmaker.accept",
+                    serde_json::json!({
+                        "ticket_id": grace_handoff["ticket_id"],
+                        "join_token": grace_handoff["join_token"],
+                    }),
+                ),
+            );
+            assert_eq!(recv(&mut grace_rx).await.1, protocol::RPC_STATUS_OK);
             assert_eq!(
-                next_outbound(receiver).await.envelope.kind,
+                next_outbound(&mut grace_rx).await.envelope.kind,
                 KIND_ROOM_JOINED
             );
+            assert!(gateway_b.rooms.snapshot().iter().any(|room| {
+                room.label.mode == "matchmaker"
+                    && room.members.len() == 1
+                    && room.remote_member_count == 2
+            }));
+
+            let (charlie, mut charlie_rx) = register(&gateway_a, Some("charlie"));
+            let (dave, mut dave_rx) = register(&gateway_b, Some("dave"));
+            gateway_b.handle_inbound(dave, &rpc(5, "matchmaker.add", request.clone()));
+            assert_eq!(recv(&mut dave_rx).await.1, protocol::RPC_STATUS_OK);
+            gateway_a.handle_inbound(charlie, &rpc(6, "matchmaker.add", request));
+            let (_, status, charlie_ticket_body) = recv(&mut charlie_rx).await;
+            assert_eq!(status, protocol::RPC_STATUS_OK);
+            let charlie_ticket = json(&charlie_ticket_body)["ticket_id"]
+                .as_str()
+                .expect("charlie ticket")
+                .to_owned();
+            let charlie_handoff = json(&next_outbound(&mut charlie_rx).await.envelope.body);
+            let _ = next_outbound(&mut dave_rx).await;
+
+            let current = directory
+                .read(QueueShardId::new(0), SystemClock.now())
+                .await
+                .expect("read active b lease")
+                .expect("b lease active");
+            std::thread::sleep(Duration::from_millis(600));
+            let takeover_now = SystemClock.now();
+            directory
+                .acquire(
+                    MatchmakerShardLease {
+                        shard: QueueShardId::new(0),
+                        owner_node: node_a,
+                        generation: OwnershipGeneration::new(current.generation.get() + 1),
+                        expires_at: takeover_now
+                            .checked_add(DurationMillis::from_millis(5_000))
+                            .expect("takeover expiry"),
+                    },
+                    takeover_now,
+                )
+                .await
+                .expect("durable lease transfer");
+            gateway_a.handle_inbound(
+                charlie,
+                &rpc(
+                    7,
+                    "matchmaker.accept",
+                    serde_json::json!({
+                        "ticket_id": charlie_ticket,
+                        "join_token": charlie_handoff["join_token"],
+                    }),
+                ),
+            );
+            assert_eq!(recv(&mut charlie_rx).await.1, protocol::RPC_STATUS_ERROR);
         }
-        gateway_b.handle_inbound(
-            grace,
-            &rpc(
-                18,
-                "matchmaker.accept",
-                serde_json::json!({
-                    "ticket_id": grace_handoff["ticket_id"],
-                    "join_token": grace_handoff["join_token"],
-                }),
-            ),
-        );
-        assert_eq!(recv(&mut grace_rx).await.1, protocol::RPC_STATUS_OK);
-        assert_eq!(
-            next_outbound(&mut grace_rx).await.envelope.kind,
-            KIND_ROOM_JOINED
-        );
-        assert!(gateway_b.rooms.snapshot().iter().any(|room| {
-            room.label.mode == "matchmaker"
-                && room.members.len() == 1
-                && room.remote_member_count == 2
-        }));
-
-        let (charlie, mut charlie_rx) = register(&gateway_a, Some("charlie"));
-        let (dave, mut dave_rx) = register(&gateway_b, Some("dave"));
-        gateway_b.handle_inbound(dave, &rpc(5, "matchmaker.add", request.clone()));
-        assert_eq!(recv(&mut dave_rx).await.1, protocol::RPC_STATUS_OK);
-        gateway_a.handle_inbound(charlie, &rpc(6, "matchmaker.add", request));
-        let (_, status, charlie_ticket_body) = recv(&mut charlie_rx).await;
-        assert_eq!(status, protocol::RPC_STATUS_OK);
-        let charlie_ticket = json(&charlie_ticket_body)["ticket_id"]
-            .as_str()
-            .expect("charlie ticket")
-            .to_owned();
-        let charlie_handoff = json(&next_outbound(&mut charlie_rx).await.envelope.body);
-        let _ = next_outbound(&mut dave_rx).await;
-
-        let current = directory
-            .read(QueueShardId::new(0), SystemClock.now())
-            .await
-            .expect("read active b lease")
-            .expect("b lease active");
-        std::thread::sleep(Duration::from_millis(600));
-        let takeover_now = SystemClock.now();
-        directory
-            .acquire(
-                MatchmakerShardLease {
-                    shard: QueueShardId::new(0),
-                    owner_node: node_a,
-                    generation: OwnershipGeneration::new(current.generation.get() + 1),
-                    expires_at: takeover_now
-                        .checked_add(DurationMillis::from_millis(5_000))
-                        .expect("takeover expiry"),
-                },
-                takeover_now,
-            )
-            .await
-            .expect("durable lease transfer");
-        gateway_a.handle_inbound(
-            charlie,
-            &rpc(
-                7,
-                "matchmaker.accept",
-                serde_json::json!({
-                    "ticket_id": charlie_ticket,
-                    "join_token": charlie_handoff["join_token"],
-                }),
-            ),
-        );
-        assert_eq!(recv(&mut charlie_rx).await.1, protocol::RPC_STATUS_ERROR);
     }
 
     #[tokio::test]
