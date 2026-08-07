@@ -22,14 +22,18 @@ use citadel::realtime::netpeer::{
     FieldAuthority, FieldBounds, RepAuthority, RepCondition, RepLayout, RepLayoutBuilder,
     RepSnapshot, TypeTag,
 };
-use citadel::realtime::registry::{Outbound, SessionHandle};
+use citadel::realtime::registry::{Outbound, ParticipantId, SessionHandle};
 use citadel::transport::TransportKind;
 use citadel_wire::codec::{ScalarQuant, codec_id};
 use citadel_wire::netpeer::{
     DeltaBunch, FieldDelta, MAX_ENVELOPE_ALLOC, RepAck, RepAckEntry, RepFieldCodec, RepSchema,
     RepSchemaTable, RepValue,
 };
-use citadel_wire::protocol::{KIND_REP_ACK, KIND_REP_DELTA, KIND_REP_SCHEMA};
+use citadel_wire::protocol::{
+    KIND_REP_ACK, KIND_REP_DELTA, KIND_REP_SCHEMA, KIND_ROOM_CREATE, KIND_ROOM_JOIN,
+    KIND_ROOM_JOINED,
+};
+use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined};
 use tokio::sync::mpsc;
 
 const CLASS: u32 = 42;
@@ -363,6 +367,38 @@ async fn connect(server_addr: SocketAddr, cert: &SelfSignedCert) -> quinn::Conne
     .expect("connection established")
 }
 
+async fn send_quic_reliable(conn: &quinn::Connection, env: TEnvelope) {
+    let mut send = conn.open_uni().await.expect("open reliable uni stream");
+    send.write_all(&env.encode_framed())
+        .await
+        .expect("write reliable frame");
+    send.finish().expect("finish reliable stream");
+}
+
+async fn recv_quic_reliable_kind(
+    conn: &quinn::Connection,
+    expected_kind: u16,
+) -> Option<TEnvelope> {
+    for _ in 0..8 {
+        let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
+            .await
+            .expect("outbound frame did not time out")
+            .expect("outbound stream");
+        let data = recv
+            .read_to_end(64 * 1024)
+            .await
+            .expect("read outbound frame");
+        let mut buf = bytes::BytesMut::from(&data[..]);
+        let env = citadel::transport::codec::decode_framed(&mut buf)
+            .expect("decode framed")
+            .expect("one frame");
+        if env.kind == expected_kind {
+            return Some(env);
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn rep_delta_traverses_real_quic_and_peer_sees_authoritative_value() {
     use citadel::lifecycle::Supervisor;
@@ -371,19 +407,14 @@ async fn rep_delta_traverses_real_quic_and_peer_sees_authoritative_value() {
     let rep = Arc::new(RepAuthority::new(
         citadel::realtime::netpeer::RateLimits::default(),
     ));
-    rep.register_class(CLASS, layout(), schema())
+    let gateway = Arc::new(Gateway::new().with_rep_authority(Arc::clone(&rep)));
+    gateway
+        .register_rep_class(CLASS, layout(), schema())
         .expect("class");
 
     // The QUIC server assigns participant ids sequentially from 1. A connects and
-    // handshakes first (id 1), then B (id 2); set the authority up for those ids.
+    // handshakes first (id 1), then B (id 2).
     let owner_id = 1u64;
-    let peer_id = 2u64;
-    rep.spawn_object(OBJ, MATCH, CLASS, Some(owner_id), false, RepSnapshot::new())
-        .expect("spawn");
-    rep.join_match(owner_id, MATCH, false);
-    rep.join_match(peer_id, MATCH, false);
-
-    let gateway = Arc::new(Gateway::new().with_rep_authority(Arc::clone(&rep)));
     let server = QuicServer::bind_with_gateway(loopback_any(), &cert, Arc::clone(&gateway))
         .expect("bind server");
     let server_addr = server.local_addr();
@@ -398,6 +429,59 @@ async fn rep_delta_traverses_real_quic_and_peer_sees_authoritative_value() {
     let conn_b = connect(server_addr, &cert).await;
     quic_guest_handshake(&conn_b).await;
 
+    // Bind both live QUIC sessions through the production room create/join
+    // handlers. The room transitions atomically establish the RepRoomBindings
+    // connection scope; direct RepAuthority::join_match calls would bypass it.
+    send_quic_reliable(
+        &conn_a,
+        TEnvelope::new(
+            KIND_ROOM_CREATE,
+            RoomCreate {
+                params: b"netpeer-authority".to_vec(),
+            }
+            .encode(),
+        ),
+    )
+    .await;
+    let room_id = RoomJoined::decode(
+        &recv_quic_reliable_kind(&conn_a, KIND_ROOM_JOINED)
+            .await
+            .expect("owner room join response")
+            .body,
+    )
+    .expect("owner room join decodes")
+    .room_id;
+    send_quic_reliable(
+        &conn_b,
+        TEnvelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
+    )
+    .await;
+    let peer_room_id = RoomJoined::decode(
+        &recv_quic_reliable_kind(&conn_b, KIND_ROOM_JOINED)
+            .await
+            .expect("peer room join response")
+            .body,
+    )
+    .expect("peer room join decodes")
+    .room_id;
+    assert_eq!(peer_room_id, room_id, "both peers join the same room");
+
+    // A RepAuthority match is an internal index, never the room identity. Use a
+    // distinct value so this real-QUIC test proves delivery follows the trusted
+    // room binding rather than accidentally relying on equal numeric ids.
+    const QUIC_MATCH: u64 = 77;
+    assert_ne!(QUIC_MATCH, room_id);
+    gateway
+        .spawn_rep_object(
+            OBJ,
+            QUIC_MATCH,
+            CLASS,
+            Some(ParticipantId::from_raw(owner_id)),
+            false,
+            RepSnapshot::new(),
+        )
+        .expect("object spawns in the room-bound replication scope");
+
     // A proposes Health = 150 over a reliable uni stream (out of bound -> clamped).
     let delta = TEnvelope::new(KIND_REP_DELTA, client_health_bunch(10, 150));
     let mut send = conn_a.open_uni().await.expect("open uni for delta");
@@ -406,8 +490,7 @@ async fn rep_delta_traverses_real_quic_and_peer_sees_authoritative_value() {
         .expect("write delta");
     send.finish().expect("finish delta stream");
 
-    // B first receives the join schema/full bootstrap; then it reads the
-    // server's authoritative rebroadcast off a reliable uni stream.
+    // B reads the server's authoritative rebroadcast off a reliable uni stream.
     let mut bunch = None;
     for _ in 0..3 {
         let mut recv = tokio::time::timeout(Duration::from_secs(5), conn_b.accept_uni())
