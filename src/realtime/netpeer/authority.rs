@@ -348,6 +348,15 @@ pub struct Validated {
 }
 
 impl Validated {
+    /// The connection that produced this proposal. The gateway rechecks its
+    /// trusted room binding immediately before an asynchronous authoritative
+    /// approval is materialized, so an old-room approval cannot apply after a
+    /// participant moves.
+    #[must_use]
+    pub fn connection_id(&self) -> u64 {
+        self.conn
+    }
+
     /// The validated `(field_id, delta)` proposals (bounds-checked/clamped).
     #[must_use]
     pub fn fields(&self) -> &[(u16, FieldDelta)] {
@@ -575,6 +584,36 @@ impl RepAuthority {
         self.inner
             .lock()
             .is_ok_and(|state| state.conns.contains_key(&conn))
+    }
+
+    /// Build the schema-only pre-admission frame for a newly registered
+    /// connection. Unlike [`Self::bootstrap`], this does not place the
+    /// connection in the global match, so a reconnect cannot observe default
+    /// match state before its trusted room admission is committed.
+    #[must_use]
+    pub fn schema_bootstrap(&self, conn: u64) -> Option<RepOutbound> {
+        let Ok(g) = self.inner.lock() else {
+            return None;
+        };
+        let table = RepSchemaTable {
+            entries: g
+                .classes
+                .iter()
+                .map(|(&class_id, class)| RepSchemaEntry {
+                    class_id,
+                    schema_hash: class.schema.schema_hash().bytes,
+                    layout_version: class.layout.layout_version(),
+                })
+                .collect(),
+        };
+        let body = table.encode().ok()?;
+        Some(RepOutbound {
+            participant: conn,
+            object_id: None,
+            kind: KIND_REP_SCHEMA,
+            body,
+            reliable: true,
+        })
     }
 
     /// Build the reliable join bootstrap in wire order: one exact schema table,
