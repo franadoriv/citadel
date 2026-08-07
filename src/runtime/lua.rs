@@ -23,6 +23,7 @@ use crate::runtime::outbound_http::{
     TrustedHttpClient,
 };
 use crate::runtime::static_data::StaticDataCatalog;
+use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, BridgeTransform, Correction, Decision, InputOutcome,
     MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEvent, NormalizedEventBatch, NormalizedPayload,
@@ -2367,6 +2368,7 @@ fn install_host_api(
     lua: &Lua,
     source_label: &str,
     static_data: StaticDataCatalog,
+    text_policy: TextPolicyCatalog,
     execution_mode: LuaExecutionMode,
     outbound_http_policy: OutboundHttpPolicy,
     http_endpoint_policy: RuntimeHttpEndpointPolicy,
@@ -2779,6 +2781,42 @@ fn install_host_api(
     })?;
     static_data_api.set("load_csv", load_csv)?;
     citadel.set("static_data", static_data_api)?;
+
+    let text_policy_api = lua.create_table()?;
+    let load_catalog = text_policy.clone();
+    let load_policy = lua.create_function(move |_, path: mlua::String| {
+        let path = path.to_str().map_err(|_| {
+            mlua::Error::RuntimeError("text policy path must be valid UTF-8".to_string())
+        })?;
+        load_catalog
+            .load_json(&path)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+    })?;
+    text_policy_api.set("load_json", load_policy)?;
+    let scan_catalog = text_policy.clone();
+    let scan_policy = lua.create_function(
+        move |lua, (reference, text): (mlua::String, mlua::String)| {
+            let reference = reference.to_str()?;
+            let text = text.to_str()?;
+            let value = scan_catalog
+                .scan_value(&reference, &text)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            static_data_value_to_lua(lua, &value)
+        },
+    )?;
+    text_policy_api.set("scan", scan_policy)?;
+    let sanitize_policy = lua.create_function(
+        move |lua, (reference, text): (mlua::String, mlua::String)| {
+            let reference = reference.to_str()?;
+            let text = text.to_str()?;
+            let value = text_policy
+                .sanitize_value(&reference, &text)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+            static_data_value_to_lua(lua, &value)
+        },
+    )?;
+    text_policy_api.set("sanitize", sanitize_policy)?;
+    citadel.set("text_policy", text_policy_api)?;
 
     let broadcast = lua.create_function(
         |lua, (kind, body, unreliable): (u16, mlua::String, Option<bool>)| {
@@ -3886,10 +3924,12 @@ fn build_lua(
     lua.set_app_data(NpcPatrols::default());
     lua.set_app_data(Arc::clone(&capability_policies.event_bus_handle));
     lua.set_app_data(Arc::clone(&capability_policies.shared_cache_handle));
+    let text_policy = TextPolicyCatalog::new(static_data.clone());
     install_host_api(
         &lua,
         source_label,
         static_data.clone(),
+        text_policy.clone(),
         execution_mode,
         capability_policies.outbound_http,
         capability_policies.http_endpoints,
@@ -3917,6 +3957,7 @@ fn build_lua(
     // message or tick handler. Successfully initialized values remain cache
     // hits and are converted to Lua tables without I/O.
     static_data.seal();
+    text_policy.seal();
     Ok(lua)
 }
 
@@ -4951,6 +4992,9 @@ mod tests {
             "log",
             "static_data.load_json",
             "static_data.load_csv",
+            "text_policy.load_json",
+            "text_policy.scan",
+            "text_policy.sanitize",
             "friends.add",
             "friends.remove",
             "friends.block",

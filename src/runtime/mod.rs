@@ -60,6 +60,7 @@ pub mod python_payload;
 pub mod readiness;
 pub mod shared_cache;
 pub(crate) mod static_data;
+pub mod text_policy;
 #[cfg(unix)]
 pub mod worker_bootstrap;
 #[cfg(any(unix, windows))]

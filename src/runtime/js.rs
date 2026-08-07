@@ -27,6 +27,7 @@ use crate::runtime::outbound_http::{
     TrustedHttpClient,
 };
 use crate::runtime::static_data::StaticDataCatalog;
+use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION,
     NormalizedEventBatch, OutboundCommand, PhysicsOptions, RealtimeAfterOutcome,
@@ -95,6 +96,9 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "log",
     "static_data.load_json",
     "static_data.load_csv",
+    "text_policy.load_json",
+    "text_policy.scan",
+    "text_policy.sanitize",
     "friends.add",
     "friends.remove",
     "friends.block",
@@ -452,6 +456,20 @@ const JS_HOST_PRELUDE: &str = r#"
           throw new Error("static data host not available");
         }
         return JSON.parse(globalThis.__citadel_static_data("csv", String(path)));
+      },
+    },
+    text_policy: {
+      load_json(path) {
+        if (!globalThis.__citadel_text_policy_load_json) throw new Error("text policy host not available");
+        return globalThis.__citadel_text_policy_load_json(path);
+      },
+      scan(policyRef, text) {
+        if (!globalThis.__citadel_text_policy_scan) throw new Error("text policy host not available");
+        return JSON.parse(globalThis.__citadel_text_policy_scan(policyRef, text));
+      },
+      sanitize(policyRef, text) {
+        if (!globalThis.__citadel_text_policy_sanitize) throw new Error("text policy host not available");
+        return JSON.parse(globalThis.__citadel_text_policy_sanitize(policyRef, text));
       },
     },
     spawn_actor(opts) {
@@ -2225,6 +2243,67 @@ fn install_static_data(ctx: &Ctx<'_>, static_data: StaticDataCatalog) -> JsHostR
     Ok(())
 }
 
+fn install_text_policy(ctx: &Ctx<'_>, text_policy: TextPolicyCatalog) -> JsHostResult<()> {
+    let load_catalog = text_policy.clone();
+    let load = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |_ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+                load_catalog.load_json(&path).map_err(|error| {
+                    rquickjs::Error::new_from_js_message(
+                        "text_policy",
+                        "load_json",
+                        error.to_string(),
+                    )
+                })
+            },
+        ),
+    )?;
+    let scan_catalog = text_policy.clone();
+    let scan = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |_ctx: Ctx<'_>, reference: String, text: String| -> rquickjs::Result<String> {
+                scan_catalog
+                    .scan_value(&reference, &text)
+                    .map(|value| value.to_string())
+                    .map_err(|error| {
+                        rquickjs::Error::new_from_js_message(
+                            "text_policy",
+                            "scan",
+                            error.to_string(),
+                        )
+                    })
+            },
+        ),
+    )?;
+    let sanitize = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |_ctx: Ctx<'_>, reference: String, text: String| -> rquickjs::Result<String> {
+                text_policy
+                    .sanitize_value(&reference, &text)
+                    .map(|value| value.to_string())
+                    .map_err(|error| {
+                        rquickjs::Error::new_from_js_message(
+                            "text_policy",
+                            "sanitize",
+                            error.to_string(),
+                        )
+                    })
+            },
+        ),
+    )?;
+    let globals = ctx.globals();
+    caught(ctx, globals.set("__citadel_text_policy_load_json", load))?;
+    caught(ctx, globals.set("__citadel_text_policy_scan", scan))?;
+    caught(ctx, globals.set("__citadel_text_policy_sanitize", sanitize))?;
+    Ok(())
+}
+
 /// Install the bounded Rust-owned HTTP bridge. The JavaScript prelude converts
 /// its JSON result into a `Uint8Array`, so scripts never see a socket or client.
 fn install_outbound_http(
@@ -2793,6 +2872,7 @@ fn build_js(
     let module_paths = Arc::new(Mutex::new(BTreeSet::new()));
     let http_endpoints = Arc::new(Mutex::new(BTreeSet::new()));
     let interceptor_mode = Arc::new(AtomicBool::new(false));
+    let text_policy = TextPolicyCatalog::new(static_data.clone());
     let runtime = QuickJsRuntime::new().map_err(|e| {
         script_error(
             &format!("failed to create QuickJS runtime for {source_label}"),
@@ -2825,6 +2905,7 @@ fn build_js(
                 ctx.eval_with_options::<(), _>(JS_HOST_PRELUDE.as_bytes().to_vec(), prelude_opts),
             )?;
             install_static_data(&ctx, static_data.clone())?;
+            install_text_policy(&ctx, text_policy.clone())?;
             install_outbound_http(&ctx, Arc::clone(&interceptor_mode), outbound_http_policy)?;
             install_http_endpoint_registration(
                 &ctx,
@@ -2865,6 +2946,7 @@ fn build_js(
         .with_detail(e.to_string())
     })?;
     static_data.seal();
+    text_policy.seal();
     Ok(JsVm {
         runtime,
         context,
