@@ -298,6 +298,7 @@ enum ControlResponse {
     Admitted {
         match_id: u64,
     },
+    AuthoritativeAdmissionUnavailable,
     Rejected,
     ChatDelivery {
         disposition: ChatDeliveryDisposition,
@@ -996,6 +997,9 @@ impl MatchmakerHandoffRouter for TlsMatchmakerHandoffRouter {
     ) -> Result<u64, MatchmakerRouterError> {
         match self.send(destination, NodeCommand::AdmitRemote(request))? {
             ControlResponse::Admitted { match_id } => Ok(match_id),
+            ControlResponse::AuthoritativeAdmissionUnavailable => Err(
+                MatchmakerRouterError::AuthoritativeAdmissionUnavailable(destination.clone()),
+            ),
             _ => Err(MatchmakerRouterError::Rejected(destination.clone())),
         }
     }
@@ -1129,9 +1133,12 @@ fn dispatch(
                 .lock()
                 .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
                 .clone();
-            match handler.and_then(|handler| handler(request).ok()) {
-                Some(match_id) => Ok(ControlResponse::Admitted { match_id }),
-                None => Ok(ControlResponse::Rejected),
+            match handler.map(|handler| handler(request)) {
+                Some(Ok(match_id)) => Ok(ControlResponse::Admitted { match_id }),
+                Some(Err(MatchmakerRouterError::AuthoritativeAdmissionUnavailable(_))) => {
+                    Ok(ControlResponse::AuthoritativeAdmissionUnavailable)
+                }
+                Some(Err(_)) | None => Ok(ControlResponse::Rejected),
             }
         }
         NodeCommand::DeliverRuntimeEvent(event) => {

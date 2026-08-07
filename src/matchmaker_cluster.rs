@@ -141,6 +141,10 @@ pub enum MatchmakerRouterError {
     /// command (expired/stale/duplicate commands fail closed).
     #[error("matchmaker router command was rejected by node {0}")]
     Rejected(NodeId),
+    /// A script-bound match cannot be admitted remotely until the authenticated
+    /// owner-to-session state and protected-intent relay is available.
+    #[error("remote authoritative match admission is unavailable at node {0}")]
+    AuthoritativeAdmissionUnavailable(NodeId),
 }
 
 /// A redemption request sent from the session-owning node to the match-owning

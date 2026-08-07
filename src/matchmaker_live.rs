@@ -20,6 +20,7 @@ use crate::matchmaker_cluster::{
     RemoteMatchmakerTicketOwner, RemoteMatchmakerTicketStatus, RemoteMatchmakerTicketSubmission,
 };
 use crate::matchmaker_transport::{RunningMatchmakerControlListener, TlsMatchmakerHandoffRouter};
+use crate::realtime::gateway::REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE;
 use crate::realtime::{Gateway, ParticipantId, ParticipantIdGen};
 use crate::services::matchmaker_directory::{
     MatchmakerShardLeaseResolution, StorageMatchmakerLeaseDirectory,
@@ -993,14 +994,15 @@ async fn accept_from_session(
                     .remove(&LiveState::handoff_key(&ticket_id, &user_id));
             }
         }
-        Err(_) => {
+        Err(error) => {
             if let Some(gateway) = gateway(inner) {
-                gateway.live_matchmaker_reply(
-                    sender,
-                    request_id,
-                    false,
-                    "match admission failed".to_owned(),
-                );
+                let message = match error {
+                    MatchmakerRouterError::AuthoritativeAdmissionUnavailable(_) => {
+                        REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE
+                    }
+                    _ => "match admission failed",
+                };
+                gateway.live_matchmaker_reply(sender, request_id, false, message.to_owned());
             }
         }
     }
@@ -1046,10 +1048,14 @@ async fn admit_remote(
                     .has_same_fence_as(&request.formation_lease)
         })
         .ok_or_else(|| MatchmakerRouterError::Rejected(inner.config.node_id.clone()))?;
-    // A cross-node match has no authoritative state/intent relay yet. Refuse
-    // before claiming durable admission or changing owner room capacity.
-    if request.requester_node != inner.config.node_id {
-        return Err(MatchmakerRouterError::Rejected(
+    // Script-bound matches need an owner-to-session state/intent relay that
+    // does not exist yet. Relay matches keep their established cross-node
+    // admission path.
+    if request.requester_node != inner.config.node_id
+        && gateway(inner)
+            .is_some_and(|gateway| gateway.remote_match_requires_state_relay(handoff.match_id))
+    {
+        return Err(MatchmakerRouterError::AuthoritativeAdmissionUnavailable(
             inner.config.node_id.clone(),
         ));
     }

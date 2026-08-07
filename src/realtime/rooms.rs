@@ -299,7 +299,6 @@ impl RoomRegistry {
     /// the remote node's local participant id as globally unique.
     /// See [`Self::join_bound`] for the `expected` binding contract
     /// (`None` = ungated node).
-    #[cfg(test)]
     pub(crate) fn admit_remote_match_bound(
         &self,
         member: RemoteRoomMember,
@@ -546,7 +545,6 @@ impl RoomRegistry {
         }
     }
 
-    #[cfg(test)]
     fn remove_remote_member(g: &mut Inner, member: &RemoteRoomMember, room_id: RoomId) {
         let (empty, name) = if let Some(room) = g.rooms.get_mut(&room_id) {
             room.remote_members.remove(member);

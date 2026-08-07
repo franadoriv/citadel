@@ -54,7 +54,7 @@ use crate::realtime::registry::{
     CloseDisposition, LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen,
     SessionHandle, SessionRegistry,
 };
-use crate::realtime::rooms::{JoinError, RoomId, RoomLabel, RoomRegistry};
+use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
     BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepField, BridgeRepValue,
@@ -89,6 +89,8 @@ pub use citadel_wire::protocol::{
 };
 
 const MATCHMAKER_HANDOFF_TTL_MS: u64 = 30_000;
+pub(crate) const REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE: &str =
+    "remote authoritative match admission is unavailable";
 /// Receiver-side expiration for a chat typing indication. Typing is intentionally
 /// ephemeral: it has no durable event id and never participates in resync.
 const CHAT_TYPING_TTL_MS: u64 = 5_000;
@@ -2593,58 +2595,80 @@ impl Gateway {
 
     /// Complete a trusted admission that was validated on a remote match node.
     ///
-    /// A remote owner currently has no authenticated state/intent data-plane to
-    /// this session node. Confirming the admission would therefore create a
-    /// roomless local socket: protected input could bypass the owner's
-    /// validator, and owner state could not be delivered with a scope fence.
-    /// Keep this path fail-closed until that transport carries a globally unique
-    /// match key, a local proxy membership, and owner-validated state.
+    /// Script-bound remote matches remain fail-closed until an authenticated
+    /// owner-to-session state/intent data plane exists. Relay matches keep the
+    /// established distributed-matchmaker admission behavior.
     pub(crate) fn live_matchmaker_finish_remote_accept(
         &self,
         sender: ParticipantId,
         request_id: u64,
         room_id: RoomId,
     ) -> Result<(), ()> {
-        if self
-            .script_gate(ScriptGateSurface::LiveAcceptRemote)
-            .is_err()
-        {
+        let binding = match self.script_gate(ScriptGateSurface::LiveAcceptRemote) {
+            Ok(binding) => binding,
+            Err(()) => {
+                let _ = self.reply_rpc(
+                    sender,
+                    request_id,
+                    protocol::RPC_STATUS_ERROR,
+                    SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+                );
+                return Err(());
+            }
+        };
+        if binding.is_some() {
             let _ = self.reply_rpc(
                 sender,
                 request_id,
                 protocol::RPC_STATUS_ERROR,
-                SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+                REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE.as_bytes(),
             );
             return Err(());
         }
-        let _ = room_id;
-        let _ = self.reply_rpc(
-            sender,
-            request_id,
-            protocol::RPC_STATUS_ERROR,
-            b"remote match state routing is unavailable",
-        );
-        Err(())
+        let label = RoomLabel {
+            map: "default".to_owned(),
+            mode: "matchmaker".to_owned(),
+            max_players: 0,
+            open: false,
+        };
+        {
+            let _scope = self.lock_room_scope();
+            self.bind_rep_connection_to_room_under_scope(sender, room_id);
+        }
+        let body = serde_json::json!({ "accepted": true, "match_id": room_id }).to_string();
+        let _ = self.reply_rpc(sender, request_id, protocol::RPC_STATUS_OK, body.as_bytes());
+        let _ = self.reply_joined_with_rep_bootstrap(sender, room_id, label);
+        Ok(())
     }
 
     /// Admit a member whose socket belongs to another session node after the
     /// durable formation/admission claim has succeeded.
     ///
-    /// Fails closed under the readiness gate on this owner node, including
-    /// for a room bound to a superseded load.
+    /// Script-bound remote matches fail closed on this owner node until their
+    /// authenticated state/intent relay exists. Relay matches retain their
+    /// prior remote room-membership admission.
     pub(crate) fn live_matchmaker_admit_remote(
         &self,
         requester_node: NodeId,
         user_id: String,
         room_id: RoomId,
     ) -> Result<(), ()> {
-        // Remote membership is a control-plane record only until the session
-        // node can receive authenticated owner state and route protected input
-        // back through the owner validator. Do not consume room capacity or
-        // create a half-admission before that data plane exists.
-        let _ = self.script_gate(ScriptGateSurface::LiveAdmitRemote)?;
-        let _ = (requester_node, user_id, room_id);
-        Err(())
+        let binding = self.script_gate(ScriptGateSurface::LiveAdmitRemote)?;
+        if self.remote_match_requires_state_relay(room_id) {
+            return Err(());
+        }
+        let admission = {
+            let _scope = self.lock_room_scope();
+            self.rooms.admit_remote_match_bound(
+                RemoteRoomMember {
+                    node_id: requester_node,
+                    user_id,
+                },
+                room_id,
+                binding.as_ref(),
+            )
+        };
+        admission.map(|_| ()).map_err(|_| ())
     }
 
     /// Shard-owner-side validation after a party ticket crossed the
@@ -5583,15 +5607,42 @@ impl Gateway {
                 request.requester_node,
             ));
         };
-        // The control plane has no authenticated owner-to-session state relay.
-        // Reject before claiming admission or consuming a remote room slot;
-        // otherwise the requester would be acknowledged by a node that cannot
-        // retain the bridge/room-scope invariant.
-        let _ = self
+        let binding = self
             .script_gate(ScriptGateSurface::ClusterAdmitRemote)
             .map_err(|()| MatchmakerRouterError::Rejected(cluster.node_id.clone()))?;
-        let _ = request;
-        Err(MatchmakerRouterError::Rejected(cluster.node_id.clone()))
+        let now = SystemClock.now();
+        let handoff = self
+            .handoff_for(&request.ticket_id, &request.user_id, now)
+            .ok_or_else(|| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
+        if handoff.token.as_str() != request.join_token || request.formation_lease != cluster.lease
+        {
+            return Err(MatchmakerRouterError::UnknownDestination(
+                cluster.node_id.clone(),
+            ));
+        }
+        if self.remote_match_requires_state_relay(handoff.room_id) {
+            return Err(MatchmakerRouterError::AuthoritativeAdmissionUnavailable(
+                cluster.node_id.clone(),
+            ));
+        }
+        cluster
+            .authority
+            .claim_admission(&request.ticket_id, &request.user_id, &cluster.lease, now)
+            .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
+        let admission = {
+            let _scope = self.lock_room_scope();
+            self.rooms.admit_remote_match_bound(
+                RemoteRoomMember {
+                    node_id: request.requester_node,
+                    user_id: request.user_id,
+                },
+                handoff.room_id,
+                binding.as_ref(),
+            )
+        };
+        admission
+            .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
+        Ok(handoff.room_id)
     }
 
     /// Send one reliable, correlated RPC response to its caller.
@@ -6176,6 +6227,13 @@ impl Gateway {
     #[must_use]
     pub(crate) fn rooms(&self) -> &RoomRegistry {
         &self.rooms
+    }
+
+    /// Whether a remote match needs the unavailable authoritative state relay.
+    /// A relay node has no script gate and no bound match, so it retains the
+    /// established cross-node matchmaker path.
+    pub(crate) fn remote_match_requires_state_relay(&self, room_id: RoomId) -> bool {
+        self.script_readiness.is_some() && self.rooms.binding(room_id).is_some()
     }
 
     /// Consult the GameScript readiness gate for one enforcement `surface`.
@@ -12666,16 +12724,18 @@ mod domain_rpc_tests {
                 }),
             ),
         );
-        assert_eq!(recv(&mut alice_rx).await.1, protocol::RPC_STATUS_ERROR);
+        assert_eq!(recv(&mut alice_rx).await.1, protocol::RPC_STATUS_OK);
         assert!(
-            alice_rx.try_recv().is_err(),
-            "a failed remote acceptance cannot emit ROOM_JOINED"
+            matches!(
+                next_outbound(&mut alice_rx).await.envelope.kind,
+                KIND_ROOM_JOINED
+            ),
+            "a relay remote acceptance emits ROOM_JOINED"
         );
-        assert_eq!(gateway_b.rooms.snapshot()[0].remote_member_count, 0);
+        assert_eq!(gateway_b.rooms.snapshot()[0].remote_member_count, 1);
 
-        // Cross-node match execution remains disabled until the owner-to-session
-        // state and protected-intent relay is installed on both gateways.
-        if gateway_a.bridge_enabled() && gateway_b.bridge_enabled() {
+        // Relay matches retain the complete distributed-matchmaker contract.
+        {
             gateway_a.handle_inbound(
                 alice,
                 &rpc(
@@ -12855,6 +12915,142 @@ mod domain_rpc_tests {
             );
             assert_eq!(recv(&mut charlie_rx).await.1, protocol::RPC_STATUS_ERROR);
         }
+    }
+
+    #[tokio::test]
+    async fn live_matchmaker_rejects_script_bound_remote_admission_with_safe_error() {
+        let node_a = NodeId::new("node-a").expect("node a");
+        let node_b = NodeId::new("node-b").expect("node b");
+        let (identity_a, cert_a) = control_identity();
+        let (identity_b, cert_b) = control_identity();
+        let router_a = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_a.clone(),
+                identity_a,
+                BTreeMap::from([(node_b.clone(), cert_b.clone())]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router a"),
+        );
+        let router_b = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_b.clone(),
+                identity_b,
+                BTreeMap::from([(node_a.clone(), cert_a)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router b"),
+        );
+        let storage: Arc<dyn crate::repository::StorageRepository> =
+            Arc::new(InMemoryStorageRepository::new());
+        let directory = StorageMatchmakerLeaseDirectory::new(storage);
+        let now = SystemClock.now();
+        directory
+            .acquire(
+                MatchmakerShardLease {
+                    shard: QueueShardId::new(0),
+                    owner_node: node_b.clone(),
+                    generation: OwnershipGeneration::new(1),
+                    expires_at: now
+                        .checked_add(DurationMillis::from_millis(500))
+                        .expect("lease expiry"),
+                },
+                now,
+            )
+            .await
+            .expect("node b owns initial shard");
+        let live_a = LiveMatchmakerNode::new(LiveMatchmakerConfig {
+            node_id: node_a.clone(),
+            shard: QueueShardId::new(0),
+            lease_ttl: DurationMillis::from_millis(500),
+            handoff_ttl: DurationMillis::from_millis(5_000),
+            command_timeout: Duration::from_secs(2),
+            directory: directory.clone(),
+            router: Arc::clone(&router_a),
+        })
+        .expect("live node a");
+        let live_b = LiveMatchmakerNode::new(LiveMatchmakerConfig {
+            node_id: node_b.clone(),
+            shard: QueueShardId::new(0),
+            lease_ttl: DurationMillis::from_millis(500),
+            handoff_ttl: DurationMillis::from_millis(5_000),
+            command_timeout: Duration::from_secs(2),
+            directory: directory.clone(),
+            router: Arc::clone(&router_b),
+        })
+        .expect("live node b");
+        live_a
+            .start_listener("127.0.0.1:0".parse().expect("loopback"))
+            .expect("listener a");
+        live_b
+            .start_listener("127.0.0.1:0".parse().expect("loopback"))
+            .expect("listener b");
+        router_a.register_endpoint(
+            node_b.clone(),
+            MatchmakerControlEndpoint {
+                address: live_b.control_listener_addr().expect("listener b present"),
+                server_name: "localhost".to_owned(),
+            },
+        );
+        router_b.register_endpoint(
+            node_a.clone(),
+            MatchmakerControlEndpoint {
+                address: live_a.control_listener_addr().expect("listener a present"),
+                server_name: "localhost".to_owned(),
+            },
+        );
+        let readiness_a = Arc::new(crate::runtime::GameScriptReadiness::new(SystemClock.now()));
+        let readiness_b = Arc::new(crate::runtime::GameScriptReadiness::new(SystemClock.now()));
+        readiness_a.record_loaded("sha256:v1", SystemClock.now());
+        readiness_b.record_loaded("sha256:v1", SystemClock.now());
+        let gateway_a = Arc::new(
+            Gateway::new()
+                .with_script_readiness(Arc::clone(&readiness_a))
+                .with_live_matchmaker(Arc::clone(&live_a)),
+        );
+        let gateway_b = Arc::new(
+            Gateway::new()
+                .with_script_readiness(Arc::clone(&readiness_b))
+                .with_live_matchmaker(Arc::clone(&live_b)),
+        );
+        gateway_a.register_live_matchmaker_endpoint();
+        gateway_b.register_live_matchmaker_endpoint();
+        let (alice, mut alice_rx) = register(&gateway_a, Some("alice"));
+        let (bob, mut bob_rx) = register(&gateway_b, Some("bob"));
+        let request = serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 });
+
+        gateway_b.handle_inbound(bob, &rpc(1, "matchmaker.add", request.clone()));
+        assert_eq!(recv(&mut bob_rx).await.1, protocol::RPC_STATUS_OK);
+        gateway_a.handle_inbound(alice, &rpc(2, "matchmaker.add", request));
+        let (_, status, alice_ticket_body) = recv(&mut alice_rx).await;
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        let alice_handoff = json(&next_outbound(&mut alice_rx).await.envelope.body);
+        let _ = next_outbound(&mut bob_rx).await;
+
+        gateway_a.handle_inbound(
+            alice,
+            &rpc(
+                3,
+                "matchmaker.accept",
+                serde_json::json!({
+                    "ticket_id": json(&alice_ticket_body)["ticket_id"],
+                    "join_token": alice_handoff["join_token"],
+                }),
+            ),
+        );
+        let (_, status, body) = recv(&mut alice_rx).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE
+        );
+        assert!(
+            alice_rx.try_recv().is_err(),
+            "a refused authoritative admission cannot emit ROOM_JOINED"
+        );
+        assert_eq!(gateway_b.rooms.snapshot()[0].remote_member_count, 0);
     }
 
     #[tokio::test]
@@ -13672,7 +13868,7 @@ mod script_gate_tests {
     }
 
     #[tokio::test]
-    async fn live_remote_admission_fails_closed_without_owner_state_routing() {
+    async fn authoritative_live_remote_admission_fails_closed_with_safe_error() {
         let readiness = boot_readiness();
         readiness.record_loaded("sha256:v1", now());
         let gw = gated_gateway(&readiness).with_rep_authority(Arc::new(
@@ -13696,10 +13892,12 @@ mod script_gate_tests {
             None,
             "a refused remote admission cannot leave a replication binding"
         );
+        let (status, body) = recv_rpc(&mut ra).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
         assert_eq!(
-            recv_rpc(&mut ra).await.0,
-            protocol::RPC_STATUS_ERROR,
-            "the requester receives an explicit admission failure"
+            String::from_utf8_lossy(&body),
+            REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE,
+            "the requester receives an explainable, client-safe admission failure"
         );
         assert!(
             ra.try_recv().is_err(),
