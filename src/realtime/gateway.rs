@@ -10313,8 +10313,7 @@ mod transform_tests {
             .recv()
             .await
             .expect("same-room schema bootstrap");
-        gw.rooms()
-            .join(same_room, room_one)
+        gw.join_room(same_room, room_one)
             .expect("same-room peer joins the bound room");
 
         let (other_room, mut other_room_rx) = register(&gw);
@@ -10323,9 +10322,8 @@ mod transform_tests {
             .recv()
             .await
             .expect("other-room schema bootstrap");
-        let room_two = gw.rooms().create(RoomLabel::with_map("other"));
-        gw.rooms()
-            .join(other_room, room_two)
+        let room_two = gw.create_room(RoomLabel::with_map("other"));
+        gw.join_room(other_room, room_two)
             .expect("other-room peer joins a different room");
 
         gw.handle_inbound(
