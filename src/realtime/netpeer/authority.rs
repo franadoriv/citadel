@@ -225,6 +225,10 @@ impl ConnBudget {
 pub struct RepOutbound {
     /// Target participant (raw id).
     pub participant: u64,
+    /// The replicated object carried by this frame. Schema-table frames carry
+    /// `None`; every `KIND_REP_DELTA` carries its authoritative object id so
+    /// the gateway can apply room visibility before client delivery.
+    pub object_id: Option<u32>,
     /// Envelope kind (`KIND_REP_DELTA`).
     pub kind: u16,
     /// Server-encoded body (never the client's bytes).
@@ -344,6 +348,15 @@ pub struct Validated {
 }
 
 impl Validated {
+    /// The connection that produced this proposal. The gateway rechecks its
+    /// trusted room binding immediately before an asynchronous authoritative
+    /// approval is materialized, so an old-room approval cannot apply after a
+    /// participant moves.
+    #[must_use]
+    pub fn connection_id(&self) -> u64 {
+        self.conn
+    }
+
     /// The validated `(field_id, delta)` proposals (bounds-checked/clamped).
     #[must_use]
     pub fn fields(&self) -> &[(u16, FieldDelta)] {
@@ -366,6 +379,18 @@ impl Validated {
     #[must_use]
     pub fn result_id(&self) -> u64 {
         self.result_id
+    }
+
+    /// Replace the already structurally validated scalar proposals with script
+    /// corrections whose object, field bounds, and value types were checked by
+    /// the authoritative bridge validator.
+    #[must_use]
+    pub fn with_corrected_scalar_fields(mut self, fields: Vec<(u16, RepValue)>) -> Self {
+        self.fields = fields
+            .into_iter()
+            .map(|(field_id, value)| (field_id, FieldDelta::Value(value)))
+            .collect();
+        self
     }
 }
 
@@ -561,6 +586,36 @@ impl RepAuthority {
             .is_ok_and(|state| state.conns.contains_key(&conn))
     }
 
+    /// Build the schema-only pre-admission frame for a newly registered
+    /// connection. Unlike [`Self::bootstrap`], this does not place the
+    /// connection in the global match, so a reconnect cannot observe default
+    /// match state before its trusted room admission is committed.
+    #[must_use]
+    pub fn schema_bootstrap(&self, conn: u64) -> Option<RepOutbound> {
+        let Ok(g) = self.inner.lock() else {
+            return None;
+        };
+        let table = RepSchemaTable {
+            entries: g
+                .classes
+                .iter()
+                .map(|(&class_id, class)| RepSchemaEntry {
+                    class_id,
+                    schema_hash: class.schema.schema_hash().bytes,
+                    layout_version: class.layout.layout_version(),
+                })
+                .collect(),
+        };
+        let body = table.encode().ok()?;
+        Some(RepOutbound {
+            participant: conn,
+            object_id: None,
+            kind: KIND_REP_SCHEMA,
+            body,
+            reliable: true,
+        })
+    }
+
     /// Build the reliable join bootstrap in wire order: one exact schema table,
     /// then a full baseline for every currently relevant object in the joined
     /// match. This is server-only lifecycle work; no client input can invoke it.
@@ -589,6 +644,7 @@ impl RepAuthority {
         };
         let mut out = vec![RepOutbound {
             participant: conn,
+            object_id: None,
             kind: KIND_REP_SCHEMA,
             body: schema_body,
             reliable: true,
@@ -625,6 +681,7 @@ impl RepAuthority {
             {
                 out.push(RepOutbound {
                     participant: conn,
+                    object_id: Some(object_id),
                     kind: KIND_REP_DELTA,
                     body,
                     reliable: true,
@@ -788,6 +845,17 @@ impl RepAuthority {
         g.objects
             .get(&object_id)
             .and_then(|o| o.authoritative.scalars.get(&field_id).cloned())
+    }
+
+    /// The trusted room/match scope and optional owning participant for an
+    /// authoritative object. The gateway uses this metadata only to fence
+    /// client-facing bootstrap delivery; untrusted clients cannot query it.
+    #[must_use]
+    pub fn object_scope(&self, object_id: u32) -> Option<(u64, Option<u64>)> {
+        let g = self.inner.lock().ok()?;
+        g.objects
+            .get(&object_id)
+            .map(|object| (object.match_id, object.owner))
     }
 
     /// Whether `value` is within the compiled `FieldBounds` of `object_id`'s
@@ -1275,6 +1343,7 @@ impl RepAuthority {
                         }
                         out.push(RepOutbound {
                             participant: peer,
+                            object_id: Some(v.object_id),
                             kind: KIND_REP_DELTA,
                             body,
                             reliable: true,

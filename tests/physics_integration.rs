@@ -11,12 +11,16 @@ use std::time::Duration;
 use citadel::maps::MapCatalog;
 use citadel::observability::NodeMetrics;
 use citadel::realtime::transform::{TransformHub, TransformHubConfig};
-use citadel::realtime::{Gateway, RoomLabel};
+use citadel::realtime::{Gateway, RoomLabel, SessionHandle};
 use citadel::runtime::LuaRuntime;
+use citadel::transport::{Envelope, TransportKind};
 use citadel_map::{CollisionMesh, MapFile, MapMetadata};
+use citadel_wire::protocol::KIND_TSYNC_HELLO;
 use citadel_wire::tsync::Snapshot;
+use tokio::sync::mpsc;
 
 static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const FIRST_SCOPED_ACTOR_ID: u32 = 0x8000_0000;
 
 struct TempMapDir(PathBuf);
 
@@ -94,20 +98,37 @@ fn server_simulated_bot_falls_jumps_and_replicates_from_a_loaded_map() {
         Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(Arc::new(runtime)))
             .with_maps(maps)
             .with_transform_hub(Arc::clone(&hub));
-    gateway.rooms().create(RoomLabel::with_map("physics-floor"));
+    let room_id = gateway.create_room(RoomLabel::with_map("physics-floor"));
+    let participant = gateway.next_participant_id();
+    let (outbound, mut reliable) = mpsc::channel(1);
+    let unreliable = gateway.register_session(SessionHandle {
+        id: participant,
+        kind: TransportKind::Quic,
+        outbound,
+        identity: None,
+    });
+    gateway
+        .join_room(participant, room_id)
+        .expect("production-style room admission");
+    gateway.handle_inbound(participant, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+    let _hello = reliable.try_recv().expect("transform handshake reply");
 
-    // The room-scoped runtime tick traverses the canonical command path:
-    // spawn_actor/set_physics -> Gateway -> TransformHub, and selects the map BVH.
+    // The room-scoped runtime tick traverses the canonical production path:
+    // create/join -> scoped tick -> spawn_actor/set_physics -> Gateway -> TransformHub.
+    // A scoped script actor uses a collision-free world id rather than its
+    // room-local Lua id (0x4000_0000).
     gateway.tick(Duration::from_millis(16), Duration::from_millis(100));
     let spawned = hub
-        .physics_state(0x4000_0000)
+        .physics_state(FIRST_SCOPED_ACTOR_ID)
         .expect("physics body attached");
     assert!(!spawned.grounded);
 
     for _ in 0..180 {
         gateway.transform_sim_step();
     }
-    let landed = hub.physics_state(0x4000_0000).expect("bot remains bodied");
+    let landed = hub
+        .physics_state(FIRST_SCOPED_ACTOR_ID)
+        .expect("bot remains bodied");
     assert!(
         landed.grounded,
         "bot rests on the loaded map floor: {landed:?}"
@@ -121,19 +142,26 @@ fn server_simulated_bot_falls_jumps_and_replicates_from_a_loaded_map() {
     // The next room tick emits apply_impulse through the same gateway command path.
     gateway.tick(Duration::from_millis(16), Duration::from_millis(100));
     gateway.transform_sim_step();
-    let airborne = hub.physics_state(0x4000_0000).expect("bot remains bodied");
+    let airborne = hub
+        .physics_state(FIRST_SCOPED_ACTOR_ID)
+        .expect("bot remains bodied");
     assert!(
         airborne.position[1] > landed.position[1],
         "a +Y impulse raises the bot: landed={landed:?}, airborne={airborne:?}"
     );
 
-    hub.register_client(7);
-    let outbound = hub.snapshot_tick();
-    let snapshot = Snapshot::decode(&outbound[0].body, hub.codec()).expect("snapshot decodes");
+    assert_eq!(
+        gateway.transform_snapshot_step(),
+        1,
+        "the room-bound transform client receives its room snapshot"
+    );
+    let outbound = unreliable.try_recv().expect("room-scoped snapshot");
+    let snapshot =
+        Snapshot::decode(&outbound.envelope.body, hub.codec()).expect("snapshot decodes");
     let update = snapshot
         .updates
         .iter()
-        .find(|update| update.object_id == 0x4000_0000)
+        .find(|update| update.object_id == FIRST_SCOPED_ACTOR_ID)
         .expect("physics bot appears in the snapshot frame");
     let position = update.fields.position.expect("snapshot carries position");
     assert!(
