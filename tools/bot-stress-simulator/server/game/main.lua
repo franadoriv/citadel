@@ -15,10 +15,12 @@ local MOVE_BLOCKED = 0
 local MOVE_ACCEPTED = 1
 local MOVE_CLAMPED = 2
 
-local positions = {}
-local participant_count = 0
+-- Cada match tiene su propio estado. El gateway ejecuta los mensajes y ticks
+-- con el `room_id` de Citadel, por lo que `citadel.broadcast` queda limitado
+-- a ese match y nunca expone snapshots a los demás.
+local positions_by_room = {}
+local announced_players_by_room = {}
 local bad_packets = 0
-local snapshot_elapsed = 0.0
 local SNAPSHOT_INTERVAL = 0.25
 local SNAPSHOT_ENTRIES_PER_CHUNK = 32
 
@@ -27,18 +29,51 @@ local function pack_ack(sequence, x, z, status)
 end
 
 citadel.on_join(function(ctx)
-  participant_count = participant_count + 1
   citadel.send(ctx.sender, KIND_PLAYER_ID, string.pack(">I8", ctx.sender), false)
   citadel.log("stress bot joined: " .. tostring(ctx.sender), "info")
 end)
 
 citadel.on_leave(function(ctx)
-  participant_count = math.max(0, participant_count - 1)
-  positions[ctx.sender] = nil
+  for _, positions in pairs(positions_by_room) do
+    positions[ctx.sender] = nil
+  end
   citadel.log("stress bot left: " .. tostring(ctx.sender), "info")
 end)
 
+-- Los parámetros son `stress-match-####|<capacidad>`. El nombre completo lo
+-- usa el registry como clave join-or-create; aquí sólo se extrae el límite
+-- para que el servidor también haga cumplir usuarios por match.
+citadel.on_room_create(function(_, params)
+  local requested = tostring(params or "")
+  local capacity = tonumber(string.match(requested, "|(%d+)$")) or 0
+  return {
+    map = "stress-arena",
+    mode = "bot-stress",
+    max_players = capacity,
+    open = true,
+  }
+end)
+
 citadel.on_message(KIND_POSITION, function(ctx, body)
+  local room_id = ctx.room_id
+  if room_id == nil then return end
+  local positions = positions_by_room[room_id]
+  if positions == nil then
+    positions = {}
+    positions_by_room[room_id] = positions
+  end
+  local announced_players = announced_players_by_room[room_id]
+  if announced_players == nil then
+    announced_players = {}
+    announced_players_by_room[room_id] = announced_players
+  end
+  -- Some transports complete the guest handshake before the client starts its
+  -- application receive loop. Repeat this identity frame after room admission
+  -- so every simulated player can prove the server-side assignment.
+  if not announced_players[ctx.sender] then
+    announced_players[ctx.sender] = true
+    citadel.send(ctx.sender, KIND_PLAYER_ID, string.pack(">I8", ctx.sender), false)
+  end
   if body == nil or #body ~= 20 then
     bad_packets = bad_packets + 1
     return
@@ -83,11 +118,17 @@ citadel.on_message(KIND_POSITION, function(ctx, body)
   -- propuso el cliente) y se mantiene su timestamp para análisis posterior.
 end)
 
-local elapsed = 0.0
-citadel.on_tick(function(dt)
+local snapshot_elapsed_by_room = {}
+local elapsed_by_room = {}
+citadel.on_tick(function(dt, room_id)
+  if room_id == nil then return end
   local step = dt or 0.0
-  elapsed = elapsed + step
-  snapshot_elapsed = snapshot_elapsed + step
+  local elapsed = (elapsed_by_room[room_id] or 0.0) + step
+  local snapshot_elapsed = (snapshot_elapsed_by_room[room_id] or 0.0) + step
+  local positions = positions_by_room[room_id] or {}
+  positions_by_room[room_id] = positions
+  local player_count = 0
+  for _, _ in pairs(positions) do player_count = player_count + 1 end
   if snapshot_elapsed >= SNAPSHOT_INTERVAL then
     snapshot_elapsed = snapshot_elapsed - SNAPSHOT_INTERVAL
     -- Sort once per snapshot so every datagram chunk retains a stable key.
@@ -118,13 +159,16 @@ citadel.on_tick(function(dt)
       chunk_index = chunk_index + 1
     end
   end
+  snapshot_elapsed_by_room[room_id] = snapshot_elapsed
   if elapsed >= 30.0 then
     elapsed = elapsed - 30.0
     citadel.log(
-      "stress map online=" .. tostring(participant_count)
+      "stress match=" .. tostring(room_id)
+        .. " online=" .. tostring(player_count)
         .. " obstacles=" .. tostring(#map.obstacles)
         .. " malformed=" .. tostring(bad_packets),
       "info"
     )
   end
+  elapsed_by_room[room_id] = elapsed
 end)

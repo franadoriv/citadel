@@ -15,8 +15,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
 use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
 
 // The simulator emits a move every 250 ms. By default an ACK is considered
 // late only once it misses that next authoritative movement window; callers
@@ -87,6 +87,8 @@ impl EventField {
                 18 => Some("receive_error"),
                 19 => Some("unhandled_message"),
                 20 => Some("run_metadata"),
+                21 => Some("match_joined"),
+                22 => Some("match_join_error"),
                 _ => None,
             },
         }
@@ -121,6 +123,8 @@ struct LogRecord {
     scope: Option<ScopeField>,
     #[serde(default, alias = "b")]
     bot: Option<usize>,
+    #[serde(default, alias = "h")]
+    match_index: Option<usize>,
     #[serde(default, alias = "p")]
     player_id: Option<u64>,
     #[serde(default, alias = "r")]
@@ -192,6 +196,8 @@ struct Summary {
     bots_started: usize,
     bots_connected: usize,
     bots_with_server_id: usize,
+    matches_joined: usize,
+    bots_joined_matches: usize,
     bots_finished: usize,
     connection_failures: usize,
     position_attempts: u64,
@@ -253,6 +259,7 @@ struct Collector {
     started_bots: BTreeSet<usize>,
     connected_bots: BTreeSet<usize>,
     bots_with_server_id: BTreeSet<usize>,
+    matches_with_joined_bots: BTreeMap<usize, BTreeSet<usize>>,
     finished_bots: BTreeSet<usize>,
     position_attempts_by_bot: BTreeMap<usize, u64>,
     acknowledgements_by_bot: BTreeMap<usize, u64>,
@@ -318,6 +325,14 @@ impl Collector {
             // for this assignment event, never for peer-position records.
             "player_id_assigned" if record.player_id.or(record.peer_id).is_some() => {
                 insert_bot(&mut self.bots_with_server_id, record.bot);
+            }
+            "match_joined" => {
+                if let (Some(match_index), Some(bot)) = (record.match_index, record.bot) {
+                    self.matches_with_joined_bots
+                        .entry(match_index)
+                        .or_default()
+                        .insert(bot);
+                }
             }
             "simulation_finished" => {
                 insert_bot(&mut self.finished_bots, record.bot);
@@ -438,6 +453,12 @@ impl Collector {
             bots_started: self.started_bots.len(),
             bots_connected: self.connected_bots.len(),
             bots_with_server_id: self.bots_with_server_id.len(),
+            matches_joined: self.matches_with_joined_bots.len(),
+            bots_joined_matches: self
+                .matches_with_joined_bots
+                .values()
+                .map(|bots| bots.len())
+                .sum(),
             bots_finished: self.finished_bots.len(),
             connection_failures,
             position_attempts,
@@ -922,10 +943,12 @@ fn print_report(report: &Report, use_color: bool) {
         format_seconds(summary.duration_seconds)
     );
     println!(
-        "bots inicio={} conectados={} id-servidor={} finalizaron={} fallos-conexión={}",
+        "bots inicio={} conectados={} id-servidor={} match-join={} matches={} finalizaron={} fallos-conexión={}",
         summary.bots_started,
         summary.bots_connected,
         summary.bots_with_server_id,
+        summary.bots_joined_matches,
+        summary.matches_joined,
         summary.bots_finished,
         summary.connection_failures
     );
@@ -1228,7 +1251,10 @@ mod tests {
         .expect("test log");
 
         let report = analyze(&input, &Config::default()).expect("analysis succeeds");
-        assert_eq!(report.summary.peer_delivery_interval.samples_over_threshold, 1);
+        assert_eq!(
+            report.summary.peer_delivery_interval.samples_over_threshold,
+            1
+        );
         assert!(
             report
                 .anomalies

@@ -17,7 +17,12 @@ use std::{
 };
 
 use citadel_client::{AuthOutcome, Envelope, QuicClient, WsClient, quic::ClientTls};
-use citadel_wire::protocol::{KIND_AUTH, KIND_AUTH_RESULT, decode_auth_result};
+use citadel_wire::{
+    protocol::{
+        KIND_AUTH, KIND_AUTH_RESULT, KIND_ROOM_CREATE, KIND_ROOM_JOINED, decode_auth_result,
+    },
+    room::{RoomCreate, RoomJoined},
+};
 use flate2::{Compression, write::GzEncoder};
 use serde::Serialize;
 use tokio::{
@@ -45,6 +50,7 @@ const CONNECTION_SETTLE: Duration = Duration::from_secs(2);
 /// intentionally outside the measured movement window, so the analyzer does
 /// not mistake shutdown for server-side packet loss.
 const ACK_DRAIN: Duration = Duration::from_secs(2);
+const MATCH_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type PeerPosition = (u64, u32, f32, f32, u64);
@@ -103,6 +109,7 @@ struct LogRecord {
     event: &'static str,
     scope: &'static str,
     bot: usize,
+    match_index: Option<usize>,
     player_id: Option<u64>,
     sequence: Option<u32>,
     peer_id: Option<u64>,
@@ -133,6 +140,10 @@ struct CompactLogRecord<'a> {
     scope: Option<u8>,
     #[serde(rename = "b")]
     bot: usize,
+    /// Match index (one-based). It lets the streaming analyzer prove that a
+    /// multi-match run did not accidentally collapse into a shared lobby.
+    #[serde(rename = "h", skip_serializing_if = "Option::is_none")]
+    match_index: Option<usize>,
     #[serde(rename = "p", skip_serializing_if = "Option::is_none")]
     player_id: Option<u64>,
     #[serde(rename = "q", skip_serializing_if = "Option::is_none")]
@@ -164,6 +175,7 @@ impl<'a> From<&'a LogRecord> for CompactLogRecord<'a> {
             // Local is omitted because it is the overwhelmingly common case.
             scope: (record.scope == "external").then_some(1),
             bot: record.bot,
+            match_index: record.match_index,
             // `player_id_assigned` establishes the bot -> server player ID
             // mapping. Repeating it on every subsequent local/peer record does
             // not add forensic value and dominates large-run file sizes.
@@ -175,8 +187,12 @@ impl<'a> From<&'a LogRecord> for CompactLogRecord<'a> {
             // Peer coordinates remain available in verbose console output,
             // while the compact trace keeps the fields needed to diagnose
             // delivery: recipient, peer, sequence, age and receive time.
-            x: (record.event != "peer_position").then_some(record.x).flatten(),
-            z: (record.event != "peer_position").then_some(record.z).flatten(),
+            x: (record.event != "peer_position")
+                .then_some(record.x)
+                .flatten(),
+            z: (record.event != "peer_position")
+                .then_some(record.z)
+                .flatten(),
             latency_ns: record.latency_ns,
             sequence_gap: record.sequence_gap,
             detail: record.detail.as_deref(),
@@ -206,6 +222,8 @@ fn event_code(event: &str) -> u8 {
         "receive_error" => 18,
         "unhandled_message" => 19,
         "run_metadata" => 20,
+        "match_joined" => 21,
+        "match_join_error" => 22,
         // The simulator only writes the known events above. Keeping an
         // explicit reserved code means a future event cannot masquerade as a
         // known one in an analysis report.
@@ -217,6 +235,7 @@ fn event_code(event: &str) -> u8 {
 struct Logger {
     clock: Arc<RunClock>,
     sender: mpsc::Sender<LogRecord>,
+    match_for_bot: Arc<[usize]>,
 }
 
 impl Logger {
@@ -238,6 +257,9 @@ impl Logger {
             event,
             scope: "local",
             bot,
+            match_index: bot
+                .checked_sub(1)
+                .and_then(|index| self.match_for_bot.get(index).copied()),
             player_id: None,
             sequence: None,
             peer_id: None,
@@ -272,6 +294,8 @@ struct Stats {
     rejected: AtomicU64,
     received: AtomicU64,
     sequence_gaps: AtomicU64,
+    matches_joined: AtomicU64,
+    match_join_failures: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,6 +329,8 @@ struct Config {
     connection_ramp: Duration,
     movement_start: TokioInstant,
     deadline: TokioInstant,
+    match_names: Arc<[String]>,
+    users_per_match: usize,
 }
 
 enum BotConnection {
@@ -347,7 +373,14 @@ impl BotConnection {
                 validate_guest_auth(&envelopes)?;
                 Ok(Self::Quic {
                     client,
-                    reliable: VecDeque::new(),
+                    // A server may bundle the guest result and the initial
+                    // PLAYER_ID on one reliable stream. Keep every frame
+                    // except the authentication result so the simulation
+                    // still observes its assigned server id.
+                    reliable: envelopes
+                        .into_iter()
+                        .filter(|envelope| envelope.kind != KIND_AUTH_RESULT)
+                        .collect(),
                 })
             }
         }
@@ -385,6 +418,19 @@ impl BotConnection {
                 .map_err(|error| error.to_string()),
             Self::Quic { client, .. } => client
                 .send_unreliable(envelope)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    async fn send_reliable(&mut self, envelope: &Envelope) -> Result<(), String> {
+        match self {
+            Self::WebSocket(client) => client
+                .send(envelope)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Quic { client, .. } => client
+                .send_reliable(envelope)
+                .await
                 .map_err(|error| error.to_string()),
         }
     }
@@ -442,7 +488,12 @@ impl Rng {
 #[tokio::main]
 async fn main() -> AppResult<()> {
     print_banner();
-    let bots = ask_usize("Cantidad de bots (1-1000)", 10, 1, 1000)?;
+    let matches = ask_usize("Cantidad de matches simultáneos (1-1000)", 1, 1, 1_000)?;
+    let users_per_match = ask_usize("Usuarios por match (1-1000)", 10, 1, 1_000)?;
+    let bots = matches
+        .checked_mul(users_per_match)
+        .filter(|total| *total <= 1_000)
+        .ok_or("matches × usuarios por match debe estar entre 1 y 1000")?;
     let minutes = ask_u64("Duración de la simulación en minutos", 1, 1, 1_440)?;
     let transport = ask_transport()?;
     let endpoint = ask_string(
@@ -467,9 +518,14 @@ async fn main() -> AppResult<()> {
     let log_path = create_log_path().await?;
     let clock = Arc::new(RunClock::new());
     let (log_sender, log_receiver) = mpsc::channel(262_144);
+    let match_for_bot: Arc<[usize]> = (0..bots)
+        .map(|bot| bot / users_per_match + 1)
+        .collect::<Vec<_>>()
+        .into();
     let logger = Logger {
         clock,
         sender: log_sender,
+        match_for_bot,
     };
     let compressed_log_path = compressed_log_path(&log_path);
     let writer = tokio::spawn(write_logs(log_path.clone(), log_receiver, verbose));
@@ -495,6 +551,11 @@ async fn main() -> AppResult<()> {
         connection_ramp,
         movement_start,
         deadline,
+        match_names: (1..=matches)
+            .map(|match_index| format!("stress-match-{match_index:04}|{users_per_match}"))
+            .collect::<Vec<_>>()
+            .into(),
+        users_per_match,
     };
     let duration_label = if duration == selected_duration {
         format!("{minutes} minuto(s)")
@@ -503,8 +564,10 @@ async fn main() -> AppResult<()> {
     };
 
     println!(
-        "{} {} bots por {} durante {}; rampa={} ms/bot, calentamiento={} ms, movimiento cada {} ms.",
+        "{} {} matches × {} bots = {} bots por {} durante {}; rampa={} ms/bot, calentamiento={} ms, movimiento cada {} ms.",
         color("▶", "36"),
+        color(&matches.to_string(), "1;36"),
+        color(&users_per_match.to_string(), "1;36"),
         color(&bots.to_string(), "1;36"),
         color(transport.label(), "1;35"),
         color(&duration_label, "1;36"),
@@ -514,7 +577,7 @@ async fn main() -> AppResult<()> {
     );
     let mut metadata = logger.record(logger.at(), "run_metadata", 0);
     metadata.detail = Some(format!(
-        "transport={}; unreliable_delivery=latest-wins; connection_ramp_ms={connection_ramp_ms}; run_unix_ns={}",
+        "transport={}; unreliable_delivery=latest-wins; matches={matches}; users_per_match={users_per_match}; connection_ramp_ms={connection_ramp_ms}; run_unix_ns={}",
         transport.label(),
         metadata.unix_ns,
     ));
@@ -554,10 +617,9 @@ async fn main() -> AppResult<()> {
                 color("✓", "32"),
                 compressed_log_path.display()
             ),
-            Ok(Err(error)) => eprintln!(
-                "{} no se pudo comprimir el log: {error}",
-                color("!", "31")
-            ),
+            Ok(Err(error)) => {
+                eprintln!("{} no se pudo comprimir el log: {error}", color("!", "31"))
+            }
             Err(error) => eprintln!(
                 "{} tarea de compresión cancelada: {error}",
                 color("!", "31")
@@ -618,6 +680,41 @@ async fn run_bot(bot: usize, config: Config, logger: Logger, stats: Arc<Stats>) 
     let mut pending = HashMap::<u32, SentMove>::new();
     let mut last_seen = HashMap::<u64, u32>::new();
     let mut server_player_id = None;
+
+    let match_index = bot.saturating_sub(1) / config.users_per_match;
+    let match_name = config
+        .match_names
+        .get(match_index)
+        .cloned()
+        .unwrap_or_default();
+    if let Err(error) = join_match(
+        bot,
+        &match_name,
+        &mut client,
+        &mut x,
+        &mut z,
+        &mut pending,
+        &mut last_seen,
+        &mut server_player_id,
+        &logger,
+        &stats,
+    )
+    .await
+    {
+        stats.failures.fetch_add(1, Ordering::Relaxed);
+        stats.match_join_failures.fetch_add(1, Ordering::Relaxed);
+        let mut record = record_for_player(
+            &logger,
+            logger.at(),
+            "match_join_error",
+            bot,
+            server_player_id,
+        );
+        record.detail = Some(error);
+        logger.write(record).await;
+        let _ = client.close().await;
+        return;
+    }
 
     while TokioInstant::now() < config.deadline {
         let remaining = config
@@ -752,6 +849,69 @@ async fn run_bot(bot: usize, config: Config, logger: Logger, stats: Arc<Stats>) 
             record_for_player(&logger, logger.at(), "close_error", bot, server_player_id);
         record.detail = Some(error.to_string());
         logger.write(record).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn join_match(
+    bot: usize,
+    match_name: &str,
+    client: &mut BotConnection,
+    x: &mut f32,
+    z: &mut f32,
+    pending: &mut HashMap<u32, SentMove>,
+    last_seen: &mut HashMap<u64, u32>,
+    server_player_id: &mut Option<u64>,
+    logger: &Logger,
+    stats: &Stats,
+) -> Result<(), String> {
+    client
+        .send_reliable(&Envelope::new(
+            KIND_ROOM_CREATE,
+            RoomCreate {
+                params: match_name.as_bytes().to_vec(),
+            }
+            .encode(),
+        ))
+        .await?;
+    let deadline = TokioInstant::now() + MATCH_JOIN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(TokioInstant::now());
+        if remaining.is_zero() {
+            return Err("timeout esperando ROOM_JOINED".to_owned());
+        }
+        match timeout(remaining.min(RECEIVE_SLICE), client.recv()).await {
+            Ok(Ok(Some(envelope))) if envelope.kind == KIND_ROOM_JOINED => {
+                let joined = RoomJoined::decode(&envelope.body)
+                    .map_err(|error| format!("ROOM_JOINED inválido: {error}"))?;
+                stats.matches_joined.fetch_add(1, Ordering::Relaxed);
+                let mut record =
+                    record_for_player(logger, logger.at(), "match_joined", bot, *server_player_id);
+                record.detail = Some(format!(
+                    "name={match_name}; room_id={}; map={}; mode={}",
+                    joined.room_id, joined.map, joined.mode
+                ));
+                logger.write(record).await;
+                return Ok(());
+            }
+            Ok(Ok(Some(envelope))) => {
+                handle_envelope(
+                    bot,
+                    &envelope,
+                    x,
+                    z,
+                    pending,
+                    last_seen,
+                    server_player_id,
+                    logger,
+                    stats,
+                )
+                .await;
+            }
+            Ok(Ok(None)) => return Err("conexión cerrada esperando ROOM_JOINED".to_owned()),
+            Ok(Err(error)) => return Err(format!("error esperando ROOM_JOINED: {error}")),
+            Err(_) => {}
+        }
     }
 }
 
@@ -895,13 +1055,7 @@ async fn observe_peer_position(
         return;
     }
     stats.received.fetch_add(1, Ordering::Relaxed);
-    let mut record = record_for_player(
-        logger,
-        received_at,
-        "peer_position",
-        bot,
-        server_player_id,
-    );
+    let mut record = record_for_player(logger, received_at, "peer_position", bot, server_player_id);
     record.scope = "external";
     record.sequence = Some(sequence);
     record.peer_id = Some(peer_id);
@@ -914,14 +1068,11 @@ async fn observe_peer_position(
         && sequence > previous.wrapping_add(1)
     {
         let gap = sequence.saturating_sub(previous).saturating_sub(1);
-        stats.sequence_gaps.fetch_add(u64::from(gap), Ordering::Relaxed);
-        let mut gap_record = record_for_player(
-            logger,
-            received_at,
-            "sequence_gap",
-            bot,
-            server_player_id,
-        );
+        stats
+            .sequence_gaps
+            .fetch_add(u64::from(gap), Ordering::Relaxed);
+        let mut gap_record =
+            record_for_player(logger, received_at, "sequence_gap", bot, server_player_id);
         gap_record.scope = "external";
         gap_record.peer_id = Some(peer_id);
         gap_record.sequence = Some(sequence);
@@ -1059,7 +1210,10 @@ fn compress_log(raw_path: PathBuf, compressed_path: PathBuf) -> AppResult<()> {
         .create_new(true)
         .write(true)
         .open(&compressed_path)?;
-    let mut writer = GzEncoder::new(io::BufWriter::with_capacity(1_048_576, destination), Compression::fast());
+    let mut writer = GzEncoder::new(
+        io::BufWriter::with_capacity(1_048_576, destination),
+        Compression::fast(),
+    );
     let mut reader = io::BufReader::with_capacity(1_048_576, source);
     io::copy(&mut reader, &mut writer)?;
     let mut destination = writer.finish()?;
@@ -1257,6 +1411,7 @@ mod tests {
             event: "peer_position",
             scope: "external",
             bot: 7,
+            match_index: Some(3),
             player_id: Some(44),
             sequence: Some(9),
             peer_id: Some(88),
@@ -1282,6 +1437,10 @@ mod tests {
         assert!(encoded.get("z").is_none());
         assert!(encoded.get("g").is_none());
         assert!(encoded.get("d").is_none());
+        assert_eq!(
+            encoded.get("h").and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
 
         let assigned_record = LogRecord {
             event: "player_id_assigned",

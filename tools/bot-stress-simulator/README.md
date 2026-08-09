@@ -29,9 +29,14 @@ cd client
 cargo run --release
 ```
 
-El programa pregunta la cantidad de bots (de 1 a 1000), los minutos de la
-simulación, el transporte (QUIC o WebSocket), su endpoint, la rampa entre
-conexiones y si se desea imprimir cada paquete. QUIC es el modo predeterminado:
+El programa pregunta la cantidad de **matches simultáneos** y los **usuarios
+por match** (su producto debe ser de 1 a 1000), los minutos de la simulación,
+el transporte (QUIC o WebSocket), su endpoint, la rampa entre conexiones y si
+se desea imprimir cada paquete. Cada bot crea o se une al nombre de sala de su
+match mediante `ROOM_CREATE`; Citadel aplica el límite por sala y el runtime
+Lua mantiene posiciones y snapshots aislados por `room_id`. Así, por ejemplo,
+`20 matches × 10 usuarios` prueba 20 partidas concurrentes sin que los peers de
+una partida reciban estados de otra. QUIC es el modo predeterminado:
 cada bot abre su propia conexión QUIC y envía posiciones como datagramas. El
 servidor confirma cada movimiento y difunde el estado en snapshots por bloques
 de hasta 32 jugadores, para no convertir cada posición en cientos de paquetes
@@ -104,8 +109,9 @@ el intervalo de movimiento.
 
 ## Validación y limpieza
 
-Con el servidor iniciado, run-validation.ps1 ejecuta 200 bots por 15 segundos
-reales con una rampa de 25 ms. clean-artifacts.ps1 mueve los JSONL y reportes
+Con el servidor iniciado, run-validation.ps1 ejecuta 10 matches de 20 bots
+(200 bots totales) por 15 segundos reales con una rampa de 25 ms.
+clean-artifacts.ps1 mueve los JSONL y reportes
 generados a la Papelera de reciclaje.
 
 El servidor aplica el mapa de forma autoritativa: un bot puede escoger una
@@ -141,9 +147,11 @@ release del repositorio.
 
 ## Consideración de capacidad
 
-Con 1000 bots y el intervalo predeterminado de 250 ms, se procesan cerca de
-cuatro millones de estados de peer por segundo antes de contar acknowledgements
-y logs. Los snapshots reducen de forma drástica la cantidad de datagramas, pero
+Con 1000 bots concentrados en una sola partida y el intervalo predeterminado de
+250 ms, se procesan cerca de cuatro millones de estados de peer por segundo
+antes de contar acknowledgements y logs. Repartirlos entre matches reduce el
+fan-out por sala y, a la vez, ejercita la programación de múltiples ticks de
+match. Los snapshots reducen de forma drástica la cantidad de datagramas, pero
 el JSONL conserva cada estado recibido para el análisis; gzip evita que esa
 evidencia ocupe varios GB por minuto.
 Usa una unidad rápida y prueba primero con 10--50 bots. El modo detallado
