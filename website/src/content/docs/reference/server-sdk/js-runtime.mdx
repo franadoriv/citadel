@@ -820,6 +820,14 @@ error. `console.log`, `console.info`, `console.warn`, `console.error`, and
 Load an operator-owned text-policy JSON file during `main.js` initialization,
 then scan or sanitize text with its opaque reference.
 
+### Mental model
+
+Think of a policy as a referee's sealed rulebook: Citadel reads and checks it
+before the match starts, then the running game can consult it quickly without
+walking back to the filing cabinet. `scan` is the referee pointing at a rule;
+`sanitize` is the same referee handing back a safe-to-display version of the
+message. The GameScript still decides whether to warn, mute, or reject a player.
+
 ```js
 const policyRef = citadel.text_policy.load_json(path); // -> string
 const result = citadel.text_policy.scan(policyRef, text); // -> object

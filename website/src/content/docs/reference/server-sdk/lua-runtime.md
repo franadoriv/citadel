@@ -262,6 +262,14 @@ expose the same operations with bytes/`Uint8Array` values and native mappings.
 Load an operator-owned text-policy JSON file during `main.lua` initialization,
 then scan or sanitize text with its opaque reference.
 
+### Mental model
+
+Think of a policy as a referee's sealed rulebook: Citadel reads and checks it
+before the match starts, then the running game can consult it quickly without
+walking back to the filing cabinet. `scan` is the referee pointing at a rule;
+`sanitize` is the same referee handing back a safe-to-display version of the
+message. The GameScript still decides whether to warn, mute, or reject a player.
+
 ```
 policy_ref = citadel.text_policy.load_json(path) -- string
 result = citadel.text_policy.scan(policy_ref, text) -- table
