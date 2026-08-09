@@ -327,6 +327,38 @@
     "since": "pre-1.0"
   },
   {
+    "name": "text_policy.load_json",
+    "category": "text_policy",
+    "params": [
+      "path:relative .json"
+    ],
+    "returns": "policy_ref:string",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "text_policy.scan",
+    "category": "text_policy",
+    "params": [
+      "policy_ref:string",
+      "text:string"
+    ],
+    "returns": "{decision:allow|flag|mask|replace|reject,matches:array,text:string}",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "text_policy.sanitize",
+    "category": "text_policy",
+    "params": [
+      "policy_ref:string",
+      "text:string"
+    ],
+    "returns": "{decision:allow|flag|mask|replace|reject,matches:array,text:string}",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "friends.add",
     "category": "domain",
     "params": [

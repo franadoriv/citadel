@@ -88,3 +88,37 @@ fn leaderboard_reset_callback_is_a_shipped_runtime_contract() {
     assert_eq!(callback.status, HostApiStatus::Shipped);
     assert_eq!(callback.since, "unreleased");
 }
+
+#[test]
+fn text_policy_is_a_shipped_cross_runtime_contract() {
+    let expected = [
+        (
+            "text_policy.load_json",
+            &["path:relative .json"][..],
+            "policy_ref:string",
+        ),
+        (
+            "text_policy.scan",
+            &["policy_ref:string", "text:string"][..],
+            "{decision:allow|flag|mask|replace|reject,matches:array,text:string}",
+        ),
+        (
+            "text_policy.sanitize",
+            &["policy_ref:string", "text:string"][..],
+            "{decision:allow|flag|mask|replace|reject,matches:array,text:string}",
+        ),
+    ];
+
+    for (name, params, returns) in expected {
+        let api = HOST_API_SURFACE
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("text policy API is declared");
+
+        assert_eq!(api.category, HostApiCategory::TextPolicy);
+        assert_eq!(api.params, params);
+        assert_eq!(api.returns, returns);
+        assert_eq!(api.status, HostApiStatus::Shipped);
+        assert_eq!(api.since, "unreleased");
+    }
+}
