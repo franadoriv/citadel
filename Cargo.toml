@@ -197,3 +197,20 @@ panic = "warn"
 todo = "warn"
 unimplemented = "warn"
 unwrap_used = "warn"
+
+# --- Build-artifact hygiene -------------------------------------------------
+# Rust's target/ can grow to hundreds of GB, dominated by debug info in the
+# dependency graph and in the many statically-linked test binaries (each
+# integration test file compiles to its own binary). These overrides strip
+# debug info down to line tables where it is rarely useful — every dependency
+# and every test binary — while leaving full debug info on this crate's own
+# dev builds for interactive debugging. `line-tables-only` still yields
+# file/line in panic backtraces, so failure diagnostics are unaffected.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = "line-tables-only"
