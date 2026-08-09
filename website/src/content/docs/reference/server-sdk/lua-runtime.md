@@ -257,6 +257,73 @@ expose the same operations with bytes/`Uint8Array` values and native mappings.
 
 ---
 
+## citadel.text_policy
+
+Load an operator-owned text-policy JSON file during `main.lua` initialization,
+then scan or sanitize text with its opaque reference.
+
+### Mental model
+
+Think of a policy as a referee's sealed rulebook: Citadel reads and checks it
+before the match starts, then the running game can consult it quickly without
+walking back to the filing cabinet. `scan` is the referee pointing at a rule;
+`sanitize` is the same referee handing back a safe-to-display version of the
+message. The GameScript still decides whether to warn, mute, or reject a player.
+
+```
+policy_ref = citadel.text_policy.load_json(path) -- string
+result = citadel.text_policy.scan(policy_ref, text) -- table
+result = citadel.text_policy.sanitize(policy_ref, text) -- table
+```
+
+`load_json` accepts one non-empty relative `.json` path under `[runtime]
+static_data_dir` (for example, `"policy.json"`) and returns a reference such
+as `"text-policy:policy.json"`. The file must be a schema-version-1 policy:
+
+```json
+{"schema_version":1,"rules":[{"id":"bad-word","category":"abuse","severity":"high","terms":["bad"],"match":"whole_word","action":"mask"}]}
+```
+
+For that policy, `scan(policy_ref, "BAD actor")` returns exactly
+`{ decision = "mask", matches = {{ rule_id = "bad-word", category = "abuse", severity = "high", span = { start = 0, end = 3 }, action = "mask" }}, text = "BAD actor" }`.
+`sanitize(policy_ref, "BAD actor")` returns the same decision and matches with
+`text = "*** actor"`. Every result has `decision`, `matches`, and `text`.
+Each match has `rule_id`, `category`, `severity` (or `nil`), `span`, and
+`action`; `span.start` and `span.end` are zero-based **UTF-8 byte offsets** in
+the input text, with an exclusive end.
+
+Matching folds ASCII letters only (`BAD` matches `bad`); it performs no Unicode
+normalization or Unicode case folding. Rules use `whole_word` or `phrase`
+matching. Actions and aggregate decisions are `allow`, `flag`, `mask`,
+`replace`, and `reject`, in that order of precedence. `sanitize` masks matched
+text with one `*` per character and applies a rule's replacement for `replace`;
+`allow`, `flag`, and `reject` retain the matched input text. Use `decision` to
+enforce a flag or rejection—the API never silently permits an invalid policy.
+
+Policies are compiled and cached by path during top-level initialization. A
+repeat load returns the cached reference. Citadel seals the catalog before
+handlers run: a cached reference remains usable, but a new path is denied, so
+message/tick handlers cannot cause policy-file I/O. A successful hot reload
+builds a new runtime and sealed catalog; a failed replacement leaves the prior
+runtime active.
+
+**Errors:** all access, parse, validation, unknown-reference, and late-load
+failures are fail-closed and raise a Lua error. Static-data access failures are
+prefixed `text policy static data error`; invalid JSON/schema/rules/actions are
+prefixed `text policy is invalid`; a post-seal cache miss says `text policy was
+not loaded during script initialization`; an invalid or foreign reference says
+`unknown text policy reference`.
+
+```lua
+local chat_policy = citadel.text_policy.load_json("policy.json")
+
+citadel.on_rpc("moderate", function(ctx, body)
+  return citadel.text_policy.sanitize(chat_policy, body)
+end)
+```
+
+---
+
 ## citadel.static_data.load_json
 
 Load one preconfigured gameplay JSON document during script initialization.

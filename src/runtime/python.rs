@@ -26,6 +26,7 @@ use crate::runtime::outbound_http::{
     TrustedHttpClient,
 };
 use crate::runtime::static_data::StaticDataCatalog;
+use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEventBatch,
     OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome,
@@ -103,6 +104,9 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "log",
     "static_data.load_json",
     "static_data.load_csv",
+    "text_policy.load_json",
+    "text_policy.scan",
+    "text_policy.sanitize",
     "friends.add",
     "friends.remove",
     "friends.block",
@@ -853,6 +857,11 @@ struct StaticDataBridge {
     catalog: StaticDataCatalog,
 }
 
+#[pyclass]
+struct TextPolicyBridge {
+    catalog: TextPolicyCatalog,
+}
+
 /// Rust-owned HTTP bridge. Python receives this narrow request facade, never a
 /// socket, an HTTP client, or proxy configuration.
 #[pyclass]
@@ -910,6 +919,31 @@ impl StaticDataBridge {
             .catalog
             .load_csv(path)
             .map_err(static_data_python_error)?;
+        static_data_value_to_python(py, &value)
+    }
+}
+
+#[pymethods]
+impl TextPolicyBridge {
+    fn load_json(&self, path: &str) -> PyResult<String> {
+        self.catalog
+            .load_json(path)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn scan(&self, policy_ref: &str, text: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = self
+            .catalog
+            .scan_value(policy_ref, text)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        static_data_value_to_python(py, &value)
+    }
+
+    fn sanitize(&self, policy_ref: &str, text: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = self
+            .catalog
+            .sanitize_value(policy_ref, text)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         static_data_value_to_python(py, &value)
     }
 }
@@ -2847,6 +2881,18 @@ fn install_static_data(
     )
 }
 
+fn install_text_policy(
+    citadel: &Bound<'_, PyModule>,
+    text_policy: TextPolicyCatalog,
+) -> PyResult<()> {
+    citadel.setattr(
+        "text_policy",
+        TextPolicyBridge {
+            catalog: text_policy,
+        },
+    )
+}
+
 fn install_outbound_http(
     citadel: &Bound<'_, PyModule>,
     interceptor_mode: Arc<AtomicBool>,
@@ -2973,6 +3019,7 @@ fn build_python(
         "python host module name",
     )?;
     let interceptor_mode = Arc::new(AtomicBool::new(false));
+    let text_policy = TextPolicyCatalog::new(static_data.clone());
     let http_endpoints = Arc::new(Mutex::new(BTreeSet::new()));
     let _build_guard = PYTHON_BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     Python::attach(|py| -> PyResult<PythonVm> {
@@ -2986,6 +3033,7 @@ fn build_python(
         let modules: Bound<'_, PyDict> = sys.getattr("modules")?.cast_into()?;
         modules.set_item("citadel", &citadel)?;
         install_static_data(&citadel, static_data.clone())?;
+        install_text_policy(&citadel, text_policy.clone())?;
         install_outbound_http(
             &citadel,
             Arc::clone(&interceptor_mode),
@@ -3021,6 +3069,7 @@ fn build_python(
             Ok(())
         })?;
         static_data.seal();
+        text_policy.seal();
         let version = sys.getattr("version")?.extract::<String>()?;
         let vm = PythonVm {
             citadel: citadel.unbind(),

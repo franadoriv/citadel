@@ -48,6 +48,8 @@ pub enum HostApiCategory {
     Storage,
     /// Read-only, cached static gameplay data.
     StaticData,
+    /// Read-only, cached text-content policy evaluation.
+    TextPolicy,
     /// Outbound HTTP host call.
     Http,
     /// Local best-effort runtime event publication and subscription.
@@ -331,6 +333,30 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "array<object>",
         status: HostApiStatus::Shipped,
         since: "pre-1.0",
+    },
+    HostApiFn {
+        name: "text_policy.load_json",
+        category: HostApiCategory::TextPolicy,
+        params: &["path:relative .json"],
+        returns: "policy_ref:string",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
+        name: "text_policy.scan",
+        category: HostApiCategory::TextPolicy,
+        params: &["policy_ref:string", "text:string"],
+        returns: "{decision:allow|flag|mask|replace|reject,matches:array,text:string}",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
+        name: "text_policy.sanitize",
+        category: HostApiCategory::TextPolicy,
+        params: &["policy_ref:string", "text:string"],
+        returns: "{decision:allow|flag|mask|replace|reject,matches:array,text:string}",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
     },
     HostApiFn {
         name: "friends.add",
