@@ -1219,7 +1219,7 @@ fn dispatch(
                 .clone();
             Ok(ControlResponse::ChatDelivery {
                 disposition: state.chat_dedupe.evaluate(source.clone(), &delivery, || {
-                    handler.map_or(ChatDeliveryDisposition::Unknown, |handler| {
+                    handler.map_or(ChatDeliveryDisposition::Unavailable, |handler| {
                         handler(source, delivery.clone())
                     })
                 }),
@@ -1554,6 +1554,63 @@ mod tests {
             Ok(ControlResponse::RuntimePropagation { accepted: false })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn chat_delivery_before_handler_registration_is_retried_after_startup() {
+        let (identity_a, cert_a) = identity();
+        let (identity_b, cert_b) = identity();
+        let node_a = node("node-a");
+        let node_b = node("node-b");
+        let router_b = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_b.clone(),
+                identity_b,
+                BTreeMap::from([(node_a.clone(), cert_a)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router b"),
+        );
+        let listener = router_b
+            .serve("127.0.0.1:0".parse().expect("loopback"))
+            .expect("listener");
+        let router_a = TlsMatchmakerHandoffRouter::new(
+            node_a,
+            identity_a,
+            BTreeMap::from([(node_b.clone(), cert_b)]),
+            BTreeMap::from([(
+                node_b.clone(),
+                MatchmakerControlEndpoint {
+                    address: listener.local_addr(),
+                    server_name: "localhost".to_owned(),
+                },
+            )]),
+            Duration::from_secs(2),
+        )
+        .expect("router a");
+        let delivery = chat_delivery();
+
+        assert_eq!(
+            router_a
+                .deliver_chat(&node_b, delivery.clone())
+                .expect("startup delivery response"),
+            ChatDeliveryDisposition::Unavailable
+        );
+
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let deliveries_for_handler = Arc::clone(&deliveries);
+        router_b.register_chat_delivery_handler(Arc::new(move |_source, _delivery| {
+            deliveries_for_handler.fetch_add(1, Ordering::SeqCst);
+            ChatDeliveryDisposition::Delivered
+        }));
+        assert_eq!(
+            router_a
+                .deliver_chat(&node_b, delivery)
+                .expect("delivery after handler registration"),
+            ChatDeliveryDisposition::Delivered
+        );
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
     }
 
     #[test]

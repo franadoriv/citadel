@@ -21,7 +21,8 @@
 
 use citadel::error::ErrorCategory;
 use citadel::repository::{
-    ChannelType, ChatModerationAudit, ChatRateLimit, ChatRepository, InMemoryChatRepository,
+    ChannelType, ChatDeliveryRequest, ChatModerationAudit, ChatRateLimit, ChatRepository,
+    InMemoryChatRepository,
 };
 use citadel::time::TimestampMillis;
 
@@ -306,6 +307,157 @@ async fn scenario_moderation_tombstone_writes_one_redacted_audit_and_expires(
     assert_eq!(repo.moderation_audit_count().await.expect("audit count"), 0);
 }
 
+async fn scenario_authorized_moderation_commits_tombstone_audit_and_outbox_once(
+    repo: &dyn ChatRepository,
+) {
+    let id = post(
+        repo,
+        "moderated",
+        ChannelType::Group,
+        "alice",
+        "secret",
+        CAP,
+        1,
+    )
+    .await;
+    let audit = ChatModerationAudit::tombstone(
+        "group_admin",
+        "moderator",
+        "group_moderation",
+        "moderated",
+        id,
+        "alice",
+        0,
+        "correlation-2",
+        "node-a",
+        ts(2),
+    );
+    let delivery = ChatDeliveryRequest {
+        origin_node_id: "node-a".to_owned(),
+        authority_epoch: 0,
+        expires_at: ts(30),
+        event_type: "message.remove",
+    };
+    let invalid_delivery = ChatDeliveryRequest {
+        expires_at: ts(2),
+        ..delivery.clone()
+    };
+
+    repo.advance_access_epoch("group:1", ts(2))
+        .await
+        .expect("advance moderation fence");
+    let before = repo
+        .channel_history("moderated", 10, None)
+        .await
+        .expect("history before stale moderation");
+    repo.moderate_delete_message_authorized_with_delivery(
+        "moderated",
+        ChannelType::Group,
+        id,
+        &audit,
+        "group:1",
+        0,
+        &delivery,
+        ts(2),
+    )
+    .await
+    .expect_err("stale moderation fence must reject");
+    assert_eq!(
+        repo.channel_history("moderated", 10, None)
+            .await
+            .expect("history after stale moderation"),
+        before,
+        "stale moderation must not change deletion, revision, or event state"
+    );
+    assert_eq!(repo.moderation_audit_count().await.expect("audit count"), 0);
+    assert!(
+        repo.active_delivery_outbox("node-a", ts(3), 10)
+            .await
+            .expect("outbox after stale moderation")
+            .is_empty()
+    );
+
+    repo.moderate_delete_message_authorized_with_delivery(
+        "moderated",
+        ChannelType::Group,
+        id,
+        &audit,
+        "group:1",
+        1,
+        &invalid_delivery,
+        ts(2),
+    )
+    .await
+    .expect_err("outbox failure rolls back moderation UoW");
+    assert!(
+        !repo
+            .channel_history("moderated", 10, None)
+            .await
+            .expect("history after rolled-back moderation")[0]
+            .deleted
+    );
+    assert_eq!(repo.moderation_audit_count().await.expect("audit count"), 0);
+    assert!(
+        repo.active_delivery_outbox("node-a", ts(3), 10)
+            .await
+            .expect("outbox")
+            .is_empty()
+    );
+
+    let message = repo
+        .moderate_delete_message_authorized_with_delivery(
+            "moderated",
+            ChannelType::Group,
+            id,
+            &audit,
+            "group:1",
+            1,
+            &delivery,
+            ts(2),
+        )
+        .await
+        .expect("atomic moderation")
+        .expect("first moderation deletes");
+    assert!(message.deleted);
+    assert_eq!(message.content, "");
+    assert_eq!(message.revision, 2);
+    assert_eq!(repo.moderation_audit_count().await.expect("audit count"), 1);
+    let outbox = repo
+        .active_delivery_outbox("node-a", ts(3), 10)
+        .await
+        .expect("outbox");
+    assert_eq!(outbox.len(), 1);
+    assert_eq!(outbox[0].event_id, message.last_event_id);
+    assert_eq!(outbox[0].origin_node_id, "node-a");
+    let payload: serde_json::Value = serde_json::from_str(&outbox[0].payload).expect("event JSON");
+    assert_eq!(payload["type"], "message.remove");
+    assert_eq!(payload["message"]["deleted"], true);
+
+    assert!(
+        repo.moderate_delete_message_authorized_with_delivery(
+            "moderated",
+            ChannelType::Group,
+            id,
+            &audit,
+            "group:1",
+            1,
+            &delivery,
+            ts(3),
+        )
+        .await
+        .expect("idempotent retry")
+        .is_none()
+    );
+    assert_eq!(repo.moderation_audit_count().await.expect("audit count"), 1);
+    assert_eq!(
+        repo.active_delivery_outbox("node-a", ts(4), 10)
+            .await
+            .expect("outbox")
+            .len(),
+        1
+    );
+}
+
 async fn scenario_channels_filter_sort_and_limit(repo: &dyn ChatRepository) {
     post(repo, "lobby-eu", ChannelType::Room, "a", "hi", CAP, 1).await;
     post(repo, "lobby-na", ChannelType::Room, "a", "hi", CAP, 2).await;
@@ -439,6 +591,7 @@ fn all_scenarios() -> Vec<Scenario> {
         scenario_edit_and_tombstone_advance_per_channel_event_order,
         scenario_rate_limit_plan_is_all_or_nothing_and_expires,
         scenario_moderation_tombstone_writes_one_redacted_audit_and_expires,
+        scenario_authorized_moderation_commits_tombstone_audit_and_outbox_once,
         scenario_channels_filter_sort_and_limit,
         scenario_canonical_descriptors_and_access_epochs_are_durable,
     ]
@@ -557,6 +710,8 @@ mod mongodb {
             scenario_delete_tombstones_durably_and_is_idempotent,
             scenario_delete_unknown_channel_or_id_is_not_found,
             scenario_edit_and_tombstone_advance_per_channel_event_order,
+            scenario_moderation_tombstone_writes_one_redacted_audit_and_expires,
+            scenario_authorized_moderation_commits_tombstone_audit_and_outbox_once,
             scenario_channels_filter_sort_and_limit,
             scenario_canonical_descriptors_and_access_epochs_are_durable,
         ];

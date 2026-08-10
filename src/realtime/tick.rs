@@ -194,6 +194,7 @@ pub struct ChatPresenceRenewalService {
 /// is cleaned in the same bounded pass so clients reconcile from history.
 pub struct ChatDeliveryDispatchService {
     dispatcher: Arc<ChatDeliveryDispatcher>,
+    wake: Arc<tokio::sync::Notify>,
     period: Duration,
     batch_limit: usize,
     cleanup_limit: usize,
@@ -204,12 +205,14 @@ impl ChatDeliveryDispatchService {
     #[must_use]
     pub fn new(
         dispatcher: Arc<ChatDeliveryDispatcher>,
+        wake: Arc<tokio::sync::Notify>,
         period: Duration,
         batch_limit: usize,
         cleanup_limit: usize,
     ) -> Self {
         Self {
             dispatcher,
+            wake,
             period,
             batch_limit: batch_limit.max(1),
             cleanup_limit: cleanup_limit.max(1),
@@ -235,6 +238,12 @@ impl AsyncService for ChatDeliveryDispatchService {
                     }
                     if let Err(error) = self.dispatcher.cleanup_expired(now, self.cleanup_limit).await {
                         tracing::warn!(error = %error, "bounded expired chat delivery cleanup failed");
+                    }
+                }
+                () = self.wake.notified() => {
+                    let now = SystemClock.now();
+                    if let Err(error) = self.dispatcher.dispatch_once(now, self.batch_limit).await {
+                        tracing::warn!(error = %error, "commit-triggered chat delivery dispatch failed; rows remain durable for retry");
                     }
                 }
             }
@@ -516,15 +525,17 @@ mod tests {
                 expires_at: TimestampMillis::from_unix_millis(2),
             })
             .expect("stage expired source row");
-        let dispatcher = Arc::new(ChatDeliveryDispatcher::new(
+        let dispatcher = Arc::new(ChatDeliveryDispatcher::new_with_local_delivery(
             NodeId::new("node-a".to_owned()).expect("node id"),
             repository.clone(),
             Arc::new(ChatPresenceDirectory::default()),
+            Arc::new(|_| Ok(crate::chat_cluster::ChatDeliveryDisposition::Rejected)),
             Arc::new(|_, _| Ok(crate::chat_cluster::ChatDeliveryDisposition::Delivered)),
         ));
         let mut supervisor = Supervisor::new();
         supervisor.spawn(ChatDeliveryDispatchService::new(
             dispatcher,
+            Arc::new(tokio::sync::Notify::new()),
             Duration::from_millis(5),
             1,
             1,
@@ -546,6 +557,55 @@ mod tests {
                 .is_empty(),
             "the supervised worker runs bounded expiry maintenance"
         );
+        supervisor.shutdown().await.expect("cooperative shutdown");
+    }
+
+    #[tokio::test]
+    async fn chat_delivery_worker_dispatches_on_commit_wake_before_fallback_period() {
+        let repository = Arc::new(InMemoryChatRepository::new());
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let dispatcher = Arc::new(ChatDeliveryDispatcher::new_with_local_delivery(
+            NodeId::new("node-a".to_owned()).expect("node id"),
+            repository.clone(),
+            Arc::new(ChatPresenceDirectory::default()),
+            Arc::new(|_| Ok(crate::chat_cluster::ChatDeliveryDisposition::Delivered)),
+            Arc::new(|_, _| Ok(crate::chat_cluster::ChatDeliveryDisposition::Delivered)),
+        ));
+        let mut supervisor = Supervisor::new();
+        supervisor.spawn(ChatDeliveryDispatchService::new(
+            dispatcher,
+            Arc::clone(&wake),
+            Duration::from_secs(60),
+            1,
+            1,
+        ));
+        tokio::task::yield_now().await;
+        repository
+            .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
+                channel_id: "channel-wake".to_owned(),
+                event_id: 2,
+                authority_epoch: 0,
+                payload: "{}".to_owned(),
+                created_at: SystemClock.now(),
+                expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+            })
+            .expect("stage after initial fallback pass");
+        wake.notify_one();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if repository
+                    .active_delivery_outbox("node-a", SystemClock.now(), 1)
+                    .expect("outbox")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit wake dispatches without waiting for periodic fallback");
         supervisor.shutdown().await.expect("cooperative shutdown");
     }
 }

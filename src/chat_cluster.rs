@@ -519,6 +519,8 @@ pub struct ChatDeliveryDispatchStats {
 /// delivery until the bounded source row expires. The callback is synchronous
 /// because the mTLS control router has a finite socket timeout and this worker
 /// is run away from the realtime reactor.
+type LocalChatDeliverySender =
+    dyn Fn(RemoteChatDelivery) -> Result<ChatDeliveryDisposition, ()> + Send + Sync;
 type ChatDeliverySender =
     dyn Fn(&NodeId, RemoteChatDelivery) -> Result<ChatDeliveryDisposition, ()> + Send + Sync;
 
@@ -526,7 +528,8 @@ pub struct ChatDeliveryDispatcher {
     source: NodeId,
     repository: Arc<dyn ChatRepository>,
     directory: Arc<ChatPresenceDirectory>,
-    deliver: Arc<ChatDeliverySender>,
+    deliver_local: Arc<LocalChatDeliverySender>,
+    deliver_remote: Arc<ChatDeliverySender>,
 }
 
 impl std::fmt::Debug for ChatDeliveryDispatcher {
@@ -540,19 +543,22 @@ impl std::fmt::Debug for ChatDeliveryDispatcher {
 }
 
 impl ChatDeliveryDispatcher {
-    /// Construct a bounded dispatcher over the selected durable chat backend.
+    /// Construct a dispatcher that attempts source-local delivery before any
+    /// current remote destinations and before acknowledging the durable row.
     #[must_use]
-    pub fn new(
+    pub fn new_with_local_delivery(
         source: NodeId,
         repository: Arc<dyn ChatRepository>,
         directory: Arc<ChatPresenceDirectory>,
-        deliver: Arc<ChatDeliverySender>,
+        deliver_local: Arc<LocalChatDeliverySender>,
+        deliver_remote: Arc<ChatDeliverySender>,
     ) -> Self {
         Self {
             source,
             repository,
             directory,
-            deliver,
+            deliver_local,
+            deliver_remote,
         }
     }
 
@@ -572,13 +578,23 @@ impl ChatDeliveryDispatcher {
         stats.loaded = rows.len();
         for row in rows {
             let mut complete = true;
+            let local_delivery = remote_delivery_from_outbox(&row, OwnershipGeneration::new(0));
+            match (self.deliver_local)(local_delivery) {
+                Ok(
+                    ChatDeliveryDisposition::Delivered
+                    | ChatDeliveryDisposition::Unknown
+                    | ChatDeliveryDisposition::Rejected,
+                ) => {}
+                Ok(ChatDeliveryDisposition::Stale | ChatDeliveryDisposition::Unavailable)
+                | Err(()) => complete = false,
+            }
             for lease in self.directory.destinations(&row.channel_id, now) {
                 if lease.node_id == self.source {
                     continue;
                 }
                 stats.attempted += 1;
                 let delivery = remote_delivery_from_outbox(&row, lease.generation);
-                match (self.deliver)(&lease.node_id, delivery) {
+                match (self.deliver_remote)(&lease.node_id, delivery) {
                     Ok(
                         ChatDeliveryDisposition::Delivered
                         | ChatDeliveryDisposition::Unknown
@@ -586,7 +602,8 @@ impl ChatDeliveryDispatcher {
                     ) => {}
                     // A stale fence must be re-resolved; a transport error is
                     // likewise retryable until the durable deadline.
-                    Ok(ChatDeliveryDisposition::Stale) | Err(()) => complete = false,
+                    Ok(ChatDeliveryDisposition::Stale | ChatDeliveryDisposition::Unavailable)
+                    | Err(()) => complete = false,
                 }
             }
             if complete {
@@ -630,6 +647,9 @@ pub enum ChatDeliveryDisposition {
     Unknown,
     /// Authentication, bounds, or deadline validation failed closed.
     Rejected,
+    /// The destination infrastructure disappeared before it could decide.
+    /// Unlike authoritative subscriber absence, this outcome remains retryable.
+    Unavailable,
 }
 
 /// Narrow command boundary for cross-node chat delivery.
@@ -679,11 +699,11 @@ impl ChatPresenceRouter for InMemoryChatPresenceRouter {
         delivery: RemoteChatDelivery,
     ) -> ChatDeliveryDisposition {
         let Ok(handlers) = self.handlers.lock() else {
-            return ChatDeliveryDisposition::Rejected;
+            return ChatDeliveryDisposition::Unavailable;
         };
         handlers
             .get(destination)
-            .map_or(ChatDeliveryDisposition::Unknown, |handler| {
+            .map_or(ChatDeliveryDisposition::Unavailable, |handler| {
                 handler(source, delivery)
             })
     }
@@ -725,18 +745,16 @@ impl ChatCommandDedupe {
         self.evaluate(source, delivery, || disposition)
     }
 
-    /// Evaluate a local delivery at most once for the command key. The callback
-    /// must only schedule bounded local work; it runs while the short-lived
-    /// dedupe lock is held so concurrent retries cannot both fan out.
+    /// Return a cached terminal result or evaluate local delivery without
+    /// holding the dedupe mutex. Concurrent misses may both evaluate; the
+    /// terminal result first inserted wins. Infrastructure failures remain
+    /// uncached so durable delivery can retry.
     pub fn evaluate(
         &self,
         source: NodeId,
         delivery: &RemoteChatDelivery,
         evaluate: impl FnOnce() -> ChatDeliveryDisposition,
     ) -> ChatDeliveryDisposition {
-        let Ok(mut state) = self.seen.lock() else {
-            return ChatDeliveryDisposition::Rejected;
-        };
         let key = (
             source,
             delivery.channel_id.clone(),
@@ -744,10 +762,39 @@ impl ChatCommandDedupe {
             delivery.destination_generation,
             delivery.authority_epoch,
         );
+        match self.seen.lock() {
+            Ok(state) => {
+                if let Some(previous) = state.0.get(&key) {
+                    return *previous;
+                }
+            }
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = (BTreeMap::new(), VecDeque::new());
+                self.seen.clear_poison();
+                drop(state);
+                return ChatDeliveryDisposition::Unavailable;
+            }
+        }
+
+        let disposition = evaluate();
+        if disposition == ChatDeliveryDisposition::Unavailable {
+            return disposition;
+        }
+
+        let mut state = match self.seen.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = (BTreeMap::new(), VecDeque::new());
+                self.seen.clear_poison();
+                drop(state);
+                return ChatDeliveryDisposition::Unavailable;
+            }
+        };
         if let Some(previous) = state.0.get(&key) {
             return *previous;
         }
-        let disposition = evaluate();
         state.0.insert(key.clone(), disposition);
         state.1.push_back(key);
         while state.1.len() > self.capacity {
@@ -800,6 +847,24 @@ mod tests {
             payload: r#"{\"type\":\"message.create\"}"#.to_owned(),
             deadline: TimestampMillis::from_unix_millis(100),
         }
+    }
+
+    #[test]
+    fn dispatcher_exposes_only_the_explicit_local_delivery_constructor() {
+        let source = include_str!("chat_cluster.rs");
+        let constructors = source
+            .split("impl ChatDeliveryDispatcher")
+            .nth(1)
+            .expect("dispatcher implementation")
+            .split("pub async fn dispatch_once")
+            .next()
+            .expect("constructor section");
+        assert!(constructors.contains("pub fn new_with_local_delivery"));
+        assert_eq!(
+            constructors.matches("pub fn ").count(),
+            1,
+            "no constructor may install an implicit terminal local-delivery callback"
+        );
     }
 
     #[test]
@@ -901,7 +966,7 @@ mod tests {
         );
         assert_eq!(
             router.deliver(&node("node-a"), &node("node-c"), delivery()),
-            ChatDeliveryDisposition::Unknown
+            ChatDeliveryDisposition::Unavailable
         );
     }
 
@@ -983,22 +1048,151 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_duplicates_schedule_local_delivery_once() {
+    fn infrastructure_unavailable_is_not_deduplicated_across_recovery() {
+        let dedupe = ChatCommandDedupe::new(2);
+        let command = delivery();
+        let evaluations = AtomicUsize::new(0);
+        assert_eq!(
+            dedupe.evaluate(node("node-a"), &command, || {
+                evaluations.fetch_add(1, Ordering::SeqCst);
+                ChatDeliveryDisposition::Unavailable
+            }),
+            ChatDeliveryDisposition::Unavailable
+        );
+        assert_eq!(
+            dedupe.evaluate(node("node-a"), &command, || {
+                evaluations.fetch_add(1, Ordering::SeqCst);
+                ChatDeliveryDisposition::Delivered
+            }),
+            ChatDeliveryDisposition::Delivered,
+            "a recovered gateway must reevaluate the retained command"
+        );
+        assert_eq!(evaluations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn poisoned_dedupe_defers_durable_ack_then_recovers_for_delivery() {
+        let repository = Arc::new(InMemoryChatRepository::new());
+        let now = TimestampMillis::from_unix_millis(10);
+        repository
+            .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
+                channel_id: "ch_poison".to_owned(),
+                event_id: 21,
+                authority_epoch: 4,
+                payload:
+                    r#"{"version":1,"type":"message.create","channel_id":"ch_poison","event_id":21}"#
+                        .to_owned(),
+                created_at: now,
+                expires_at: TimestampMillis::from_unix_millis(100),
+            })
+            .expect("stage poison-recovery row");
+        let dedupe = Arc::new(ChatCommandDedupe::new(2));
+        let poison_result = std::panic::catch_unwind({
+            let dedupe = Arc::clone(&dedupe);
+            move || {
+                let _guard = dedupe.seen.lock().expect("dedupe lock before poisoning");
+                assert!(
+                    dedupe.seen.is_poisoned(),
+                    "deliberately poison the dedupe mutex"
+                );
+            }
+        });
+        assert!(poison_result.is_err(), "poisoning assertion must unwind");
+        let handler_attempts = Arc::new(AtomicUsize::new(0));
+        let dispatcher = ChatDeliveryDispatcher::new_with_local_delivery(
+            node("node-a"),
+            repository.clone(),
+            Arc::new(ChatPresenceDirectory::default()),
+            {
+                let dedupe = Arc::clone(&dedupe);
+                let handler_attempts = Arc::clone(&handler_attempts);
+                Arc::new(move |delivery| {
+                    Ok(dedupe.evaluate(node("node-a"), &delivery, || {
+                        handler_attempts.fetch_add(1, Ordering::SeqCst);
+                        ChatDeliveryDisposition::Delivered
+                    }))
+                })
+            },
+            Arc::new(|_, _| Ok(ChatDeliveryDisposition::Delivered)),
+        );
+
+        let first = dispatcher
+            .dispatch_once(now, 8)
+            .await
+            .expect("poisoned pass");
+        assert_eq!(first.acknowledged, 0);
+        assert_eq!(first.deferred, 1);
+        assert_eq!(handler_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            repository
+                .active_delivery_outbox("node-a", now, 8)
+                .expect("row retained after poisoned dedupe")
+                .len(),
+            1
+        );
+
+        let retry = dispatcher
+            .dispatch_once(now, 8)
+            .await
+            .expect("recovered pass");
+        assert_eq!(retry.acknowledged, 1);
+        assert_eq!(retry.deferred, 0);
+        assert_eq!(handler_attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            repository
+                .active_delivery_outbox("node-a", now, 8)
+                .expect("row acknowledged after recovered delivery")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn panicking_delivery_handler_does_not_poison_dedupe_and_retry_delivers() {
+        let dedupe = ChatCommandDedupe::new(2);
+        let command = delivery();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dedupe.evaluate(node("node-a"), &command, || {
+                assert!(
+                    dedupe.seen.is_poisoned(),
+                    "deliberately panic in the external delivery handler"
+                );
+                ChatDeliveryDisposition::Delivered
+            })
+        }));
+        assert!(panic_result.is_err(), "handler assertion must unwind");
+        assert!(
+            !dedupe.seen.is_poisoned(),
+            "external handler panic must not poison the dedupe mutex"
+        );
+        assert_eq!(
+            dedupe.evaluate(node("node-a"), &command, || {
+                ChatDeliveryDisposition::Delivered
+            }),
+            ChatDeliveryDisposition::Delivered
+        );
+    }
+
+    #[test]
+    fn concurrent_duplicates_evaluate_without_holding_the_dedupe_lock() {
         let dedupe = Arc::new(ChatCommandDedupe::new(8));
         let command = Arc::new(delivery());
         let start = Arc::new(Barrier::new(2));
+        let evaluating = Arc::new(Barrier::new(2));
         let scheduled = Arc::new(AtomicUsize::new(0));
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 let dedupe = Arc::clone(&dedupe);
                 let command = Arc::clone(&command);
                 let start = Arc::clone(&start);
+                let evaluating = Arc::clone(&evaluating);
                 let scheduled = Arc::clone(&scheduled);
                 scope.spawn(move || {
                     start.wait();
                     assert_eq!(
                         dedupe.evaluate(node("node-a"), &command, || {
                             scheduled.fetch_add(1, Ordering::SeqCst);
+                            evaluating.wait();
                             ChatDeliveryDisposition::Delivered
                         }),
                         ChatDeliveryDisposition::Delivered
@@ -1006,7 +1200,11 @@ mod tests {
                 });
             }
         });
-        assert_eq!(scheduled.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduled.load(Ordering::SeqCst),
+            2,
+            "at-least-once concurrent duplicates may both reach external delivery"
+        );
     }
 
     #[test]
@@ -1201,8 +1399,12 @@ mod tests {
 
         let deliveries_a = Arc::new(Mutex::new(Vec::new()));
         let deliveries_b = Arc::new(Mutex::new(Vec::new()));
-        let dispatcher_a =
-            ChatDeliveryDispatcher::new(node("node-a"), repository.clone(), directory.clone(), {
+        let dispatcher_a = ChatDeliveryDispatcher::new_with_local_delivery(
+            node("node-a"),
+            repository.clone(),
+            directory.clone(),
+            Arc::new(|_| Ok(ChatDeliveryDisposition::Rejected)),
+            {
                 let deliveries = Arc::clone(&deliveries_a);
                 Arc::new(move |_, delivery| {
                     deliveries
@@ -1211,9 +1413,14 @@ mod tests {
                         .push(delivery.event_id);
                     Ok(ChatDeliveryDisposition::Delivered)
                 })
-            });
-        let dispatcher_b =
-            ChatDeliveryDispatcher::new(node("node-b"), repository.clone(), directory, {
+            },
+        );
+        let dispatcher_b = ChatDeliveryDispatcher::new_with_local_delivery(
+            node("node-b"),
+            repository.clone(),
+            directory,
+            Arc::new(|_| Ok(ChatDeliveryDisposition::Rejected)),
+            {
                 let deliveries = Arc::clone(&deliveries_b);
                 Arc::new(move |_, delivery| {
                     deliveries
@@ -1222,7 +1429,8 @@ mod tests {
                         .push(delivery.event_id);
                     Ok(ChatDeliveryDisposition::Delivered)
                 })
-            });
+            },
+        );
 
         let (stats_a, stats_b) = tokio::join!(
             dispatcher_a.dispatch_once(now, 8),
@@ -1278,8 +1486,12 @@ mod tests {
         }
         let unavailable = Arc::new(AtomicUsize::new(1));
         let attempted = Arc::new(AtomicUsize::new(0));
-        let dispatcher =
-            ChatDeliveryDispatcher::new(node("node-a"), repository.clone(), directory, {
+        let dispatcher = ChatDeliveryDispatcher::new_with_local_delivery(
+            node("node-a"),
+            repository.clone(),
+            directory,
+            Arc::new(|_| Ok(ChatDeliveryDisposition::Rejected)),
+            {
                 let unavailable = Arc::clone(&unavailable);
                 let attempted = Arc::clone(&attempted);
                 Arc::new(move |destination, delivery| {
@@ -1288,12 +1500,13 @@ mod tests {
                     if destination.as_str() == "node-c"
                         && unavailable.fetch_sub(1, Ordering::SeqCst) > 0
                     {
-                        Err(())
+                        Ok(ChatDeliveryDisposition::Unavailable)
                     } else {
                         Ok(ChatDeliveryDisposition::Delivered)
                     }
                 })
-            });
+            },
+        );
 
         assert_eq!(
             dispatcher.dispatch_once(now, 8).await.expect("first pass"),
@@ -1330,6 +1543,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_dispatch_retries_failed_local_delivery_before_acknowledging() {
+        let repository = Arc::new(InMemoryChatRepository::new());
+        let now = TimestampMillis::from_unix_millis(10);
+        repository
+            .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
+                channel_id: "ch_local".to_owned(),
+                event_id: 14,
+                authority_epoch: 4,
+                payload:
+                    r#"{"version":1,"type":"message.create","channel_id":"ch_local","event_id":14}"#
+                        .to_owned(),
+                created_at: now,
+                expires_at: TimestampMillis::from_unix_millis(100),
+            })
+            .expect("stage local row");
+        let remaining_failures = Arc::new(AtomicUsize::new(1));
+        let local_attempts = Arc::new(AtomicUsize::new(0));
+        let remote_attempts = Arc::new(AtomicUsize::new(0));
+        let dispatcher = ChatDeliveryDispatcher::new_with_local_delivery(
+            node("node-a"),
+            repository.clone(),
+            Arc::new(ChatPresenceDirectory::default()),
+            {
+                let remaining_failures = Arc::clone(&remaining_failures);
+                let local_attempts = Arc::clone(&local_attempts);
+                Arc::new(move |delivery| {
+                    local_attempts.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(delivery.event_id, 14);
+                    if remaining_failures.fetch_sub(1, Ordering::SeqCst) > 0 {
+                        Err(())
+                    } else {
+                        Ok(ChatDeliveryDisposition::Delivered)
+                    }
+                })
+            },
+            {
+                let remote_attempts = Arc::clone(&remote_attempts);
+                Arc::new(move |_, _| {
+                    remote_attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(())
+                })
+            },
+        );
+
+        let first = dispatcher.dispatch_once(now, 8).await.expect("first pass");
+        assert_eq!(first.acknowledged, 0);
+        assert_eq!(first.deferred, 1);
+        assert_eq!(
+            repository
+                .active_delivery_outbox("node-a", now, 8)
+                .expect("source retained after local failure")
+                .len(),
+            1
+        );
+
+        let retry = dispatcher.dispatch_once(now, 8).await.expect("retry pass");
+        assert_eq!(retry.acknowledged, 1);
+        assert_eq!(retry.deferred, 0);
+        assert_eq!(local_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(remote_attempts.load(Ordering::SeqCst), 0);
+        assert!(
+            repository
+                .active_delivery_outbox("node-a", now, 8)
+                .expect("source acknowledged after local success")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn durable_dispatch_expiry_is_purged_without_attempting_remote_delivery() {
         let repository = Arc::new(InMemoryChatRepository::new());
         let directory = Arc::new(ChatPresenceDirectory::default());
@@ -1359,14 +1642,19 @@ mod tests {
             ChatLeaseUpdate::Applied
         );
         let attempted = Arc::new(AtomicUsize::new(0));
-        let dispatcher =
-            ChatDeliveryDispatcher::new(node("node-a"), repository.clone(), directory, {
+        let dispatcher = ChatDeliveryDispatcher::new_with_local_delivery(
+            node("node-a"),
+            repository.clone(),
+            directory,
+            Arc::new(|_| Ok(ChatDeliveryDisposition::Rejected)),
+            {
                 let attempted = Arc::clone(&attempted);
                 Arc::new(move |_, _| {
                     attempted.fetch_add(1, Ordering::SeqCst);
                     Ok(ChatDeliveryDisposition::Delivered)
                 })
-            });
+            },
+        );
 
         assert_eq!(
             dispatcher

@@ -521,6 +521,35 @@ impl ChatRepository for PgChatRepository {
         })
     }
 
+    async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        audit: &ChatModerationAudit,
+        access_key: &str,
+        expected_access_epoch: u64,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>> {
+        with_tx!(self, conn => {
+            ensure_access_epoch_conn(conn, access_key, expected_access_epoch).await?;
+            if !delete_message_conn(conn, channel, id, now).await? { return Ok(None); }
+            let message = channel_history_conn(conn, channel, 0, None).await?.into_iter()
+                .find(|message| message.id == id)
+                .ok_or_else(|| AppError::internal("tombstoned chat message was not retained"))?;
+            insert_moderation_audit_conn(conn, audit).await?;
+            stage_delivery_outbox_conn(conn, &ChatDeliveryOutboxRecord {
+                origin_node_id: delivery.origin_node_id.clone(),
+                channel_id: channel.to_owned(), event_id: message.last_event_id,
+                authority_epoch: delivery.authority_epoch,
+                payload: serialize_delivery_event(channel, channel_type, delivery.event_type, &message)?,
+                created_at: now, expires_at: delivery.expires_at,
+            }).await?;
+            Ok(Some(message))
+        })
+    }
+
     async fn cleanup_moderation_audit(
         &self,
         before: TimestampMillis,

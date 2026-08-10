@@ -3284,8 +3284,9 @@ impl MongoChatRepository {
         id: u64,
         audit: &ChatModerationAudit,
         authorization: Option<(&str, u64)>,
+        delivery: Option<(ChatDeliveryRequest, ChannelType)>,
         now: TimestampMillis,
-    ) -> AppResult<bool> {
+    ) -> AppResult<Option<ChatMessage>> {
         let channel = chat_id(channel, "chat channel")?.to_owned();
         let id = chat_i64(id, "chat message id")?;
         let audit = chat_audit_doc(audit)?;
@@ -3294,10 +3295,16 @@ impl MongoChatRepository {
             Some((key, epoch)) => Some((chat_id(key, "chat access key")?.to_owned(), epoch)),
             None => None,
         };
+        if let Some((request, _)) = &delivery {
+            if request.origin_node_id.is_empty() || chat_timestamp(request.expires_at)? <= now {
+                return Err(AppError::validation("invalid chat delivery request"));
+            }
+        }
         chat_transaction(&self.client, &self.database, self.session.as_ref(), move |db, session| {
             let channel = channel.clone();
             let audit = audit.clone();
             let authorization = authorization.clone();
+            let delivery = delivery.clone();
             Box::pin(async move {
                 if let Some((key, expected)) = authorization {
                     if chat_epoch(db, session, &key).await? != expected {
@@ -3320,7 +3327,7 @@ impl MongoChatRepository {
                     .await?
                     .ok_or_else(message_not_found)?;
                 if existing.get_bool("deleted").unwrap_or(false) {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let seq = channels
                     .find_one_and_update(
@@ -3337,29 +3344,50 @@ impl MongoChatRepository {
                 let row = messages
                     .find_one_and_update(
                         doc! {"channel_id": &channel, "id": id, "deleted": false},
-                        doc! {"$set": {"content": "", "deleted": true, "updated_at_unix_ms": now}, "$inc": {"revision": 1_i64}},
+                        doc! {"$set": {"content": "", "deleted": true, "updated_at_unix_ms": now, "last_event_id": event}, "$inc": {"revision": 1_i64}},
                     )
                     .return_document(ReturnDocument::After)
                     .session(&mut *session)
                     .await?
                     .ok_or_else(message_not_found)?;
+                let message = chat_message_from_doc(&row)?;
                 insert_chat_event(
                     db,
                     session,
                     &channel,
                     event,
                     id,
-                    row.get_i64("revision")
+                    i64::try_from(message.revision)
                         .map_err(|_| AppError::internal("invalid MongoDB chat message"))?,
                     "message_deleted",
                     now,
                 )
                 .await?;
+                if let Some((request, channel_type)) = delivery {
+                    let payload = serialize_delivery_event(
+                        &channel,
+                        channel_type,
+                        request.event_type,
+                        &message,
+                    )?;
+                    db.collection::<Document>(CHAT_DELIVERY_OUTBOX)
+                        .insert_one(doc! {
+                            "channel_id": &channel,
+                            "event_id": event,
+                            "origin_node_id": chat_id(&request.origin_node_id, "chat delivery origin node")?,
+                            "authority_epoch": chat_i64(request.authority_epoch, "chat delivery authority epoch")?,
+                            "payload": payload,
+                            "created_at_unix_ms": now,
+                            "expires_at_unix_ms": chat_timestamp(request.expires_at)?,
+                        })
+                        .session(&mut *session)
+                        .await?;
+                }
                 db.collection::<Document>(CHAT_MODERATION_AUDIT)
                     .insert_one(audit)
                     .session(&mut *session)
                     .await?;
-                Ok(true)
+                Ok(Some(message))
             })
         })
         .await
@@ -3768,8 +3796,10 @@ impl ChatRepository for MongoChatRepository {
         audit: &ChatModerationAudit,
         now: TimestampMillis,
     ) -> AppResult<bool> {
-        self.moderate_delete_inner(channel, id, audit, None, now)
-            .await
+        Ok(self
+            .moderate_delete_inner(channel, id, audit, None, None, now)
+            .await?
+            .is_some())
     }
     async fn moderate_delete_message_authorized(
         &self,
@@ -3780,8 +3810,31 @@ impl ChatRepository for MongoChatRepository {
         expected: u64,
         now: TimestampMillis,
     ) -> AppResult<bool> {
-        self.moderate_delete_inner(channel, id, audit, Some((access_key, expected)), now)
-            .await
+        Ok(self
+            .moderate_delete_inner(channel, id, audit, Some((access_key, expected)), None, now)
+            .await?
+            .is_some())
+    }
+    async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        audit: &ChatModerationAudit,
+        access_key: &str,
+        expected: u64,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>> {
+        self.moderate_delete_inner(
+            channel,
+            id,
+            audit,
+            Some((access_key, expected)),
+            Some((delivery.clone(), channel_type)),
+            now,
+        )
+        .await
     }
     async fn cleanup_moderation_audit(
         &self,

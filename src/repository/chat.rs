@@ -585,6 +585,22 @@ pub trait ChatRepository: Send + Sync {
         now: TimestampMillis,
     ) -> AppResult<bool>;
 
+    /// Atomically fence authorization, tombstone the message, reserve its
+    /// revision/event id, append the redacted audit, and stage live delivery.
+    /// A repeated tombstone returns `None` and appends nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        audit: &ChatModerationAudit,
+        access_key: &str,
+        expected_access_epoch: u64,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>>;
+
     /// Remove at most `limit` durable moderation audits older than `before`.
     /// The independent audit retention window never changes message retention.
     async fn cleanup_moderation_audit(
@@ -1225,6 +1241,77 @@ impl ChatRepository for InMemoryChatRepository {
             return Err(AppError::permission("CHAT_UNAVAILABLE"));
         }
         self.moderate_delete_message(channel, id, audit, now).await
+    }
+
+    async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        audit: &ChatModerationAudit,
+        access_key: &str,
+        expected_access_epoch: u64,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>> {
+        if delivery.expires_at <= now || delivery.origin_node_id.is_empty() {
+            return Err(AppError::validation("invalid chat delivery request"));
+        }
+        let epochs = self.access_epochs_guard()?;
+        if epochs.get(access_key).copied().unwrap_or(0) != expected_access_epoch {
+            return Err(AppError::permission("CHAT_UNAVAILABLE"));
+        }
+        let mut channels = self.guard()?;
+        let state = channels.get_mut(channel).ok_or_else(channel_not_found)?;
+        let event_id = state
+            .next_event_id
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat event id overflow"))?;
+        let message = state
+            .history
+            .iter_mut()
+            .find(|message| message.id == id)
+            .ok_or_else(message_not_found)?;
+        if message.deleted {
+            return Ok(None);
+        }
+        let mut next = message.clone();
+        next.deleted = true;
+        next.content.clear();
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat message revision overflow"))?;
+        next.updated_at_unix_ms = now.unix_millis();
+        next.last_event_id = event_id;
+        let record = ChatDeliveryOutboxRecord {
+            origin_node_id: delivery.origin_node_id.clone(),
+            channel_id: channel.to_owned(),
+            event_id,
+            authority_epoch: delivery.authority_epoch,
+            payload: serialize_delivery_event(channel, channel_type, delivery.event_type, &next)?,
+            created_at: now,
+            expires_at: delivery.expires_at,
+        };
+        let mut audits = self
+            .moderation_audit
+            .lock()
+            .map_err(|_| AppError::internal("chat moderation audit mutex poisoned"))?;
+        let mut outbox = self
+            .outbox
+            .lock()
+            .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
+        if outbox
+            .iter()
+            .any(|row| row.channel_id == channel && row.event_id == event_id)
+        {
+            return Err(AppError::internal("chat delivery event already exists"));
+        }
+        *message = next.clone();
+        state.next_event_id = event_id;
+        audits.push(audit.clone());
+        outbox.push(record);
+        Ok(Some(next))
     }
 
     async fn cleanup_moderation_audit(
