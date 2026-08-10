@@ -14,11 +14,16 @@
 //!
 //! Endpoints and certificates are parameters; no credentials are embedded.
 
+pub mod chat;
 pub mod http;
 pub mod networkpeer;
 pub mod quic;
 pub mod websocket;
 
+pub use chat::{
+    ChatEvent, ChatEventCursor, ChatEventDisposition, ChatEventError, ChatEventKind, ChatMessage,
+    ChatPresence,
+};
 pub use citadel_wire::Envelope;
 pub use http::{
     CitadelHttpClient, EmailAuthenticationRequest, LookupUsersRequest, LookupUsersResponse,
