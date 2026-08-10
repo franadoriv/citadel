@@ -18,7 +18,8 @@
   <a href="https://github.com/franadoriv/citadel/releases">Download a release</a> ·
   <a href="website/src/content/docs/quickstart.md">Get started</a> ·
   <a href="website/src/content/docs/tutorials/knights-vs-monsters.mdx">Build a game</a> ·
-  <a href="website/src/content/docs/guides/install-client-sdk.mdx">Client SDKs</a>
+  <a href="website/src/content/docs/guides/install-client-sdk.mdx">Client SDKs</a> ·
+  <a href="https://discord.gg/79mpfygtQ">Join the Discord community</a>
 </p>
 
 Citadel is the authoritative backend for an online game. Your client renders
