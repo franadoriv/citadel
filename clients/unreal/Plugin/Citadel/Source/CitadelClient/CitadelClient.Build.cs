@@ -43,6 +43,9 @@ public class CitadelClient : ModuleRules
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
 			"Json",
+			// IPluginManager resolves the shared repository fixture from the
+			// plugin base directory in the UE automation smoke.
+			"Projects",
 		});
 
 		// Header-driven binding: use Unreal's uint8/uint16/uint32 aliases.

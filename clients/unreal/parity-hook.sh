@@ -28,6 +28,7 @@ ffi_include="$repo_root/crates/citadel-client-ffi/include"
 static_contract="$hook_dir/test_networkpeer_abi_v3.py"
 real_ffi_gate="$hook_dir/test_real_ffi_gate.py"
 clock_v2_parity="$hook_dir/test_clock_v2_parity.py"
+chat_live_source="$hook_dir/tier_b_check.py"
 
 if [[ ! -f "$tu" ]]; then
   echo "unreal Tier-B: translation unit not found at $tu" >&2
@@ -52,6 +53,11 @@ if [[ ! -f "$clock_v2_parity" ]]; then
   exit 1
 fi
 python3 "$clock_v2_parity"
+if [[ ! -f "$chat_live_source" ]]; then
+  echo "unreal Tier-B: chat live source gate not found at $chat_live_source" >&2
+  exit 1
+fi
+python3 "$chat_live_source"
 
 # Runtime-load guard: a UE module DLL must contain exactly one
 # IMPLEMENT_MODULE, or it compiles + links (the gated UE build passes) but the

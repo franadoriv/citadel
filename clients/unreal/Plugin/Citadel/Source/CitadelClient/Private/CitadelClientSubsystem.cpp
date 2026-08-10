@@ -52,6 +52,7 @@ void UCitadelClientSubsystem::Disconnect()
         citadel_client_free(Handle);
         Handle = nullptr;
     }
+    InvalidateChatConnectionState();
     LastStatus = ECitadelStatus::Disconnected;
 }
 
@@ -72,6 +73,12 @@ FString UCitadelClientSubsystem::GetLastError()
 
 ECitadelStatus UCitadelClientSubsystem::Send(uint16 Kind, const TArray<uint8>& Payload, bool bReliable)
 {
+    if (Handle == nullptr)
+    {
+        LastStatus = ECitadelStatus::Disconnected;
+        InvalidateChatConnectionState();
+        return LastStatus;
+    }
     const CitadelStatus Status = citadel_client_send(
         Handle,
         Kind,
@@ -79,26 +86,218 @@ ECitadelStatus UCitadelClientSubsystem::Send(uint16 Kind, const TArray<uint8>& P
         static_cast<uintptr_t>(Payload.Num()),
         bReliable);
     LastStatus = ToUe(Status);
+    if (LastStatus == ECitadelStatus::Disconnected) InvalidateChatConnectionState();
     return LastStatus;
+}
+
+void UCitadelClientSubsystem::InvalidateChatConnectionState()
+{
+    if (ChatLiveState != nullptr) ChatLiveState->OnDisconnect();
+    if (ChatJoinSync != nullptr) ChatJoinSync->OnDisconnect();
+    if (ChatHistorySync != nullptr) ChatHistorySync->CancelAll();
+}
+
+int64 UCitadelClientSubsystem::AllocateChatRequestId()
+{
+    if (NextChatRequestId <= 0 || NextChatRequestId == TNumericLimits<int64>::Max())
+        NextChatRequestId = 1;
+    return NextChatRequestId++;
+}
+
+ECitadelStatus UCitadelClientSubsystem::SendChatRequest(
+    const FCitadelChatRpcRequest& Request,
+    int64& OutRequestId)
+{
+    const int64 RequestId = AllocateChatRequestId();
+    OutRequestId = RequestId;
+    const bool bInitialJoin = Request.Method == TEXT("chat.join");
+    if (bInitialJoin && ChatJoinSync == nullptr) ChatJoinSync = NewObject<UCitadelChatJoinSync>(this);
+    if (bInitialJoin && !ChatJoinSync->BeginInitialJoin(RequestId))
+    {
+        LastStatus = ECitadelStatus::InvalidArgument;
+        return LastStatus;
+    }
+    TArray<uint8> Payload;
+    if (!UCitadelChatRequestLibrary::BuildRpcPayload(RequestId, Request, Payload))
+    {
+        if (bInitialJoin) ChatJoinSync->CancelRequest(RequestId);
+        LastStatus = ECitadelStatus::InvalidArgument;
+        return LastStatus;
+    }
+    const ECitadelStatus Status = Send(CitadelWire::KIND_RPC_REQUEST, Payload, true);
+    if (bInitialJoin && Status != ECitadelStatus::Ok) ChatJoinSync->CancelRequest(RequestId);
+    return Status;
+}
+
+ECitadelStatus UCitadelClientSubsystem::RejoinChatChannel(
+    const FString& ChannelId,
+    const FCitadelChatRpcRequest& JoinRequest,
+    int64& OutRequestId)
+{
+    const int64 RequestId = AllocateChatRequestId();
+    OutRequestId = RequestId;
+    if (ChatJoinSync == nullptr) ChatJoinSync = NewObject<UCitadelChatJoinSync>(this);
+    if (JoinRequest.Method != TEXT("chat.join")
+        || !ChatJoinSync->BeginRejoin(RequestId, ChannelId, GetChatLiveState()))
+    {
+        LastStatus = ECitadelStatus::InvalidArgument;
+        return LastStatus;
+    }
+    TArray<uint8> Payload;
+    if (!UCitadelChatRequestLibrary::BuildRpcPayload(RequestId, JoinRequest, Payload))
+    {
+        ChatJoinSync->CancelRequest(RequestId);
+        LastStatus = ECitadelStatus::InvalidArgument;
+        return LastStatus;
+    }
+    const ECitadelStatus Status = Send(CitadelWire::KIND_RPC_REQUEST, Payload, true);
+    if (Status != ECitadelStatus::Ok) ChatJoinSync->CancelRequest(RequestId);
+    return Status;
+}
+
+UCitadelChatLiveEventDispatcher* UCitadelClientSubsystem::GetChatLiveDispatcher()
+{
+    if (ChatLiveDispatcher == nullptr)
+    {
+        ChatLiveDispatcher = NewObject<UCitadelChatLiveEventDispatcher>(this);
+        ChatLiveDispatcher->OnChatEvent.AddDynamic(this, &UCitadelClientSubsystem::ApplyChatLiveEvent);
+    }
+    return ChatLiveDispatcher;
+}
+
+UCitadelChatLiveState* UCitadelClientSubsystem::GetChatLiveState()
+{
+    if (ChatLiveState == nullptr) ChatLiveState = NewObject<UCitadelChatLiveState>(this);
+    return ChatLiveState;
+}
+
+ECitadelStatus UCitadelClientSubsystem::BeginChatReconcile(
+    const FString& ChannelId,
+    int64 RequiredWatermarkEventId,
+    int32 PageLimit)
+{
+    UCitadelChatLiveState* State = GetChatLiveState();
+    if (!State->HasChannel(ChannelId) || !State->NeedsReconcile(ChannelId))
+    {
+        LastStatus = ECitadelStatus::InvalidArgument;
+        return LastStatus;
+    }
+    if (ChatHistorySync == nullptr) ChatHistorySync = NewObject<UCitadelChatHistorySync>(this);
+    if (ChatHistorySync->IsReconciling(ChannelId))
+    {
+        LastStatus = ECitadelStatus::Ok;
+        return LastStatus;
+    }
+    const int64 RequestId = AllocateChatRequestId();
+    const FCitadelChatRpcRequest Request = ChatHistorySync->BeginReconcile(
+        ChannelId, RequiredWatermarkEventId, PageLimit, RequestId);
+    TArray<uint8> Payload;
+    if (!UCitadelChatRequestLibrary::BuildRpcPayload(RequestId, Request, Payload))
+    {
+        ChatHistorySync->CancelReconcile(ChannelId);
+        LastStatus = ECitadelStatus::InvalidArgument;
+        return LastStatus;
+    }
+    const ECitadelStatus Status = Send(CitadelWire::KIND_RPC_REQUEST, Payload, true);
+    if (Status != ECitadelStatus::Ok) ChatHistorySync->CancelReconcile(ChannelId);
+    return Status;
+}
+
+void UCitadelClientSubsystem::ApplyChatLiveEvent(const FCitadelChatLiveEvent& Event)
+{
+    if (Event.Type == ECitadelChatEventType::AccessRevoked)
+    {
+        if (ChatJoinSync != nullptr) ChatJoinSync->OnAccessRevoked(Event.ChannelId);
+        if (ChatHistorySync != nullptr) ChatHistorySync->CancelChannel(Event.ChannelId);
+    }
+    UCitadelChatLiveState* State = GetChatLiveState();
+    const ECitadelChatApplyResult Result = State->Apply(Event);
+    if (Result == ECitadelChatApplyResult::Gap
+        || (Event.Type == ECitadelChatEventType::ResyncRequired
+            && Result == ECitadelChatApplyResult::NeedsReconcile))
+    {
+        // Use the state's monotonic authority fence. The history owner admits
+        // only one generation per channel; failed sends are cancelled for retry.
+        int64 RequiredWatermark = -1;
+        if (State->GetRequiredReconcileWatermark(Event.ChannelId, RequiredWatermark))
+            BeginChatReconcile(Event.ChannelId, RequiredWatermark, 50);
+    }
+}
+
+bool UCitadelClientSubsystem::RouteInboundEnvelope(uint16 Kind, const TArray<uint8>& Payload)
+{
+    const bool bDispatched = GetChatLiveDispatcher()->DispatchEnvelope(Kind, Payload);
+    if (Kind != CitadelWire::KIND_RPC_RESPONSE) return bDispatched;
+
+    if (ChatJoinSync != nullptr)
+    {
+        FString JoinedChannel;
+        int64 RequiredWatermark = -1;
+        FString JoinError;
+        const ECitadelChatJoinResponseResult JoinResult = ChatJoinSync->HandleJoinResponse(Payload,
+            GetChatLiveState(), JoinedChannel, RequiredWatermark, JoinError);
+        if (JoinResult != ECitadelChatJoinResponseResult::Ignored)
+        {
+            if (JoinResult == ECitadelChatJoinResponseResult::ReconcileRequired)
+                return BeginChatReconcile(JoinedChannel, RequiredWatermark, 50) == ECitadelStatus::Ok;
+            return JoinResult != ECitadelChatJoinResponseResult::Failed && bDispatched;
+        }
+    }
+
+    if (ChatHistorySync == nullptr) return bDispatched;
+    const int64 NextRequestId = AllocateChatRequestId();
+    FCitadelChatRpcRequest NextRequest;
+    FString ChannelId;
+    FString Error;
+    const ECitadelChatHistoryResponseResult Result = ChatHistorySync->HandleRpcResponse(
+        Payload, NextRequestId, GetChatLiveState(), NextRequest, ChannelId, Error);
+    if (Result == ECitadelChatHistoryResponseResult::RequestNextPage
+        || Result == ECitadelChatHistoryResponseResult::Restarted
+        || Result == ECitadelChatHistoryResponseResult::AwaitingAck)
+    {
+        // Only this correlated terminal-history branch may seal the private ACK.
+        if (Result == ECitadelChatHistoryResponseResult::AwaitingAck)
+            NextRequest.SealForNativeSend();
+        TArray<uint8> RequestPayload;
+        if (!UCitadelChatRequestLibrary::BuildRpcPayload(NextRequestId, NextRequest, RequestPayload))
+        {
+            ChatHistorySync->CancelReconcile(ChannelId);
+            return false;
+        }
+        const bool bSent = Send(CitadelWire::KIND_RPC_REQUEST, RequestPayload, true) == ECitadelStatus::Ok;
+        if (!bSent) ChatHistorySync->CancelReconcile(ChannelId);
+        return bSent;
+    }
+    return Result != ECitadelChatHistoryResponseResult::Failed && bDispatched;
 }
 
 ECitadelStatus UCitadelClientSubsystem::Poll(uint16& OutKind, TArray<uint8>& OutPayload)
 {
-    // A generous fixed buffer for the skeleton; a real subsystem would size this
-    // from the wire limits and retry on truncation.
-    uint8 Buffer[2048];
+    // citadel_client_poll consumes an envelope even when the caller buffer is
+    // short, so retry is impossible. Reuse the canonical 8 MiB reliable-frame
+    // bound and reject any impossible truncation before touching the output.
+    constexpr int32 MaxReliableFrameBodyBytes = 8 * 1024 * 1024;
+    if (PollBuffer.Num() != MaxReliableFrameBodyBytes)
+        PollBuffer.SetNumUninitialized(MaxReliableFrameBodyBytes);
     uint16 Kind = 0;
     uintptr_t Len = 0;
     bool bTruncated = false;
     const CitadelStatus Status = citadel_client_poll(
-        Handle, &Kind, Buffer, static_cast<uintptr_t>(sizeof(Buffer)), &Len, &bTruncated);
+        Handle, &Kind, PollBuffer.GetData(), static_cast<uintptr_t>(PollBuffer.Num()), &Len, &bTruncated);
     if (Status == CITADEL_STATUS_OK)
     {
+        if (bTruncated || Len > static_cast<uintptr_t>(PollBuffer.Num()))
+        {
+            OutPayload.Reset();
+            LastStatus = ECitadelStatus::Receive;
+            return LastStatus;
+        }
         OutKind = Kind;
         OutPayload.Reset();
-        OutPayload.Append(Buffer, static_cast<int32>(Len));
+        OutPayload.Append(PollBuffer.GetData(), static_cast<int32>(Len));
     }
     LastStatus = ToUe(Status);
+    if (LastStatus == ECitadelStatus::Disconnected) InvalidateChatConnectionState();
     return LastStatus;
 }
 
@@ -398,6 +597,15 @@ void UCitadelClientSubsystem::OnPlayerResponse(FHttpRequestPtr Request, FHttpRes
     }
 }
 
+void UCitadelClientSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
+    GetChatLiveState();
+    GetChatLiveDispatcher();
+    ChatJoinSync = NewObject<UCitadelChatJoinSync>(this);
+    ChatHistorySync = NewObject<UCitadelChatHistorySync>(this);
+}
+
 void UCitadelClientSubsystem::Deinitialize()
 {
     if (Handle != nullptr)
@@ -405,5 +613,10 @@ void UCitadelClientSubsystem::Deinitialize()
         citadel_client_free(Handle);
         Handle = nullptr;
     }
+    ChatLiveDispatcher = nullptr;
+    ChatLiveState = nullptr;
+    ChatJoinSync = nullptr;
+    ChatHistorySync = nullptr;
+    PollBuffer.Reset();
     Super::Deinitialize();
 }

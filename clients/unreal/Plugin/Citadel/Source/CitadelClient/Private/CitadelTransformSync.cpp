@@ -653,6 +653,11 @@ void UCitadelTransformSyncSubsystem::PumpInbound()
     // Drain all currently-available envelopes this frame.
     while (Client->Poll(Kind, Payload) == ECitadelStatus::Ok)
     {
+        // This subsystem is the unique queue reader. Route every envelope first
+        // so the raw Blueprint path is preserved and KIND_CHAT_EVENT / correlated
+        // history replies reach the integrated chat dispatcher and resync driver.
+        Client->RouteInboundEnvelope(Kind, Payload);
+
         if (Kind == CitadelWire::KIND_TSYNC_HELLO)
         {
             CitadelTransform::FCodecParams Params;
