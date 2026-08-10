@@ -418,12 +418,14 @@ while client.poll(out) == CitadelClient.Status.OK:
 		# ... render text in your chat UI ...
 ```
 
-:::note[Godot client is a skeleton]
-`clients/godot/citadel/client.gd` is a documented skeleton: the native
-GDExtension backing `send`/`poll` is not wired up in this repo yet (see
-`website/src/content/docs/reference/client-sdk/godot-web.mdx`). The calls above are the intended
-surface and will work once the native extension lands; today `send`/`poll`
-return an error status instead of moving bytes.
+:::note[Godot transport: native GDExtension or Web]
+`send`/`poll` above move real bytes through the native `CitadelClientNative`
+GDExtension, shipped prebuilt for Windows in the Godot release package (it drives
+the same C ABI as Unity and Unreal). If you copy only the GDScript files without
+that native binary, the calls return an error status through `last_error` (the
+SDK's "skeleton" fallback) instead of moving bytes. For a browser export, use
+`CitadelWebClient`, which needs no GDExtension — see the
+[Godot Web SDK](/reference/client-sdk/godot-web/).
 :::
 
 </TabItem>
@@ -488,5 +490,7 @@ exercised by the gateway integration tests in `src/realtime/gateway.rs`
   style method on any client SDK today.
 - **Blueprint cannot send/receive raw envelope kinds today.** See the
   Blueprint tab above.
-- **Godot's native client is a skeleton.** `send`/`poll` do not move bytes
-  until the GDExtension is wired up.
+- **Godot transport needs the native GDExtension or the Web client.**
+  `send`/`poll` move bytes through the prebuilt `CitadelClientNative` (Windows
+  release package); with only the GDScript files and no native binary they return
+  an error status. Browser exports use `CitadelWebClient` (no GDExtension).

@@ -251,12 +251,14 @@ Choose one client path below. All paths share the exact three game kinds and
 the same text bodies from [Step 2](#step-2-agree-on-three-messages).
 
 :::caution[Current engine status]
-Unreal and Unity have usable native client routes. The Godot SDK currently
-contains real protocol code but its native GDExtension transport is still a
-skeleton, so its tab shows the intended game code but cannot yet make a live
-connection. Blueprint can call the Unreal connection/auth nodes, while raw game
-envelopes (`Send`/`Poll`) are currently C++ only; the Blueprint recipe below uses
-a small C++ bridge component.
+Unity, Unreal, and Godot all have working native client routes. On Godot the
+release package ships a prebuilt Windows GDExtension (`CitadelClientNative`) that
+drives the same C ABI as Unity and Unreal, so its tab makes a live connection
+once that package is installed; copying only the GDScript files without the
+native binary falls back to an error status (the SDK's "skeleton" state). In
+Unreal, Blueprint can call the connection/auth nodes, while raw game envelopes
+(`Send`/`Poll`) are currently C++ only; the Blueprint recipe below uses a small
+C++ bridge component.
 :::
 
 <Tabs syncKey="engine">
@@ -432,14 +434,17 @@ the same packet. Networking is a team sport; packet queues dislike tug-of-war.
 </TabItem>
 <TabItem label="Godot GDScript">
 
-### Godot: write the game-side script now, wire transport next
+### Godot: connect with the native GDExtension
 
-Copy the Godot protocol/client scripts as described in the
-[Godot SDK README](../../../../../../clients/godot/README.md).
-The protocol encoding below is real, but the native GDExtension bridge is not
-yet shipped; `connect_websocket`/`connect_quic` will report a non-OK status until
-that bridge lands. Use this tab to prepare your game code, then run the live
-version through Web, Unity, or Unreal today.
+Install the Godot SDK from the release package — see
+[Install a client SDK → Godot](/guides/install-client-sdk/) (or the
+[Godot SDK README](../../../../../../clients/godot/README.md)). The Windows
+package ships the prebuilt `CitadelClientNative` GDExtension, so
+`connect_websocket`/`connect_quic` make a live connection. If you copied only the
+GDScript files without the native binary, those calls return a non-OK status and
+`last_error` reports that the extension is not loaded — install the release
+package (or build the extension) for a live transport. For a browser export, use
+`CitadelWebClient` instead (see [Godot Web](/reference/client-sdk/godot-web/)).
 
 ```gdscript
 extends Node2D
