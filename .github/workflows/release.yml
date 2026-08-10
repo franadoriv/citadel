@@ -13,6 +13,14 @@ on:
   push:
     branches:
       - release
+    # A push whose changes are entirely under website/ (a docs-only fix) skips
+    # this whole workflow: no version gate, no binary packaging, no GitHub
+    # Release, and the Citadel version stays put. Vercel deploys the docs on its
+    # own (its production branch is `release`). Any file outside website/ makes
+    # the release run normally. To force a full release regardless of paths, use
+    # the manual run (workflow_dispatch) below.
+    paths-ignore:
+      - 'website/**'
   workflow_dispatch:
 
 permissions:
