@@ -27,6 +27,16 @@ superadmin cannot leave, be kicked, or be demoted.
 | `groups.cancel_admission` | `{ "group_id": number }` | Cancels the caller's request or invitation and returns `{}`. Repeating it is safe. |
 | `groups.transfer_ownership` | `{ "group_id": number, "user_id": string }` | Only the current superadmin may transfer ownership to an existing member; returns the group with the new superadmin. |
 
+:::caution[These admission methods are trusted game-logic only today]
+`groups.join`, `groups.invite`, `groups.approve_request`, `groups.accept_invitation`,
+`groups.cancel_admission`, and `groups.transfer_ownership` are currently reachable
+only from **trusted game logic** through the `groups.call` host API — the realtime
+client-RPC router does not dispatch them yet, so a game client that calls them
+directly over RPC receives an "unknown domain method" error. The client-RPC
+surface is the CRUD and membership set (`create`, `list`, `get`, `update`,
+`delete`, `add_member`, `leave`, `kick`, `promote`, `demote`).
+:::
+
 Only one pending admission state is allowed for a player in a group. Invitations
 and requests are persisted, so they survive server restart; they do not by
 themselves deliver a player notification.

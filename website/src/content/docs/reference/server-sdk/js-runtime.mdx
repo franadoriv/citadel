@@ -961,11 +961,10 @@ citadel.friends_add(user, other) -> string
 **Errors:** returns an error string if the operation fails (e.g., database error,
 user not found). The error is already sanitized and safe to log.
 
-:::caution[Current limitation]
-The JavaScript adapter does not yet support the friends host functions due to
-limitations in the rquickjs binding. Calling `citadel.friends_add` will throw
-an error "friends host not available". This is a known gap tracked in
-and will be implemented when the binding supports better function registration.
+:::note[Friends host API in JavaScript]
+The JavaScript runtime supports the friends host functions (`friends_add`,
+`friends_remove`, `friends_block`, `friends_list`), on parity with Lua and
+Python.
 :::
 
 ```js
