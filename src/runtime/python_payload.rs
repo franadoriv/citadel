@@ -287,6 +287,9 @@ impl VerifiedPayload {
                 .open(staging.join(READY_FILE))?;
             ready.write_all(digest.as_bytes())?;
             ready.sync_all()?;
+            // Windows refuses to rename the staging directory while the READY
+            // file still has an open handle. Close it before atomic activation.
+            drop(ready);
             set_private_file(&staging.join(READY_FILE))?;
             // Persist the READY directory entry before the atomic activation.
             sync_dir(&staging)?;
@@ -368,25 +371,20 @@ fn validate_relative_path(value: &str) -> Result<(), PythonPayloadError> {
     if value.is_empty()
         || value.len() > MAX_PATH_BYTES
         || value.contains('\\')
+        || value.contains(':')
+        || value.bytes().any(|byte| byte.is_ascii_control())
         || Path::new(value).is_absolute()
     {
         return Err(PythonPayloadError::InvalidPath(value.into()));
     }
-    let path = Path::new(value);
-    let components: Vec<_> = path.components().collect();
-    if components.is_empty()
-        || components
-            .iter()
-            .any(|c| !matches!(c, Component::Normal(_)))
+    // Signed payload paths are canonical slash-delimited wire values. Building
+    // a PathBuf from their components rewrites '/' to '\\' on Windows, so use
+    // the wire separator to validate instead of comparing platform paths.
+    if value
+        .split('/')
+        .any(|component| component.is_empty() || matches!(component, "." | ".."))
     {
-        return Err(PythonPayloadError::InvalidPath(path.into()));
-    }
-    let canonical = components
-        .iter()
-        .map(|component| component.as_os_str())
-        .collect::<PathBuf>();
-    if canonical.as_os_str() != path.as_os_str() {
-        return Err(PythonPayloadError::InvalidPath(path.into()));
+        return Err(PythonPayloadError::InvalidPath(value.into()));
     }
     Ok(())
 }
@@ -936,7 +934,20 @@ mod tests {
     fn path_validation_property_rejects_generated_escape_forms() {
         // Property-style coverage: no separator/parent-component composition
         // may become an accepted cache-relative path.
-        for segment in ["", ".", "..", "a/..", "../a", "a//b", "/a", "a\\b"] {
+        for segment in [
+            "",
+            ".",
+            "..",
+            "a/..",
+            "../a",
+            "a//b",
+            "/a",
+            "//server/share",
+            "C:/a",
+            "C:a",
+            "a:b",
+            "a\\b",
+        ] {
             assert!(validate_relative_path(segment).is_err(), "{segment:?}");
         }
         for name in ["site.py", "Lib/site.py", "Lib/encodings/utf_8.py"] {
