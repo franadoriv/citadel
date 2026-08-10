@@ -61,6 +61,13 @@
     {"name":"create_is_deleted","event":{"version":1,"type":"message.create","channel_id":"ch_demo","event_id":5,"message":{"id":1,"sender":"alice","content":"","created_at_unix_ms":1000,"updated_at_unix_ms":1000,"revision":1,"last_event_id":5,"deleted":true}}},
     {"name":"remove_has_content","event":{"version":1,"type":"message.remove","channel_id":"ch_demo","event_id":7,"message":{"id":1,"sender":"alice","content":"secret remains","created_at_unix_ms":1000,"updated_at_unix_ms":1200,"revision":3,"last_event_id":7,"deleted":true}}},
     {"name":"typing_without_expiry","event":{"version":1,"type":"typing","channel_id":"ch_demo","presence":{"presence_id":"p","user_id":"u"},"typing":true}},
-    {"name":"resync_without_watermark","event":{"version":1,"type":"resync_required","channel_id":"ch_demo"}}
+    {"name":"resync_without_watermark","event":{"version":1,"type":"resync_required","channel_id":"ch_demo"}},
+    {"name":"numeric_string_event_id","payload":"{\"version\":1,\"type\":\"message.create\",\"channel_id\":\"ch_demo\",\"event_id\":\"5\",\"message\":{\"id\":1,\"sender\":\"alice\",\"content\":\"hello\",\"created_at_unix_ms\":1000,\"updated_at_unix_ms\":1000,\"revision\":1,\"last_event_id\":5,\"deleted\":false}}"},
+    {"name":"fractional_revision","payload":"{\"version\":1,\"type\":\"message.create\",\"channel_id\":\"ch_demo\",\"event_id\":5,\"message\":{\"id\":1,\"sender\":\"alice\",\"content\":\"hello\",\"created_at_unix_ms\":1000,\"updated_at_unix_ms\":1000,\"revision\":1.5,\"last_event_id\":5,\"deleted\":false}}"},
+    {"name":"unknown_variant_field","payload":"{\"version\":1,\"type\":\"presence.leave\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"},\"force_current\":true}"},
+    {"name":"duplicate_type","payload":"{\"version\":1,\"type\":\"presence.leave\",\"type\":\"presence.leave\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"}}"},
+    {"name":"unknown_hyphenated_field","payload":"{\"version\":1,\"type\":\"presence.leave\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"},\"force-current\":true}"},
+    {"name":"typing_false_nonzero_expiry","payload":"{\"version\":1,\"type\":\"typing\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"},\"typing\":false,\"expires_at\":10}"},
+    {"name":"duplicate_resync_scope","payload":"{\"version\":1,\"type\":\"resync_required\",\"channel_id\":\"ch_demo\",\"watermark_event_id\":9,\"scopes\":[\"history\",\"history\"]}"}
   ]
 }

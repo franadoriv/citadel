@@ -23,6 +23,7 @@ REQUIRED_ADDON_FILES = (
     "addons/citadel/client.gd",
     "addons/citadel/web_client.gd",
     "addons/citadel/rooms.gd",
+    "addons/citadel/chat_live.gd",
 )
 REQUIRED_WEB_FILES = (
     "web/index.html",

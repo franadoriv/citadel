@@ -129,6 +129,8 @@ func poll(out: Dictionary) -> Status:
 	var native_result: Dictionary = _native.poll()
 	var status: Status = int(native_result.get("transport_status", Status.INTERNAL)) as Status
 	if status == Status.OK:
+		out["truncated"] = bool(native_result.get("truncated", false))
+		out["required_len"] = int(native_result.get("required_len", 0))
 		out["kind"] = native_result.get("kind", -1)
 		out["payload"] = native_result.get("payload", PackedByteArray())
 	elif status != Status.AGAIN:
