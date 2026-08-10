@@ -893,8 +893,7 @@ impl DomainRpcServices {
         {
             return Self::err(&error.to_string());
         }
-        let delivery = match Self::chat_delivery_request(lease.access_epoch, "message.create", now)
-        {
+        let delivery = match self.chat_delivery_request(lease.access_epoch, "message.create", now) {
             Ok(delivery) => delivery,
             Err(error) => return Self::err(&error),
         };
@@ -1091,8 +1090,7 @@ impl DomainRpcServices {
             return Self::err(&error.to_string());
         }
         let now = SystemClock.now();
-        let delivery = match Self::chat_delivery_request(lease.access_epoch, "message.update", now)
-        {
+        let delivery = match self.chat_delivery_request(lease.access_epoch, "message.update", now) {
             Ok(delivery) => delivery,
             Err(error) => return Self::err(&error),
         };
@@ -1161,8 +1159,7 @@ impl DomainRpcServices {
             return Self::err(&error.to_string());
         }
         let now = SystemClock.now();
-        let delivery = match Self::chat_delivery_request(lease.access_epoch, "message.remove", now)
-        {
+        let delivery = match self.chat_delivery_request(lease.access_epoch, "message.remove", now) {
             Ok(delivery) => delivery,
             Err(error) => return Self::err(&error),
         };
@@ -1439,6 +1436,7 @@ impl DomainRpcServices {
 
     /// Bound durable remote retries independently of a socket's lifetime.
     fn chat_delivery_request(
+        &self,
         authority_epoch: u64,
         event_type: &'static str,
         now: TimestampMillis,
@@ -1448,6 +1446,7 @@ impl DomainRpcServices {
             .checked_add(DurationMillis::from_millis(RETRY_WINDOW_MS))
             .map_err(|_| "CHAT_UNAVAILABLE".to_owned())?;
         Ok(crate::services::ChatDeliveryRequest {
+            origin_node_id: self.node_id.clone(),
             authority_epoch,
             expires_at,
             event_type,

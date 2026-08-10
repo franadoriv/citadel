@@ -565,7 +565,10 @@ impl ChatDeliveryDispatcher {
         limit: usize,
     ) -> crate::error::AppResult<ChatDeliveryDispatchStats> {
         let mut stats = ChatDeliveryDispatchStats::default();
-        let rows = self.repository.active_delivery_outbox(now, limit).await?;
+        let rows = self
+            .repository
+            .active_delivery_outbox(self.source.as_str(), now, limit)
+            .await?;
         stats.loaded = rows.len();
         for row in rows {
             let mut complete = true;
@@ -589,7 +592,11 @@ impl ChatDeliveryDispatcher {
             if complete {
                 if self
                     .repository
-                    .acknowledge_delivery_outbox(&row.channel_id, row.event_id)
+                    .acknowledge_delivery_outbox(
+                        self.source.as_str(),
+                        &row.channel_id,
+                        row.event_id,
+                    )
                     .await?
                 {
                     stats.acknowledged += 1;
@@ -830,6 +837,7 @@ mod tests {
     #[test]
     fn durable_outbox_row_preserves_its_authority_fence_and_deadline() {
         let record = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_1".to_owned(),
             event_id: 7,
             authority_epoch: 4,
@@ -848,6 +856,7 @@ mod tests {
     #[test]
     fn dispatcher_loads_a_durable_row_with_its_committed_fences() {
         let record = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_1".to_owned(),
             event_id: 8,
             authority_epoch: 9,
@@ -1160,12 +1169,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_dispatchers_only_deliver_and_acknowledge_their_origin_rows() {
+        let repository = Arc::new(InMemoryChatRepository::new());
+        let directory = Arc::new(ChatPresenceDirectory::default());
+        let now = TimestampMillis::from_unix_millis(10);
+        for (event_id, origin_node_id) in [(21, "node-a"), (22, "node-b")] {
+            repository
+                .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                    channel_id: "ch_shared".to_owned(),
+                    event_id,
+                    origin_node_id: origin_node_id.to_owned(),
+                    authority_epoch: 4,
+                    payload: r#"{"type":"message.create"}"#.to_owned(),
+                    created_at: now,
+                    expires_at: TimestampMillis::from_unix_millis(100),
+                })
+                .expect("stage origin-owned row");
+        }
+        assert_eq!(
+            directory.advertise(
+                ChatPresenceLease {
+                    channel_id: "ch_shared".to_owned(),
+                    node_id: node("node-c"),
+                    generation: OwnershipGeneration::new(1),
+                    expires_at: TimestampMillis::from_unix_millis(100),
+                },
+                now,
+            ),
+            ChatLeaseUpdate::Applied
+        );
+
+        let deliveries_a = Arc::new(Mutex::new(Vec::new()));
+        let deliveries_b = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher_a =
+            ChatDeliveryDispatcher::new(node("node-a"), repository.clone(), directory.clone(), {
+                let deliveries = Arc::clone(&deliveries_a);
+                Arc::new(move |_, delivery| {
+                    deliveries
+                        .lock()
+                        .expect("deliveries a lock")
+                        .push(delivery.event_id);
+                    Ok(ChatDeliveryDisposition::Delivered)
+                })
+            });
+        let dispatcher_b =
+            ChatDeliveryDispatcher::new(node("node-b"), repository.clone(), directory, {
+                let deliveries = Arc::clone(&deliveries_b);
+                Arc::new(move |_, delivery| {
+                    deliveries
+                        .lock()
+                        .expect("deliveries b lock")
+                        .push(delivery.event_id);
+                    Ok(ChatDeliveryDisposition::Delivered)
+                })
+            });
+
+        let (stats_a, stats_b) = tokio::join!(
+            dispatcher_a.dispatch_once(now, 8),
+            dispatcher_b.dispatch_once(now, 8),
+        );
+        assert_eq!(stats_a.expect("node a dispatch").loaded, 1);
+        assert_eq!(stats_b.expect("node b dispatch").loaded, 1);
+        assert_eq!(*deliveries_a.lock().expect("deliveries a lock"), vec![21]);
+        assert_eq!(*deliveries_b.lock().expect("deliveries b lock"), vec![22]);
+        assert!(
+            repository
+                .active_delivery_outbox("node-a", now, 8)
+                .expect("node a rows after ack")
+                .is_empty()
+        );
+        assert!(
+            repository
+                .active_delivery_outbox("node-b", now, 8)
+                .expect("node b rows after ack")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn durable_dispatch_waits_for_every_remote_destination_before_acknowledging() {
         let repository = Arc::new(InMemoryChatRepository::new());
         let directory = Arc::new(ChatPresenceDirectory::default());
         let now = TimestampMillis::from_unix_millis(10);
         repository
             .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
                 channel_id: "ch_1".to_owned(),
                 event_id: 12,
                 authority_epoch: 4,
@@ -1218,7 +1306,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .active_delivery_outbox(now, 8)
+                .active_delivery_outbox("node-a", now, 8)
                 .expect("source retained")
                 .len(),
             1
@@ -1235,7 +1323,7 @@ mod tests {
         assert_eq!(attempted.load(Ordering::SeqCst), 4);
         assert!(
             repository
-                .active_delivery_outbox(now, 8)
+                .active_delivery_outbox("node-a", now, 8)
                 .expect("source removed after all acks")
                 .is_empty()
         );
@@ -1249,6 +1337,7 @@ mod tests {
         let expired_at = TimestampMillis::from_unix_millis(20);
         repository
             .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
                 channel_id: "ch_expired".to_owned(),
                 event_id: 13,
                 authority_epoch: 4,
@@ -1296,7 +1385,7 @@ mod tests {
         );
         assert!(
             repository
-                .active_delivery_outbox(created_at, 8)
+                .active_delivery_outbox("node-a", created_at, 8)
                 .expect("outbox query")
                 .is_empty()
         );

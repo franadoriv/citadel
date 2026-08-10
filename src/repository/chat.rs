@@ -127,6 +127,9 @@ pub struct ChatMessage {
 /// persisted as a socket or participant capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatDeliveryOutboxRecord {
+    /// Stable node that committed the mutation and exclusively owns delivery
+    /// and acknowledgement of this row.
+    pub origin_node_id: String,
     /// Opaque durable channel identifier.
     pub channel_id: String,
     /// Stable channel-scoped event identity.
@@ -149,6 +152,8 @@ pub struct ChatDeliveryOutboxRecord {
 /// enclosing mutation transaction commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatDeliveryRequest {
+    /// Stable node that is committing and will dispatch this mutation.
+    pub origin_node_id: String,
     /// Authorization fence captured when the caller was authorized.
     pub authority_epoch: u64,
     /// Exclusive retry deadline for bounded live delivery.
@@ -608,16 +613,21 @@ pub trait ChatRepository: Send + Sync {
     /// Destination leases are deliberately resolved only by the dispatcher.
     async fn stage_delivery_outbox(&self, record: ChatDeliveryOutboxRecord) -> AppResult<bool>;
 
-    /// Read source rows whose exclusive retry deadline has not elapsed.
+    /// Read active source rows owned by `origin_node_id` only.
     async fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>>;
 
-    /// Remove a source row only after terminal dispatcher acknowledgement.
-    async fn acknowledge_delivery_outbox(&self, channel_id: &str, event_id: u64)
-    -> AppResult<bool>;
+    /// Remove an owned source row only after terminal dispatcher acknowledgement.
+    async fn acknowledge_delivery_outbox(
+        &self,
+        origin_node_id: &str,
+        channel_id: &str,
+        event_id: u64,
+    ) -> AppResult<bool>;
 
     /// Remove at most `limit` source rows whose exclusive retry deadline has
     /// elapsed at or before `through`.
@@ -707,6 +717,11 @@ impl InMemoryChatRepository {
     /// backend's `(channel_id, event_id)` idempotency boundary for deterministic
     /// local tests; the in-memory repository itself is intentionally volatile.
     pub fn stage_delivery_outbox(&self, record: ChatDeliveryOutboxRecord) -> AppResult<bool> {
+        if record.origin_node_id.is_empty() {
+            return Err(AppError::validation(
+                "chat delivery outbox origin node is required",
+            ));
+        }
         if record.expires_at <= record.created_at {
             return Err(AppError::validation(
                 "chat delivery outbox expiry must be after creation",
@@ -728,16 +743,22 @@ impl InMemoryChatRepository {
     /// Read active source rows in deterministic channel/event order.
     pub fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>> {
+        if origin_node_id.is_empty() {
+            return Err(AppError::validation(
+                "chat delivery outbox origin node is required",
+            ));
+        }
         let outbox = self
             .outbox
             .lock()
             .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
         let mut active: Vec<_> = outbox
             .iter()
-            .filter(|record| record.is_current_at(now))
+            .filter(|record| record.origin_node_id == origin_node_id && record.is_current_at(now))
             .cloned()
             .collect();
         active.sort_by(|left, right| {
@@ -749,13 +770,27 @@ impl InMemoryChatRepository {
 
     /// Remove one source row after the dispatcher receives its terminal
     /// acknowledgement. Retrying or merely reading a row never consumes it.
-    pub fn acknowledge_delivery_outbox(&self, channel_id: &str, event_id: u64) -> AppResult<bool> {
+    pub fn acknowledge_delivery_outbox(
+        &self,
+        origin_node_id: &str,
+        channel_id: &str,
+        event_id: u64,
+    ) -> AppResult<bool> {
+        if origin_node_id.is_empty() {
+            return Err(AppError::validation(
+                "chat delivery outbox origin node is required",
+            ));
+        }
         let mut outbox = self
             .outbox
             .lock()
             .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
         let initial_len = outbox.len();
-        outbox.retain(|record| record.channel_id != channel_id || record.event_id != event_id);
+        outbox.retain(|record| {
+            record.origin_node_id != origin_node_id
+                || record.channel_id != channel_id
+                || record.event_id != event_id
+        });
         Ok(outbox.len() != initial_len)
     }
 
@@ -924,6 +959,7 @@ impl ChatRepository for InMemoryChatRepository {
         InMemoryChatRepository::stage_delivery_outbox(
             self,
             ChatDeliveryOutboxRecord {
+                origin_node_id: delivery.origin_node_id.clone(),
                 channel_id: channel.to_owned(),
                 event_id: message.last_event_id,
                 authority_epoch: delivery.authority_epoch,
@@ -1054,6 +1090,7 @@ impl ChatRepository for InMemoryChatRepository {
         InMemoryChatRepository::stage_delivery_outbox(
             self,
             ChatDeliveryOutboxRecord {
+                origin_node_id: delivery.origin_node_id.clone(),
                 channel_id: channel.to_owned(),
                 event_id: message.last_event_id,
                 authority_epoch: delivery.authority_epoch,
@@ -1141,6 +1178,7 @@ impl ChatRepository for InMemoryChatRepository {
         InMemoryChatRepository::stage_delivery_outbox(
             self,
             ChatDeliveryOutboxRecord {
+                origin_node_id: delivery.origin_node_id.clone(),
                 channel_id: channel.to_owned(),
                 event_id: message.last_event_id,
                 authority_epoch: delivery.authority_epoch,
@@ -1271,18 +1309,25 @@ impl ChatRepository for InMemoryChatRepository {
 
     async fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>> {
-        InMemoryChatRepository::active_delivery_outbox(self, now, limit)
+        InMemoryChatRepository::active_delivery_outbox(self, origin_node_id, now, limit)
     }
 
     async fn acknowledge_delivery_outbox(
         &self,
+        origin_node_id: &str,
         channel_id: &str,
         event_id: u64,
     ) -> AppResult<bool> {
-        InMemoryChatRepository::acknowledge_delivery_outbox(self, channel_id, event_id)
+        InMemoryChatRepository::acknowledge_delivery_outbox(
+            self,
+            origin_node_id,
+            channel_id,
+            event_id,
+        )
     }
 
     async fn cleanup_delivery_outbox(
@@ -1317,6 +1362,7 @@ mod tests {
     #[test]
     fn outbox_record_is_live_only_before_its_exclusive_expiry() {
         let record = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_1".to_owned(),
             event_id: 4,
             authority_epoch: 2,
@@ -1332,6 +1378,7 @@ mod tests {
     fn in_memory_outbox_is_idempotent_acknowledged_and_expires_records() {
         let repository = InMemoryChatRepository::new();
         let active = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_b".to_owned(),
             event_id: 2,
             authority_epoch: 2,
@@ -1351,27 +1398,28 @@ mod tests {
         );
         assert_eq!(
             repository
-                .active_delivery_outbox(ts(9), 1)
+                .active_delivery_outbox("node-a", ts(9), 1)
                 .expect("active rows"),
             vec![active.clone()]
         );
         assert!(
             repository
-                .acknowledge_delivery_outbox("ch_b", 2)
+                .acknowledge_delivery_outbox("node-a", "ch_b", 2)
                 .expect("acknowledged")
         );
         assert!(
             !repository
-                .acknowledge_delivery_outbox("ch_b", 2)
+                .acknowledge_delivery_outbox("node-a", "ch_b", 2)
                 .expect("idempotent acknowledgement")
         );
         assert!(
             repository
-                .active_delivery_outbox(ts(9), 1)
+                .active_delivery_outbox("node-a", ts(9), 1)
                 .expect("acknowledged rows")
                 .is_empty()
         );
         let expired = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_b".to_owned(),
             event_id: 3,
             authority_epoch: 2,
@@ -1386,7 +1434,7 @@ mod tests {
         );
         assert!(
             repository
-                .active_delivery_outbox(ts(10), 1)
+                .active_delivery_outbox("node-a", ts(10), 1)
                 .expect("expired rows")
                 .is_empty()
         );
@@ -1403,6 +1451,7 @@ mod tests {
         let repository = InMemoryChatRepository::new();
         let error = repository
             .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
                 channel_id: "ch_window".to_owned(),
                 event_id: 1,
                 authority_epoch: 2,
@@ -1415,7 +1464,7 @@ mod tests {
         assert_eq!(error.category(), crate::error::ErrorCategory::Validation);
         assert!(
             repository
-                .active_delivery_outbox(ts(10), 1)
+                .active_delivery_outbox("node-a", ts(10), 1)
                 .expect("no invalid row was staged")
                 .is_empty()
         );

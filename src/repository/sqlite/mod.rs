@@ -719,6 +719,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_outbox_origin_migration_discards_legacy_rows_and_old_writers_fail_closed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("legacy sqlite database");
+        sqlx::raw_sql(
+            "CREATE TABLE chat_delivery_outbox (
+                outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                authority_epoch INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                expires_at_unix_ms INTEGER NOT NULL,
+                UNIQUE (channel_id, event_id)
+            );
+            CREATE INDEX chat_delivery_outbox_expiry_idx
+            ON chat_delivery_outbox (expires_at_unix_ms, outbox_id);
+            INSERT INTO chat_delivery_outbox
+            (channel_id, event_id, authority_epoch, payload, created_at_unix_ms, expires_at_unix_ms)
+            VALUES ('legacy', 1, 0, '{}', 1, 100);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy outbox");
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations-sqlite/20260810120000_add_chat_outbox_origin.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("migrate outbox ownership");
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM chat_delivery_outbox")
+            .fetch_one(&pool)
+            .await
+            .expect("count migrated rows");
+        assert_eq!(remaining, 0, "legacy work recovers through durable history");
+
+        sqlx::query(
+            "INSERT INTO chat_delivery_outbox
+            (channel_id, event_id, authority_epoch, payload, created_at_unix_ms, expires_at_unix_ms)
+            VALUES ('rolling-old-writer', 2, 0, '{}', 1, 100)",
+        )
+        .execute(&pool)
+        .await
+        .expect("rolling old writer uses fail-closed default");
+        let claimable: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chat_delivery_outbox WHERE origin_node_id = 'node-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count claimable rows");
+        assert_eq!(claimable, 0);
+    }
+
+    #[tokio::test]
     async fn chat_delivery_outbox_round_trips_and_acknowledges() {
         let config = DatabaseConfig {
             url: Some("sqlite::memory:".to_string()),
@@ -729,6 +786,7 @@ mod tests {
             .expect("connect + migrate in-memory sqlite");
         let repository = db.chat_repository();
         let record = crate::repository::chat::ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_delivery".to_owned(),
             event_id: 7,
             authority_epoch: 4,
@@ -749,22 +807,35 @@ mod tests {
                 .await
                 .expect("duplicate row")
         );
+        assert!(
+            repository
+                .active_delivery_outbox("node-b", TimestampMillis::from_unix_millis(19), 10)
+                .await
+                .expect("foreign origin cannot read row")
+                .is_empty()
+        );
+        assert!(
+            !repository
+                .acknowledge_delivery_outbox("node-b", "ch_delivery", 7)
+                .await
+                .expect("foreign origin cannot acknowledge row")
+        );
         assert_eq!(
             repository
-                .active_delivery_outbox(TimestampMillis::from_unix_millis(19), 10)
+                .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(19), 10)
                 .await
                 .expect("active rows"),
             vec![record.clone()]
         );
         assert!(
             repository
-                .acknowledge_delivery_outbox("ch_delivery", 7)
+                .acknowledge_delivery_outbox("node-a", "ch_delivery", 7)
                 .await
                 .expect("acknowledge row")
         );
         assert!(
             repository
-                .active_delivery_outbox(TimestampMillis::from_unix_millis(19), 10)
+                .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(19), 10)
                 .await
                 .expect("acknowledged rows")
                 .is_empty()
@@ -778,7 +849,7 @@ mod tests {
         db.reset_storage_for_tests().await.expect("reset outbox");
         assert!(
             repository
-                .active_delivery_outbox(TimestampMillis::from_unix_millis(19), 10)
+                .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(19), 10)
                 .await
                 .expect("reset rows")
                 .is_empty()
@@ -810,6 +881,7 @@ mod tests {
         let repository = db.chat_repository();
         let now = TimestampMillis::from_unix_millis(100);
         let delivery = crate::repository::chat::ChatDeliveryRequest {
+            origin_node_id: "node-a".to_owned(),
             authority_epoch: 0,
             expires_at: now,
             event_type: "message.create",
@@ -839,7 +911,7 @@ mod tests {
         );
         assert!(
             repository
-                .active_delivery_outbox(TimestampMillis::from_unix_millis(101), 10)
+                .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(101), 10)
                 .await
                 .expect("outbox after rollback")
                 .is_empty()
@@ -897,7 +969,7 @@ mod tests {
         assert_eq!(message.revision, 1);
         assert!(
             repository
-                .active_delivery_outbox(TimestampMillis::from_unix_millis(101), 10)
+                .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(101), 10)
                 .await
                 .expect("outbox after edit/delete rollbacks")
                 .is_empty()

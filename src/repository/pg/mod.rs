@@ -733,6 +733,10 @@ mod tests {
     );
     const CRDB_CHAT_DELIVERY_OUTBOX: &str =
         include_str!("../../../migrations-crdb/20260726130000_create_chat_delivery_outbox.sql");
+    const CRDB_CHAT_OUTBOX_ORIGIN: &str =
+        include_str!("../../../migrations-crdb/20260810120000_add_chat_outbox_origin.sql");
+    const PG_CHAT_OUTBOX_ORIGIN: &str =
+        include_str!("../../../migrations/20260810120000_add_chat_outbox_origin.sql");
     const CRDB_STORAGE_INDEX_MEMBERSHIPS: &str = include_str!(
         "../../../migrations-crdb/20260713150000_create_storage_index_memberships.sql"
     );
@@ -881,5 +885,10 @@ mod tests {
         assert!(CRDB_CHAT_DELIVERY_OUTBOX.contains("UNIQUE (channel_id, event_id)"));
         assert!(CRDB_CHAT_DELIVERY_OUTBOX.contains("authority_epoch INT8 NOT NULL"));
         assert!(CRDB_CHAT_DELIVERY_OUTBOX.contains("chat_delivery_outbox_expiry_idx"));
+        for migration in [CRDB_CHAT_OUTBOX_ORIGIN, PG_CHAT_OUTBOX_ORIGIN] {
+            assert!(migration.contains("origin_node_id"));
+            assert!(migration.contains("DELETE FROM chat_delivery_outbox"));
+            assert!(migration.contains("chat_delivery_outbox_origin_active_idx"));
+        }
     }
 }

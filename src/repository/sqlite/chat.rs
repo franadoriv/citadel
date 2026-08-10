@@ -70,13 +70,13 @@ DELETE FROM chat_rate_limits WHERE rowid IN \
 (SELECT rowid FROM chat_rate_limits WHERE window_started_at_unix_ms < ? ORDER BY window_started_at_unix_ms LIMIT ?)";
 const INSERT_OUTBOX_SQL: &str = "\
 INSERT INTO chat_delivery_outbox \
-(channel_id, event_id, authority_epoch, payload, created_at_unix_ms, expires_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?) \
+(origin_node_id, channel_id, event_id, authority_epoch, payload, created_at_unix_ms, expires_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?) \
 ON CONFLICT(channel_id, event_id) DO NOTHING";
 const ACTIVE_OUTBOX_SQL: &str = "\
-SELECT channel_id, event_id, authority_epoch, payload, created_at_unix_ms, expires_at_unix_ms \
-FROM chat_delivery_outbox WHERE expires_at_unix_ms > ? ORDER BY channel_id, event_id LIMIT ?";
-const ACKNOWLEDGE_OUTBOX_SQL: &str =
-    "DELETE FROM chat_delivery_outbox WHERE channel_id = ? AND event_id = ?";
+SELECT origin_node_id, channel_id, event_id, authority_epoch, payload, created_at_unix_ms, expires_at_unix_ms \
+FROM chat_delivery_outbox WHERE origin_node_id = ? AND expires_at_unix_ms > ? ORDER BY channel_id, event_id LIMIT ?";
+const ACKNOWLEDGE_OUTBOX_SQL: &str = "DELETE FROM chat_delivery_outbox \
+WHERE origin_node_id = ? AND channel_id = ? AND event_id = ?";
 const DELETE_EXPIRED_OUTBOX_SQL: &str = "\
 DELETE FROM chat_delivery_outbox WHERE rowid IN \
 (SELECT rowid FROM chat_delivery_outbox WHERE expires_at_unix_ms <= ? \
@@ -182,6 +182,7 @@ fn parse_outbox_record(row: &SqliteRow) -> AppResult<ChatDeliveryOutboxRecord> {
     let created_at: i64 = get(row, "created_at_unix_ms")?;
     let expires_at: i64 = get(row, "expires_at_unix_ms")?;
     Ok(ChatDeliveryOutboxRecord {
+        origin_node_id: get(row, "origin_node_id")?,
         channel_id: get(row, "channel_id")?,
         event_id: to_u64(event_id, "chat delivery event id")?,
         authority_epoch: to_u64(authority_epoch, "chat delivery authority epoch")?,
@@ -333,6 +334,7 @@ impl ChatRepository for SqliteChatRepository {
                 .find(|message| message.id == id)
                 .ok_or_else(|| AppError::internal("created chat message was not retained"))?;
             stage_delivery_outbox_conn(conn, &ChatDeliveryOutboxRecord {
+                origin_node_id: delivery.origin_node_id.clone(),
                 channel_id: channel.to_owned(), event_id: message.last_event_id,
                 authority_epoch: delivery.authority_epoch,
                 payload: serialize_delivery_event(channel, channel_type, delivery.event_type, &message)?,
@@ -417,6 +419,7 @@ impl ChatRepository for SqliteChatRepository {
             ensure_access_epoch_conn(conn, access_key, expected_access_epoch).await?;
             let message = edit_message_conn(conn, channel, id, content, now).await?;
             stage_delivery_outbox_conn(conn, &ChatDeliveryOutboxRecord {
+                origin_node_id: delivery.origin_node_id.clone(),
                 channel_id: channel.to_owned(), event_id: message.last_event_id,
                 authority_epoch: delivery.authority_epoch,
                 payload: serialize_delivery_event(channel, channel_type, delivery.event_type, &message)?,
@@ -466,6 +469,7 @@ impl ChatRepository for SqliteChatRepository {
                 .find(|message| message.id == id)
                 .ok_or_else(|| AppError::internal("tombstoned chat message was not retained"))?;
             stage_delivery_outbox_conn(conn, &ChatDeliveryOutboxRecord {
+                origin_node_id: delivery.origin_node_id.clone(),
                 channel_id: channel.to_owned(), event_id: message.last_event_id,
                 authority_epoch: delivery.authority_epoch,
                 payload: serialize_delivery_event(channel, channel_type, delivery.event_type, &message)?,
@@ -551,21 +555,23 @@ impl ChatRepository for SqliteChatRepository {
 
     async fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        with_conn!(self, conn => active_delivery_outbox_conn(conn, now, limit).await)
+        with_conn!(self, conn => active_delivery_outbox_conn(conn, origin_node_id, now, limit).await)
     }
 
     async fn acknowledge_delivery_outbox(
         &self,
+        origin_node_id: &str,
         channel_id: &str,
         event_id: u64,
     ) -> AppResult<bool> {
-        with_tx!(self, conn => acknowledge_delivery_outbox_conn(conn, channel_id, event_id).await)
+        with_tx!(self, conn => acknowledge_delivery_outbox_conn(conn, origin_node_id, channel_id, event_id).await)
     }
 
     async fn cleanup_delivery_outbox(
@@ -584,6 +590,11 @@ async fn stage_delivery_outbox_conn(
     conn: &mut SqliteConnection,
     record: &ChatDeliveryOutboxRecord,
 ) -> AppResult<bool> {
+    if record.origin_node_id.is_empty() {
+        return Err(AppError::validation(
+            "chat delivery outbox origin node is required",
+        ));
+    }
     if record.expires_at <= record.created_at {
         return Err(AppError::validation(
             "chat delivery outbox expiry must be after creation",
@@ -591,6 +602,7 @@ async fn stage_delivery_outbox_conn(
     }
     let event_id = to_i64(record.event_id, "chat delivery event id")?;
     let result = sqlx::query(INSERT_OUTBOX_SQL)
+        .bind(&record.origin_node_id)
         .bind(&record.channel_id)
         .bind(event_id)
         .bind(to_i64(
@@ -608,12 +620,19 @@ async fn stage_delivery_outbox_conn(
 
 async fn active_delivery_outbox_conn(
     conn: &mut SqliteConnection,
+    origin_node_id: &str,
     now: TimestampMillis,
     limit: usize,
 ) -> AppResult<Vec<ChatDeliveryOutboxRecord>> {
+    if origin_node_id.is_empty() {
+        return Err(AppError::validation(
+            "chat delivery outbox origin node is required",
+        ));
+    }
     let limit =
         i64::try_from(limit).map_err(|_| AppError::internal("outbox limit out of range"))?;
     let rows = sqlx::query(ACTIVE_OUTBOX_SQL)
+        .bind(origin_node_id)
         .bind(ts_to_millis(now)?)
         .bind(limit)
         .fetch_all(&mut *conn)
@@ -624,11 +643,18 @@ async fn active_delivery_outbox_conn(
 
 async fn acknowledge_delivery_outbox_conn(
     conn: &mut SqliteConnection,
+    origin_node_id: &str,
     channel_id: &str,
     event_id: u64,
 ) -> AppResult<bool> {
+    if origin_node_id.is_empty() {
+        return Err(AppError::validation(
+            "chat delivery outbox origin node is required",
+        ));
+    }
     let event_id = to_i64(event_id, "chat delivery event id")?;
     let result = sqlx::query(ACKNOWLEDGE_OUTBOX_SQL)
+        .bind(origin_node_id)
         .bind(channel_id)
         .bind(event_id)
         .execute(&mut *conn)

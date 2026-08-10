@@ -507,6 +507,7 @@ mod tests {
         let repository = Arc::new(InMemoryChatRepository::new());
         repository
             .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
                 channel_id: "channel-1".to_owned(),
                 event_id: 1,
                 authority_epoch: 0,
@@ -530,7 +531,7 @@ mod tests {
         ));
         for _ in 0..10 {
             if repository
-                .active_delivery_outbox(SystemClock.now(), 1)
+                .active_delivery_outbox("node-a", SystemClock.now(), 1)
                 .expect("read outbox")
                 .is_empty()
             {
@@ -540,7 +541,7 @@ mod tests {
         }
         assert!(
             repository
-                .active_delivery_outbox(SystemClock.now(), 1)
+                .active_delivery_outbox("node-a", SystemClock.now(), 1)
                 .expect("read outbox")
                 .is_empty(),
             "the supervised worker runs bounded expiry maintenance"
