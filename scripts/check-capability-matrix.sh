@@ -11,3 +11,4 @@ else
 fi
 
 "$python_bin" scripts/generate_readme_capability_matrix.py --check
+"$python_bin" scripts/generate_docs_capability_matrix.py --check

@@ -61,6 +61,7 @@ export default defineConfig({
 						{ label: 'GameScript: your rules, enforced', slug: 'gamescript' },
 						{ label: 'Getting started', slug: 'quickstart' },
 						{ label: 'Build Knights vs Monsters', slug: 'tutorials/knights-vs-monsters' },
+						{ label: 'Engine & platform support', slug: 'support-matrix' },
 					],
 				},
 				{
