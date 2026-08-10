@@ -82,7 +82,11 @@ docker exec "$container" mongosh --quiet --port "$port" --eval \
 
 export CITADEL_TEST_MONGODB_URL="mongodb://citadel_test:${password}@127.0.0.1:${port}/citadel_test?authSource=admin&replicaSet=rs0"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
-export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
+# These contracts all share the single disposable replica set above, so they
+# must run serially: a concurrent run lets one test's writes/cleanup clobber
+# another's data. Force one thread regardless of any inherited RUST_TEST_THREADS
+# (release CI sets it to 4 for the rest of the gate).
+export RUST_TEST_THREADS=1
 
 # Run every contract target that has a MongoDB branch while the authenticated
 # rs0 URL is set. The un-gated reference cases in those targets are intentional:
