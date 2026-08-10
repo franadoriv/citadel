@@ -128,6 +128,33 @@ override sólo evita ejecutar un minuto entero en un smoke test.
 conocido, para comprobar que el Lua devuelve `move_rejected`; no se usa en
 pruebas de carga normales.
 
+## Matchmaker en dos nodos
+
+`run-cluster-matchmaker.sh` levanta dos nodos locales con certificados mTLS
+efímeros y ejecuta el binario `cluster-matchmaker`. Este no reparte salas
+creadas directamente: cada cohorte es exactamente un usuario autenticado en
+node-a y otro en node-b, con una query que sólo les permite emparejarse entre
+ellos. Por tanto prueba el forwarding de tickets/handoffs/admisiones del
+matchmaker entre nodos, manteniendo cada socket en su nodo de sesión.
+
+El clúster requiere PostgreSQL o CockroachDB; SQLite se rechaza
+intencionadamente porque los leases con fencing necesitan transacciones
+portables. Proporciona una base temporal antes de arrancar:
+
+```bash
+CITADEL_CLUSTER_DATABASE_URL='postgres://citadel:citadel@127.0.0.1:5432/citadel_stress' \
+  ./run-cluster-matchmaker.sh
+```
+
+El runner valida ambos TOML, espera `/health` en los dos nodos y los detiene al
+salir. Intenta mover a la Papelera sus certificados, configuraciones y logs;
+si el host no soporta Papelera para temporales, muestra la ruta para que el
+operador la retire de forma segura. El probe informa la
+distribución de sesiones, autenticaciones, `matchmaker.add`, handoffs,
+admisiones, `ROOM_JOINED`, errores y latencias p50/p95/p99. WebSocket se usa a
+propósito: este benchmark mide el control-plane del clúster, no el perfil de
+datagramas QUIC del simulador de movimiento.
+
 ## Compilar el cliente para otra plataforma
 
 El cliente es un crate Rust independiente y no contiene código específico de

@@ -442,12 +442,18 @@ async fn handle_job(inner: &LiveInner, job: Job) {
                         true,
                         serde_json::json!({ "ticket_id": ticket_id.as_str() }).to_string(),
                     ),
-                    Err(_) => gateway.live_matchmaker_reply(
-                        sender,
-                        request_id,
-                        false,
-                        "matchmaker shard is unavailable".to_owned(),
-                    ),
+                    Err(error) => {
+                        // Keep the client reply deliberately coarse, but retain
+                        // the typed local cause for operators diagnosing a
+                        // cluster control-plane outage.
+                        tracing::warn!(%error, "live matchmaker ticket submission failed");
+                        gateway.live_matchmaker_reply(
+                            sender,
+                            request_id,
+                            false,
+                            "matchmaker shard is unavailable".to_owned(),
+                        )
+                    }
                 }
             }
         }

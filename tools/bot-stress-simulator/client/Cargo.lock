@@ -119,6 +119,7 @@ dependencies = [
  "citadel-client",
  "citadel-wire",
  "flate2",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
