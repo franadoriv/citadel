@@ -27,8 +27,11 @@ env.Append(LINKFLAGS=[ffi_link])
 if os.name == "nt":
     # Rust's Windows pipe implementation imports this ntdll entry point when
     # linked as a static archive into the GDExtension. The host telemetry
-    # dependency also resolves GetAdaptersAddresses from iphlpapi.
-    env.Append(LIBS=["ntdll", "iphlpapi"])
+    # dependency also resolves GetAdaptersAddresses from iphlpapi. Current std
+    # resolves GetUserProfileDirectoryW (userenv) for env::home_dir, and getrandom
+    # resolves SystemFunction036 (advapi32); both must be linked when the Rust
+    # archive is pulled into the GDExtension.
+    env.Append(LIBS=["ntdll", "iphlpapi", "userenv", "advapi32"])
 
 sources = Glob("src/*.cpp")
 library = env.SharedLibrary(
