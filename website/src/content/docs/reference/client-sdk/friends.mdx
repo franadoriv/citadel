@@ -545,4 +545,4 @@ for (const friend of response.friends) console.log(friend.user_id, friend.state)
 ## Related surfaces
 
 - **Operator console (admin API):** Friends can also be managed via the [admin-console friends endpoints](/reference/admin-api/friends) for operator-side tooling and batch operations.
-- **Server-side scripting (host API):** A server-side Lua, Python, or JavaScript script can manage friends via the `citadel.friends.*` host-API functions — a tracked follow-on, not yet shipped. When available, it will expose identical semantics over the scripting runtime.
+- **Server-side scripting (parity host API):** A server-side Lua, Python, or JavaScript script manages friends through the `citadel.friends.*` parity host API, which exposes the same friend management (add/remove/block/list) semantics as the game-client RPC surface.

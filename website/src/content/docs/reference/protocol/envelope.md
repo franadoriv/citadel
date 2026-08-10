@@ -739,3 +739,10 @@ For the full room lifecycle and admission hooks, see the
 [room client reference](/reference/client-sdk/rooms/). Transform, NetworkPeer,
 and networked-actor frames have their own higher-level reference pages; their raw
 contract remains indexed above so the kind namespace has one canonical catalog.
+
+## Custom kind numbering
+
+The constants above assign kinds `1`–`28`, and Citadel keeps the rest of the low
+range through `99` in reserve for future first-party protocol growth.
+Any custom game envelope kind an application defines for its own traffic must use a value `>= 100` so it never collides with a current or future reserved kind.
+The `100`/`101`/`102` kinds in the chat and notification relay examples follow this rule.

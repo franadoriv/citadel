@@ -10,7 +10,9 @@ message send/broadcast operations.
 :::note[Current shipped runtimes]
 Lua ships in the default embedded server runtime. Python ships as an embedded
 CPython trusted-tier runtime with `--features runtime-python`. JavaScript ships
-as capped embedded QuickJS with `--features runtime-js`.
+as capped embedded QuickJS with `--features runtime-js`. Both non-Lua runtimes
+are feature-gated, so embedded Python game logic requires the `runtime-python`
+build and default builds link neither.
 :::
 
 ## Modules

@@ -239,9 +239,9 @@ general-purpose relay pattern: your [Lua runtime script](/reference/server-sdk/l
 registers a handler for an application-chosen envelope `kind` with
 `citadel.on_message`, and forwards it to peers with `citadel.broadcast`
 (everyone) or `citadel.send` (one session, by its transport-level session
-id). Reserved kinds run through 26 (see the
+id). Citadel reserves and holds the low kind range through `99` (see the
 [envelope reference](/reference/protocol/envelope/#constants)), so an
-application-defined notification kind must be **27 or higher**.
+application-defined notification kind must be **100 or higher**.
 
 :::note[Future work — not implemented]
 The store is now persisted, but session-aware "deliver if online, otherwise

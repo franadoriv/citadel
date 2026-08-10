@@ -210,14 +210,13 @@ curl -s -X DELETE "http://127.0.0.1:7350/console/v1/storage/saves/slot-1?user_id
 
 ## Lua runtime storage access
 
-The embedded Lua runtime (see [Lua runtime API](/reference/server-sdk/lua-runtime/)) does
-**not** expose storage functions today. The `citadel` global registers
-messaging, RPC, logging, and actor-spawning hooks (`on_message`, `on_rpc`,
-`log`, `broadcast`, `send`, `spawn_actor`, `move_actor`, `despawn_actor`), but
-no `citadel.storage_*` accessor exists in `src/runtime/lua.rs`. Game scripts
-cannot read or write storage objects from Lua yet — this is a gap, not an
-intentionally hidden feature; track it as future runtime-surface work rather
-than assuming it is reachable.
+The embedded Lua runtime (see [Lua runtime API](/reference/server-sdk/lua-runtime/)) now
+exposes user-owned storage from trusted game logic: `citadel.storage_read`,
+`citadel.storage_write`, `citadel.storage_delete`, `citadel.storage_index_query`,
+and `citadel.register_storage_index_filter`. Searching an operator-declared index
+is trusted game-logic work, not a generic client endpoint — the console API on
+this page and the runtime accessors share the same durable objects, versions, and
+permission model. Python and JavaScript expose the same storage accessors.
 
 ## Errors
 
@@ -240,8 +239,9 @@ Storage routes use the console API's shared JSON error shape (see
 
 - **Console-admin-only.** No client-facing storage API exists yet; see the
   status callout above.
-- **No Lua storage access.** See [Lua runtime storage access](#lua-runtime-storage-access)
-  above.
+- **Runtime storage is trusted-tier.** Lua, Python, and JavaScript reach storage
+  through the accessors in [Lua runtime storage access](#lua-runtime-storage-access)
+  above; there is still no direct game-client storage endpoint.
 - **Values are JSON objects only.** There is no opaque/binary value type or
   content-type metadata in the current contract.
 - For the full section walkthrough (roles, login, and how Storage sits among

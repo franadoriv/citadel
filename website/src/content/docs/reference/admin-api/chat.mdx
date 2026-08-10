@@ -13,8 +13,8 @@ Citadel's chat surface has two distinct parts today:
 2. A **realtime delivery pattern** built from primitives that already ship:
    your Lua script relays a custom envelope kind with `citadel.on_message` +
    `citadel.broadcast`/`citadel.send`, and each client SDK sends/receives that
-   kind. There is no chat-specific wire kind or client method yet — see the
-   note in [Realtime delivery today](#realtime-delivery-today).
+   kind. This relay pattern needs no chat-specific wire kind or client method —
+   see [Realtime delivery today](#realtime-delivery-today).
 
 Source: `src/services/chat.rs` (thin service over the repository),
 `src/repository/chat.rs` (channel/history model + in-memory backend),
@@ -280,25 +280,25 @@ status/code list.
 
 ## Realtime delivery today
 
-There is **no dedicated chat wire kind and no chat-specific client SDK
-method** yet. What exists today is the same general-purpose relay pattern
+This relay pattern carries **no dedicated chat wire kind and no chat-specific
+client SDK method** of its own — it is the same general-purpose relay pattern
 [Rooms](/reference/client-sdk/rooms) and [transform sync](/reference/client-sdk/transform-sync) are
 built on: your [Lua runtime script](/reference/server-sdk/lua-runtime) registers a
 handler for an application-chosen envelope `kind` with `citadel.on_message`,
 and re-sends it to peers with `citadel.broadcast` (everyone but the sender)
-or `citadel.send` (one session). Reserved kinds run through 26 (see the
+or `citadel.send` (one session). Citadel reserves and holds the low kind range through `99` (see the
 [envelope reference](/reference/protocol/envelope/#constants) and
 [rooms](/reference/client-sdk/rooms/#wire-protocol)), so an application-defined chat kind
-must be **27 or higher**.
+must be **100 or higher**.
 
-:::note[Future work — not implemented]
-A dedicated chat wire protocol and chat-specific client SDK API (message
-history sync, per-channel subscribe/unsubscribe, typing indicators, etc.) are
-**future work**. The
-pattern below is the *only* way chat messages reach a connected game client
-today: a plain custom envelope kind, relayed by your own Lua script. It is
-not chat-aware — the server does not know `kind 100` means "chat message" —
-your game defines that convention.
+:::note[Authorized durable chat ships as a partial client domain feature]
+The console API and Lua relay documented here are not the only chat surface. An
+authorized durable chat domain feature now ships (partial): live delivery is
+available after `chat.join`, and committed reliable `KIND_CHAT_EVENT` (28)
+presence/typing/message fan-out reaches clients through their normal inbound
+envelope path (typing is local-node only). See the
+[chat domain feature](/reference/client-sdk/domain-features/#chat) for the client
+method and callback contract; the console API below stays the history/moderation surface.
 :::
 
 ### Server: relay a chat message (Lua)
@@ -485,9 +485,9 @@ exercised by the gateway integration tests in `src/realtime/gateway.rs`
 - **No realtime wire delivery for the console API.** The console's `POST`
   route is a manual producer, not a live feed — a message appended through
   the console is not pushed to any connected game client.
-- **No chat-specific client SDK surface.** The relay pattern above uses only
-  generic envelope send/receive; there is no `SendChatMessage`/`OnChatMessage`
-  style method on any client SDK today.
+- **This relay pattern has no chat-specific SDK method.** It uses only generic
+  envelope send/receive; the durable chat domain feature described under
+  [Realtime delivery today](#realtime-delivery-today) is the chat-specific surface.
 - **Blueprint cannot send/receive raw envelope kinds today.** See the
   Blueprint tab above.
 - **Godot transport needs the native GDExtension or the Web client.**

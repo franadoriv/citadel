@@ -106,6 +106,10 @@ binding works at runtime. See the [C ABI reference](/reference/client-sdk/c-abi/
 bit-packed varint form, the collection model, and the decoder caps. The three
 `KIND_REP_*` constants are declared in the Unreal SDK header and verified by
 Tier-A parity; the new C ABI functions are bound in the Tier-B signature check.
+The matching server validate/apply/rebroadcast trust boundary is the
+[NetworkPeer Server Authority](/reference/server-sdk/networkpeer-authority/) contract, and
+[NetworkPeer schema evolution](/reference/server-sdk/networkpeer-schema-evolution/) governs how
+that pinned `netcode.netpeer` schema identity may change without breaking the wire.
 
 ## Status and limits
 

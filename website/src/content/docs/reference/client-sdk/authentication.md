@@ -5,7 +5,7 @@ description: Device, custom-id, and email/password authentication endpoints — 
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Citadel exposes device-id, custom-id, and email/password authentication. Every
+Citadel exposes device authentication (a device id), custom-id, and email/password sign-in. Every
 successful request receives the same opaque session-token pair; the password is
 only accepted by the HTTP login boundary and is never a realtime credential.
 
