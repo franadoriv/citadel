@@ -239,6 +239,28 @@ export class CitadelClient {
   }
 
   /**
+   * Present the token handshake and await the `KIND_AUTH_RESULT` ack that binds
+   * this connection to the token's account. The account/session peer of
+   * {@link handshakeGuest}: the `KIND_AUTH` body is the UTF-8 encoding of
+   * `token` (an empty body is the guest handshake, so pass a non-empty token
+   * and use {@link handshakeGuest} for anonymous sessions).
+   *
+   * @param {string} token Opaque session-token string (UTF-8 encoded on the wire).
+   * @param {{ timeoutMs?: number }} [opts]
+   * @returns {Promise<{ status: number, userId: string, reasonClass: number }>}
+   */
+  async handshakeToken(token, opts = {}) {
+    if (typeof token !== "string" || token.length === 0) {
+      throw new TypeError("handshakeToken requires a non-empty token string; use handshakeGuest for anonymous sessions");
+    }
+    this.send(KIND_AUTH, new TextEncoder().encode(token));
+    const ack = await this.waitForKind(KIND_AUTH_RESULT, opts.timeoutMs);
+    const result = decodeAuthResult(ack);
+    if (!result) throw new Error("malformed auth result");
+    return result;
+  }
+
+  /**
    * Send a raw envelope of `kind` carrying `body`.
    * @param {number} kind
    * @param {Uint8Array} [body]

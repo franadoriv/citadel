@@ -6,6 +6,7 @@
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/char_string.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/quaternion.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 
@@ -17,6 +18,25 @@ constexpr size_t kMaximumPollCapacity = 4 * 1024 * 1024;
 
 int64_t as_status(CitadelStatus status) {
     return static_cast<int64_t>(status);
+}
+
+PackedFloat32Array floats_to_packed(const float *values, int64_t count) {
+    PackedFloat32Array packed;
+    packed.resize(count);
+    std::copy_n(values, count, packed.ptrw());
+    return packed;
+}
+
+// Mirror citadel-client-ffi's CitadelTransformState (position/rotation/velocity,
+// in Citadel centimetre world units) into the Dictionary the GDScript transform
+// components sample. Keys and float-array shapes match the Unity TransformState
+// reference and clients/godot/citadel/transform_sync.gd's sample consumer.
+Dictionary transform_state_to_dictionary(const CitadelTransformState &state) {
+    Dictionary dict;
+    dict["position"] = floats_to_packed(state.position, 3);
+    dict["rotation"] = floats_to_packed(state.rotation, 4);
+    dict["velocity"] = floats_to_packed(state.velocity, 3);
+    return dict;
 }
 
 } // namespace
@@ -37,6 +57,17 @@ void CitadelClientNative::_bind_methods() {
     ClassDB::bind_method(D_METHOD("decode_rep", "body", "schema_hash", "layout_version", "codecs"),
                          &CitadelClientNative::decode_rep);
     ClassDB::bind_method(D_METHOD("encode_rep", "object_id", "is_full", "result_id", "base_id", "field_count", "schema_hash", "layout_version", "fields"), &CitadelClientNative::encode_rep);
+    ClassDB::bind_method(D_METHOD("transform_view_new", "hello"), &CitadelClientNative::transform_view_new);
+    ClassDB::bind_method(D_METHOD("transform_view_apply_datagram", "view", "snapshot"),
+                         &CitadelClientNative::transform_view_apply_datagram);
+    ClassDB::bind_method(D_METHOD("transform_view_ack", "view"), &CitadelClientNative::transform_view_ack);
+    ClassDB::bind_method(D_METHOD("transform_view_sample_now", "view", "object_id"),
+                         &CitadelClientNative::transform_view_sample_now);
+    ClassDB::bind_method(D_METHOD("transform_view_authoritative", "view", "object_id"),
+                         &CitadelClientNative::transform_view_authoritative);
+    ClassDB::bind_method(D_METHOD("transform_view_free", "view"), &CitadelClientNative::transform_view_free);
+    ClassDB::bind_method(D_METHOD("transform_encode_input", "input_seq", "sim_tick", "dt", "object_id", "ownership_epoch", "velocity_x", "velocity_y", "velocity_z"),
+                         &CitadelClientNative::transform_encode_input);
     ClassDB::bind_method(D_METHOD("last_error"), &CitadelClientNative::last_error);
     ClassDB::bind_method(D_METHOD("free_handle"), &CitadelClientNative::free_handle);
 }
@@ -264,6 +295,120 @@ Dictionary CitadelClientNative::encode_rep(int64_t object_id, bool is_full, int6
     if (status == CITADEL_STATUS_OK && truncated) { output.resize(len); status = citadel_rep_encoder_finish(encoder, output.data(), output.size(), &len, &truncated); }
     citadel_rep_encoder_free(encoder); result["transport_status"] = as_status(status);
     if (status == CITADEL_STATUS_OK && !truncated) { PackedByteArray body; body.resize(static_cast<int64_t>(len)); if (len > 0) std::copy_n(output.data(), len, body.ptrw()); result["body"] = body; }
+    return result;
+}
+
+Variant CitadelClientNative::transform_view_new(const PackedByteArray &hello) const {
+    const uint8_t *body = hello.is_empty() ? nullptr : hello.ptr();
+    CitadelTransformView *view = nullptr;
+    const CitadelStatus status = citadel_transform_view_new(body, hello.size(), &view);
+    if (status != CITADEL_STATUS_OK || view == nullptr) {
+        // A nil Variant matches the GDScript wrapper's `_view == null` guard; a
+        // zero int would silently pass it and defeat the negotiation checks.
+        return Variant();
+    }
+    return static_cast<int64_t>(reinterpret_cast<intptr_t>(view));
+}
+
+bool CitadelClientNative::transform_view_apply_datagram(int64_t view, const PackedByteArray &snapshot) const {
+    if (view == 0) {
+        return false;
+    }
+    CitadelTransformView *view_ptr = reinterpret_cast<CitadelTransformView *>(static_cast<intptr_t>(view));
+    const uint8_t *body = snapshot.is_empty() ? nullptr : snapshot.ptr();
+    bool applied = false;
+    const CitadelStatus status =
+        citadel_transform_view_apply_datagram(view_ptr, body, snapshot.size(), &applied);
+    return status == CITADEL_STATUS_OK && applied;
+}
+
+PackedByteArray CitadelClientNative::transform_view_ack(int64_t view) const {
+    PackedByteArray result;
+    if (view == 0) {
+        return result;
+    }
+    CitadelTransformView *view_ptr = reinterpret_cast<CitadelTransformView *>(static_cast<intptr_t>(view));
+    std::array<uint8_t, 8> ack{};
+    if (citadel_transform_view_ack(view_ptr, ack.data()) != CITADEL_STATUS_OK) {
+        return result;
+    }
+    result.resize(static_cast<int64_t>(ack.size()));
+    std::copy_n(ack.data(), ack.size(), result.ptrw());
+    return result;
+}
+
+Dictionary CitadelClientNative::transform_view_sample_now(int64_t view, int64_t object_id) const {
+    Dictionary result;
+    if (view == 0) {
+        return result;
+    }
+    CitadelTransformView *view_ptr = reinterpret_cast<CitadelTransformView *>(static_cast<intptr_t>(view));
+    CitadelTransformState state{};
+    bool found = false;
+    if (citadel_transform_view_sample_now(view_ptr, static_cast<uint32_t>(object_id), &state, &found) !=
+            CITADEL_STATUS_OK ||
+        !found) {
+        // An empty Dictionary is the "no sample" signal the GDScript checks with
+        // sample.is_empty(); never fabricate a zero transform for a missing id.
+        return result;
+    }
+    return transform_state_to_dictionary(state);
+}
+
+Dictionary CitadelClientNative::transform_view_authoritative(int64_t view, int64_t object_id) const {
+    Dictionary result;
+    if (view == 0) {
+        return result;
+    }
+    CitadelTransformView *view_ptr = reinterpret_cast<CitadelTransformView *>(static_cast<intptr_t>(view));
+    CitadelTransformState state{};
+    uint32_t input_seq = 0;
+    bool found = false;
+    if (citadel_transform_view_authoritative_state(view_ptr, static_cast<uint32_t>(object_id), &state,
+                                                    &input_seq, &found) != CITADEL_STATUS_OK ||
+        !found) {
+        return result;
+    }
+    Dictionary sample = transform_state_to_dictionary(state);
+    sample["input_seq"] = static_cast<int64_t>(input_seq);
+    return sample;
+}
+
+void CitadelClientNative::transform_view_free(int64_t view) const {
+    if (view == 0) {
+        return;
+    }
+    citadel_transform_view_free(reinterpret_cast<CitadelTransformView *>(static_cast<intptr_t>(view)));
+}
+
+PackedByteArray CitadelClientNative::transform_encode_input(int64_t input_seq, int64_t sim_tick, double dt,
+                                                            int64_t object_id, int64_t ownership_epoch,
+                                                            double velocity_x, double velocity_y,
+                                                            double velocity_z) const {
+    PackedByteArray result;
+    std::vector<uint8_t> buffer(256);
+    uintptr_t length = 0;
+    bool truncated = false;
+    CitadelStatus status = citadel_transform_encode_input(
+        static_cast<uint32_t>(input_seq), static_cast<uint32_t>(sim_tick), static_cast<float>(dt),
+        static_cast<uint32_t>(object_id), static_cast<uint32_t>(ownership_epoch),
+        static_cast<float>(velocity_x), static_cast<float>(velocity_y), static_cast<float>(velocity_z),
+        buffer.data(), buffer.size(), &length, &truncated);
+    if (status == CITADEL_STATUS_OK && truncated) {
+        buffer.resize(length);
+        status = citadel_transform_encode_input(
+            static_cast<uint32_t>(input_seq), static_cast<uint32_t>(sim_tick), static_cast<float>(dt),
+            static_cast<uint32_t>(object_id), static_cast<uint32_t>(ownership_epoch),
+            static_cast<float>(velocity_x), static_cast<float>(velocity_y), static_cast<float>(velocity_z),
+            buffer.data(), buffer.size(), &length, &truncated);
+    }
+    if (status != CITADEL_STATUS_OK || truncated) {
+        return result;
+    }
+    result.resize(static_cast<int64_t>(length));
+    if (length > 0) {
+        std::copy_n(buffer.data(), length, result.ptrw());
+    }
     return result;
 }
 

@@ -103,6 +103,7 @@ export class CitadelClient {
   static connectWebTransport(url: string, opts?: WebTransportConnectOptions): Promise<CitadelClient>;
   static connectAuto(endpoints: AutoConnectEndpoints, opts?: AutoConnectOptions): Promise<CitadelClient>;
   handshakeGuest(opts?: { timeoutMs?: number }): Promise<AuthResult>;
+  handshakeToken(token: string, opts?: { timeoutMs?: number }): Promise<AuthResult>;
   send(kind: number, body?: Uint8Array, opts?: SendOptions): void;
   sendEnvelope(env: Envelope, opts?: SendOptions): void;
   on(kind: number, handler: EnvelopeHandler): () => void;

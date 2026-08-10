@@ -21,7 +21,7 @@ check when picking an engine.
 
 | Capability | Unity | Unreal | Godot | Web / JS | Rust |
 | --- | :---: | :---: | :---: | :---: | :---: |
-| Connect and authenticated realtime handshake | ✅ | ✅ | ✅ | 🟡 | ✅ |
+| Connect and authenticated realtime handshake | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Guest realtime handshake | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Email/password authentication | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Player profile, exact lookup, session refresh, and logout | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -35,7 +35,7 @@ check when picking an engine.
 <details>
 <summary>Row-by-row notes &amp; caveats</summary>
 
-- **Connect and authenticated realtime handshake** — Native engines (QUIC/C ABI) and Rust ship a dedicated authenticated token handshake helper; the Web SDK ships only the guest handshake helper over WebSocket, so token authentication uses the generic KIND_AUTH envelope.
+- **Connect and authenticated realtime handshake** — All SDKs ship connect plus dedicated guest and token realtime handshake helpers; native engines use QUIC/C ABI, and the Web SDK uses WebSocket (handshakeGuest / handshakeToken).
 - **Guest realtime handshake** — All clients can connect as a guest where server policy permits.
 - **Email/password authentication** — First-class HTTP registration/sign-in uses POST /v1/auth/email and returns caller-owned session tokens; durable hashed multi-key admission limits protect the public boundary. Email verification, recovery/change-password, and linking remain pending.
 - **Player profile, exact lookup, session refresh, and logout** — First-class HTTP lifecycle APIs preserve the sanitized backend error contract; the completion manifest checks their bindings and web anchors across all released SDKs. Refreshed token pairs stay caller-owned for atomic secure storage.
@@ -55,7 +55,7 @@ check when picking an engine.
 | Named room component and map-ready event | ✅ | ✅ | ✅ | ✅ | 🟡 |
 | Local ticket matchmaker RPC workflow | 🟡 | ✅ | 🟡 | 🟡 | 🟡 |
 | Local party management and party tickets | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
-| Transform sync snapshots and interpolation | ✅ | ✅ | 🟡 | 🟡 | 🟡 |
+| Transform sync snapshots and interpolation | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | Owner prediction, reconciliation, and rewind | 🟡 | ✅ | 🟡 | ⬜ | 🟡 |
 | NetworkPeer property replication authoring | 🟡 | 🟡 | 🟡 | 🟡 | ✅ |
 | Networked-actor presence/spawn integration | 🟡 | ✅ | 🟡 | ⬜ | 🟡 |
@@ -67,7 +67,7 @@ check when picking an engine.
 - **Named room component and map-ready event** — Unity, Unreal, Godot, and JS/Web expose named-room join/create, leave, map-ready, and joined/left lifecycle events; Unity/Godot editor smoke remains manual.
 - **Local ticket matchmaker RPC workflow** — All can use generic RPC; dedicated matchmaker event ergonomics differ.
 - **Local party management and party tickets** — All use generic RPC; feature itself remains local-node only.
-- **Transform sync snapshots and interpolation** — Unity (via the shared C ABI) and Unreal (a faithful C++ port) run the full interpolation runtime with Hermite/slerp and an adaptive buffer; Godot ships the GDScript surface but its GDExtension does not expose the transform runtime yet, so it is source-only. The browser SDK ships v2 snapshot decode primitives and an epoch fence over WebTransport unreliable datagrams (WebSocket stays reliable-only), without the interpolation runtime.
+- **Transform sync snapshots and interpolation** — Unity (via the shared C ABI) and Unreal (a faithful C++ port) run the full interpolation runtime with Hermite/slerp and an adaptive buffer; Godot's GDExtension also binds and runs the transform runtime (its 7 transform methods are headless-smoke verified in Godot 4.7); a full in-editor gameplay pass stays a manual pre-release check. The browser SDK ships v2 snapshot decode primitives and an epoch fence over WebTransport unreliable datagrams (WebSocket stays reliable-only), without the interpolation runtime.
 - **Owner prediction, reconciliation, and rewind** — Unreal is the fully documented owner integration; other surfaces are bounded.
 - **NetworkPeer property replication authoring** — Rust ships canonical typed authoring. C ABI v3 encodes and iterates decoded typed keyed-collection operations; Unity has a managed v3 wrapper, while Unreal/Godot bindings are source-level only. Engine runtime verification is deferred because those engines are unavailable.
 - **Networked-actor presence/spawn integration** — Unreal is end-to-end; Unity/Godot have transform layers but not full spawn integration.

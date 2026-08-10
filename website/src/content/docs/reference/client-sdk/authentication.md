@@ -165,10 +165,8 @@ client.authenticate(Some(&token)).await?;
 
 ```js
 const client = await CitadelClient.connect("ws://127.0.0.1:7352/");
-// The current Web SDK exposes guest handshake directly. Send KIND_AUTH with
-// token bytes and await KIND_AUTH_RESULT for account authentication.
-client.send(KIND_AUTH, new TextEncoder.encode(token));
-await client.waitForKind(KIND_AUTH_RESULT);
+// Dedicated helpers frame KIND_AUTH and await KIND_AUTH_RESULT for you.
+await client.handshakeToken(token); // or client.handshakeGuest() for a guest session
 ```
 </TabItem>
 </Tabs>
