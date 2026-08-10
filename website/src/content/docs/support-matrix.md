@@ -21,7 +21,7 @@ check when picking an engine.
 
 | Capability | Unity | Unreal | Godot | Web / JS | Rust |
 | --- | :---: | :---: | :---: | :---: | :---: |
-| Connect and authenticated realtime handshake | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Connect and authenticated realtime handshake | ✅ | ✅ | ✅ | 🟡 | ✅ |
 | Guest realtime handshake | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Email/password authentication | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Player profile, exact lookup, session refresh, and logout | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -35,7 +35,7 @@ check when picking an engine.
 <details>
 <summary>Row-by-row notes &amp; caveats</summary>
 
-- **Connect and authenticated realtime handshake** — Native engines use QUIC/C ABI paths; Web uses WebSocket handshake.
+- **Connect and authenticated realtime handshake** — Native engines (QUIC/C ABI) and Rust ship a dedicated authenticated token handshake helper; the Web SDK ships only the guest handshake helper over WebSocket, so token authentication uses the generic KIND_AUTH envelope.
 - **Guest realtime handshake** — All clients can connect as a guest where server policy permits.
 - **Email/password authentication** — First-class HTTP registration/sign-in uses POST /v1/auth/email and returns caller-owned session tokens; durable hashed multi-key admission limits protect the public boundary. Email verification, recovery/change-password, and linking remain pending.
 - **Player profile, exact lookup, session refresh, and logout** — First-class HTTP lifecycle APIs preserve the sanitized backend error contract; the completion manifest checks their bindings and web anchors across all released SDKs. Refreshed token pairs stay caller-owned for atomic secure storage.
@@ -55,7 +55,7 @@ check when picking an engine.
 | Named room component and map-ready event | ✅ | ✅ | ✅ | ✅ | 🟡 |
 | Local ticket matchmaker RPC workflow | 🟡 | ✅ | 🟡 | 🟡 | 🟡 |
 | Local party management and party tickets | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
-| Transform sync snapshots and interpolation | ✅ | ✅ | ✅ | ⬜ | 🟡 |
+| Transform sync snapshots and interpolation | ✅ | ✅ | 🟡 | 🟡 | 🟡 |
 | Owner prediction, reconciliation, and rewind | 🟡 | ✅ | 🟡 | ⬜ | 🟡 |
 | NetworkPeer property replication authoring | 🟡 | 🟡 | 🟡 | 🟡 | ✅ |
 | Networked-actor presence/spawn integration | 🟡 | ✅ | 🟡 | ⬜ | 🟡 |
@@ -67,9 +67,9 @@ check when picking an engine.
 - **Named room component and map-ready event** — Unity, Unreal, Godot, and JS/Web expose named-room join/create, leave, map-ready, and joined/left lifecycle events; Unity/Godot editor smoke remains manual.
 - **Local ticket matchmaker RPC workflow** — All can use generic RPC; dedicated matchmaker event ergonomics differ.
 - **Local party management and party tickets** — All use generic RPC; feature itself remains local-node only.
-- **Transform sync snapshots and interpolation** — Unity/Unreal/Godot have engine surfaces; WebSocket lacks unreliable snapshot path.
+- **Transform sync snapshots and interpolation** — Unity (via the shared C ABI) and Unreal (a faithful C++ port) run the full interpolation runtime with Hermite/slerp and an adaptive buffer; Godot ships the GDScript surface but its GDExtension does not expose the transform runtime yet, so it is source-only. The browser SDK ships v2 snapshot decode primitives and an epoch fence over WebTransport unreliable datagrams (WebSocket stays reliable-only), without the interpolation runtime.
 - **Owner prediction, reconciliation, and rewind** — Unreal is the fully documented owner integration; other surfaces are bounded.
-- **NetworkPeer property replication authoring** — Rust ships canonical typed authoring. C ABI v3 encodes typed keyed-collection operations but cannot yet iterate decoded collection operations; Unity has a managed v3 wrapper, while Unreal/Godot bindings are source-level only. Engine runtime verification is deferred because those engines are unavailable.
+- **NetworkPeer property replication authoring** — Rust ships canonical typed authoring. C ABI v3 encodes and iterates decoded typed keyed-collection operations; Unity has a managed v3 wrapper, while Unreal/Godot bindings are source-level only. Engine runtime verification is deferred because those engines are unavailable.
 - **Networked-actor presence/spawn integration** — Unreal is end-to-end; Unity/Godot have transform layers but not full spawn integration.
 - **Authoritative server physics replication** — Replicates through transform/actor layers; no WebSocket binary gameplay helper.
 
@@ -115,12 +115,12 @@ yet published, the SDK still builds from source.
 <details>
 <summary>Row-by-row notes &amp; caveats</summary>
 
-- **Standalone server package** — Windows, Linux x86_64 musl, and Linux ARM64 musl release archives are published and CI-validated. Native Apple Silicon and Intel macOS packages build in CI; their first published, Developer-ID-signed and notarized release is pending Apple credentials and release verification.
-- **Unity SDK package** — Windows native FFI package is released. Native Apple Silicon and Intel macOS .dylib packages build in CI; public signed/notarized delivery awaits its first release.
-- **Unreal plugin package** — Windows drop-in package is released. Native macOS staticlib packages build in CI; an Unreal Editor macOS smoke and the first signed public release remain manual release gates.
-- **Godot SDK package** — Windows GDExtension package is released; the portable Godot Web ZIP ships the reliable WebSocketPeer addon plus a verified .html/.js/.pck/.wasm export without native artifacts. Linux CI loads it in Chromium against a real Citadel WebSocket server for guest auth, relay, receive/poll and close; deployed-browser TLS/origin smoke remains manual. Native macOS framework packages build in CI; a Godot Editor macOS smoke and the first signed public release remain manual release gates.
+- **Standalone server package** — Windows, Linux x86_64 musl, and Linux ARM64 musl release archives are published and CI-validated. Native Apple Silicon and Intel macOS packages exist only as a local Makefile target (package-macos) and are not built in CI: the macOS release matrix is intentionally disabled pending Apple Developer ID and notarization credentials, and no macOS package is published yet.
+- **Unity SDK package** — Windows native FFI package is released. Native Apple Silicon and Intel macOS .dylib packages exist only as a local Makefile target (package-client-unity-macos) and are not built in CI: the macOS matrix is disabled pending Apple Developer ID and notarization credentials, and none is published yet.
+- **Unreal plugin package** — Windows drop-in package is released. Native macOS staticlib packages exist only as a local Makefile target (package-client-unreal-macos) and are not built in CI: the macOS matrix is disabled pending Apple Developer ID and notarization credentials; an Unreal Editor macOS smoke and the first signed public release remain manual gates, and none is published yet.
+- **Godot SDK package** — Windows GDExtension package is released; the portable Godot Web ZIP ships the reliable WebSocketPeer addon plus a verified .html/.js/.pck/.wasm export without native artifacts. Linux CI loads it in Chromium against a real Citadel WebSocket server for guest auth, relay, receive/poll and close; deployed-browser TLS/origin smoke remains manual. Native macOS .dylib packages exist only as a local Makefile target (package-client-godot-macos) and are not built in CI: the macOS matrix is disabled pending Apple Developer ID and notarization credentials; a Godot Editor macOS smoke and the first signed public release remain manual gates, and none is published yet.
 - **Web / JavaScript SDK** — WebSocket client runs in supported browsers; this is not a native engine package.
-- **Rust client crate and C ABI source** — Source integration is portable; native macOS FFI archives now build in the engine-package CI but await their first signed public release.
+- **Rust client crate and C ABI source** — Source integration is portable; the Windows C ABI FFI archives ship bundled inside the engine client packages, while native macOS FFI archives exist only as local Makefile targets (package-client-*-macos) and are not built in CI: the macOS matrix is disabled pending Apple Developer ID and notarization credentials, and none is published yet.
 
 </details>
 
@@ -194,7 +194,7 @@ language columns show which embedded game-logic runtimes expose it.
 <summary>Row-by-row notes &amp; caveats</summary>
 
 - **Versioned JSON storage read/write/delete/list** — Permissions, cursors, create-only, compare-and-swap, and runtime access ship.
-- **Storage indexes and query filters** — Operator-declared SQLite/PostgreSQL/CockroachDB indexes provide bounded equality filters plus durable include/exclude callbacks in Lua/Python/JS; index search is trusted game-logic work, not a generic client endpoint.
+- **Storage indexes and query filters** — Operator-declared SQLite/PostgreSQL/CockroachDB/MongoDB indexes provide bounded equality filters plus durable include/exclude callbacks in Lua/Python/JS; index search is trusted game-logic work, not a generic client endpoint.
 - **Atomic multi-resource account/storage/wallet updates** — Repository boundaries exist but no public multi-update unit-of-work API.
 - **SQLite backend** — Single-file durable default for self-hosted nodes.
 - **PostgreSQL backend** — Durable production backend with migrations.
@@ -218,7 +218,7 @@ language columns show which embedded game-logic runtimes expose it.
 | Groups/clans: CRUD, role-safe membership, and admission workflows | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Group invitations and join requests | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Authorized durable direct, group, and room chat history | 🟡 | ✅ | ✅ | ✅ | ⬜ | ⬜ |
-| Chat presence, typing, and live fan-out | 🟡 | ⬜ | ⬜ | 🟡 | ⬜ | ⬜ |
+| Chat presence, typing, and live fan-out | 🟡 | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
 | Chat moderation and history administration | ✅ | — | — | — | — | — |
 | Durable player notification inbox | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Local live notification delivery | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
@@ -230,7 +230,7 @@ language columns show which embedded game-logic runtimes expose it.
 
 - **Friends: invite, accept, block, remove, list** — Durable social graph with game-client RPC and parity host API.
 - **Social-provider friend import and friends-of-friends** — Requires provider identity integrations and graph traversal.
-- **Groups/clans: CRUD, role-safe membership, and admission workflows** — Open self-join, closed-group requests, invitations, approval/accept/cancel flows, and superadmin ownership transfer are durable and exposed through client RPC and parity host APIs.
+- **Groups/clans: CRUD, role-safe membership, and admission workflows** — Open self-join, closed-group requests, invitations, approval/accept/cancel flows, and superadmin ownership transfer are durable and exposed to trusted game logic through the groups.call host API; client RPC covers CRUD and role-safe membership.
 - **Group invitations and join requests** — Persisted request and invitation state supports idempotent cancellation, role-safe approval, and invitation acceptance.
 - **Authorized durable direct, group, and room chat history** — Send, history, author edit/delete, group-admin moderation, revisions, tombstones, redacted audit records, and multi-key durable limits derive targets server-side and fence friendship, membership, and room access; live delivery is available after chat.join on current authenticated cluster leases.
 - **Chat presence, typing, and live fan-out** — Chat.join/leave, authorized ephemeral typing with receiver-side expiry, presence, committed reliable KIND_CHAT_EVENT fan-out, bounded resync, revocation cleanup, and typed mTLS cross-node durable delivery with leased fenced advertisements ship. Typing is local-node only.
@@ -277,7 +277,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Local realtime parties** — Invite/accept/leader/remove and atomic party tickets ship; all clients use generic RPC and client-specific convenience ergonomics remain partial.
 - **Distributed party ownership, presence, and failover** — PostgreSQL/CockroachDB clusters provide durably fenced owner routing, restart-safe membership snapshots, privacy-scoped presence, one recovery resync per owner generation, and atomic whole-party tickets. Party data messages and dedicated client SDK ergonomics remain unshipped; SQLite/MongoDB clusters are rejected.
 - **Transform sync, prediction, reconciliation, rewind** — Authoritative snapshots and owner modes; browser WebSocket cannot use the unreliable hot path.
-- **NetworkPeer property replication** — Opt-in gateway authority, trusted schema/object lifecycle seam, shared-grid relevance, ABI v3 typed scalar/vector/quaternion and keyed-collection authoring, and Rust authoring ship. The C ABI cannot yet iterate decoded keyed-collection operations; Unreal receive/apply/ACK/full-recovery and match/room AOI remain separate.
+- **NetworkPeer property replication** — Opt-in gateway authority, trusted schema/object lifecycle seam, shared-grid relevance, ABI v3 typed scalar/vector/quaternion and keyed-collection authoring, C ABI decoded keyed-collection iteration, and Rust authoring ship. Unreal receive/apply/ACK/full-recovery and match/room AOI remain separate.
 - **CMAP static collision, server navmesh, and map queries** — Static cooked collision feeds navmesh, map_info, raycasts, overlap, and ground queries.
 - **Server-simulated kinematic physics** — Deterministic static-map collision, gravity, impulse, movement intent, and state; no dynamic rigid bodies.
 
@@ -297,7 +297,7 @@ language columns show which embedded game-logic runtimes expose it.
 | Broadcast/send, actors, maps, physics, storage, log | — | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Friends, groups, leaderboards, chat, wallet, notifications host APIs | — | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Before/after API and realtime interception hooks | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
-| Matchmaker callbacks, leaderboard/tournament reset callbacks | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
+| Matchmaker callbacks, leaderboard/tournament reset callbacks | 🟡 | 🟡 | 🟡 | 🟡 | ⬜ | ⬜ |
 | Runtime outbound HTTP, custom HTTP endpoints, events, shared cache | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Dashboard and authenticated operator API | ✅ | — | — | — | — | — |
 | Console MFA, user lifecycle, password reset, ACL templates | ⬜ | — | — | — | — | — |
@@ -316,7 +316,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Broadcast/send, actors, maps, physics, storage, log** — Current language-neutral host surface is mechanically checked.
 - **Friends, groups, leaderboards, chat, wallet, notifications host APIs** — Friends/notifications have direct functions; remaining domain calls use validated bridges.
 - **Before/after API and realtime interception hooks** — Post-handshake before hooks can veto eligible envelopes; after hooks observe the synchronous local delivery outcome without mutation or side effects.
-- **Matchmaker callbacks, leaderboard/tournament reset callbacks** — Schedulers and callback contracts are not shipped.
+- **Matchmaker callbacks, leaderboard/tournament reset callbacks** — A durable, supervised leaderboard-reset scheduler delivers on_leaderboard_reset to Lua, Python, and JavaScript under fenced backend leases; matchmaker matched callbacks and tournament-reset callbacks are not shipped.
 - **Runtime outbound HTTP, custom HTTP endpoints, events, shared cache** — Trusted Lua, Python, and JavaScript expose Rust-owned asynchronous http.start/poll/cancel with explicit egress policy, DNS rebinding defenses, and shared rate/concurrency limits. They can also register bounded endpoints under /ext when enabled, use opt-in best-effort events, and share an opt-in non-durable cache with fenced cluster fan-out.
 - **Dashboard and authenticated operator API** — Accounts, storage, groups, chat, notifications, leaderboards, matches, runtime, config, purchases, audit, and the error journal.
 - **Console MFA, user lifecycle, password reset, ACL templates** — Operator authentication roles ship; these advanced controls do not.
