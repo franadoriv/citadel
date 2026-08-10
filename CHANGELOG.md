@@ -5,6 +5,54 @@ All notable changes to Citadel are documented here. Version numbers follow
 
 ## Unreleased
 
+## [0.10.0] - 2026-08-09
+
+### Added
+
+- **GameScript authoritative game logic.** Embedded Lua, Python, and JavaScript
+  runtimes can own protected gameplay end-to-end: a supervised worker protocol
+  with a real Windows backend and per-match isolation, an immutable
+  hash-addressed revision repository (PostgreSQL, CockroachDB, MongoDB, SQLite),
+  a per-match execution scheduler, a mandatory readiness gate for match
+  admission (`runtime.require_script`), and an authoritative input/command
+  bridge (`citadel.on_input`, fenced command batches, lag-compensated fire/hit)
+  with Lua/Python/JavaScript parity. GameScript is documented as a headline
+  feature.
+- **Text-policy content-safety API.** Operator-owned JSON policies loaded during
+  script initialization, with identical `load_json`, `scan`, and `sanitize`
+  surfaces across Lua, Python, and JavaScript. Rust-owned, cached, and sealed
+  before handlers run; fail-closed on an invalid policy.
+- Exposed authoritative navigation queries to server runtimes.
+- Added a two-node cluster matchmaker probe to the bot stress simulator for
+  multi-node load testing.
+
+### Changed
+
+- **Room-scoped replication isolation.** Room membership and replication
+  membership are now bound atomically across every lifecycle transition, and the
+  object/connection-to-room binding is enforced as an invariant at delivery,
+  apply, and bootstrap. Cross-room delivery fails closed, closing a cross-match
+  transform/replicated-state leak. Remote authoritative admission fail-closes
+  pending the cross-node relay follow-up.
+- Extracted `citadel-transform` so the engine SDK C ABI no longer links the
+  server crate.
+- Party RPC now reuses the shared server runtime.
+- Cached Python payload extraction to avoid repeated unpacking.
+
+### Security
+
+- Hardened console operator authentication.
+- Terminated TLS on the HTTP surface and served security response headers.
+
+### Fixed
+
+- Kept slash-delimited signed Python payloads valid on native Windows, closing
+  READY before the atomic staging-directory activation.
+- Tracked match overrun streaks per quantum kind.
+- Fenced GameScript submit-dedupe against concurrent revision pruning.
+- Made JSON stale-guards independent of build-graph ordering.
+- Dropped `COLLATE C` from the CockroachDB settlement-outbox migration.
+
 ## [0.9.14] - 2026-08-03
 
 ### Added
