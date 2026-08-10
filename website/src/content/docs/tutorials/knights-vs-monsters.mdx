@@ -250,15 +250,14 @@ That is less dramatic than a server crash, which is exactly the point.
 Choose one client path below. All paths share the exact three game kinds and
 the same text bodies from [Step 2](#step-2-agree-on-three-messages).
 
-:::caution[Current engine status]
-Unity, Unreal, and Godot all have working native client routes. On Godot the
-release package ships a prebuilt Windows GDExtension (`CitadelClientNative`) that
-drives the same C ABI as Unity and Unreal, so its tab makes a live connection
-once that package is installed; copying only the GDScript files without the
-native binary falls back to an error status (the SDK's "skeleton" state). In
-Unreal, Blueprint can call the connection/auth nodes, while raw game envelopes
-(`Send`/`Poll`) are currently C++ only; the Blueprint recipe below uses a small
-C++ bridge component.
+:::note[Which client path to use]
+Unity, Unreal, and Godot all have working native client routes, plus browser
+paths through the Web/JavaScript SDKs. For Godot, the release package ships a
+prebuilt Windows GDExtension, so this tab connects live once you install it
+(build it from source for other desktop platforms); for a browser export, use
+the pure-GDScript Web client instead. In Unreal, Blueprint can drive connection
+and auth, but raw game envelopes (`Send`/`Poll`) are C++ only, so the Blueprint
+recipe below adds a small C++ bridge component.
 :::
 
 <Tabs syncKey="engine">

@@ -422,10 +422,10 @@ while client.poll(out) == CitadelClient.Status.OK:
 `send`/`poll` above move real bytes through the native `CitadelClientNative`
 GDExtension, shipped prebuilt for Windows in the Godot release package (it drives
 the same C ABI as Unity and Unreal). If you copy only the GDScript files without
-that native binary, the calls return an error status through `last_error` (the
-SDK's "skeleton" fallback) instead of moving bytes. For a browser export, use
-`CitadelWebClient`, which needs no GDExtension — see the
-[Godot Web SDK](/reference/client-sdk/godot-web/).
+that native binary, the calls return a clear error through `last_error` instead
+of moving bytes — install the full release package (or build the extension) to
+fix it. For a browser export, use `CitadelWebClient`, which needs no
+GDExtension — see the [Godot Web SDK](/reference/client-sdk/godot-web/).
 :::
 
 </TabItem>
