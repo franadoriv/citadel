@@ -16,11 +16,16 @@
     "./protocol": "./src/protocol.js",
     "./envelope": "./src/envelope.js",
     "./client": "./src/client.js",
+    "./chat": {
+      "types": "./chat.d.ts",
+      "import": "./src/chat.js"
+    },
     "./networkpeer": "./src/networkpeer.js"
   },
   "files": [
     "src/",
     "index.d.ts",
+    "chat.d.ts",
     "README.md"
   ],
   "scripts": {
@@ -39,5 +44,8 @@
   ],
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "lossless-json": "4.3.1"
   }
 }

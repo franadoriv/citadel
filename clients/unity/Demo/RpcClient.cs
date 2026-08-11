@@ -146,7 +146,8 @@ namespace Citadel.Demo
             if (!CitadelProtocol.TryDecodeRpcResponse(
                     body, length, out ulong requestId, out byte status, out byte[] payload))
             {
-                Debug.LogWarning("[Citadel] dropped a malformed RPC response.");
+                Debug.LogWarning("[Citadel] malformed RPC response; failing all pending callbacks.");
+                FailAllPending("malformed RPC response");
                 return;
             }
 
@@ -168,6 +169,19 @@ namespace Citadel.Demo
             {
                 // A throwing callback must not wedge the poll loop.
                 Debug.LogError($"[Citadel] RPC callback for request_id {requestId} threw: {e}");
+            }
+        }
+
+        /// <summary>Fail and remove every callback when a consumed frame cannot be correlated.</summary>
+        public void FailAllPending(string reason)
+        {
+            byte[] payload = System.Text.Encoding.UTF8.GetBytes(reason ?? "RPC transport failure");
+            var pending = new List<KeyValuePair<ulong, Action<CitadelRpcResult>>>(_pending);
+            _pending.Clear();
+            foreach (KeyValuePair<ulong, Action<CitadelRpcResult>> item in pending)
+            {
+                try { item.Value?.Invoke(new CitadelRpcResult(item.Key, false, payload)); }
+                catch (Exception e) { Debug.LogError($"[Citadel] RPC failure callback for request_id {item.Key} threw: {e}"); }
             }
         }
 

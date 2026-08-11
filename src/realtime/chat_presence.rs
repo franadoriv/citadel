@@ -62,6 +62,11 @@ pub struct ChatLeave {
     pub remaining: Vec<ChatSubscription>,
 }
 
+/// The subscriber authority registry could not be inspected. Callers must
+/// treat this as retryable infrastructure failure, never authoritative absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatPresenceUnavailable;
+
 /// Process-local chat presence. It is intentionally single-node;
 /// owns the leased cross-node directory and typed router.
 #[derive(Debug, Default)]
@@ -75,6 +80,18 @@ impl ChatPresenceRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_state_for_test(&self) {
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.state.lock().expect("presence lock before poisoning");
+            assert!(
+                self.state.is_poisoned(),
+                "deliberately poison the chat presence mutex"
+            );
+        }));
+        assert!(poison.is_err(), "poisoning assertion must unwind");
     }
 
     /// Idempotently add one participant to a channel.
@@ -156,16 +173,21 @@ impl ChatPresenceRegistry {
     /// durable event. Cross-node delivery uses this narrow view after validating
     /// its channel lease, so an event never reaches a subscription that predates
     /// a local authority change.
-    #[must_use]
     pub fn subscribers_at_authority_epoch(
         &self,
         channel_id: &str,
         authority_epoch: u64,
-    ) -> Vec<ChatSubscription> {
-        let Ok(state) = self.state.lock() else {
-            return Vec::new();
+    ) -> Result<Vec<ChatSubscription>, ChatPresenceUnavailable> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                self.state.clear_poison();
+                drop(state);
+                return Err(ChatPresenceUnavailable);
+            }
         };
-        state
+        Ok(state
             .channels
             .get(channel_id)
             .map(|channel| {
@@ -175,7 +197,7 @@ impl ChatPresenceRegistry {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// Snapshot every local subscription. Callers use this only to reconcile a
@@ -332,12 +354,15 @@ mod tests {
             5,
         );
 
-        let current = registry.subscribers_at_authority_epoch("ch_a", 5);
+        let current = registry
+            .subscribers_at_authority_epoch("ch_a", 5)
+            .expect("healthy authority registry");
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].user_id, "bob");
         assert!(
             registry
                 .subscribers_at_authority_epoch("ch_a", 6)
+                .expect("healthy authority registry")
                 .is_empty()
         );
     }

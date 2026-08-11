@@ -13,8 +13,9 @@
 namespace godot {
 namespace {
 
-constexpr size_t kInitialPollCapacity = 64 * 1024;
-constexpr size_t kMaximumPollCapacity = 4 * 1024 * 1024;
+// citadel_client_poll consumes the queue item even when truncated. Use the
+// protocol-wide bounded envelope cap in one call; never "retry" into the next item.
+constexpr size_t kPollCapacity = 8 * 1024 * 1024;
 
 int64_t as_status(CitadelStatus status) {
     return static_cast<int64_t>(status);
@@ -155,18 +156,17 @@ Dictionary CitadelClientNative::poll() {
         return result;
     }
 
-    std::vector<uint8_t> buffer(kInitialPollCapacity);
+    std::vector<uint8_t> buffer(kPollCapacity);
     uint16_t kind = 0;
     uintptr_t payload_len = 0;
     bool truncated = false;
     CitadelStatus status = citadel_client_poll(
         handle_, &kind, buffer.data(), buffer.size(), &payload_len, &truncated);
-    if (status == CITADEL_STATUS_OK && truncated && payload_len <= kMaximumPollCapacity) {
-        buffer.resize(payload_len);
-        status = citadel_client_poll(handle_, &kind, buffer.data(), buffer.size(), &payload_len, &truncated);
-    }
-
     result["transport_status"] = as_status(status);
+    if (status == CITADEL_STATUS_OK) {
+        result["truncated"] = truncated;
+        result["required_len"] = static_cast<int64_t>(payload_len);
+    }
     if (status == CITADEL_STATUS_OK && !truncated) {
         PackedByteArray payload;
         payload.resize(static_cast<int64_t>(payload_len));

@@ -69,7 +69,7 @@ async fn websocket_call_rpc_resolves_correlated_reply() {
     // Success path: `add(2, 40)` resolves to the correlated `42` reply.
     let reply = tokio::time::timeout(
         Duration::from_secs(5),
-        client.call_rpc("add", &encode_add(2, 40)),
+        client.call_rpc("add", &encode_add(2, 40), |_| Ok(())),
     )
     .await
     .expect("add rpc did not time out")
@@ -81,7 +81,7 @@ async fn websocket_call_rpc_resolves_correlated_reply() {
     // helper's request-id counter advances and still matches correctly).
     let reply = tokio::time::timeout(
         Duration::from_secs(5),
-        client.call_rpc("add", &encode_add(100, 1)),
+        client.call_rpc("add", &encode_add(100, 1), |_| Ok(())),
     )
     .await
     .expect("second add did not time out")
@@ -91,10 +91,13 @@ async fn websocket_call_rpc_resolves_correlated_reply() {
 
     // Error path: a handler that raises maps to `ClientError::Rpc` (never a
     // panic), carrying the correlation id and a generic message.
-    let err = tokio::time::timeout(Duration::from_secs(5), client.call_rpc("boom", b""))
-        .await
-        .expect("boom rpc did not time out")
-        .expect_err("boom rpc reports an error");
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_rpc("boom", b"", |_| Ok(())),
+    )
+    .await
+    .expect("boom rpc did not time out")
+    .expect_err("boom rpc reports an error");
     // The error is a correlated `Rpc` variant carrying this (third) call's id.
     assert!(
         matches!(err, ClientError::Rpc { request_id: 3, .. }),
@@ -104,7 +107,7 @@ async fn websocket_call_rpc_resolves_correlated_reply() {
     // Unknown method also errors rather than hanging or panicking.
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        client.call_rpc("does-not-exist", b""),
+        client.call_rpc("does-not-exist", b"", |_| Ok(())),
     )
     .await
     .expect("unknown rpc did not time out")
@@ -124,14 +127,15 @@ async fn quic_call_rpc_resolves_correlated_reply() {
     let mut sup = Supervisor::new();
     sup.spawn(server);
 
-    let client = QuicClient::connect(addr, "localhost", ClientTls::insecure_skip_verification())
-        .await
-        .expect("client connects");
+    let mut client =
+        QuicClient::connect(addr, "localhost", ClientTls::insecure_skip_verification())
+            .await
+            .expect("client connects");
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let reply = tokio::time::timeout(
         Duration::from_secs(5),
-        client.call_rpc("add", &encode_add(20, 22)),
+        client.call_rpc("add", &encode_add(20, 22), |_| Ok(())),
     )
     .await
     .expect("add rpc did not time out")
@@ -139,10 +143,13 @@ async fn quic_call_rpc_resolves_correlated_reply() {
     let sum = u32::from_be_bytes(reply.as_slice().try_into().expect("u32 reply"));
     assert_eq!(sum, 42);
 
-    let err = tokio::time::timeout(Duration::from_secs(5), client.call_rpc("boom", b""))
-        .await
-        .expect("boom rpc did not time out")
-        .expect_err("boom rpc reports an error");
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_rpc("boom", b"", |_| Ok(())),
+    )
+    .await
+    .expect("boom rpc did not time out")
+    .expect_err("boom rpc reports an error");
     assert!(matches!(err, ClientError::Rpc { .. }));
 
     client.close();

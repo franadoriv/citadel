@@ -29,7 +29,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
@@ -97,7 +97,8 @@ impl ChannelType {
 }
 
 /// One retained chat message, or its tombstone.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     /// Per-channel sequential id (starts at 1, monotonic, never reused).
     pub id: u64,
@@ -120,6 +121,18 @@ pub struct ChatMessage {
     pub deleted: bool,
 }
 
+/// Closed wire DTO persisted in the durable delivery outbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChatDeliveryEvent {
+    pub(crate) version: u8,
+    #[serde(rename = "type")]
+    pub(crate) event_type: String,
+    pub(crate) channel_id: String,
+    pub(crate) event_id: u64,
+    pub(crate) message: ChatMessage,
+}
+
 /// One durable chat-event row awaiting bounded live delivery attempts.
 ///
 /// It contains an opaque channel event payload only. Destination nodes are
@@ -127,6 +140,9 @@ pub struct ChatMessage {
 /// persisted as a socket or participant capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatDeliveryOutboxRecord {
+    /// Stable node that committed the mutation and exclusively owns delivery
+    /// and acknowledgement of this row.
+    pub origin_node_id: String,
     /// Opaque durable channel identifier.
     pub channel_id: String,
     /// Stable channel-scoped event identity.
@@ -149,6 +165,8 @@ pub struct ChatDeliveryOutboxRecord {
 /// enclosing mutation transaction commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatDeliveryRequest {
+    /// Stable node that is committing and will dispatch this mutation.
+    pub origin_node_id: String,
     /// Authorization fence captured when the caller was authorized.
     pub authority_epoch: u64,
     /// Exclusive retry deadline for bounded live delivery.
@@ -157,25 +175,81 @@ pub struct ChatDeliveryRequest {
     pub event_type: &'static str,
 }
 
+pub(crate) fn validate_delivery_event_state(event: &ChatDeliveryEvent) -> AppResult<()> {
+    let message = &event.message;
+    if event.version != 1
+        || event.channel_id.trim().is_empty()
+        || event.event_id == 0
+        || message.id == 0
+        || message.sender.trim().is_empty()
+        || message.last_event_id != event.event_id
+        || message.updated_at_unix_ms < message.created_at_unix_ms
+    {
+        return Err(AppError::validation("invalid chat delivery event state"));
+    }
+    let state_matches_type = match event.event_type.as_str() {
+        "message.create" => {
+            crate::services::validate_chat_content(&message.content)?;
+            !message.deleted
+                && message.revision == 1
+                && message.created_at_unix_ms == message.updated_at_unix_ms
+        }
+        "message.update" => {
+            crate::services::validate_chat_content(&message.content)?;
+            !message.deleted && message.revision > 1
+        }
+        "message.remove" => message.deleted && message.content.is_empty() && message.revision > 1,
+        other => {
+            return Err(AppError::validation(format!(
+                "unsupported chat delivery event type `{other}`"
+            )));
+        }
+    };
+    if !state_matches_type {
+        return Err(AppError::validation(
+            "chat delivery event type does not match message state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delivery_request(
+    delivery: &ChatDeliveryRequest,
+    expected_event_type: &'static str,
+    now: TimestampMillis,
+) -> AppResult<()> {
+    if delivery.event_type != expected_event_type {
+        return Err(AppError::validation(format!(
+            "chat delivery request type `{}` does not match `{expected_event_type}` mutation",
+            delivery.event_type
+        )));
+    }
+    if delivery.origin_node_id.trim().is_empty() || delivery.expires_at <= now {
+        return Err(AppError::validation("invalid chat delivery request"));
+    }
+    Ok(())
+}
+
 /// Serialize the one client-visible durable event form used by both immediate
 /// local fan-out and persisted remote delivery. Keeping it at the repository
 /// boundary lets durable backends write the exact payload in the transaction
 /// that reserves `last_event_id`.
 pub fn serialize_delivery_event(
     channel_id: &str,
-    channel_type: ChannelType,
+    _channel_type: ChannelType,
     event_type: &str,
     message: &ChatMessage,
 ) -> AppResult<String> {
-    serde_json::to_string(&serde_json::json!({
-        "version": 1,
-        "type": event_type,
-        "channel_id": channel_id,
-        "channel_type": channel_type.as_str(),
-        "event_id": message.last_event_id,
-        "message": message,
-    }))
-    .map_err(|error| AppError::internal(format!("serialize chat delivery event: {error}")))
+    let event = ChatDeliveryEvent {
+        version: 1,
+        event_type: event_type.to_owned(),
+        channel_id: channel_id.to_owned(),
+        event_id: message.last_event_id,
+        message: message.clone(),
+    };
+    validate_delivery_event_state(&event)?;
+    serde_json::to_string(&event)
+        .map_err(|error| AppError::internal(format!("serialize chat delivery event: {error}")))
 }
 
 impl ChatDeliveryOutboxRecord {
@@ -580,6 +654,22 @@ pub trait ChatRepository: Send + Sync {
         now: TimestampMillis,
     ) -> AppResult<bool>;
 
+    /// Atomically fence authorization, tombstone the message, reserve its
+    /// revision/event id, append the redacted audit, and stage live delivery.
+    /// A repeated tombstone returns `None` and appends nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        audit: &ChatModerationAudit,
+        access_key: &str,
+        expected_access_epoch: u64,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>>;
+
     /// Remove at most `limit` durable moderation audits older than `before`.
     /// The independent audit retention window never changes message retention.
     async fn cleanup_moderation_audit(
@@ -608,16 +698,21 @@ pub trait ChatRepository: Send + Sync {
     /// Destination leases are deliberately resolved only by the dispatcher.
     async fn stage_delivery_outbox(&self, record: ChatDeliveryOutboxRecord) -> AppResult<bool>;
 
-    /// Read source rows whose exclusive retry deadline has not elapsed.
+    /// Read active source rows owned by `origin_node_id` only.
     async fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>>;
 
-    /// Remove a source row only after terminal dispatcher acknowledgement.
-    async fn acknowledge_delivery_outbox(&self, channel_id: &str, event_id: u64)
-    -> AppResult<bool>;
+    /// Remove an owned source row only after terminal dispatcher acknowledgement.
+    async fn acknowledge_delivery_outbox(
+        &self,
+        origin_node_id: &str,
+        channel_id: &str,
+        event_id: u64,
+    ) -> AppResult<bool>;
 
     /// Remove at most `limit` source rows whose exclusive retry deadline has
     /// elapsed at or before `through`.
@@ -642,7 +737,7 @@ pub(crate) fn message_not_found() -> AppError {
 
 /// One channel's mutable state: identity, activity bookkeeping, and its bounded
 /// message ring.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ChannelState {
     channel_type: ChannelType,
     last_activity_unix_ms: u64,
@@ -707,6 +802,11 @@ impl InMemoryChatRepository {
     /// backend's `(channel_id, event_id)` idempotency boundary for deterministic
     /// local tests; the in-memory repository itself is intentionally volatile.
     pub fn stage_delivery_outbox(&self, record: ChatDeliveryOutboxRecord) -> AppResult<bool> {
+        if record.origin_node_id.is_empty() {
+            return Err(AppError::validation(
+                "chat delivery outbox origin node is required",
+            ));
+        }
         if record.expires_at <= record.created_at {
             return Err(AppError::validation(
                 "chat delivery outbox expiry must be after creation",
@@ -728,16 +828,22 @@ impl InMemoryChatRepository {
     /// Read active source rows in deterministic channel/event order.
     pub fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>> {
+        if origin_node_id.is_empty() {
+            return Err(AppError::validation(
+                "chat delivery outbox origin node is required",
+            ));
+        }
         let outbox = self
             .outbox
             .lock()
             .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
         let mut active: Vec<_> = outbox
             .iter()
-            .filter(|record| record.is_current_at(now))
+            .filter(|record| record.origin_node_id == origin_node_id && record.is_current_at(now))
             .cloned()
             .collect();
         active.sort_by(|left, right| {
@@ -749,13 +855,27 @@ impl InMemoryChatRepository {
 
     /// Remove one source row after the dispatcher receives its terminal
     /// acknowledgement. Retrying or merely reading a row never consumes it.
-    pub fn acknowledge_delivery_outbox(&self, channel_id: &str, event_id: u64) -> AppResult<bool> {
+    pub fn acknowledge_delivery_outbox(
+        &self,
+        origin_node_id: &str,
+        channel_id: &str,
+        event_id: u64,
+    ) -> AppResult<bool> {
+        if origin_node_id.is_empty() {
+            return Err(AppError::validation(
+                "chat delivery outbox origin node is required",
+            ));
+        }
         let mut outbox = self
             .outbox
             .lock()
             .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
         let initial_len = outbox.len();
-        outbox.retain(|record| record.channel_id != channel_id || record.event_id != event_id);
+        outbox.retain(|record| {
+            record.origin_node_id != origin_node_id
+                || record.channel_id != channel_id
+                || record.event_id != event_id
+        });
         Ok(outbox.len() != initial_len)
     }
 
@@ -903,40 +1023,74 @@ impl ChatRepository for InMemoryChatRepository {
         delivery: &ChatDeliveryRequest,
         now: TimestampMillis,
     ) -> AppResult<ChatMessage> {
-        let id = self
-            .post_message_authorized(
+        validate_delivery_request(delivery, "message.create", now)?;
+        let epochs = self.access_epochs_guard()?;
+        if epochs.get(access_key).copied().unwrap_or(0) != expected_access_epoch {
+            return Err(AppError::permission("CHAT_UNAVAILABLE"));
+        }
+        let mut channels = self.guard()?;
+        let mut next = channels
+            .get(channel)
+            .cloned()
+            .unwrap_or_else(|| ChannelState {
+                channel_type,
+                last_activity_unix_ms: now.unix_millis(),
+                next_id: 0,
+                next_event_id: 0,
+                history: VecDeque::new(),
+            });
+        let id = next
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat message id overflow"))?;
+        let event_id = next
+            .next_event_id
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat event id overflow"))?;
+        let message = ChatMessage {
+            id,
+            sender: sender.to_owned(),
+            content: content.to_owned(),
+            created_at_unix_ms: now.unix_millis(),
+            updated_at_unix_ms: now.unix_millis(),
+            revision: 1,
+            last_event_id: event_id,
+            deleted: false,
+        };
+        next.next_id = id;
+        next.next_event_id = event_id;
+        next.last_activity_unix_ms = now.unix_millis();
+        let capacity = capacity.max(1);
+        while next.history.len() >= capacity {
+            next.history.pop_front();
+        }
+        next.history.push_back(message.clone());
+        let record = ChatDeliveryOutboxRecord {
+            origin_node_id: delivery.origin_node_id.clone(),
+            channel_id: channel.to_owned(),
+            event_id,
+            authority_epoch: delivery.authority_epoch,
+            payload: serialize_delivery_event(
                 channel,
                 channel_type,
-                sender,
-                content,
-                capacity,
-                access_key,
-                expected_access_epoch,
-                now,
-            )
-            .await?;
-        let message = self
-            .channel_history(channel, 0, None)
-            .await?
-            .into_iter()
-            .find(|message| message.id == id)
-            .ok_or_else(|| AppError::internal("created chat message was not retained"))?;
-        InMemoryChatRepository::stage_delivery_outbox(
-            self,
-            ChatDeliveryOutboxRecord {
-                channel_id: channel.to_owned(),
-                event_id: message.last_event_id,
-                authority_epoch: delivery.authority_epoch,
-                payload: serialize_delivery_event(
-                    channel,
-                    channel_type,
-                    delivery.event_type,
-                    &message,
-                )?,
-                created_at: now,
-                expires_at: delivery.expires_at,
-            },
-        )?;
+                delivery.event_type,
+                &message,
+            )?,
+            created_at: now,
+            expires_at: delivery.expires_at,
+        };
+        let mut outbox = self
+            .outbox
+            .lock()
+            .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
+        if outbox
+            .iter()
+            .any(|row| row.channel_id == channel && row.event_id == event_id)
+        {
+            return Err(AppError::internal("chat delivery event already exists"));
+        }
+        channels.insert(channel.to_owned(), next);
+        outbox.push(record);
         Ok(message)
     }
 
@@ -1048,25 +1202,61 @@ impl ChatRepository for InMemoryChatRepository {
         delivery: &ChatDeliveryRequest,
         now: TimestampMillis,
     ) -> AppResult<ChatMessage> {
-        let message = self
-            .edit_message_authorized(channel, id, content, access_key, expected_access_epoch, now)
-            .await?;
-        InMemoryChatRepository::stage_delivery_outbox(
-            self,
-            ChatDeliveryOutboxRecord {
-                channel_id: channel.to_owned(),
-                event_id: message.last_event_id,
-                authority_epoch: delivery.authority_epoch,
-                payload: serialize_delivery_event(
-                    channel,
-                    channel_type,
-                    delivery.event_type,
-                    &message,
-                )?,
-                created_at: now,
-                expires_at: delivery.expires_at,
-            },
-        )?;
+        validate_delivery_request(delivery, "message.update", now)?;
+        let epochs = self.access_epochs_guard()?;
+        if epochs.get(access_key).copied().unwrap_or(0) != expected_access_epoch {
+            return Err(AppError::permission("CHAT_UNAVAILABLE"));
+        }
+        let mut channels = self.guard()?;
+        let state = channels.get_mut(channel).ok_or_else(channel_not_found)?;
+        let event_id = state
+            .next_event_id
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat event id overflow"))?;
+        let mut next = state.clone();
+        let message = next
+            .history
+            .iter_mut()
+            .find(|message| message.id == id)
+            .ok_or_else(message_not_found)?;
+        if message.deleted {
+            return Err(AppError::conflict("chat message is tombstoned"));
+        }
+        message.content = content.to_owned();
+        message.revision = message
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat message revision overflow"))?;
+        message.updated_at_unix_ms = now.unix_millis();
+        message.last_event_id = event_id;
+        let message = message.clone();
+        next.next_event_id = event_id;
+        let record = ChatDeliveryOutboxRecord {
+            origin_node_id: delivery.origin_node_id.clone(),
+            channel_id: channel.to_owned(),
+            event_id,
+            authority_epoch: delivery.authority_epoch,
+            payload: serialize_delivery_event(
+                channel,
+                channel_type,
+                delivery.event_type,
+                &message,
+            )?,
+            created_at: now,
+            expires_at: delivery.expires_at,
+        };
+        let mut outbox = self
+            .outbox
+            .lock()
+            .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
+        if outbox
+            .iter()
+            .any(|row| row.channel_id == channel && row.event_id == event_id)
+        {
+            return Err(AppError::internal("chat delivery event already exists"));
+        }
+        *state = next;
+        outbox.push(record);
         Ok(message)
     }
 
@@ -1126,34 +1316,62 @@ impl ChatRepository for InMemoryChatRepository {
         delivery: &ChatDeliveryRequest,
         now: TimestampMillis,
     ) -> AppResult<Option<ChatMessage>> {
-        if !self
-            .delete_message_authorized(channel, id, access_key, expected_access_epoch, now)
-            .await?
-        {
+        validate_delivery_request(delivery, "message.remove", now)?;
+        let epochs = self.access_epochs_guard()?;
+        if epochs.get(access_key).copied().unwrap_or(0) != expected_access_epoch {
+            return Err(AppError::permission("CHAT_UNAVAILABLE"));
+        }
+        let mut channels = self.guard()?;
+        let state = channels.get_mut(channel).ok_or_else(channel_not_found)?;
+        let event_id = state
+            .next_event_id
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat event id overflow"))?;
+        let mut next = state.clone();
+        let message = next
+            .history
+            .iter_mut()
+            .find(|message| message.id == id)
+            .ok_or_else(message_not_found)?;
+        if message.deleted {
             return Ok(None);
         }
-        let message = self
-            .channel_history(channel, 0, None)
-            .await?
-            .into_iter()
-            .find(|message| message.id == id)
-            .ok_or_else(|| AppError::internal("tombstoned chat message was not retained"))?;
-        InMemoryChatRepository::stage_delivery_outbox(
-            self,
-            ChatDeliveryOutboxRecord {
-                channel_id: channel.to_owned(),
-                event_id: message.last_event_id,
-                authority_epoch: delivery.authority_epoch,
-                payload: serialize_delivery_event(
-                    channel,
-                    channel_type,
-                    delivery.event_type,
-                    &message,
-                )?,
-                created_at: now,
-                expires_at: delivery.expires_at,
-            },
-        )?;
+        message.deleted = true;
+        message.content.clear();
+        message.revision = message
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat message revision overflow"))?;
+        message.updated_at_unix_ms = now.unix_millis();
+        message.last_event_id = event_id;
+        let message = message.clone();
+        next.next_event_id = event_id;
+        let record = ChatDeliveryOutboxRecord {
+            origin_node_id: delivery.origin_node_id.clone(),
+            channel_id: channel.to_owned(),
+            event_id,
+            authority_epoch: delivery.authority_epoch,
+            payload: serialize_delivery_event(
+                channel,
+                channel_type,
+                delivery.event_type,
+                &message,
+            )?,
+            created_at: now,
+            expires_at: delivery.expires_at,
+        };
+        let mut outbox = self
+            .outbox
+            .lock()
+            .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
+        if outbox
+            .iter()
+            .any(|row| row.channel_id == channel && row.event_id == event_id)
+        {
+            return Err(AppError::internal("chat delivery event already exists"));
+        }
+        *state = next;
+        outbox.push(record);
         Ok(Some(message))
     }
 
@@ -1187,6 +1405,75 @@ impl ChatRepository for InMemoryChatRepository {
             return Err(AppError::permission("CHAT_UNAVAILABLE"));
         }
         self.moderate_delete_message(channel, id, audit, now).await
+    }
+
+    async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        audit: &ChatModerationAudit,
+        access_key: &str,
+        expected_access_epoch: u64,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>> {
+        validate_delivery_request(delivery, "message.remove", now)?;
+        let epochs = self.access_epochs_guard()?;
+        if epochs.get(access_key).copied().unwrap_or(0) != expected_access_epoch {
+            return Err(AppError::permission("CHAT_UNAVAILABLE"));
+        }
+        let mut channels = self.guard()?;
+        let state = channels.get_mut(channel).ok_or_else(channel_not_found)?;
+        let event_id = state
+            .next_event_id
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat event id overflow"))?;
+        let message = state
+            .history
+            .iter_mut()
+            .find(|message| message.id == id)
+            .ok_or_else(message_not_found)?;
+        if message.deleted {
+            return Ok(None);
+        }
+        let mut next = message.clone();
+        next.deleted = true;
+        next.content.clear();
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("chat message revision overflow"))?;
+        next.updated_at_unix_ms = now.unix_millis();
+        next.last_event_id = event_id;
+        let record = ChatDeliveryOutboxRecord {
+            origin_node_id: delivery.origin_node_id.clone(),
+            channel_id: channel.to_owned(),
+            event_id,
+            authority_epoch: delivery.authority_epoch,
+            payload: serialize_delivery_event(channel, channel_type, delivery.event_type, &next)?,
+            created_at: now,
+            expires_at: delivery.expires_at,
+        };
+        let mut audits = self
+            .moderation_audit
+            .lock()
+            .map_err(|_| AppError::internal("chat moderation audit mutex poisoned"))?;
+        let mut outbox = self
+            .outbox
+            .lock()
+            .map_err(|_| AppError::internal("chat delivery outbox mutex poisoned"))?;
+        if outbox
+            .iter()
+            .any(|row| row.channel_id == channel && row.event_id == event_id)
+        {
+            return Err(AppError::internal("chat delivery event already exists"));
+        }
+        *message = next.clone();
+        state.next_event_id = event_id;
+        audits.push(audit.clone());
+        outbox.push(record);
+        Ok(Some(next))
     }
 
     async fn cleanup_moderation_audit(
@@ -1271,18 +1558,25 @@ impl ChatRepository for InMemoryChatRepository {
 
     async fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>> {
-        InMemoryChatRepository::active_delivery_outbox(self, now, limit)
+        InMemoryChatRepository::active_delivery_outbox(self, origin_node_id, now, limit)
     }
 
     async fn acknowledge_delivery_outbox(
         &self,
+        origin_node_id: &str,
         channel_id: &str,
         event_id: u64,
     ) -> AppResult<bool> {
-        InMemoryChatRepository::acknowledge_delivery_outbox(self, channel_id, event_id)
+        InMemoryChatRepository::acknowledge_delivery_outbox(
+            self,
+            origin_node_id,
+            channel_id,
+            event_id,
+        )
     }
 
     async fn cleanup_delivery_outbox(
@@ -1317,6 +1611,7 @@ mod tests {
     #[test]
     fn outbox_record_is_live_only_before_its_exclusive_expiry() {
         let record = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_1".to_owned(),
             event_id: 4,
             authority_epoch: 2,
@@ -1332,6 +1627,7 @@ mod tests {
     fn in_memory_outbox_is_idempotent_acknowledged_and_expires_records() {
         let repository = InMemoryChatRepository::new();
         let active = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_b".to_owned(),
             event_id: 2,
             authority_epoch: 2,
@@ -1351,27 +1647,28 @@ mod tests {
         );
         assert_eq!(
             repository
-                .active_delivery_outbox(ts(9), 1)
+                .active_delivery_outbox("node-a", ts(9), 1)
                 .expect("active rows"),
             vec![active.clone()]
         );
         assert!(
             repository
-                .acknowledge_delivery_outbox("ch_b", 2)
+                .acknowledge_delivery_outbox("node-a", "ch_b", 2)
                 .expect("acknowledged")
         );
         assert!(
             !repository
-                .acknowledge_delivery_outbox("ch_b", 2)
+                .acknowledge_delivery_outbox("node-a", "ch_b", 2)
                 .expect("idempotent acknowledgement")
         );
         assert!(
             repository
-                .active_delivery_outbox(ts(9), 1)
+                .active_delivery_outbox("node-a", ts(9), 1)
                 .expect("acknowledged rows")
                 .is_empty()
         );
         let expired = ChatDeliveryOutboxRecord {
+            origin_node_id: "node-a".to_owned(),
             channel_id: "ch_b".to_owned(),
             event_id: 3,
             authority_epoch: 2,
@@ -1386,7 +1683,7 @@ mod tests {
         );
         assert!(
             repository
-                .active_delivery_outbox(ts(10), 1)
+                .active_delivery_outbox("node-a", ts(10), 1)
                 .expect("expired rows")
                 .is_empty()
         );
@@ -1403,6 +1700,7 @@ mod tests {
         let repository = InMemoryChatRepository::new();
         let error = repository
             .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: "node-a".to_owned(),
                 channel_id: "ch_window".to_owned(),
                 event_id: 1,
                 authority_epoch: 2,
@@ -1415,7 +1713,7 @@ mod tests {
         assert_eq!(error.category(), crate::error::ErrorCategory::Validation);
         assert!(
             repository
-                .active_delivery_outbox(ts(10), 1)
+                .active_delivery_outbox("node-a", ts(10), 1)
                 .expect("no invalid row was staged")
                 .is_empty()
         );
@@ -1431,6 +1729,92 @@ mod tests {
             revision: 1,
             last_event_id: id,
             deleted: false,
+        }
+    }
+
+    #[test]
+    fn delivery_serializer_rejects_every_receiver_invalid_state() {
+        let created = message(1, "hello");
+        for event_type in ["future.event", "message.update", "message.remove"] {
+            assert!(
+                serialize_delivery_event("ch", ChannelType::Room, event_type, &created).is_err(),
+                "{event_type} must not serialize create state"
+            );
+        }
+
+        let mut updated = created.clone();
+        updated.revision = 2;
+        updated.updated_at_unix_ms = 2;
+        assert!(
+            serialize_delivery_event("ch", ChannelType::Room, "message.create", &updated).is_err()
+        );
+        assert!(
+            serialize_delivery_event("ch", ChannelType::Room, "message.remove", &updated).is_err()
+        );
+
+        let mut removed = updated.clone();
+        removed.deleted = true;
+        removed.content.clear();
+        for event_type in ["message.create", "message.update"] {
+            assert!(
+                serialize_delivery_event("ch", ChannelType::Room, event_type, &removed).is_err(),
+                "{event_type} must not serialize remove state"
+            );
+        }
+
+        let mut zero_message_id = created.clone();
+        zero_message_id.id = 0;
+        let mut zero_event_id = created.clone();
+        zero_event_id.last_event_id = 0;
+        let mut blank_sender = created.clone();
+        blank_sender.sender = " \t".to_owned();
+        let mut reversed_time = updated;
+        reversed_time.updated_at_unix_ms = reversed_time.created_at_unix_ms - 1;
+        for (name, event_type, message) in [
+            ("zero message id", "message.create", &zero_message_id),
+            ("zero event id", "message.create", &zero_event_id),
+            ("blank sender", "message.create", &blank_sender),
+            ("reversed timestamps", "message.update", &reversed_time),
+        ] {
+            assert!(
+                serialize_delivery_event("ch", ChannelType::Room, event_type, message).is_err(),
+                "{name} must not serialize"
+            );
+        }
+        assert!(
+            serialize_delivery_event("", ChannelType::Room, "message.create", &created).is_err(),
+            "an empty channel must not serialize"
+        );
+    }
+
+    #[test]
+    fn delivery_serializer_round_trips_canonical_create_update_remove_boundaries() {
+        let created = message(1, "é");
+        let mut updated = created.clone();
+        updated.revision = 2;
+        updated.updated_at_unix_ms = 2;
+        updated.last_event_id = 2;
+        let mut removed = updated.clone();
+        removed.revision = 3;
+        removed.updated_at_unix_ms = 3;
+        removed.last_event_id = 3;
+        removed.content.clear();
+        removed.deleted = true;
+
+        for (event_type, message) in [
+            ("message.create", created),
+            ("message.update", updated),
+            ("message.remove", removed),
+        ] {
+            let payload = serialize_delivery_event("ch", ChannelType::Room, event_type, &message)
+                .expect("canonical state serializes");
+            let decoded: ChatDeliveryEvent =
+                serde_json::from_str(&payload).expect("serialized event round trips");
+            assert_eq!(decoded.version, 1);
+            assert_eq!(decoded.event_type, event_type);
+            assert_eq!(decoded.channel_id, "ch");
+            assert_eq!(decoded.event_id, message.last_event_id);
+            assert_eq!(decoded.message, message);
         }
     }
 

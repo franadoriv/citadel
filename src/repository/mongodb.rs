@@ -125,7 +125,7 @@ const GAMESCRIPT_COUNTERS: &str = "gamescript_counters";
 
 const SCHEMA_COLLECTION: &str = "citadel_schema";
 const SCHEMA_ID: &str = "mongodb-foundation";
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 // MongoDB recommends retrying a whole transaction on
 // `TransientTransactionError`, but retrying *only* the commit when the result
 // is unknown.  A direct `UnitOfWork` has no replayable user closure, so it can
@@ -558,6 +558,16 @@ const SCHEMA: &[CollectionSpec] = &[
             IndexSpec {
                 name: "chat_outbox_expiry",
                 keys: &[("expires_at_unix_ms", 1), ("outbox_id", 1)],
+                unique: false,
+            },
+            IndexSpec {
+                name: "chat_outbox_origin_active",
+                keys: &[
+                    ("origin_node_id", 1),
+                    ("expires_at_unix_ms", 1),
+                    ("channel_id", 1),
+                    ("event_id", 1),
+                ],
                 unique: false,
             },
         ],
@@ -3054,6 +3064,10 @@ fn chat_i64(value: u64, name: &'static str) -> AppResult<i64> {
 
 fn chat_outbox_from_doc(doc: &Document) -> AppResult<ChatDeliveryOutboxRecord> {
     Ok(ChatDeliveryOutboxRecord {
+        origin_node_id: doc
+            .get_str("origin_node_id")
+            .map_err(|_| AppError::internal("invalid MongoDB chat outbox"))?
+            .to_owned(),
         channel_id: doc
             .get_str("channel_id")
             .map_err(|_| AppError::internal("invalid MongoDB chat outbox"))?
@@ -3170,7 +3184,7 @@ impl MongoChatRepository {
             insert_chat_event(db, session, &channel, event, id, 1, "message_sent", now).await?;
             let watermark=id.saturating_sub(i64::try_from(capacity.max(1)).unwrap_or(i64::MAX)); if watermark>0 { messages.delete_many(doc!{"channel_id":&channel,"id":{"$lte":watermark}}).session(&mut *session).await?; }
             let message=chat_message_from_doc(&doc!{"id":id,"sender":sender,"content":content,"created_at_unix_ms":now,"updated_at_unix_ms":now,"revision":1_i64,"last_event_id":event,"deleted":false})?;
-            if let Some(delivery)=delivery { db.collection::<Document>(CHAT_DELIVERY_OUTBOX).insert_one(doc!{"channel_id":&channel,"event_id":event,"authority_epoch":chat_i64(delivery.authority_epoch,"chat delivery authority epoch")?,"payload":serialize_delivery_event(&channel,channel_type,delivery.event_type,&message)?,"created_at_unix_ms":now,"expires_at_unix_ms":chat_timestamp(delivery.expires_at)?}).session(&mut *session).await?; }
+            if let Some(delivery)=delivery { db.collection::<Document>(CHAT_DELIVERY_OUTBOX).insert_one(doc!{"channel_id":&channel,"event_id":event,"origin_node_id":chat_id(&delivery.origin_node_id,"chat delivery origin node")?,"authority_epoch":chat_i64(delivery.authority_epoch,"chat delivery authority epoch")?,"payload":serialize_delivery_event(&channel,channel_type,delivery.event_type,&message)?,"created_at_unix_ms":now,"expires_at_unix_ms":chat_timestamp(delivery.expires_at)?}).session(&mut *session).await?; }
             Ok(message)
         })}).await
     }
@@ -3243,7 +3257,7 @@ impl MongoChatRepository {
             Some((key, epoch)) => Some((chat_id(key, "chat access key")?.to_owned(), epoch)),
             None => None,
         };
-        chat_transaction(&self.client,&self.database,self.session.as_ref(),move|db,session|{let channel=channel.clone();let content=content.clone();let authorization=authorization.clone();let delivery=delivery.clone();Box::pin(async move {if let Some((key,expected))=authorization {if chat_epoch(db,session,&key).await?!=expected{return Err(AppError::permission("chat authorization is no longer current").into())}}let channels=db.collection::<Document>(CHAT_CHANNELS);if channels.find_one(doc!{"channel_id":&channel}).session(&mut *session).await?.is_none(){return Err(channel_not_found().into())}let seq=channels.find_one_and_update(doc!{"channel_id":&channel},doc!{"$inc":{"next_event_id":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(channel_not_found)?;let event=seq.get_i64("next_event_id").map_err(|_|AppError::internal("invalid MongoDB chat channel"))?;let row=db.collection::<Document>(CHAT_MESSAGES).find_one_and_update(doc!{"channel_id":&channel,"id":id,"deleted":false},doc!{"$set":{"content":content,"updated_at_unix_ms":now,"last_event_id":event},"$inc":{"revision":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(message_not_found)?;let message=chat_message_from_doc(&row)?;if let Some((delivery,channel_type))=delivery {let expires=chat_timestamp(delivery.expires_at)?;if expires<=now{return Err(AppError::validation("chat delivery outbox expiry must be after creation").into())}let payload=serialize_delivery_event(&channel,channel_type,delivery.event_type,&message)?;db.collection::<Document>(CHAT_DELIVERY_OUTBOX).insert_one(doc!{"channel_id":&channel,"event_id":event,"authority_epoch":chat_i64(delivery.authority_epoch,"chat delivery authority epoch")?,"payload":payload,"created_at_unix_ms":now,"expires_at_unix_ms":expires}).session(&mut *session).await?;}insert_chat_event(db,session,&channel,event,id,message.revision as i64,"message_updated",now).await?;Ok(message)})}).await
+        chat_transaction(&self.client,&self.database,self.session.as_ref(),move|db,session|{let channel=channel.clone();let content=content.clone();let authorization=authorization.clone();let delivery=delivery.clone();Box::pin(async move {if let Some((key,expected))=authorization {if chat_epoch(db,session,&key).await?!=expected{return Err(AppError::permission("chat authorization is no longer current").into())}}let channels=db.collection::<Document>(CHAT_CHANNELS);if channels.find_one(doc!{"channel_id":&channel}).session(&mut *session).await?.is_none(){return Err(channel_not_found().into())}let seq=channels.find_one_and_update(doc!{"channel_id":&channel},doc!{"$inc":{"next_event_id":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(channel_not_found)?;let event=seq.get_i64("next_event_id").map_err(|_|AppError::internal("invalid MongoDB chat channel"))?;let row=db.collection::<Document>(CHAT_MESSAGES).find_one_and_update(doc!{"channel_id":&channel,"id":id,"deleted":false},doc!{"$set":{"content":content,"updated_at_unix_ms":now,"last_event_id":event},"$inc":{"revision":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(message_not_found)?;let message=chat_message_from_doc(&row)?;if let Some((delivery,channel_type))=delivery {let expires=chat_timestamp(delivery.expires_at)?;if expires<=now{return Err(AppError::validation("chat delivery outbox expiry must be after creation").into())}let payload=serialize_delivery_event(&channel,channel_type,delivery.event_type,&message)?;db.collection::<Document>(CHAT_DELIVERY_OUTBOX).insert_one(doc!{"channel_id":&channel,"event_id":event,"origin_node_id":chat_id(&delivery.origin_node_id,"chat delivery origin node")?,"authority_epoch":chat_i64(delivery.authority_epoch,"chat delivery authority epoch")?,"payload":payload,"created_at_unix_ms":now,"expires_at_unix_ms":expires}).session(&mut *session).await?;}insert_chat_event(db,session,&channel,event,id,message.revision as i64,"message_updated",now).await?;Ok(message)})}).await
     }
     #[allow(clippy::collapsible_if)]
     async fn delete_inner(
@@ -3270,8 +3284,9 @@ impl MongoChatRepository {
         id: u64,
         audit: &ChatModerationAudit,
         authorization: Option<(&str, u64)>,
+        delivery: Option<(ChatDeliveryRequest, ChannelType)>,
         now: TimestampMillis,
-    ) -> AppResult<bool> {
+    ) -> AppResult<Option<ChatMessage>> {
         let channel = chat_id(channel, "chat channel")?.to_owned();
         let id = chat_i64(id, "chat message id")?;
         let audit = chat_audit_doc(audit)?;
@@ -3280,10 +3295,16 @@ impl MongoChatRepository {
             Some((key, epoch)) => Some((chat_id(key, "chat access key")?.to_owned(), epoch)),
             None => None,
         };
+        if let Some((request, _)) = &delivery {
+            if request.origin_node_id.is_empty() || chat_timestamp(request.expires_at)? <= now {
+                return Err(AppError::validation("invalid chat delivery request"));
+            }
+        }
         chat_transaction(&self.client, &self.database, self.session.as_ref(), move |db, session| {
             let channel = channel.clone();
             let audit = audit.clone();
             let authorization = authorization.clone();
+            let delivery = delivery.clone();
             Box::pin(async move {
                 if let Some((key, expected)) = authorization {
                     if chat_epoch(db, session, &key).await? != expected {
@@ -3306,7 +3327,7 @@ impl MongoChatRepository {
                     .await?
                     .ok_or_else(message_not_found)?;
                 if existing.get_bool("deleted").unwrap_or(false) {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let seq = channels
                     .find_one_and_update(
@@ -3323,29 +3344,50 @@ impl MongoChatRepository {
                 let row = messages
                     .find_one_and_update(
                         doc! {"channel_id": &channel, "id": id, "deleted": false},
-                        doc! {"$set": {"content": "", "deleted": true, "updated_at_unix_ms": now}, "$inc": {"revision": 1_i64}},
+                        doc! {"$set": {"content": "", "deleted": true, "updated_at_unix_ms": now, "last_event_id": event}, "$inc": {"revision": 1_i64}},
                     )
                     .return_document(ReturnDocument::After)
                     .session(&mut *session)
                     .await?
                     .ok_or_else(message_not_found)?;
+                let message = chat_message_from_doc(&row)?;
                 insert_chat_event(
                     db,
                     session,
                     &channel,
                     event,
                     id,
-                    row.get_i64("revision")
+                    i64::try_from(message.revision)
                         .map_err(|_| AppError::internal("invalid MongoDB chat message"))?,
                     "message_deleted",
                     now,
                 )
                 .await?;
+                if let Some((request, channel_type)) = delivery {
+                    let payload = serialize_delivery_event(
+                        &channel,
+                        channel_type,
+                        request.event_type,
+                        &message,
+                    )?;
+                    db.collection::<Document>(CHAT_DELIVERY_OUTBOX)
+                        .insert_one(doc! {
+                            "channel_id": &channel,
+                            "event_id": event,
+                            "origin_node_id": chat_id(&request.origin_node_id, "chat delivery origin node")?,
+                            "authority_epoch": chat_i64(request.authority_epoch, "chat delivery authority epoch")?,
+                            "payload": payload,
+                            "created_at_unix_ms": now,
+                            "expires_at_unix_ms": chat_timestamp(request.expires_at)?,
+                        })
+                        .session(&mut *session)
+                        .await?;
+                }
                 db.collection::<Document>(CHAT_MODERATION_AUDIT)
                     .insert_one(audit)
                     .session(&mut *session)
                     .await?;
-                Ok(true)
+                Ok(Some(message))
             })
         })
         .await
@@ -3372,7 +3414,7 @@ impl MongoChatRepository {
                 "chat delivery outbox expiry must be after creation",
             ));
         }
-        chat_transaction(&self.client,&self.database,self.session.as_ref(),move|db,session|{let channel=channel.clone();let key=key.clone();let delivery=delivery.clone();Box::pin(async move {if chat_epoch(db,session,&key).await?!=expected{return Err(AppError::permission("chat authorization is no longer current").into())}let channels=db.collection::<Document>(CHAT_CHANNELS);if channels.find_one(doc!{"channel_id":&channel}).session(&mut *session).await?.is_none(){return Err(channel_not_found().into())}let messages=db.collection::<Document>(CHAT_MESSAGES);let existing=messages.find_one(doc!{"channel_id":&channel,"id":id}).session(&mut *session).await?.ok_or_else(message_not_found)?;if existing.get_bool("deleted").unwrap_or(false){return Ok(None)}let seq=channels.find_one_and_update(doc!{"channel_id":&channel},doc!{"$inc":{"next_event_id":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(channel_not_found)?;let event=seq.get_i64("next_event_id").map_err(|_|AppError::internal("invalid MongoDB chat channel"))?;let row=messages.find_one_and_update(doc!{"channel_id":&channel,"id":id,"deleted":false},doc!{"$set":{"content":"","deleted":true,"updated_at_unix_ms":now,"last_event_id":event},"$inc":{"revision":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(message_not_found)?;let message=chat_message_from_doc(&row)?;let payload=serialize_delivery_event(&channel,channel_type,delivery.event_type,&message)?;insert_chat_event(db,session,&channel,event,id,message.revision as i64,"message_deleted",now).await?;db.collection::<Document>(CHAT_DELIVERY_OUTBOX).insert_one(doc!{"channel_id":&channel,"event_id":event,"authority_epoch":chat_i64(delivery.authority_epoch,"chat delivery authority epoch")?,"payload":payload,"created_at_unix_ms":now,"expires_at_unix_ms":expires}).session(&mut *session).await?;Ok(Some(message))})}).await
+        chat_transaction(&self.client,&self.database,self.session.as_ref(),move|db,session|{let channel=channel.clone();let key=key.clone();let delivery=delivery.clone();Box::pin(async move {if chat_epoch(db,session,&key).await?!=expected{return Err(AppError::permission("chat authorization is no longer current").into())}let channels=db.collection::<Document>(CHAT_CHANNELS);if channels.find_one(doc!{"channel_id":&channel}).session(&mut *session).await?.is_none(){return Err(channel_not_found().into())}let messages=db.collection::<Document>(CHAT_MESSAGES);let existing=messages.find_one(doc!{"channel_id":&channel,"id":id}).session(&mut *session).await?.ok_or_else(message_not_found)?;if existing.get_bool("deleted").unwrap_or(false){return Ok(None)}let seq=channels.find_one_and_update(doc!{"channel_id":&channel},doc!{"$inc":{"next_event_id":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(channel_not_found)?;let event=seq.get_i64("next_event_id").map_err(|_|AppError::internal("invalid MongoDB chat channel"))?;let row=messages.find_one_and_update(doc!{"channel_id":&channel,"id":id,"deleted":false},doc!{"$set":{"content":"","deleted":true,"updated_at_unix_ms":now,"last_event_id":event},"$inc":{"revision":1_i64}}).return_document(ReturnDocument::After).session(&mut *session).await?.ok_or_else(message_not_found)?;let message=chat_message_from_doc(&row)?;let payload=serialize_delivery_event(&channel,channel_type,delivery.event_type,&message)?;insert_chat_event(db,session,&channel,event,id,message.revision as i64,"message_deleted",now).await?;db.collection::<Document>(CHAT_DELIVERY_OUTBOX).insert_one(doc!{"channel_id":&channel,"event_id":event,"origin_node_id":chat_id(&delivery.origin_node_id,"chat delivery origin node")?,"authority_epoch":chat_i64(delivery.authority_epoch,"chat delivery authority epoch")?,"payload":payload,"created_at_unix_ms":now,"expires_at_unix_ms":expires}).session(&mut *session).await?;Ok(Some(message))})}).await
     }
 }
 
@@ -3754,8 +3796,10 @@ impl ChatRepository for MongoChatRepository {
         audit: &ChatModerationAudit,
         now: TimestampMillis,
     ) -> AppResult<bool> {
-        self.moderate_delete_inner(channel, id, audit, None, now)
-            .await
+        Ok(self
+            .moderate_delete_inner(channel, id, audit, None, None, now)
+            .await?
+            .is_some())
     }
     async fn moderate_delete_message_authorized(
         &self,
@@ -3766,8 +3810,31 @@ impl ChatRepository for MongoChatRepository {
         expected: u64,
         now: TimestampMillis,
     ) -> AppResult<bool> {
-        self.moderate_delete_inner(channel, id, audit, Some((access_key, expected)), now)
-            .await
+        Ok(self
+            .moderate_delete_inner(channel, id, audit, Some((access_key, expected)), None, now)
+            .await?
+            .is_some())
+    }
+    async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        audit: &ChatModerationAudit,
+        access_key: &str,
+        expected: u64,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>> {
+        self.moderate_delete_inner(
+            channel,
+            id,
+            audit,
+            Some((access_key, expected)),
+            Some((delivery.clone(), channel_type)),
+            now,
+        )
+        .await
     }
     async fn cleanup_moderation_audit(
         &self,
@@ -3897,7 +3964,7 @@ impl ChatRepository for MongoChatRepository {
                 "chat delivery outbox expiry must be after creation",
             ));
         }
-        let doc = doc! {"channel_id":chat_id(&record.channel_id,"chat channel")?,"event_id":chat_i64(record.event_id,"chat delivery event id")?,"authority_epoch":chat_i64(record.authority_epoch,"chat delivery authority epoch")?,"payload":record.payload,"created_at_unix_ms":chat_timestamp(record.created_at)?,"expires_at_unix_ms":chat_timestamp(record.expires_at)?};
+        let doc = doc! {"origin_node_id":chat_id(&record.origin_node_id,"chat delivery origin node")?,"channel_id":chat_id(&record.channel_id,"chat channel")?,"event_id":chat_i64(record.event_id,"chat delivery event id")?,"authority_epoch":chat_i64(record.authority_epoch,"chat delivery authority epoch")?,"payload":record.payload,"created_at_unix_ms":chat_timestamp(record.created_at)?,"expires_at_unix_ms":chat_timestamp(record.expires_at)?};
         let collection = self.database.collection::<Document>(CHAT_DELIVERY_OUTBOX);
         let inserted = match &self.session {
             None => collection.insert_one(doc).await,
@@ -3917,6 +3984,7 @@ impl ChatRepository for MongoChatRepository {
     }
     async fn active_delivery_outbox(
         &self,
+        origin_node_id: &str,
         now: TimestampMillis,
         limit: usize,
     ) -> AppResult<Vec<ChatDeliveryOutboxRecord>> {
@@ -3924,7 +3992,7 @@ impl ChatRepository for MongoChatRepository {
             return Ok(Vec::new());
         }
         let collection = self.database.collection::<Document>(CHAT_DELIVERY_OUTBOX);
-        let query = doc! {"expires_at_unix_ms":{"$gt":chat_timestamp(now)?}};
+        let query = doc! {"origin_node_id":chat_id(origin_node_id,"chat delivery origin node")?,"expires_at_unix_ms":{"$gt":chat_timestamp(now)?}};
         let documents = match &self.session {
             None => collection
                 .find(query)
@@ -3955,9 +4023,14 @@ impl ChatRepository for MongoChatRepository {
         };
         documents.iter().map(chat_outbox_from_doc).collect()
     }
-    async fn acknowledge_delivery_outbox(&self, channel: &str, event_id: u64) -> AppResult<bool> {
+    async fn acknowledge_delivery_outbox(
+        &self,
+        origin_node_id: &str,
+        channel: &str,
+        event_id: u64,
+    ) -> AppResult<bool> {
         let collection = self.database.collection::<Document>(CHAT_DELIVERY_OUTBOX);
-        let query = doc! {"channel_id":chat_id(channel,"chat channel")?,"event_id":chat_i64(event_id,"chat delivery event id")?};
+        let query = doc! {"origin_node_id":chat_id(origin_node_id,"chat delivery origin node")?,"channel_id":chat_id(channel,"chat channel")?,"event_id":chat_i64(event_id,"chat delivery event id")?};
         let result = match &self.session {
             None => collection.delete_one(query).await.map_err(mongo_error)?,
             Some(cell) => {
@@ -7566,6 +7639,17 @@ impl MongoDatabase {
                     .await
                     .map_err(mongo_error)?;
             }
+            if spec.name == CHAT_DELIVERY_OUTBOX {
+                // Ownership cannot be reconstructed from a legacy row. Drop
+                // only currently visible unowned work; an old writer racing
+                // this reconciliation remains fail-closed because dispatch
+                // queries require an exact origin. Durable history recovers it.
+                self.database
+                    .collection::<Document>(CHAT_DELIVERY_OUTBOX)
+                    .delete_many(doc! {"origin_node_id":{"$exists":false}})
+                    .await
+                    .map_err(mongo_error)?;
+            }
             for index in spec.indexes {
                 self.reconcile_index(spec.name, *index).await?;
             }
@@ -8014,9 +8098,9 @@ mod tests {
     #[test]
     fn foundation_manifest_covers_every_existing_domain_projection() {
         let plan = MongoSchemaPlan::foundation();
-        assert_eq!(plan.version, 6);
+        assert_eq!(plan.version, 7);
         assert_eq!(plan.collections, 40);
-        assert!(plan.indexes >= 61);
+        assert!(plan.indexes >= 62);
     }
 
     #[test]
@@ -8054,7 +8138,16 @@ mod tests {
         assert_eq!(spec("chat_events").indexes.len(), 1);
         assert_eq!(spec("chat_moderation_audit").indexes.len(), 1);
         assert_eq!(spec("chat_rate_limits").indexes.len(), 2);
-        assert_eq!(spec("chat_delivery_outbox").indexes.len(), 2);
+        assert_eq!(spec("chat_delivery_outbox").indexes.len(), 3);
+        assert_eq!(
+            spec("chat_delivery_outbox").indexes[2].keys,
+            [
+                ("origin_node_id", 1),
+                ("expires_at_unix_ms", 1),
+                ("channel_id", 1),
+                ("event_id", 1),
+            ]
+        );
         assert_eq!(
             spec("chat_messages").indexes[1].keys,
             [("channel_id", 1), ("created_at_unix_ms", 1), ("id", 1)]

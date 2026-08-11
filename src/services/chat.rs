@@ -83,6 +83,7 @@ pub fn validate_chat_content(content: &str) -> AppResult<()> {
 pub struct ChatService {
     repo: Arc<dyn ChatRepository>,
     capacity: usize,
+    delivery_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ChatService {
@@ -100,6 +101,7 @@ impl ChatService {
         Self {
             repo,
             capacity: capacity.max(1),
+            delivery_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -107,6 +109,21 @@ impl ChatService {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Clone the selected repository for supervised outbox workers assembled
+    /// alongside the service.
+    #[must_use]
+    pub fn repository(&self) -> Arc<dyn ChatRepository> {
+        Arc::clone(&self.repo)
+    }
+
+    /// Shared bounded wake primitive for the supervised durable-delivery worker.
+    /// `Notify` retains one permit, so a commit racing worker registration cannot
+    /// lose the wake. Multiple commits coalesce rather than spawning per-row work.
+    #[must_use]
+    pub fn delivery_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.delivery_notify)
     }
 
     /// Resolve a server-derived canonical descriptor to its durable opaque
@@ -195,7 +212,8 @@ impl ChatService {
         let sender = sender.into();
         let content = content.into();
         validate_chat_content(&content)?;
-        self.repo
+        let message = self
+            .repo
             .post_message_authorized_with_delivery(
                 channel,
                 channel_type,
@@ -207,7 +225,9 @@ impl ChatService {
                 delivery,
                 now,
             )
-            .await
+            .await?;
+        self.delivery_notify.notify_one();
+        Ok(message)
     }
 
     /// List channels, most-recently-active first (ties broken by channel id),
@@ -330,7 +350,8 @@ impl ChatService {
             return Err(crate::error::AppError::permission("CHAT_UNAVAILABLE"));
         }
         validate_chat_content(content)?;
-        self.repo
+        let message = self
+            .repo
             .edit_message_authorized_with_delivery(
                 channel,
                 channel_type,
@@ -341,7 +362,9 @@ impl ChatService {
                 delivery,
                 now,
             )
-            .await
+            .await?;
+        self.delivery_notify.notify_one();
+        Ok(message)
     }
 
     /// Tombstone a message only while its immutable author retains access and
@@ -388,7 +411,8 @@ impl ChatService {
         if message.deleted {
             return Ok(None);
         }
-        self.repo
+        let message = self
+            .repo
             .delete_message_authorized_with_delivery(
                 channel,
                 channel_type,
@@ -398,7 +422,11 @@ impl ChatService {
                 delivery,
                 now,
             )
-            .await
+            .await?;
+        if message.is_some() {
+            self.delivery_notify.notify_one();
+        }
+        Ok(message)
     }
 
     async fn message_for_author(
@@ -529,6 +557,63 @@ impl ChatService {
                 now,
             )
             .await
+    }
+
+    /// Commit fenced moderation, redacted audit, and durable delivery together.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn moderate_delete_message_authorized_with_delivery(
+        &self,
+        channel: &str,
+        channel_type: ChannelType,
+        id: u64,
+        actor_kind: &str,
+        actor_id: &str,
+        reason_code: &str,
+        access_key: &str,
+        expected_access_epoch: u64,
+        correlation_id: &str,
+        node_id: &str,
+        delivery: &ChatDeliveryRequest,
+        now: TimestampMillis,
+    ) -> AppResult<Option<ChatMessage>> {
+        let message = self
+            .messages(channel, 0, None)
+            .await?
+            .into_iter()
+            .find(|message| message.id == id)
+            .ok_or_else(crate::repository::chat::message_not_found)?;
+        if message.deleted {
+            return Ok(None);
+        }
+        let audit = ChatModerationAudit::tombstone(
+            actor_kind,
+            actor_id,
+            reason_code,
+            channel,
+            id,
+            &message.sender,
+            expected_access_epoch,
+            correlation_id,
+            node_id,
+            now,
+        );
+        let message = self
+            .repo
+            .moderate_delete_message_authorized_with_delivery(
+                channel,
+                channel_type,
+                id,
+                &audit,
+                access_key,
+                expected_access_epoch,
+                delivery,
+                now,
+            )
+            .await?;
+        if message.is_some() {
+            self.delivery_notify.notify_one();
+        }
+        Ok(message)
     }
 
     /// Perform one bounded, idempotent moderation-audit retention pass.
@@ -721,6 +806,70 @@ mod tests {
         );
         assert!(
             chat.edit_as_author("direct", id, "alice", "late", "direct", 0, 1, now(20_000))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_delivery_mutation_notifies_but_noop_does_not() {
+        let repo = Arc::new(InMemoryChatRepository::new());
+        let chat = ChatService::new(repo);
+        let wake = chat.delivery_notify();
+        let id = chat
+            .append("group", ChannelType::Group, "alice", "secret", now(1))
+            .await
+            .expect("seed message");
+        let delivery = ChatDeliveryRequest {
+            origin_node_id: "node-a".to_owned(),
+            authority_epoch: 0,
+            expires_at: now(30),
+            event_type: "message.remove",
+        };
+        let pending = wake.notified();
+        tokio::pin!(pending);
+        pending.as_mut().enable();
+        assert!(
+            chat.delete_as_author_with_delivery(
+                "group",
+                ChannelType::Group,
+                id,
+                "alice",
+                "group:1",
+                0,
+                100,
+                &delivery,
+                now(2),
+            )
+            .await
+            .expect("commit delivery mutation")
+            .is_some()
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(50), pending)
+            .await
+            .expect("successful commit wakes dispatcher");
+
+        let no_wake = wake.notified();
+        tokio::pin!(no_wake);
+        no_wake.as_mut().enable();
+        assert!(
+            chat.delete_as_author_with_delivery(
+                "group",
+                ChannelType::Group,
+                id,
+                "alice",
+                "group:1",
+                0,
+                100,
+                &delivery,
+                now(3),
+            )
+            .await
+            .expect("repeat is a no-op")
+            .is_none()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), no_wake)
                 .await
                 .is_err()
         );

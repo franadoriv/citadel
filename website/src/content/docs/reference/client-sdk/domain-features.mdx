@@ -66,7 +66,7 @@ copied id never authorizes an operation. The retired raw `{ "channel",
 | `chat.leave` | `{ "channel_id":"ch_…" }` | `{ "left": boolean }` | `CHAT_NOT_SUBSCRIBED` only for a conflicting session identity |
 | `chat.typing` | `{ "channel_id":"ch_…", "typing":true }` | `{ "typing", "expires_at" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
 | `chat.send` | `{ "channel_id":"ch_…", "content":"hello" }` | `{ "message", "event_id" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
-| `chat.history` | `{ "channel_id":"ch_…", "limit":50, "before_message_id":123, "acknowledge_watermark":9 }` | `{ "items", "watermark_event_id" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
+| `chat.history` | `{ "channel_id":"ch_…", "limit":50, "before_message_id":123 }` | `{ "items", "watermark_event_id" }` | `CHAT_NOT_SUBSCRIBED`, `CHAT_UNAVAILABLE`, `CHAT_RATE_LIMITED` |
 | `chat.edit` | `{ "channel_id":"ch_…", "message_id":123, "content":"replacement" }` | `{ "message", "event_id" }` | author/window/access/rate errors |
 | `chat.delete` | `{ "channel_id":"ch_…", "message_id":123 }` | `{ "message_id", "deleted", "event_id" }` | author/window/access/rate errors |
 | `chat.moderate` | `{ "channel_id":"ch_…", "message_id":123 }` for a group subscription | `{ "message_id", "deleted", "event_id" }` | group-role/access/rate errors |
@@ -78,15 +78,55 @@ Unknown, forbidden, and revoked targets all return `CHAT_UNAVAILABLE`.
 ### `KIND_CHAT_EVENT` callback
 
 `KIND_CHAT_EVENT` (28) is a reliable UTF-8 JSON **server-to-client** envelope.
-Use each SDK's normal inbound envelope callback or poll dispatcher and branch on
-kind 28. Events are at-least-once: deduplicate durable mutations by
-`(channel_id, event_id)`. `presence.join`, `presence.leave`, `message.create`,
-`message.update`, and `message.remove` carry the shown type; `typing` carries
-`{ presence, typing, expires_at }` and is non-durable, so clients clear a true
-state at its Unix-millisecond `expires_at`; `access.revoked` ends delivery for
-the recipient; `resync_required` carries a durable
-`watermark_event_id` and requires a `chat.history` acknowledgement. This is
-single-node delivery; another node's sockets are not yet recipients.
+Feed it to the released SDK's typed dispatcher rather than decoding JSON in game
+code. Durable delivery spans the source node and current authenticated cluster
+leases and remains at-least-once. The SDK owns duplicate/gap classification,
+typing expiry, terminal revocation, reconnect fencing, transactional history
+application, and the private correlated watermark acknowledgement. Receiving a
+history page is not equivalent to applying it.
+
+<Tabs syncKey="engine">
+<TabItem label="Unreal C++">
+
+```cpp
+ChatLive->DispatchEnvelope(Envelope.Kind, Envelope.Payload);
+```
+</TabItem>
+<TabItem label="Unity C#">
+
+```csharp
+chat.HandleEnvelope(envelope.Kind, envelope.Payload);
+chat.OnDisconnected(); // fences pending apply/ACK authority
+```
+</TabItem>
+<TabItem label="Godot GDScript">
+
+```gdscript
+chat.handle_envelope(envelope.kind, envelope.payload)
+chat.on_disconnected() # only a correlated rejoin restores admission
+```
+</TabItem>
+<TabItem label="JavaScript">
+
+```js
+client.onChatEvent((event) => cursor.observe(event));
+await client.reconcileChat(cursor, applyHistorySnapshot);
+```
+</TabItem>
+<TabItem label="Rust (citadel-client)">
+
+```rust
+let event = ChatEvent::from_envelope(&envelope)?;
+let disposition = cursor.observe(&event)?;
+```
+</TabItem>
+</Tabs>
+
+All decoders reject malformed JSON, duplicate or unknown fields, invalid numeric
+types, unsupported versions/variants, and inconsistent message state. The raw
+envelope callback remains available for diagnostics and forward-compatible
+instrumentation, but cannot manufacture joined cursors, applied snapshots, or
+acknowledgements.
 
 `chat.moderate` is intentionally unavailable for direct and room targets. A
 group superadmin can tombstone any retained group message; an admin can
@@ -117,40 +157,84 @@ balances; adjustment is trusted game-logic authority only.
 <TabItem label="Unreal C++">
 
 ```cpp
-// Send "groups.create" with UTF-8 JSON; await the correlated RPC response.
-RpcClient.CallRpc("groups.create", R"({"name":"Raiders"})");
+// Raw released seam: u64 request id + u16 method length are big-endian.
+TArray<uint8> Body;
+auto AppendBe = [&Body](uint64 Value, int32 Bytes) {
+    for (int32 Shift = (Bytes - 1) * 8; Shift >= 0; Shift -= 8)
+        Body.Add(static_cast<uint8>((Value >> Shift) & 0xff));
+};
+const uint64 RequestId = 1;
+const FTCHARToUTF8 Method(TEXT("groups.list"));
+const FTCHARToUTF8 Json(TEXT("{\"limit\":50}"));
+AppendBe(RequestId, 8);
+AppendBe(static_cast<uint64>(Method.Length()), 2);
+Body.Append(reinterpret_cast<const uint8*>(Method.Get()), Method.Length());
+Body.Append(reinterpret_cast<const uint8*>(Json.Get()), Json.Length());
+Client->Send(CitadelWire::KIND_RPC_REQUEST, Body, true);
+// The one poll owner uses Poll(...) and matches KIND_RPC_RESPONSE by RequestId.
 ```
 </TabItem>
 <TabItem label="Unreal Blueprint">
 
-1. Call **Send RPC** with method `groups.create` and JSON `{"name":"Raiders"}`.
-2. Await the correlated response and branch on its status.
+The released plugin has no generic Blueprint RPC node. Do not invent **Send
+RPC**. Use the typed domain nodes instead—for chat, call **Build Typing** with
+the channel id and `true`, then **Send Chat Request** and retain its output
+request id. Generic methods such as `groups.list` currently require the C++ raw
+envelope seam shown above.
 </TabItem>
 <TabItem label="Unity C#">
 
 ```csharp
-client.CallRpc("leaderboards.list", Encoding.UTF8.GetBytes("{}"));
+bool sent = rpcClient.CallRpc(
+    "groups.list", Encoding.UTF8.GetBytes("{\"limit\":50}"), result =>
+    {
+        if (result.Ok) Debug.Log(Encoding.UTF8.GetString(result.Payload));
+        else Debug.LogError(result.PayloadAsText());
+    });
+if (!sent) Debug.LogError("groups.list was not sent");
 ```
 </TabItem>
 <TabItem label="Godot GDScript">
 
 ```gdscript
-client.call_rpc("wallet.balances", "{}".to_utf8_buffer, on_result)
+# There is no public call_rpc; use the released protocol + raw send seam.
+var on_result := func(status: int, payload: PackedByteArray) -> void:
+    print("groups.list status=", status, " payload=", payload.get_string_from_utf8())
+var request_id := next_rpc_id
+var body := CitadelProtocol.encode_rpc_request(
+    request_id, "groups.list", '{"limit":50}'.to_utf8_buffer())
+var status := client.send(CitadelProtocol.KIND_RPC_REQUEST, body, true)
+if status == CitadelClient.Status.OK or status == CitadelClient.Status.AGAIN:
+    pending_rpc[request_id] = on_result
+    next_rpc_id += 1
+
+# From the single poll owner's KIND_RPC_RESPONSE branch:
+var response := CitadelProtocol.decode_rpc_response(envelope.payload)
+if not response.is_empty():
+    var callback: Callable = pending_rpc.get(response.request_id, Callable())
+    pending_rpc.erase(response.request_id)
+    if callback.is_valid(): callback.call(response.status, response.payload)
 ```
 </TabItem>
 <TabItem label="JavaScript">
 
 ```js
-const response = await client.callRpc("chat.history", new TextEncoder.encode(JSON.stringify({
-  channel_id,
-  limit: 50,
-})));
+const response = await client.callRpc(
+  "groups.list",
+  new TextEncoder().encode(JSON.stringify({ limit: 50 })),
+);
 ```
 </TabItem>
 <TabItem label="Rust (citadel-client)">
 
 ```rust
-let response = client.call_rpc("groups.list", br#"{"limit":50}"#).await?;
+let mut inbound = Vec::new();
+let response = client
+    .call_rpc("groups.list", br#"{"limit":50}"#, |envelope| {
+        inbound.push(envelope); // retain non-matching traffic for normal dispatch
+        Ok(())
+    })
+    .await?;
 ```
 </TabItem>
 </Tabs>

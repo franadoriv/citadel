@@ -38,8 +38,8 @@ pub use backend::{
     Backend, BackendKind, InMemoryBackend, InMemoryUnitOfWork, UnitOfWork, select_backend,
 };
 pub use chat::{
-    ChannelSummary, ChannelType, ChatChannel, ChatDeliveryOutboxRecord, ChatMessage,
-    ChatModerationAudit, ChatRateLimit, ChatRepository, DEFAULT_CHANNEL_HISTORY_CAP,
+    ChannelSummary, ChannelType, ChatChannel, ChatDeliveryOutboxRecord, ChatDeliveryRequest,
+    ChatMessage, ChatModerationAudit, ChatRateLimit, ChatRepository, DEFAULT_CHANNEL_HISTORY_CAP,
     InMemoryChatRepository,
 };
 pub use friends::{

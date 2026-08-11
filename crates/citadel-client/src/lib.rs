@@ -14,11 +14,21 @@
 //!
 //! Endpoints and certificates are parameters; no credentials are embedded.
 
+pub mod chat;
+pub mod chat_rpc;
 pub mod http;
 pub mod networkpeer;
 pub mod quic;
+mod rpc;
 pub mod websocket;
 
+pub use chat::{
+    ChatAcknowledgementRequest, ChatCursorState, ChatEvent, ChatEventCursor, ChatEventDisposition,
+    ChatEventError, ChatEventKind, ChatHistoryApplication, ChatHistoryRequest, ChatHistoryResult,
+    ChatJoinAttempt, ChatJoinRequest, ChatJoinResult, ChatLeaveResult, ChatMessage,
+    ChatMutationResult, ChatPresence, ChatRemoveResult, ChatTypingResult,
+};
+pub use chat_rpc::{ChatHistoryOptions, ChatRequestError, ChatRpcRequest, ChatTarget};
 pub use citadel_wire::Envelope;
 pub use http::{
     CitadelHttpClient, EmailAuthenticationRequest, LookupUsersRequest, LookupUsersResponse,

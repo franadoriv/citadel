@@ -29,6 +29,9 @@ namespace Citadel.Demo
         [Tooltip("Optional room helper; room frames are forwarded to it by the single poll loop.")]
         public CitadelRooms rooms;
 
+        /// <summary>Durable chat helper fed by this component's one poll loop.</summary>
+        public CitadelChatLive chatLive;
+
         [Tooltip("Optional prefab for a peer. If null, a primitive cube is created.")]
         public GameObject peerPrefab;
 
@@ -37,9 +40,20 @@ namespace Citadel.Demo
 
         private readonly Dictionary<ulong, Transform> _peers = new Dictionary<ulong, Transform>();
 
-        // Reusable poll buffer. Peer bodies are 16 bytes (8 id + 8 position);
-        // 256 is comfortable headroom and avoids per-frame allocation.
-        private readonly byte[] _buffer = new byte[256];
+        // The C ABI consumes one envelope per poll even when the destination is
+        // too small. Match the protocol's bounded native/Unreal envelope cap so
+        // valid history responses are never consumed as truncated 8 KiB frames.
+        private readonly byte[] _buffer = new byte[8 * 1024 * 1024];
+
+        private void Awake()
+        {
+            if (chatLive == null && rpcClient != null)
+            {
+                chatLive = new CitadelChatLive((method, payload, callback) =>
+                    rpcClient.CallRpc(method, payload, result =>
+                        callback?.Invoke(result.Ok ? result.Payload : System.Array.Empty<byte>())), 64);
+            }
+        }
 
         private void Update()
         {
@@ -60,13 +74,19 @@ namespace Citadel.Demo
 
                 if (result == PollResult.Disconnected)
                 {
+                    rpcClient?.FailAllPending("transport disconnected");
+                    chatLive?.OnDisconnected();
                     Debug.LogWarning("[Citadel] server disconnected");
                     break;
                 }
 
                 if (truncated)
                 {
-                    // Should never happen for the tiny position bodies; skip if it does.
+                    // Poll already consumed this envelope, so correlation cannot
+                    // be recovered. Fail all RPCs and consume chat admission.
+                    rpcClient?.FailAllPending($"consumed oversized RPC envelope ({length} bytes)");
+                    chatLive?.OnDisconnected();
+                    Debug.LogError($"[Citadel] consumed oversized envelope ({length} bytes); pending RPCs failed closed");
                     continue;
                 }
 
@@ -75,6 +95,16 @@ namespace Citadel.Demo
                     // Correlated RPC reply: hand it to the RPC helper, if present.
                     rpcClient?.HandleResponse(_buffer, length);
                     continue;
+                }
+
+                if (chatLive != null)
+                {
+                    var payload = new byte[length];
+                    System.Buffer.BlockCopy(_buffer, 0, payload, 0, length);
+                    if (chatLive.HandleEnvelope(kind, payload))
+                    {
+                        continue;
+                    }
                 }
 
                 if (rooms != null && rooms.HandleEnvelope(kind, _buffer, length))

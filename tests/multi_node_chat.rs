@@ -111,7 +111,12 @@ async fn two_nodes_deliver_durable_chat_but_never_route_typing(
         Arc::new(InMemoryGroupsRepository::new()),
     ));
     let chat = Arc::new(ChatService::new(Arc::clone(&chat_repository)));
-    let node_a = gateway("node-a", friends.clone(), groups.clone(), chat.clone());
+    let node_a = Arc::new(gateway(
+        "node-a",
+        friends.clone(),
+        groups.clone(),
+        chat.clone(),
+    ));
     let node_b = Arc::new(gateway("node-b", friends, groups, chat));
     let (alice, mut alice_rx) = register(&node_a, "alice");
     let (bob, mut bob_rx) = register(&node_b, "bob");
@@ -190,16 +195,18 @@ async fn two_nodes_deliver_durable_chat_but_never_route_typing(
             }),
         ),
     );
-    let local_event = alice_rx.recv().await.expect("local durable event");
-    assert_eq!(local_event.envelope.kind, KIND_CHAT_EVENT);
     assert_eq!(rpc_response(&mut alice_rx).await.1, protocol::RPC_STATUS_OK);
 
+    let local = Arc::clone(&node_a);
+    let local_delivery = Arc::clone(&local);
+    let local_node = node("node-a");
     let destination = Arc::clone(&node_b);
     let destination_directory_for_router = Arc::clone(&destination_directory);
-    let dispatcher = ChatDeliveryDispatcher::new(
-        node("node-a"),
+    let dispatcher = ChatDeliveryDispatcher::new_with_local_delivery(
+        local_node.clone(),
         chat_repository,
         source_directory,
+        Arc::new(move |delivery| Ok(local_delivery.deliver_local_chat(&local_node, delivery))),
         Arc::new(move |destination_node, delivery| {
             assert_eq!(destination_node.as_str(), "node-b");
             Ok(destination.deliver_remote_chat(
@@ -215,6 +222,11 @@ async fn two_nodes_deliver_durable_chat_but_never_route_typing(
         .expect("dispatch succeeds");
     assert_eq!(stats.attempted, 1);
     assert_eq!(stats.acknowledged, 1);
+    let local_event = alice_rx
+        .recv()
+        .await
+        .expect("dispatcher delivers source-local durable event");
+    assert_eq!(local_event.envelope.kind, KIND_CHAT_EVENT);
     let remote_event = bob_rx.recv().await.expect("remote durable event");
     assert_eq!(remote_event.delivery, Delivery::Reliable);
     assert_eq!(remote_event.envelope.kind, KIND_CHAT_EVENT);
@@ -246,6 +258,191 @@ async fn two_nodes_deliver_durable_chat_but_never_route_typing(
             .loaded,
         0
     );
+}
+
+async fn two_nodes_deliver_moderation_tombstone_locally_and_remotely(
+    chat_repository: Arc<dyn ChatRepository>,
+) {
+    let friends = Arc::new(FriendsService::new(Arc::new(
+        InMemoryFriendsRepository::new(),
+    )));
+    let groups = Arc::new(GroupsService::new(
+        Arc::new(InMemoryGroupsRepository::new()),
+    ));
+    let chat = Arc::new(ChatService::new(Arc::clone(&chat_repository)));
+    let node_a = Arc::new(gateway(
+        "node-a",
+        friends.clone(),
+        groups.clone(),
+        chat.clone(),
+    ));
+    let node_b = Arc::new(gateway("node-b", friends, groups, chat));
+    let (alice, mut alice_rx) = register(&node_a, "alice");
+    let (bob, mut bob_rx) = register(&node_b, "bob");
+
+    node_a.handle_inbound(
+        alice,
+        &rpc(20, "groups.create", serde_json::json!({"name": "Raiders"})),
+    );
+    let (_, status, body) = rpc_response(&mut alice_rx).await;
+    assert_eq!(status, protocol::RPC_STATUS_OK);
+    let group_id = serde_json::from_slice::<serde_json::Value>(&body).expect("group JSON")["id"]
+        .as_u64()
+        .expect("group id");
+    node_a.handle_inbound(
+        alice,
+        &rpc(
+            21,
+            "groups.add_member",
+            serde_json::json!({"group_id": group_id, "user_id": "bob"}),
+        ),
+    );
+    assert_eq!(rpc_response(&mut alice_rx).await.1, protocol::RPC_STATUS_OK);
+
+    for (gateway, participant, receiver, request_id) in [
+        (&*node_a, alice, &mut alice_rx, 22_u64),
+        (&*node_b, bob, &mut bob_rx, 23_u64),
+    ] {
+        gateway.handle_inbound(
+            participant,
+            &rpc(
+                request_id,
+                "chat.join",
+                serde_json::json!({"target": {"kind": "group", "group_id": group_id}}),
+            ),
+        );
+        assert_eq!(rpc_response(receiver).await.1, protocol::RPC_STATUS_OK);
+    }
+    let channel = chat_repository
+        .resolve_canonical_channel(
+            &format!("group:{group_id}"),
+            citadel::repository::ChannelType::Group,
+            SystemClock.now(),
+        )
+        .await
+        .expect("group channel");
+
+    let now = SystemClock.now();
+    let expires_at = TimestampMillis::from_unix_millis(now.unix_millis().saturating_add(60_000));
+    let directory_a = Arc::new(ChatPresenceDirectory::default());
+    let directory_b = Arc::new(ChatPresenceDirectory::default());
+    for directory in [&directory_a, &directory_b] {
+        assert_eq!(
+            directory.advertise(
+                ChatPresenceLease {
+                    channel_id: channel.id.clone(),
+                    node_id: node("node-a"),
+                    generation: OwnershipGeneration::new(1),
+                    expires_at,
+                },
+                now,
+            ),
+            ChatLeaseUpdate::Applied
+        );
+        assert_eq!(
+            directory.advertise(
+                ChatPresenceLease {
+                    channel_id: channel.id.clone(),
+                    node_id: node("node-b"),
+                    generation: OwnershipGeneration::new(1),
+                    expires_at,
+                },
+                now,
+            ),
+            ChatLeaseUpdate::Applied
+        );
+    }
+
+    node_b.handle_inbound(
+        bob,
+        &rpc(
+            24,
+            "chat.send",
+            serde_json::json!({"channel_id": channel.id, "content": "remove me"}),
+        ),
+    );
+    assert_eq!(rpc_response(&mut bob_rx).await.1, protocol::RPC_STATUS_OK);
+
+    let source_b = Arc::clone(&node_b);
+    let source_node_b = node("node-b");
+    let destination_a = Arc::clone(&node_a);
+    let destination_directory_a = Arc::clone(&directory_a);
+    ChatDeliveryDispatcher::new_with_local_delivery(
+        source_node_b.clone(),
+        Arc::clone(&chat_repository),
+        Arc::clone(&directory_b),
+        Arc::new(move |delivery| Ok(source_b.deliver_local_chat(&source_node_b, delivery))),
+        Arc::new(move |destination, delivery| {
+            Ok(destination_a.deliver_remote_chat(destination, &destination_directory_a, delivery))
+        }),
+    )
+    .dispatch_once(now, 8)
+    .await
+    .expect("deliver create");
+    let bob_create = bob_rx
+        .recv()
+        .await
+        .expect("dispatcher delivers sender create");
+    assert_eq!(bob_create.envelope.kind, KIND_CHAT_EVENT);
+    let alice_create = alice_rx.recv().await.expect("recipient receives create");
+    assert_eq!(alice_create.envelope.kind, KIND_CHAT_EVENT);
+
+    node_a.handle_inbound(
+        alice,
+        &rpc(
+            25,
+            "chat.moderate",
+            serde_json::json!({"channel_id": channel.id, "message_id": 1}),
+        ),
+    );
+    let (_, status, body) = rpc_response(&mut alice_rx).await;
+    assert_eq!(status, protocol::RPC_STATUS_OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("moderation RPC JSON")["deleted"],
+        true
+    );
+
+    let source_a = Arc::clone(&node_a);
+    let source_node_a = node("node-a");
+    let destination_b = Arc::clone(&node_b);
+    let destination_directory_b = Arc::clone(&directory_b);
+    let stats = ChatDeliveryDispatcher::new_with_local_delivery(
+        source_node_a.clone(),
+        chat_repository,
+        directory_a,
+        Arc::new(move |delivery| Ok(source_a.deliver_local_chat(&source_node_a, delivery))),
+        Arc::new(move |destination, delivery| {
+            Ok(destination_b.deliver_remote_chat(destination, &destination_directory_b, delivery))
+        }),
+    )
+    .dispatch_once(now, 8)
+    .await
+    .expect("deliver remove");
+    assert_eq!(stats.attempted, 1);
+    assert_eq!(stats.acknowledged, 1);
+    let alice_remove = alice_rx
+        .recv()
+        .await
+        .expect("dispatcher delivers moderator remove");
+    assert_eq!(alice_remove.envelope.kind, KIND_CHAT_EVENT);
+    let remove_json: serde_json::Value =
+        serde_json::from_slice(&alice_remove.envelope.body).expect("remove JSON");
+    assert_eq!(remove_json["type"], "message.remove");
+    assert_eq!(remove_json["message"]["deleted"], true);
+    let bob_remove = bob_rx.recv().await.expect("author receives remote remove");
+    assert_eq!(bob_remove.envelope.kind, 28);
+    let remote_json: serde_json::Value =
+        serde_json::from_slice(&bob_remove.envelope.body).expect("remote remove JSON");
+    assert_eq!(remote_json["type"], "message.remove");
+    assert_eq!(remote_json["message"]["deleted"], true);
+}
+
+#[tokio::test]
+async fn two_nodes_deliver_moderation_tombstone_in_memory_reference() {
+    two_nodes_deliver_moderation_tombstone_locally_and_remotely(Arc::new(
+        InMemoryChatRepository::new(),
+    ))
+    .await;
 }
 
 #[tokio::test]

@@ -313,6 +313,29 @@ impl ChatPresencePublisher for ControlChatPresencePublisher {
     }
 }
 
+fn deliver_local_chat(
+    gateway: &std::sync::Weak<Gateway>,
+    local_node: &crate::session::NodeId,
+    delivery: crate::chat_cluster::RemoteChatDelivery,
+) -> Result<crate::chat_cluster::ChatDeliveryDisposition, ()> {
+    gateway
+        .upgrade()
+        .ok_or(())
+        .map(|gateway| gateway.deliver_local_chat(local_node, delivery))
+}
+
+fn deliver_remote_chat_to_gateway(
+    gateway: &std::sync::Weak<Gateway>,
+    local_node: &crate::session::NodeId,
+    directory: &crate::chat_cluster::ChatPresenceDirectory,
+    delivery: crate::chat_cluster::RemoteChatDelivery,
+) -> crate::chat_cluster::ChatDeliveryDisposition {
+    gateway.upgrade().map_or(
+        crate::chat_cluster::ChatDeliveryDisposition::Unavailable,
+        |gateway| gateway.deliver_remote_chat(local_node, directory, delivery),
+    )
+}
+
 /// Build a [`Supervisor`] with every transport the app's config enables.
 ///
 /// The returned supervisor shares `cancel`, so cancelling it stops all started
@@ -484,7 +507,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // only supplies the operator-configured mTLS identity and endpoint map.
     let mut chat_cluster_directory = None;
     let mut chat_cluster_router = None;
-    let mut chat_cluster_node = None;
+    let mut pending_control_listener = None;
     let mut runtime_cache_lease_renewal = None;
     if app.config().cluster.enabled {
         let cluster = &app.config().cluster;
@@ -662,11 +685,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
                 AppError::config("cluster.control_bind must be a socket address")
                     .with_detail(error.to_string())
             })?;
-        live.start_listener(control_bind)?;
+        pending_control_listener = Some((Arc::clone(&live), control_bind));
         gateway = gateway.with_live_matchmaker(live);
         chat_cluster_directory = Some(chat_directory);
         chat_cluster_router = Some(router);
-        chat_cluster_node = Some(local_node);
     }
 
     let gateway = Arc::new(gateway);
@@ -683,35 +705,42 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // runtime is attached (embedded or external worker): a bound match's
     // script answers land here for validation + materialization.
     gateway.attach_bridge_sink();
-    let mut chat_delivery_dispatcher = None;
-    if let (Some(directory), Some(router), Some(local_node)) = (
-        chat_cluster_directory,
-        chat_cluster_router,
-        chat_cluster_node,
-    ) {
+    let local_node = NodeId::new(app.config().server.node_id.clone())?;
+    let directory = chat_cluster_directory
+        .unwrap_or_else(|| Arc::new(crate::chat_cluster::ChatPresenceDirectory::default()));
+    if let Some(router) = &chat_cluster_router {
         let gateway = Arc::downgrade(&gateway);
         let delivery_local_node = local_node.clone();
         let delivery_directory = Arc::clone(&directory);
         router.register_chat_delivery_handler(Arc::new(move |_source, delivery| {
-            gateway.upgrade().map_or(
-                crate::chat_cluster::ChatDeliveryDisposition::Unknown,
-                |gateway| {
-                    gateway.deliver_remote_chat(&delivery_local_node, &delivery_directory, delivery)
-                },
+            deliver_remote_chat_to_gateway(
+                &gateway,
+                &delivery_local_node,
+                &delivery_directory,
+                delivery,
             )
         }));
-        let delivery_router = Arc::clone(&router);
-        chat_delivery_dispatcher = Some(Arc::new(ChatDeliveryDispatcher::new(
-            local_node.clone(),
-            app.backend().chat_repository(),
-            directory,
-            Arc::new(move |destination, delivery| {
-                delivery_router
-                    .deliver_chat(destination, delivery)
-                    .map_err(|_| ())
-            }),
-        )));
     }
+    if let Some((live, control_bind)) = pending_control_listener {
+        live.start_listener(control_bind)?;
+    }
+    let local_gateway = Arc::downgrade(&gateway);
+    let local_delivery_node = local_node.clone();
+    let delivery_router = chat_cluster_router;
+    let chat_delivery_dispatcher = Arc::new(ChatDeliveryDispatcher::new_with_local_delivery(
+        local_node,
+        app.backend().chat_repository(),
+        directory,
+        Arc::new(move |delivery| {
+            deliver_local_chat(&local_gateway, &local_delivery_node, delivery)
+        }),
+        Arc::new(move |destination, delivery| {
+            delivery_router.as_ref().map_or(
+                Ok(crate::chat_cluster::ChatDeliveryDisposition::Unavailable),
+                |router| router.deliver_chat(destination, delivery).map_err(|_| ()),
+            )
+        }),
+    ));
 
     // A player notification is persisted before this process-local sink is
     // called. A full/disconnected outbound queue merely drops its live attempt;
@@ -728,6 +757,15 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // The ticket index has a single local leader in this deployment. Keep its
     // 250 ms lifecycle independent from an optional game-script tick so TTL
     // cleanup and formation do not stop when no script registered on_tick.
+    let chat_delivery_interval =
+        std::time::Duration::from_millis((app.config().cluster.lease_ttl_ms / 2).max(1));
+    supervisor.spawn(crate::realtime::ChatDeliveryDispatchService::new(
+        chat_delivery_dispatcher,
+        app.chat().delivery_notify(),
+        chat_delivery_interval,
+        64,
+        64,
+    ));
     if !app.config().cluster.enabled {
         supervisor.spawn(crate::realtime::MatchmakerTickService::new(
             Arc::clone(&gateway),
@@ -737,19 +775,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         // Renew well before the exclusive lease deadline. The worker is
         // independent from socket traffic and all remote calls remain bounded
         // control-plane commands.
-        let renewal_ms = (app.config().cluster.lease_ttl_ms / 2).max(1);
         supervisor.spawn(crate::realtime::ChatPresenceRenewalService::new(
             Arc::clone(&gateway),
-            std::time::Duration::from_millis(renewal_ms),
+            chat_delivery_interval,
         ));
-        if let Some(dispatcher) = chat_delivery_dispatcher {
-            supervisor.spawn(crate::realtime::ChatDeliveryDispatchService::new(
-                dispatcher,
-                std::time::Duration::from_millis(renewal_ms),
-                64,
-                64,
-            ));
-        }
         if let Some(renewal) = runtime_cache_lease_renewal {
             supervisor.spawn(renewal);
         }
@@ -1720,6 +1749,50 @@ mod tests {
 
     fn loopback(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn dropped_gateway_makes_remote_outbox_delivery_retryable() {
+        let gateway = Arc::new(Gateway::new());
+        let weak = Arc::downgrade(&gateway);
+        drop(gateway);
+        let delivery = crate::chat_cluster::RemoteChatDelivery {
+            event_id: 1,
+            channel_id: "channel".to_owned(),
+            destination_generation: crate::session::OwnershipGeneration::new(1),
+            authority_epoch: 0,
+            payload: "{}".to_owned(),
+            deadline: crate::time::TimestampMillis::from_unix_millis(u64::MAX),
+        };
+        let node_id =
+            crate::session::NodeId::new("node-b".to_owned()).expect("static test node id is valid");
+        assert_eq!(
+            deliver_remote_chat_to_gateway(
+                &weak,
+                &node_id,
+                &crate::chat_cluster::ChatPresenceDirectory::default(),
+                delivery,
+            ),
+            crate::chat_cluster::ChatDeliveryDisposition::Unavailable
+        );
+    }
+
+    #[test]
+    fn dropped_gateway_makes_local_outbox_delivery_retryable() {
+        let gateway = Arc::new(Gateway::new());
+        let weak = Arc::downgrade(&gateway);
+        drop(gateway);
+        let delivery = crate::chat_cluster::RemoteChatDelivery {
+            event_id: 1,
+            channel_id: "channel".to_owned(),
+            destination_generation: crate::session::OwnershipGeneration::new(0),
+            authority_epoch: 0,
+            payload: "{}".to_owned(),
+            deadline: crate::time::TimestampMillis::from_unix_millis(1),
+        };
+        let node_id =
+            crate::session::NodeId::new("node-a".to_owned()).expect("static test node id is valid");
+        assert!(deliver_local_chat(&weak, &node_id, delivery).is_err());
     }
 
     #[test]
