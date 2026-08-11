@@ -109,6 +109,7 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let acceptor = TlsAcceptor::from(config);
+    let api_keys = Arc::clone(app.api_keys());
     let router = super::router(app);
     let mut connections = tokio::task::JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -178,7 +179,7 @@ where
             connections.shutdown().await;
         }
     }
-    Ok(())
+    api_keys.flush_last_used().await
 }
 
 /// The socket address a bound listener is actually serving on.

@@ -134,7 +134,8 @@ pub async fn serve<F>(listener: TcpListener, app: App, shutdown: F) -> AppResult
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    axum::serve(
+    let api_keys = Arc::clone(app.api_keys());
+    let serve_result = axum::serve(
         listener,
         router(app).into_make_service_with_connect_info::<SocketAddr>(),
     )
@@ -146,7 +147,10 @@ where
             "HTTP server terminated with an error",
         )
         .with_detail(e.to_string())
-    })
+    });
+    let flush_result = api_keys.flush_last_used().await;
+    serve_result?;
+    flush_result
 }
 
 /// Serve on `listener` using whichever scheme the configuration selects.

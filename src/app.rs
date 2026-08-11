@@ -20,11 +20,11 @@ use crate::host_telemetry::{HostTelemetryService, HostTelemetrySnapshot};
 use crate::observability::NodeMetrics;
 use crate::repository::{Backend, BackendKind, InMemoryBackend, select_backend};
 use crate::services::{
-    AuditLog, AuthenticationRateLimitPolicy, AuthenticationService, AuthenticationServiceImpl,
-    ChatAccessCoordinator, ChatRateLimitPolicy, ChatService, ConsoleTokenStore,
-    DatabaseExplorerRateLimiter, FriendsService, GroupsService, Health, InMemorySessionService,
-    LeaderboardService, NotificationService, PlayerNotificationService, PurchaseService,
-    SharedSessionService, WalletService,
+    ApiKeyService, AuditLog, AuthenticationRateLimitPolicy, AuthenticationService,
+    AuthenticationServiceImpl, ChatAccessCoordinator, ChatRateLimitPolicy, ChatService,
+    ConsoleTokenStore, DatabaseExplorerRateLimiter, FriendsService, GroupsService, Health,
+    InMemorySessionService, LeaderboardService, NotificationService, PlayerNotificationService,
+    PurchaseService, SharedSessionService, WalletService,
 };
 use crate::time::{Clock, SystemClock};
 
@@ -56,6 +56,7 @@ pub struct App {
     auth: Arc<dyn AuthenticationService>,
     sessions: SharedSessionService,
     console_tokens: Arc<ConsoleTokenStore>,
+    api_keys: Arc<ApiKeyService>,
     audit: Arc<AuditLog>,
     error_journal: Arc<ErrorJournal>,
     chat_access: Arc<ChatAccessCoordinator>,
@@ -130,6 +131,7 @@ impl App {
             Arc::clone(&sessions),
         ));
         let console_tokens = Arc::new(ConsoleTokenStore::from_config(&config.console));
+        let api_keys = Arc::new(ApiKeyService::new(backend.api_key_repository()));
         let error_journal = error_reporting::journal_for_config(&config.errors);
         let chat = Arc::new(ChatService::new(backend.chat_repository()));
         let chat_rate_limits = Arc::new(ChatRateLimitPolicy::new(config.chat.limits.clone()));
@@ -174,6 +176,7 @@ impl App {
             auth,
             sessions,
             console_tokens,
+            api_keys,
             audit: Arc::new(AuditLog::default()),
             error_journal,
             chat_access,
@@ -315,6 +318,11 @@ impl App {
     #[must_use]
     pub fn console_tokens(&self) -> &Arc<ConsoleTokenStore> {
         &self.console_tokens
+    }
+
+    #[must_use]
+    pub fn api_keys(&self) -> &Arc<ApiKeyService> {
+        &self.api_keys
     }
 
     /// The console action audit trail.

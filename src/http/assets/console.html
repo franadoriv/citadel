@@ -336,6 +336,15 @@ select.form-in {
 .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
 .form-row .field { flex: 1; min-width: 130px; margin-bottom: 0; }
 .form-row .field.fixed { flex: 0 0 auto; }
+.scope-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+.scope-option {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--navy-900);
+  color: var(--text-muted); font-family: var(--mono); font-size: 12px;
+}
+.scope-option input { accent-color: var(--accent-400); }
+.inline-error { color: var(--bad); font-size: 12.5px; margin: 0 0 12px; }
+.secret-value { user-select: all; overflow-wrap: anywhere; }
 
 pre.code {
   margin: 0; background: var(--navy-900); border: 1px solid var(--border);
@@ -403,8 +412,24 @@ pre.code {
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
 
 @media (max-width: 820px) {
-  .app { grid-template-columns: 1fr; grid-template-areas: "brand" "topbar" "content"; }
-  .sidebar { display: none; }
+  .app {
+    grid-template-columns: 1fr;
+    grid-template-rows: var(--topbar-h) var(--topbar-h) auto 1fr;
+    grid-template-areas: "brand" "topbar" "sidebar" "content";
+  }
+  .topbar { overflow-x: auto; padding: 0 14px; }
+  .topbar .meta { min-width: max-content; }
+  .sidebar {
+    display: flex; align-items: center; gap: 4px; padding: 6px 8px;
+    overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  .nav-group { display: flex; gap: 4px; padding: 0; flex: 0 0 auto; }
+  .nav-group .label { display: none; }
+  .nav-item { margin: 0; white-space: nowrap; }
+  .content { padding: 18px 14px 32px; }
+  .page-head { flex-direction: column; }
+  .page-head .btn { width: 100%; justify-content: center; }
+  .scope-grid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -458,7 +483,7 @@ pre.code {
 </div>
 
 <div id="modal-root"></div>
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast" aria-live="polite"></div>
 
 <script>
 "use strict";
@@ -491,7 +516,8 @@ pre.code {
     trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
     download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
     send: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
-    plug: '<path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0V8zM12 17v5"/>'
+    plug: '<path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0V8zM12 17v5"/>',
+    key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12l9-9M17 6l3 3M14 9l2 2"/>'
   };
   function svg(name) { return '<svg viewBox="0 0 24 24">' + (I[name] || '') + '</svg>'; }
 
@@ -539,11 +565,12 @@ pre.code {
   // ---- Auth state + API helper ---------------------------------------------
   var TOKEN_KEY = 'citadel.console.token';
   var ROLE_KEY = 'citadel.console.role';
-  var state = { user: null };
+  var state = { user: null, sessionGeneration: 0, viewGeneration: 0 };
   var ACT = {};   // per-view click actions: data-act -> fn(dataset, el)
   var FORM = {};  // per-view form actions: data-form -> fn(values, formEl)
 
   function token() { return sessionStorage.getItem(TOKEN_KEY) || ''; }
+  function isAdmin() { return !!(state.user && state.user.role === 'admin'); }
   function isViewer() { return !!(state.user && state.user.role === 'viewer'); }
   function adminDis() { return isViewer() ? ' disabled title="admin role required"' : ''; }
 
@@ -571,6 +598,22 @@ pre.code {
     });
   }
 
+  function captureApiKeyRequestContext() {
+    return {
+      route: currentRoute(),
+      sessionGeneration: state.sessionGeneration,
+      viewGeneration: state.viewGeneration,
+      token: token()
+    };
+  }
+  function apiKeyRequestContextIsCurrent(context) {
+    return !!state.user
+      && context.route === currentRoute()
+      && context.sessionGeneration === state.sessionGeneration
+      && context.viewGeneration === state.viewGeneration
+      && context.token === token();
+  }
+
   // ---- Toast ----------------------------------------------------------------
   var toastTimer = null;
   function toast(msg, kind) {
@@ -583,17 +626,49 @@ pre.code {
   function fail(e) { if (e && e.message !== 'session expired') toast(e.message || 'request failed', 'err'); }
 
   // ---- Modal (inline dialog; native dialogs are never used) -----------------
+  var modalReturnFocus = null;
   function openModal(title, bodyHtml) {
-    qs('modal-root').innerHTML =
-      '<div class="modal-back"><div class="panel modal">'
-      + '<div class="panel-head"><h2>' + esc(title) + '</h2><div class="spacer"></div>'
+    var modalRoot = qs('modal-root');
+    if (!modalRoot.firstChild) modalReturnFocus = document.activeElement;
+    modalRoot.innerHTML =
+      '<div class="modal-back"><div class="panel modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">'
+      + '<div class="panel-head"><h2 id="modal-title">' + esc(title) + '</h2><div class="spacer"></div>'
       + '<button class="btn small" data-act="modal-close">Close</button></div>'
       + '<div class="panel-body">' + bodyHtml + '</div></div></div>';
+    var dialog = modalRoot.querySelector('[role="dialog"]');
+    var focusableSelector = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+    var modalFocusTarget = dialog.querySelector('.panel-body input:not([disabled]), .panel-body select:not([disabled]), .panel-body textarea:not([disabled]), .panel-body [tabindex]:not([tabindex="-1"]), .panel-body button:not([disabled])')
+      || dialog.querySelector(focusableSelector);
+    if (modalFocusTarget) modalFocusTarget.focus();
+    dialog.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeModal();
+        return;
+      }
+      if (ev.key !== 'Tab') return;
+      var focusable = dialog.querySelectorAll(focusableSelector);
+      if (!focusable.length) { ev.preventDefault(); return; }
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (ev.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        ev.preventDefault();
+        last.focus();
+      } else if (!ev.shiftKey && document.activeElement === last) {
+        ev.preventDefault();
+        first.focus();
+      }
+    });
   }
-  function closeModal() { qs('modal-root').innerHTML = ''; }
+  function closeModal() {
+    qs('modal-root').replaceChildren();
+    if (modalReturnFocus && document.contains(modalReturnFocus)) modalReturnFocus.focus();
+    modalReturnFocus = null;
+  }
 
   // ---- Inline confirm: swap the button for a "Confirm? Yes / No" pair -------
   function armConfirm(btn) {
+    var confirmReturnFocus = document.activeElement;
     var wrap = document.createElement('span');
     wrap.className = 'confirm-inline';
     var q = document.createElement('span');
@@ -614,7 +689,19 @@ pre.code {
     no.setAttribute('data-act', '__cancel');
     wrap.appendChild(q); wrap.appendChild(yes); wrap.appendChild(no);
     wrap.__orig = btn;
+    wrap.__restore = function () {
+      wrap.replaceWith(btn);
+      if (confirmReturnFocus && document.contains(confirmReturnFocus)) confirmReturnFocus.focus();
+      else btn.focus();
+    };
+    wrap.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') { ev.preventDefault(); wrap.__restore(); return; }
+      if (ev.key !== 'Tab') return;
+      if (ev.shiftKey && document.activeElement === yes) { ev.preventDefault(); no.focus(); }
+      else if (!ev.shiftKey && document.activeElement === no) { ev.preventDefault(); yes.focus(); }
+    });
     btn.replaceWith(wrap);
+    yes.focus();
   }
 
   // ---- Event delegation (clicks + form submits, whole document) --------------
@@ -626,12 +713,14 @@ pre.code {
       if (act === '__cancel') {
         ev.preventDefault();
         var w = btn.closest('.confirm-inline');
-        if (w && w.__orig) w.replaceWith(w.__orig);
+        if (w && w.__restore) w.__restore();
         return;
       }
       if (btn.hasAttribute('data-confirm')) { ev.preventDefault(); armConfirm(btn); return; }
       if (act === 'logout') { ev.preventDefault(); logout(false); return; }
       if (act === 'modal-close') { ev.preventDefault(); closeModal(); return; }
+      var confirmation = btn.closest('.confirm-inline');
+      if (confirmation && confirmation.__restore) confirmation.__restore();
       var fn = ACT[act];
       if (fn) { ev.preventDefault(); fn(btn.dataset, btn); }
     });
@@ -752,6 +841,7 @@ pre.code {
     ]},
     { label: 'System', items: [
       { id: 'configuration', title: 'Configuration', icon: 'settings' },
+      { id: 'api-keys', title: 'API Keys', icon: 'key', adminOnly: true },
       { id: 'api', title: 'API Explorer / Runtime', icon: 'terminal' },
       { id: 'audit', title: 'Audit Logs', icon: 'scroll' },
       { id: 'errors', title: 'Error Journal', icon: 'alert' }
@@ -766,6 +856,7 @@ pre.code {
     NAV.forEach(function (g) {
       html += '<div class="nav-group"><div class="label">' + esc(g.label) + '</div>';
       g.items.forEach(function (it) {
+        if (it.adminOnly && !isAdmin()) return;
         var cls = 'nav-item' + (it.id === active ? ' active' : '');
         html += '<a class="' + cls + '" href="#/' + it.id + '">'
           + '<span class="ico">' + svg(it.icon) + '</span>'
@@ -785,9 +876,10 @@ pre.code {
   }
   function currentRoute() {
     var h = (location.hash || '').replace(/^#\/?/, '').trim();
-    return ROUTES[h] ? h : 'status';
+    return ROUTES[h] && (!ROUTES[h].adminOnly || isAdmin()) ? h : 'status';
   }
   function render() {
+    state.viewGeneration += 1;
     if (!state.user) return;
     var id = currentRoute();
     var route = ROUTES[id];
@@ -2003,6 +2095,167 @@ pre.code {
     };
   }
 
+  // ==== API Keys (human admin only) ============================================
+  var API_KEY_SCOPES = [
+    'telemetry:read', 'config:read', 'audit:read', 'errors:read',
+    'accounts:read', 'groups:read', 'runtime:read', 'matches:read',
+    'storage:read', 'database:read', 'chat:read', 'notifications:read',
+    'leaderboards:read', 'tournaments:read', 'purchases:read', 'subscriptions:read'
+  ];
+
+  function apiKeyStateTag(status) {
+    if (status === 'active') return '<span class="pill ok"><span class="dot"></span>active</span>';
+    if (status === 'expired') return '<span class="pill warn"><span class="dot"></span>expired</span>';
+    return '<span class="pill bad"><span class="dot"></span>revoked</span>';
+  }
+
+  function setApiKeyError(message) {
+    var error = qs('api-key-error');
+    if (!error) return;
+    error.textContent = message || '';
+    if (message) error.removeAttribute('hidden'); else error.setAttribute('hidden', '');
+  }
+
+  function renderApiKeys() {
+    ACT = {}; FORM = {};
+    if (!isAdmin()) {
+      location.replace('#/status');
+      return;
+    }
+    setPage(pageHead('API Keys', 'Read-only machine credentials. Metadata is listed here; secrets are never returned after issuance.',
+      '<button class="btn primary" data-act="api-key-new">' + svg('plus') + 'Create API key</button>')
+      + '<div id="api-key-error" class="inline-error" role="alert" aria-live="polite" hidden></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Keys</h2><span class="sub" id="api-key-count"></span>'
+      + '<div class="spacer"></div><button class="btn small" data-act="api-key-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div id="api-key-table">' + loadingRows(8) + '</div></div>');
+    ACT['api-key-new'] = openApiKeyCreate;
+    ACT['api-key-refresh'] = loadApiKeys;
+    ACT['api-key-rotate'] = rotateApiKey;
+    ACT['api-key-revoke'] = revokeApiKey;
+    loadApiKeys();
+  }
+
+  function loadApiKeys() {
+    setApiKeyError('');
+    api('GET', '/console/v1/api-keys').then(function (d) {
+      var keys = d.keys || [];
+      var rows = '';
+      keys.forEach(function (key) {
+        var usable = key.status === 'active';
+        var disabled = usable ? '' : ' disabled title="only active keys can be changed"';
+        var actions = '<span class="form-row">'
+          + '<button class="btn small" data-act="api-key-rotate" data-id="' + esc(key.id)
+          + '" data-generation="' + esc(key.generation) + '" data-confirm' + disabled + '>Rotate</button>'
+          + '<button class="btn small danger" data-act="api-key-revoke" data-id="' + esc(key.id)
+          + '" data-generation="' + esc(key.generation) + '" data-confirm' + disabled + '>Revoke</button></span>';
+        rows += '<tr><td><b>' + esc(key.name) + '</b><br><span class="mono">' + esc(key.id) + '</span></td>'
+          + '<td>' + apiKeyStateTag(key.status) + '</td>'
+          + '<td>' + (key.scopes || []).map(function (scope) { return '<span class="tag-soft">' + esc(scope) + '</span>'; }).join(' ') + '</td>'
+          + '<td>' + esc(fmtTime(key.created_at)) + '</td>'
+          + '<td>' + esc(key.expires_at == null ? 'never' : fmtTime(key.expires_at)) + '</td>'
+          + '<td>' + esc(fmtTime(key.last_used_at)) + '</td>'
+          + '<td>' + esc(key.generation) + '</td><td>' + actions + '</td></tr>';
+      });
+      if (!keys.length) rows = emptyRowHtml(8, 'No API keys have been created.');
+      setHtml('api-key-table', tableHtml(['Name / public ID', 'Status', 'Scopes', 'Created', 'Expires', 'Last used', 'Generation', 'Actions'], rows));
+      setText('api-key-count', fmtNum(keys.length) + ' key(s)');
+    }).catch(function (error) {
+      setHtml('api-key-table', emptyBlock('key', 'Could not load API keys', 'Try again or inspect the server error journal.'));
+      setApiKeyError(error.message || 'request failed');
+    });
+  }
+
+  function openApiKeyCreate() {
+    var scopeOptions = API_KEY_SCOPES.map(function (scope) {
+      return '<label class="scope-option"><input type="checkbox" name="scopes" value="' + esc(scope) + '">'
+        + esc(scope) + '</label>';
+    }).join('');
+    openModal('Create API key',
+      '<form data-form="api-key-create">'
+      + '<div id="api-key-form-error" class="inline-error" role="alert" aria-live="polite" hidden></div>'
+      + field('Name', '<input class="form-in" name="name" maxlength="128" autocomplete="off" required placeholder="metrics collector">')
+      + '<fieldset class="field" style="border:0;padding:0;margin:0 0 12px"><legend style="color:var(--text-muted);font-size:12px;font-weight:600;margin-bottom:6px">Read scopes (choose at least one)</legend>'
+      + '<div class="scope-grid">' + scopeOptions + '</div></fieldset>'
+      + field('Expiration (optional)', '<input class="form-in" type="datetime-local" name="expires_at">')
+      + '<button class="btn primary" type="submit">' + svg('key') + 'Create and reveal secret</button>'
+      + '</form>');
+    FORM['api-key-create'] = function (values, form) {
+      var selected = Array.prototype.map.call(form.querySelectorAll('input[name="scopes"]:checked'), function (input) { return input.value; });
+      var error = qs('api-key-form-error');
+      function formError(message) {
+        if (!error) return;
+        error.textContent = message || '';
+        if (message) error.removeAttribute('hidden'); else error.setAttribute('hidden', '');
+      }
+      var name = (values.name || '').trim();
+      if (!name) { formError('Name is required.'); return; }
+      if (!selected.length) { formError('Choose at least one read scope.'); return; }
+      var expiresAt = null;
+      if (values.expires_at) {
+        expiresAt = Date.parse(values.expires_at);
+        if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+          formError('Expiration must be a valid future date and time.');
+          return;
+        }
+      }
+      formError('');
+      var requestContext = captureApiKeyRequestContext();
+      api('POST', '/console/v1/api-keys', { name: name, scopes: selected, expires_at: expiresAt })
+        .then(function (issued) {
+          if (!apiKeyRequestContextIsCurrent(requestContext)) return;
+          loadApiKeys();
+          showApiKeySecret('API key created', issued);
+        })
+        .catch(function (apiError) { formError(apiError.message || 'request failed'); });
+    };
+  }
+
+  function showApiKeySecret(title, issued) {
+    openModal(title,
+      '<div class="notice">' + svg('alert') + '<div><b>Copy this secret now.</b> It is shown only once. '
+      + 'Closing this dialog or navigating away permanently removes it from the console.</div></div>'
+      + '<pre class="code secret-value" id="api-key-secret" tabindex="0">' + esc(issued.secret) + '</pre>'
+      + '<div id="api-key-secret-error" class="inline-error" role="alert" aria-live="polite" hidden style="margin-top:12px"></div>'
+      + '<div class="toolbar" style="margin-top:14px;margin-bottom:0"><button class="btn primary" data-act="api-key-copy">Copy secret</button></div>');
+    ACT['api-key-copy'] = function () {
+      var secretNode = qs('api-key-secret');
+      var error = qs('api-key-secret-error');
+      if (!secretNode) return;
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        error.textContent = 'Clipboard access is unavailable. Select and copy the secret manually.';
+        error.removeAttribute('hidden');
+        secretNode.focus();
+        return;
+      }
+      navigator.clipboard.writeText(secretNode.textContent)
+        .then(function () { toast('API key secret copied', 'ok'); })
+        .catch(function () {
+          error.textContent = 'Copy failed. Select and copy the secret manually.';
+          error.removeAttribute('hidden');
+          secretNode.focus();
+        });
+    };
+  }
+
+  function rotateApiKey(data) {
+    setApiKeyError('');
+    var requestContext = captureApiKeyRequestContext();
+    api('POST', '/console/v1/api-keys/' + encodeURIComponent(data.id) + '/rotate', { generation: Number(data.generation) })
+      .then(function (issued) {
+        if (!apiKeyRequestContextIsCurrent(requestContext)) return;
+        loadApiKeys();
+        showApiKeySecret('API key rotated', issued);
+      })
+      .catch(function (error) { setApiKeyError(error.message || 'request failed'); });
+  }
+
+  function revokeApiKey(data) {
+    setApiKeyError('');
+    api('POST', '/console/v1/api-keys/' + encodeURIComponent(data.id) + '/revoke', { generation: Number(data.generation) })
+      .then(function () { toast('API key revoked', 'ok'); loadApiKeys(); })
+      .catch(function (error) { setApiKeyError(error.message || 'request failed'); });
+  }
+
   // ==== Configuration ==========================================================
   var cfgData = null;
 
@@ -2210,6 +2463,7 @@ pre.code {
     matches: renderMatches,
     purchases: renderPurchases,
     configuration: renderConfiguration,
+    'api-keys': renderApiKeys,
     api: renderApi,
     audit: renderAudit,
     errors: renderErrors
@@ -2226,6 +2480,7 @@ pre.code {
   }
 
   function logout(expired) {
+    state.sessionGeneration += 1;
     sessionStorage.removeItem(TOKEN_KEY);
     sessionStorage.removeItem(ROLE_KEY);
     state.user = null;
@@ -2260,6 +2515,7 @@ pre.code {
         }
         sessionStorage.setItem(TOKEN_KEY, x.d.token);
         sessionStorage.setItem(ROLE_KEY, x.d.role);
+        state.sessionGeneration += 1;
         state.user = { username: u, role: x.d.role };
         qs('login-pass').value = '';
         setText('login-err', '');

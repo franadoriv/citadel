@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::app::App;
 use crate::error_journal::JournalPage;
-use crate::services::ConsoleIdentity;
+use crate::services::ConsolePrincipal;
 
 /// The Error Journal section route.
 pub const ERRORS_PATH: &str = "/console/v1/errors";
@@ -28,7 +28,7 @@ pub struct ErrorsQuery {
 /// `GET /console/v1/errors`: read retained incidents newest-first.
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(query): Query<ErrorsQuery>,
 ) -> Json<JournalPage> {
     app.metrics().record_http_request();

@@ -7,9 +7,15 @@ The Dashboard **Database Explorer** is an operator diagnostic surface for the
 single database configured on this Citadel node. It is deliberately not a SQL
 console: it has no SQL-text, mutation, DDL, import, or export operation.
 
-Both `admin` and `viewer` console roles may use every route below. Returned
-cells are redacted by the server for credential-like columns (password hashes,
-tokens, keys, and secrets); role does not bypass redaction.
+Both human console roles generally use the routes below: human `admin` and human
+`viewer`. The internal `api_keys` relation is the exception because it contains
+credential verifier material. It is hidden from human `viewer` listings, and a
+direct describe, page, or row request returns `403`. API key principals also
+cannot discover or inspect `api_keys`, even when they carry `database:read`;
+listing hides it and direct access returns `403`. Only a human `admin` can
+inspect that relation, and its verifier is always redacted. Other returned cells
+are redacted by the server for credential-like columns (password hashes, tokens,
+keys, and secrets); role does not bypass redaction.
 
 ## Availability and limits
 
@@ -41,7 +47,11 @@ adapters have live compatibility coverage; MongoDB has no foreign-key catalog.
 | `/console/v1/database/rows` | POST | Return one redacted, keyset-paginated row page. |
 | `/console/v1/database/row` | POST | Return one redacted row through a previously issued opaque reference. |
 
-All routes require `Authorization: Bearer <console-token>`. Every successful
+All routes require an `Authorization: Bearer YOUR_TOKEN` header. Human console
+sessions use their assigned role. A machine credential requires
+`database:read`, which covers normal application relations and only these exact
+semantic `POST` reads (row page and opaque row lookup); it does not grant
+arbitrary SQL or access to the protected `api_keys` relation. Every successful
 read adds an in-memory console audit record with the operator, action, and
 logical table, never SQL, filter values, cursors, row keys, or returned cells.
 

@@ -20,7 +20,7 @@ use serde::Serialize;
 use crate::app::App;
 use crate::config::Config;
 use crate::error::{AppError, redact_url_credentials};
-use crate::services::ConsoleIdentity;
+use crate::services::ConsolePrincipal;
 
 use crate::http::error::ApiError;
 
@@ -71,7 +71,7 @@ pub struct ConfigEntry {
 /// `GET /console/v1/config`: the redacted effective configuration.
 pub(super) async fn get_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
 ) -> Result<Json<ConfigResponse>, ApiError> {
     app.metrics().record_http_request();
     let groups = config_groups(app.config()).map_err(ApiError::from)?;

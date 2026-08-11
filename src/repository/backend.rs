@@ -51,14 +51,14 @@ use super::groups::GroupsState;
 use super::pg::PgDatabase;
 use super::sqlite::SqliteDatabase;
 use super::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
-    GroupsRepository, InMemoryAuthIdentityRepository, InMemoryChatRepository,
-    InMemoryFriendsRepository, InMemoryGameScriptRepository, InMemoryGroupsRepository,
-    InMemoryLeaderboardsRepository, InMemoryNotificationsRepository, InMemoryPurchasesRepository,
-    InMemorySessionRepository, InMemoryStorageRepository, InMemoryTournamentsRepository,
-    InMemoryUserRepository, InMemoryWalletRepository, LeaderboardsRepository,
-    NotificationsRepository, PurchasesRepository, SessionRepository, StorageRepository,
-    TournamentsRepository, UserRepository, WalletRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, FriendsRepository,
+    GameScriptRepository, GroupsRepository, InMemoryApiKeyRepository,
+    InMemoryAuthIdentityRepository, InMemoryChatRepository, InMemoryFriendsRepository,
+    InMemoryGameScriptRepository, InMemoryGroupsRepository, InMemoryLeaderboardsRepository,
+    InMemoryNotificationsRepository, InMemoryPurchasesRepository, InMemorySessionRepository,
+    InMemoryStorageRepository, InMemoryTournamentsRepository, InMemoryUserRepository,
+    InMemoryWalletRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
+    SessionRepository, StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 
 /// Which persistence backend a node is running on.
@@ -145,6 +145,8 @@ pub trait UnitOfWork: Send {
 /// `Debug` with a redacted representation (no connection string).
 #[async_trait]
 pub trait Backend: Send + Sync + fmt::Debug {
+    /// Dedicated machine-credential repository (never generic object storage).
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository>;
     /// Which backend this is.
     fn kind(&self) -> BackendKind;
     /// A pooled (autocommit) storage repository.
@@ -286,6 +288,7 @@ pub async fn select_backend(config: &DatabaseConfig) -> AppResult<Arc<dyn Backen
 /// dropped transaction leaves no partial state.
 #[derive(Debug)]
 pub struct InMemoryBackend {
+    api_keys: Arc<InMemoryApiKeyRepository>,
     users: Arc<InMemoryUserRepository>,
     identities: Arc<InMemoryAuthIdentityRepository>,
     sessions: Arc<InMemorySessionRepository>,
@@ -310,6 +313,7 @@ impl InMemoryBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            api_keys: Arc::new(InMemoryApiKeyRepository::new()),
             users: Arc::new(InMemoryUserRepository::new()),
             identities: Arc::new(InMemoryAuthIdentityRepository::new()),
             sessions: Arc::new(InMemorySessionRepository::new()),
@@ -337,6 +341,10 @@ impl Default for InMemoryBackend {
 
 #[async_trait]
 impl Backend for InMemoryBackend {
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        Arc::clone(&self.api_keys) as Arc<dyn ApiKeyRepository>
+    }
+
     fn kind(&self) -> BackendKind {
         BackendKind::InMemory
     }

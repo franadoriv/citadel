@@ -1,9 +1,10 @@
 //! Console audit trail.
 //!
-//! Every console mutation (and login attempt) leaves an [`AuditEntry`]: who
-//! acted, with which role, what they did, on what, and when. Section handlers
-//! record entries explicitly — an explicit call is greppable, testable, and
-//! never guesses the target the way blanket middleware would.
+//! Every console mutation and login attempt leaves an [`AuditEntry`]: who acted,
+//! with which role, what they did, on what, and when. Machine-credential reads
+//! are recorded centrally after authentication and route authorization, before
+//! handler execution; mutation and human-read entries remain explicit in their
+//! owning handlers.
 //!
 //! The log is a bounded in-process ring: the newest [`AuditLog::capacity`]
 //! entries are kept, older ones are dropped, and a node restart clears it.
@@ -17,6 +18,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use crate::services::ConsolePrincipal;
 use crate::time::TimestampMillis;
 
 /// Default bound on retained entries.
@@ -27,11 +29,20 @@ pub const DEFAULT_AUDIT_CAPACITY: usize = 1024;
 pub struct AuditEntry {
     /// When the action happened (unix milliseconds).
     pub time_unix_ms: u64,
-    /// The operator username that acted (or the presented username for a
-    /// failed login).
+    /// Actor kind (`human`, `api_key`, or `unauthenticated`).
+    pub actor_type: String,
+    /// The operator username or public API-key id.
     pub actor: String,
-    /// The operator's role at the time (`admin`, `viewer`, or `-` when
-    /// unauthenticated, e.g. a failed login).
+    /// Public machine credential id, when the actor is an API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    /// Human-readable API-key name, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_name: Option<String>,
+    /// Explicit machine scopes, absent for human actors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+    /// The operator's role at the time (`admin`, `viewer`, `api_key`, or `-`).
     pub role: String,
     /// Dotted action verb, e.g. `console.login`, `storage.write`,
     /// `accounts.ban`.
@@ -53,10 +64,55 @@ impl AuditEntry {
         target: impl Into<String>,
         details: impl Into<String>,
     ) -> Self {
+        let role = role.into();
         Self {
             time_unix_ms: time.unix_millis(),
+            actor_type: if role == "-" {
+                "unauthenticated".to_string()
+            } else {
+                "human".to_string()
+            },
             actor: actor.into(),
-            role: role.into(),
+            credential_id: None,
+            key_name: None,
+            scopes: None,
+            role,
+            action: action.into(),
+            target: target.into(),
+            details: details.into(),
+        }
+    }
+
+    /// Build an entry carrying explicit human or machine actor metadata.
+    #[must_use]
+    pub fn for_principal(
+        time: TimestampMillis,
+        principal: &ConsolePrincipal,
+        action: impl Into<String>,
+        target: impl Into<String>,
+        details: impl Into<String>,
+    ) -> Self {
+        let (credential_id, key_name, scopes) = match principal {
+            ConsolePrincipal::Human(_) => (None, None, None),
+            ConsolePrincipal::ApiKey(key) => (
+                Some(key.id.as_str().to_string()),
+                Some(key.name.clone()),
+                Some(
+                    key.scopes
+                        .iter()
+                        .map(|scope| scope.as_str().to_string())
+                        .collect(),
+                ),
+            ),
+        };
+        Self {
+            time_unix_ms: time.unix_millis(),
+            actor_type: principal.actor_type().to_string(),
+            actor: principal.actor_id(),
+            credential_id,
+            key_name,
+            scopes,
+            role: principal.role_label().to_string(),
             action: action.into(),
             target: target.into(),
             details: details.into(),

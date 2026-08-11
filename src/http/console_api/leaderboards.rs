@@ -32,7 +32,7 @@ use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
 use crate::services::{
-    AuditEntry, ConsoleIdentity, CreateLeaderboardRequest, LeaderboardSummary, Operator,
+    AuditEntry, ConsolePrincipal, CreateLeaderboardRequest, LeaderboardSummary, Operator,
     RankedRecord, SortOrder,
 };
 use crate::time::{Clock, SystemClock};
@@ -211,7 +211,7 @@ pub struct RecordsResponse {
 /// `GET /console/v1/leaderboards`: every board with its record count.
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
 ) -> Result<Json<LeaderboardsResponse>, ApiError> {
     app.metrics().record_http_request();
     let items: Vec<LeaderboardRow> = app
@@ -228,7 +228,7 @@ pub(super) async fn list_handler(
 /// `POST /console/v1/leaderboards`: create a board (admin).
 pub(super) async fn create_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<CreateBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<LeaderboardRow>), ApiError> {
     app.metrics().record_http_request();
@@ -256,8 +256,8 @@ pub(super) async fn create_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "leaderboards.create",
         definition.id.clone(),
         format!(
@@ -281,7 +281,7 @@ pub(super) async fn create_handler(
 /// `DELETE /console/v1/leaderboards/{id}`: delete a board (admin).
 pub(super) async fn delete_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     app.metrics().record_http_request();
@@ -289,8 +289,8 @@ pub(super) async fn delete_handler(
     app.leaderboards().delete(&id).await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "leaderboards.delete",
         id,
         "deleted leaderboard",
@@ -301,7 +301,7 @@ pub(super) async fn delete_handler(
 /// `POST /console/v1/leaderboards/{id}/records`: submit a score (admin).
 pub(super) async fn submit_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(id): Path<String>,
     body: Result<Json<SubmitBody>, JsonRejection>,
 ) -> Result<Json<SubmitResponse>, ApiError> {
@@ -329,8 +329,8 @@ pub(super) async fn submit_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "leaderboards.record.submit",
         format!("{id}/{}", record.user_id),
         format!("score={} subscore={}", record.score, record.subscore),
@@ -348,7 +348,7 @@ pub(super) async fn submit_handler(
 /// `GET /console/v1/leaderboards/{id}/records`: a ranked page.
 pub(super) async fn records_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(id): Path<String>,
     Query(query): Query<RecordsQuery>,
 ) -> Result<Json<RecordsResponse>, ApiError> {
@@ -367,7 +367,7 @@ pub(super) async fn records_handler(
 /// (admin).
 pub(super) async fn delete_record_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((id, user_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     app.metrics().record_http_request();
@@ -375,8 +375,8 @@ pub(super) async fn delete_record_handler(
     app.leaderboards().delete_record(&id, &user_id).await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "leaderboards.record.delete",
         format!("{id}/{user_id}"),
         "deleted record",

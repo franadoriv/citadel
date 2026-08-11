@@ -66,6 +66,61 @@ impl ConsoleIdentity {
     }
 }
 
+/// Explicit authenticated principal; machine credentials never become usernames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsolePrincipal {
+    Human(ConsoleIdentity),
+    ApiKey(crate::services::ApiKeyPrincipal),
+}
+
+impl ConsolePrincipal {
+    /// Require an administrator backed by a human console session.
+    pub fn require_admin(&self) -> AppResult<()> {
+        match self {
+            Self::Human(identity) => identity.require_admin(),
+            Self::ApiKey(_) => Err(AppError::permission(
+                "API keys cannot perform console mutations",
+            )),
+        }
+    }
+
+    /// Stable actor identifier for rate limits and audit targets.
+    #[must_use]
+    pub fn actor_id(&self) -> String {
+        match self {
+            Self::Human(identity) => identity.username.clone(),
+            Self::ApiKey(key) => key.id.as_str().to_string(),
+        }
+    }
+
+    /// Human role or the explicit machine credential label.
+    #[must_use]
+    pub const fn role_label(&self) -> &'static str {
+        match self {
+            Self::Human(identity) => identity.role.as_str(),
+            Self::ApiKey(_) => "api_key",
+        }
+    }
+
+    /// Actor kind used in API responses and audit records.
+    #[must_use]
+    pub const fn actor_type(&self) -> &'static str {
+        match self {
+            Self::Human(_) => "human",
+            Self::ApiKey(_) => "api_key",
+        }
+    }
+
+    /// Return the human identity without allowing machine impersonation.
+    #[must_use]
+    pub const fn human(&self) -> Option<&ConsoleIdentity> {
+        match self {
+            Self::Human(identity) => Some(identity),
+            Self::ApiKey(_) => None,
+        }
+    }
+}
+
 /// Check the presented credentials against the console configuration.
 ///
 /// The admin password is checked before the viewer password, and both compares

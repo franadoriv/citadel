@@ -22,7 +22,7 @@ use crate::error::AppError;
 use crate::http::error::ApiError;
 use crate::matchmaker::MatchmakerStats;
 use crate::realtime::{RoomId, RoomSnapshot};
-use crate::services::ConsoleIdentity;
+use crate::services::ConsolePrincipal;
 
 /// The Matches section route.
 pub const MATCHES_PATH: &str = "/console/v1/matches";
@@ -133,7 +133,7 @@ pub struct MatchDetail {
 /// why to the operator).
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(query): Query<MatchesQuery>,
 ) -> Result<Json<MatchesResponse>, ApiError> {
     app.metrics().record_http_request();
@@ -167,7 +167,7 @@ pub(super) async fn list_handler(
 /// closed like the listing on a gated, not-ready node.
 pub(super) async fn detail_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(id): Path<RoomId>,
 ) -> Result<Json<MatchDetail>, ApiError> {
     app.metrics().record_http_request();

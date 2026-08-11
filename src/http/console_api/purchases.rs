@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
-use crate::services::{AuditEntry, ConsoleIdentity, Purchase, PurchaseStore, SubscriptionRow};
+use crate::services::{AuditEntry, ConsolePrincipal, Purchase, PurchaseStore, SubscriptionRow};
 use crate::time::{Clock, SystemClock};
 
 /// The Purchases section route.
@@ -77,7 +77,7 @@ pub struct ValidateBody {
 /// `GET /console/v1/purchases`: newest-first validated purchases.
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(params): Query<ListParams>,
 ) -> Result<Json<PurchasesPage>, ApiError> {
     app.metrics().record_http_request();
@@ -94,7 +94,7 @@ pub(super) async fn list_handler(
 /// `POST /console/v1/purchases`: validate + record a receipt (admin).
 pub(super) async fn validate_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<ValidateBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Purchase>), ApiError> {
     app.metrics().record_http_request();
@@ -114,8 +114,8 @@ pub(super) async fn validate_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "purchases.validate",
         format!("transaction {}", purchase.transaction_id),
         format!(
@@ -131,7 +131,7 @@ pub(super) async fn validate_handler(
 /// `GET /console/v1/purchases/{transaction_id}`: one purchase.
 pub(super) async fn detail_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(transaction_id): Path<String>,
 ) -> Result<Json<Purchase>, ApiError> {
     app.metrics().record_http_request();
@@ -145,7 +145,7 @@ pub(super) async fn detail_handler(
 /// `GET /console/v1/subscriptions`: subscription rows with derived status.
 pub(super) async fn subscriptions_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(params): Query<ListParams>,
 ) -> Result<Json<SubscriptionsPage>, ApiError> {
     app.metrics().record_http_request();

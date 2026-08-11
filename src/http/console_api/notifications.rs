@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
-use crate::services::{AuditEntry, ConsoleIdentity, Notification, Recipient};
+use crate::services::{AuditEntry, ConsolePrincipal, Notification, Recipient};
 use crate::time::{Clock, SystemClock};
 
 /// The Notifications section route (list + send).
@@ -125,7 +125,7 @@ fn recipient_target(user_id: Option<&str>) -> String {
 /// `GET /console/v1/notifications`: newest-first page (any role).
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(params): Query<ListParams>,
 ) -> Result<Json<NotificationsPage>, ApiError> {
     app.metrics().record_http_request();
@@ -147,7 +147,7 @@ pub(super) async fn list_handler(
 /// `POST /console/v1/notifications`: send targeted or broadcast (admin).
 pub(super) async fn send_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<SendBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<NotificationRow>), ApiError> {
     app.metrics().record_http_request();
@@ -177,8 +177,8 @@ pub(super) async fn send_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "notifications.send",
         recipient_target(body.user_id.as_deref()),
         format!("sent notification {id} ({})", body.subject),
@@ -200,7 +200,7 @@ pub(super) async fn send_handler(
 /// `DELETE /console/v1/notifications/{id}`: delete (admin).
 pub(super) async fn delete_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
     app.metrics().record_http_request();
@@ -208,8 +208,8 @@ pub(super) async fn delete_handler(
     app.notifications().delete(id).await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "notifications.delete",
         id.to_string(),
         "deleted notification",

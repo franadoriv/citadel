@@ -18,6 +18,7 @@
 //! must, so the contract tests in `tests/storage_repository_contract.rs` can be
 //! reused against future implementations.
 
+pub mod api_keys;
 pub mod backend;
 pub mod chat;
 pub mod friends;
@@ -34,6 +35,9 @@ pub mod sqlite;
 pub mod tournaments;
 pub mod wallet;
 
+pub use api_keys::{
+    ApiKeyId, ApiKeyRepository, ApiKeyScope, ApiKeyVerifier, InMemoryApiKeyRepository, StoredApiKey,
+};
 pub use backend::{
     Backend, BackendKind, InMemoryBackend, InMemoryUnitOfWork, UnitOfWork, select_backend,
 };
