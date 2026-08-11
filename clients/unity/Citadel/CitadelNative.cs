@@ -245,6 +245,22 @@ namespace Citadel
             public uint quat_bits;
         }
 
+        // Legacy 7-field scalar descriptor that citadel_rep_decode consumes (C ABI
+        // CitadelRepCodec; its 40-byte layout is frozen). Kept distinct from RepCodec
+        // above, which is the 9-field v3 descriptor the encoder's add_collection takes —
+        // passing the wider struct to the legacy decode mis-strides multi-codec arrays.
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RepCodecLegacy
+        {
+            public byte kind;
+            public long int_min;
+            public long int_max;
+            public float scalar_min;
+            public float scalar_max;
+            public uint values_per_unit;
+            public uint max_len;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         public struct RepCollectionOp
         {
@@ -274,7 +290,7 @@ namespace Citadel
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
         public static extern CitadelStatus citadel_rep_decode(
             [In] byte[] body, UIntPtr bodyLen, [In] byte[] schemaHash, uint layoutVersion,
-            [In] RepCodec[] codecs, UIntPtr codecCount, out IntPtr decoded);
+            [In] RepCodecLegacy[] codecs, UIntPtr codecCount, out IntPtr decoded);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
         public static extern CitadelStatus citadel_rep_decoded_header(
             IntPtr decoded, out uint objectId, [MarshalAs(UnmanagedType.I1)] out bool isFull,

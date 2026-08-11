@@ -116,7 +116,7 @@ namespace
 		{
 			UE_LOG(LogCitadelEditor, Warning,
 		       TEXT("Citadel: unable to read Landscape collision heightfield '%s'."),
-		       *Collision->GetPathName);
+		       *Collision->GetPathName());
 			return;
 		}
 
@@ -136,7 +136,7 @@ namespace
 				{
 					UE_LOG(LogCitadelEditor, Warning,
 					       TEXT("Citadel: Landscape collision '%s' has a non-finite height."),
-					       *Collision->GetPathName);
+					       *Collision->GetPathName());
 					return;
 				}
 				const FVector WorldV = WorldXform.TransformPosition(FVector(X, Y, Z));

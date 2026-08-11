@@ -21,7 +21,18 @@ namespace Citadel
         {
             if (body == null || schemaHash == null || schemaHash.Length != 16 || codecs == null)
                 throw new ArgumentException("NetworkPeer decode requires body, 16-byte schema hash, and codecs.");
-            var status = CitadelNative.citadel_rep_decode(body, (UIntPtr)body.Length, schemaHash, layoutVersion, codecs, (UIntPtr)codecs.Length, out var handle);
+            // citadel_rep_decode consumes the legacy 7-field scalar descriptor; map
+            // the public v3-shaped RepCodec (whose vector_bounds/quat_bits the legacy
+            // decode ignores) into it so a multi-codec array does not mis-stride.
+            var legacy = new CitadelNative.RepCodecLegacy[codecs.Length];
+            for (var i = 0; i < codecs.Length; i++)
+                legacy[i] = new CitadelNative.RepCodecLegacy
+                {
+                    kind = codecs[i].kind, int_min = codecs[i].int_min, int_max = codecs[i].int_max,
+                    scalar_min = codecs[i].scalar_min, scalar_max = codecs[i].scalar_max,
+                    values_per_unit = codecs[i].values_per_unit, max_len = codecs[i].max_len,
+                };
+            var status = CitadelNative.citadel_rep_decode(body, (UIntPtr)body.Length, schemaHash, layoutVersion, legacy, (UIntPtr)legacy.Length, out var handle);
             if (status != CitadelStatus.Ok || handle == IntPtr.Zero) throw new CitadelException(status, "NetworkPeer delta decode failed.");
             status = CitadelNative.citadel_rep_decoded_header(handle, out var id, out var full, out var result, out var basis);
             if (status != CitadelStatus.Ok) { CitadelNative.citadel_rep_decoded_free(handle); throw new CitadelException(status, "NetworkPeer delta header failed."); }
