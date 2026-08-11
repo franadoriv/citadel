@@ -21,8 +21,8 @@
 
 use citadel::error::ErrorCategory;
 use citadel::repository::{
-    ChannelType, ChatDeliveryRequest, ChatModerationAudit, ChatRateLimit, ChatRepository,
-    InMemoryChatRepository,
+    ChannelSummary, ChannelType, ChatDeliveryOutboxRecord, ChatDeliveryRequest, ChatMessage,
+    ChatModerationAudit, ChatRateLimit, ChatRepository, InMemoryChatRepository,
 };
 use citadel::time::TimestampMillis;
 
@@ -305,6 +305,385 @@ async fn scenario_moderation_tombstone_writes_one_redacted_audit_and_expires(
         1
     );
     assert_eq!(repo.moderation_audit_count().await.expect("audit count"), 0);
+}
+
+async fn scenario_malformed_delivery_request_cannot_commit_mutation_or_outbox(
+    repo: &dyn ChatRepository,
+) {
+    for (channel, event_type) in [
+        ("invalid-delivery-type", "future.event"),
+        ("mismatched-delivery-state", "message.update"),
+    ] {
+        let delivery = ChatDeliveryRequest {
+            origin_node_id: "node-a".to_owned(),
+            authority_epoch: 0,
+            expires_at: ts(30),
+            event_type,
+        };
+        repo.post_message_authorized_with_delivery(
+            channel,
+            ChannelType::Room,
+            "alice",
+            "must not commit",
+            CAP,
+            channel,
+            0,
+            &delivery,
+            ts(1),
+        )
+        .await
+        .expect_err("malformed delivery request must fail its transaction");
+        assert!(
+            repo.channel_history(channel, 10, None)
+                .await
+                .expect("history after malformed delivery")
+                .is_empty(),
+            "malformed delivery must not commit message state"
+        );
+        assert!(
+            repo.active_delivery_outbox("node-a", ts(2), 10)
+                .await
+                .expect("outbox after malformed delivery")
+                .iter()
+                .all(|row| row.channel_id != channel),
+            "malformed delivery must not commit an outbox row"
+        );
+    }
+}
+
+async fn scenario_invalid_delivery_metadata_cannot_commit_mutation_or_outbox(
+    repo: &dyn ChatRepository,
+) {
+    for (case, origin_node_id, expires_at) in
+        [("empty-origin", "", ts(30)), ("expired", "node-a", ts(1))]
+    {
+        let create_channel = format!("{case}-create");
+        let create_delivery = ChatDeliveryRequest {
+            origin_node_id: origin_node_id.to_owned(),
+            authority_epoch: 0,
+            expires_at,
+            event_type: "message.create",
+        };
+        let before_create = repo
+            .channel_history(&create_channel, 10, None)
+            .await
+            .expect("history before rejected create");
+        repo.post_message_authorized_with_delivery(
+            &create_channel,
+            ChannelType::Room,
+            "alice",
+            "must not commit",
+            CAP,
+            &create_channel,
+            0,
+            &create_delivery,
+            ts(1),
+        )
+        .await
+        .expect_err("invalid delivery metadata must reject create");
+        assert_eq!(
+            repo.channel_history(&create_channel, 10, None)
+                .await
+                .expect("history after rejected create"),
+            before_create,
+            "{case} create changed message/history state"
+        );
+
+        let edit_channel = format!("{case}-edit");
+        let edit_id = post(
+            repo,
+            &edit_channel,
+            ChannelType::Room,
+            "alice",
+            "original",
+            CAP,
+            1,
+        )
+        .await;
+        let before_edit = repo
+            .channel_history(&edit_channel, 10, None)
+            .await
+            .expect("history before rejected edit");
+        let edit_delivery = ChatDeliveryRequest {
+            event_type: "message.update",
+            ..create_delivery.clone()
+        };
+        repo.edit_message_authorized_with_delivery(
+            &edit_channel,
+            ChannelType::Room,
+            edit_id,
+            "must not commit",
+            &edit_channel,
+            0,
+            &edit_delivery,
+            ts(1),
+        )
+        .await
+        .expect_err("invalid delivery metadata must reject edit");
+        assert_eq!(
+            repo.channel_history(&edit_channel, 10, None)
+                .await
+                .expect("history after rejected edit"),
+            before_edit,
+            "{case} edit changed content, revision, history, or event state"
+        );
+
+        let delete_channel = format!("{case}-delete");
+        let delete_id = post(
+            repo,
+            &delete_channel,
+            ChannelType::Room,
+            "alice",
+            "retain",
+            CAP,
+            1,
+        )
+        .await;
+        let before_delete = repo
+            .channel_history(&delete_channel, 10, None)
+            .await
+            .expect("history before rejected delete");
+        let delete_delivery = ChatDeliveryRequest {
+            event_type: "message.remove",
+            ..create_delivery
+        };
+        repo.delete_message_authorized_with_delivery(
+            &delete_channel,
+            ChannelType::Room,
+            delete_id,
+            &delete_channel,
+            0,
+            &delete_delivery,
+            ts(1),
+        )
+        .await
+        .expect_err("invalid delivery metadata must reject delete");
+        assert_eq!(
+            repo.channel_history(&delete_channel, 10, None)
+                .await
+                .expect("history after rejected delete"),
+            before_delete,
+            "{case} delete changed tombstone, revision, history, or event state"
+        );
+
+        let outbox = repo
+            .active_delivery_outbox("node-a", ts(2), 100)
+            .await
+            .expect("outbox after rejected delivery metadata");
+        assert!(
+            outbox.iter().all(|row| !row.channel_id.starts_with(case)),
+            "{case} staged an outbox row"
+        );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObservableRepositoryState {
+    channels: Vec<ChannelSummary>,
+    histories: Vec<(String, Vec<ChatMessage>)>,
+    outbox: Vec<ChatDeliveryOutboxRecord>,
+}
+
+async fn observable_repository_state(repo: &dyn ChatRepository) -> ObservableRepositoryState {
+    let channels = repo.list_channels(None, 0).await.expect("list channels");
+    let mut histories = Vec::with_capacity(channels.len());
+    for summary in &channels {
+        histories.push((
+            summary.channel.clone(),
+            repo.channel_history(&summary.channel, 0, None)
+                .await
+                .expect("complete channel history"),
+        ));
+    }
+    let outbox = repo
+        .active_delivery_outbox("node-a", ts(50), 1000)
+        .await
+        .expect("complete active delivery outbox");
+    ObservableRepositoryState {
+        channels,
+        histories,
+        outbox,
+    }
+}
+
+async fn scenario_serializer_rejection_cannot_commit_mutation_or_outbox(repo: &dyn ChatRepository) {
+    let create_delivery = ChatDeliveryRequest {
+        origin_node_id: "node-a".to_owned(),
+        authority_epoch: 0,
+        expires_at: ts(100),
+        event_type: "message.create",
+    };
+    let oversized = "x".repeat(2049);
+    let create_cases = [
+        ("blank-channel", "", "alice", "valid"),
+        ("blank-sender", "create-blank-sender", "", "valid"),
+        (
+            "whitespace-sender",
+            "create-whitespace-sender",
+            " \t",
+            "valid",
+        ),
+        ("empty-content", "create-empty-content", "alice", ""),
+        (
+            "whitespace-content",
+            "create-whitespace-content",
+            "alice",
+            " \t",
+        ),
+        (
+            "control-content",
+            "create-control-content",
+            "alice",
+            "bad\u{0000}content",
+        ),
+        (
+            "oversized-content",
+            "create-oversized-content",
+            "alice",
+            oversized.as_str(),
+        ),
+    ];
+    for (case, channel, sender, content) in create_cases {
+        let before = observable_repository_state(repo).await;
+        repo.post_message_authorized_with_delivery(
+            channel,
+            ChannelType::Room,
+            sender,
+            content,
+            CAP,
+            channel,
+            0,
+            &create_delivery,
+            ts(10),
+        )
+        .await
+        .expect_err("serializer-invalid create must fail");
+        assert_eq!(
+            observable_repository_state(repo).await,
+            before,
+            "{case} create changed complete history, counters, event state, or outbox"
+        );
+    }
+
+    let edit_delivery = ChatDeliveryRequest {
+        event_type: "message.update",
+        ..create_delivery.clone()
+    };
+    let edit_cases = [
+        ("empty-content", "edit-empty-content", "alice", "", 21),
+        (
+            "whitespace-content",
+            "edit-whitespace-content",
+            "alice",
+            " \t",
+            21,
+        ),
+        (
+            "control-content",
+            "edit-control-content",
+            "alice",
+            "bad\u{0000}content",
+            21,
+        ),
+        (
+            "oversized-content",
+            "edit-oversized-content",
+            "alice",
+            oversized.as_str(),
+            21,
+        ),
+        (
+            "earlier-than-created",
+            "edit-earlier-than-created",
+            "alice",
+            "valid edit",
+            19,
+        ),
+        (
+            "invalid-baseline-sender",
+            "edit-invalid-baseline",
+            " \t",
+            "valid edit",
+            21,
+        ),
+    ];
+    for (case, channel, baseline_sender, content, now) in edit_cases {
+        let id = post(
+            repo,
+            channel,
+            ChannelType::Room,
+            baseline_sender,
+            "original",
+            CAP,
+            20,
+        )
+        .await;
+        let before = observable_repository_state(repo).await;
+        repo.edit_message_authorized_with_delivery(
+            channel,
+            ChannelType::Room,
+            id,
+            content,
+            channel,
+            0,
+            &edit_delivery,
+            ts(now),
+        )
+        .await
+        .expect_err("serializer-invalid edit must fail");
+        assert_eq!(
+            observable_repository_state(repo).await,
+            before,
+            "{case} edit changed complete history, counters, event state, or outbox"
+        );
+    }
+
+    let delete_delivery = ChatDeliveryRequest {
+        event_type: "message.remove",
+        ..create_delivery
+    };
+    for (case, channel, baseline_sender, now) in [
+        (
+            "earlier-than-created",
+            "delete-earlier-than-created",
+            "alice",
+            19,
+        ),
+        (
+            "invalid-baseline-sender",
+            "delete-invalid-baseline",
+            " \t",
+            21,
+        ),
+    ] {
+        let id = post(
+            repo,
+            channel,
+            ChannelType::Room,
+            baseline_sender,
+            "original",
+            CAP,
+            20,
+        )
+        .await;
+        let before = observable_repository_state(repo).await;
+        repo.delete_message_authorized_with_delivery(
+            channel,
+            ChannelType::Room,
+            id,
+            channel,
+            0,
+            &delete_delivery,
+            ts(now),
+        )
+        .await
+        .expect_err("serializer-invalid delete must fail");
+        assert_eq!(
+            observable_repository_state(repo).await,
+            before,
+            "{case} delete changed complete history, counters, event state, or outbox"
+        );
+    }
 }
 
 async fn scenario_authorized_moderation_commits_tombstone_audit_and_outbox_once(
@@ -591,6 +970,9 @@ fn all_scenarios() -> Vec<Scenario> {
         scenario_edit_and_tombstone_advance_per_channel_event_order,
         scenario_rate_limit_plan_is_all_or_nothing_and_expires,
         scenario_moderation_tombstone_writes_one_redacted_audit_and_expires,
+        scenario_malformed_delivery_request_cannot_commit_mutation_or_outbox,
+        scenario_invalid_delivery_metadata_cannot_commit_mutation_or_outbox,
+        scenario_serializer_rejection_cannot_commit_mutation_or_outbox,
         scenario_authorized_moderation_commits_tombstone_audit_and_outbox_once,
         scenario_channels_filter_sort_and_limit,
         scenario_canonical_descriptors_and_access_epochs_are_durable,

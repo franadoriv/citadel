@@ -4,6 +4,12 @@ import { registerChatCursor } from "./chat-internal.js";
 import { isNextU64, isU64, maxU64, parseChatJsonText } from "./chat-json.js";
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const encoder = new TextEncoder();
+const MAX_CHAT_CONTENT_BYTES = 2_048;
+// Keep kind-28 decoding within the authenticated DeliverChat control payload
+// boundary (server matchmaker_transport::MAX_FRAME_BYTES / 2). Generic realtime
+// envelopes remain larger; chat rejects before UTF-8 decode or lexical scanning.
+const MAX_CHAT_EVENT_BYTES = 32 * 1024;
 const EVENT_TYPES = new Set([
   "presence.join",
   "presence.leave",
@@ -25,15 +31,99 @@ function nonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function validChatContent(value) {
+  return nonEmptyString(value)
+    && encoder.encode(value).byteLength <= MAX_CHAT_CONTENT_BYTES
+    && ![...value].some((character) => character !== "\n" && character !== "\r"
+      && /\p{Cc}/u.test(character));
+}
+
+function exactKeys(value, keys) {
+  if (!object(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+// lossless-json preserves u64 values, but—like JSON.parse—accepts duplicate
+// object names. Scan the lexical JSON first so duplicate names, including
+// escaped aliases such as "type" and "t\u0079pe", fail closed at any depth.
+function hasUniqueJsonObjectKeys(text) {
+  let offset = 0;
+  const skipWhitespace = () => {
+    while (offset < text.length && /\s/u.test(text[offset])) offset += 1;
+  };
+  const parseString = () => {
+    const start = offset;
+    if (text[offset++] !== "\"") throw new Error("expected string");
+    while (offset < text.length) {
+      const current = text[offset++];
+      if (current === "\"") return JSON.parse(text.slice(start, offset));
+      if (current === "\\") {
+        if (offset >= text.length) throw new Error("truncated escape");
+        if (text[offset] === "u") offset += 5;
+        else offset += 1;
+      } else if (current.charCodeAt(0) < 0x20) {
+        throw new Error("control character");
+      }
+    }
+    throw new Error("unterminated string");
+  };
+  const parseValue = (depth) => {
+    if (depth > 64) throw new Error("JSON nesting limit");
+    skipWhitespace();
+    if (text[offset] === "{") {
+      offset += 1;
+      skipWhitespace();
+      const keys = new Set();
+      if (text[offset] === "}") { offset += 1; return; }
+      while (true) {
+        skipWhitespace();
+        const key = parseString();
+        if (keys.has(key)) throw new Error("duplicate key");
+        keys.add(key);
+        skipWhitespace();
+        if (text[offset++] !== ":") throw new Error("expected colon");
+        parseValue(depth + 1);
+        skipWhitespace();
+        const separator = text[offset++];
+        if (separator === "}") return;
+        if (separator !== ",") throw new Error("expected comma");
+      }
+    }
+    if (text[offset] === "[") {
+      offset += 1;
+      skipWhitespace();
+      if (text[offset] === "]") { offset += 1; return; }
+      while (true) {
+        parseValue(depth + 1);
+        skipWhitespace();
+        const separator = text[offset++];
+        if (separator === "]") return;
+        if (separator !== ",") throw new Error("expected comma");
+      }
+    }
+    if (text[offset] === "\"") { parseString(); return; }
+    const token = text.slice(offset).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/u);
+    if (!token) throw new Error("invalid JSON value");
+    offset += token[0].length;
+  };
+  try {
+    parseValue(0);
+    skipWhitespace();
+    return offset === text.length;
+  } catch {
+    return false;
+  }
+}
 
 function validPresence(value) {
-  return object(value)
+  return exactKeys(value, ["presence_id", "user_id"])
     && nonEmptyString(value.presence_id)
     && nonEmptyString(value.user_id);
 }
 
 function validMessage(value, type, eventId) {
-  if (!object(value)
+  if (!exactKeys(value, ["id", "sender", "content", "created_at_unix_ms", "updated_at_unix_ms", "revision", "last_event_id", "deleted"])
     || !isU64(value.id, true)
     || !nonEmptyString(value.sender)
     || typeof value.content !== "string"
@@ -46,10 +136,12 @@ function validMessage(value, type, eventId) {
     || typeof value.deleted !== "boolean") return false;
 
   if (type === "message.create") {
-    return !value.deleted && value.revision === 1
+    return validChatContent(value.content) && !value.deleted && value.revision === 1
       && value.created_at_unix_ms === value.updated_at_unix_ms;
   }
-  if (type === "message.update") return !value.deleted && value.revision > 1;
+  if (type === "message.update") {
+    return validChatContent(value.content) && !value.deleted && value.revision > 1;
+  }
   return value.deleted && value.content.length === 0 && value.revision > 1;
 }
 
@@ -63,9 +155,12 @@ function validMessage(value, type, eventId) {
 export function decodeChatEvent(body) {
   let value;
   try {
-    const text = typeof body === "string"
-      ? body
-      : decoder.decode(body instanceof Uint8Array ? body : new Uint8Array(body));
+    const bytes = typeof body === "string"
+      ? encoder.encode(body)
+      : (body instanceof Uint8Array ? body : new Uint8Array(body));
+    if (bytes.byteLength > MAX_CHAT_EVENT_BYTES) return null;
+    const text = typeof body === "string" ? body : decoder.decode(bytes);
+    if (!hasUniqueJsonObjectKeys(text)) return null;
     value = parseChatJsonText(text);
   } catch {
     return null;
@@ -74,6 +169,22 @@ export function decodeChatEvent(body) {
     || value.version !== 1
     || !EVENT_TYPES.has(value.type)
     || !nonEmptyString(value.channel_id)) return null;
+
+  const fields = {
+    "presence.join": ["version", "type", "channel_id", "channel_type", "presence"],
+    "presence.leave": ["version", "type", "channel_id", "presence"],
+    typing: ["version", "type", "channel_id", "presence", "typing", "expires_at"],
+    "message.create": ["version", "type", "channel_id", "event_id", "message"],
+    "message.update": ["version", "type", "channel_id", "event_id", "message"],
+    "message.remove": ["version", "type", "channel_id", "event_id", "message"],
+    "access.revoked": ["version", "type", "channel_id", "presence"],
+  };
+  if (value.type === "resync_required") {
+    const expected = value.scopes === undefined
+      ? ["version", "type", "channel_id", "watermark_event_id"]
+      : ["version", "type", "channel_id", "watermark_event_id", "scopes"];
+    if (!exactKeys(value, expected)) return null;
+  } else if (!exactKeys(value, fields[value.type])) return null;
 
   if (PRESENCE_TYPES.has(value.type) && !validPresence(value.presence)) return null;
   if (value.type === "presence.join"
@@ -86,12 +197,16 @@ export function decodeChatEvent(body) {
   }
 
   if (value.type === "typing"
-    && (typeof value.typing !== "boolean" || !isU64(value.expires_at))) return null;
+    && (typeof value.typing !== "boolean"
+      || !isU64(value.expires_at)
+      || (!value.typing && value.expires_at !== 0))) return null;
 
   if (value.type === "resync_required") {
     if (!isU64(value.watermark_event_id)) return null;
     if (value.scopes !== undefined
-      && (!Array.isArray(value.scopes) || value.scopes.some((scope) => !nonEmptyString(scope)))) return null;
+      && (!Array.isArray(value.scopes)
+        || value.scopes.some((scope) => !nonEmptyString(scope))
+        || new Set(value.scopes).size !== value.scopes.length)) return null;
   }
 
   return value;

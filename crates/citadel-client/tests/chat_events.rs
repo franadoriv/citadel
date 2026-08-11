@@ -11,7 +11,23 @@ use serde_json::Value;
 struct Fixture {
     version: u8,
     valid: Vec<ValidCase>,
+    content_validation: Vec<ContentValidationCase>,
     invalid: Vec<InvalidCase>,
+}
+
+#[derive(Deserialize)]
+struct ContentValidationCase {
+    name: String,
+    event: String,
+    content: Option<String>,
+    content_repeat: Option<ContentRepeat>,
+    accepted: bool,
+}
+
+#[derive(Deserialize)]
+struct ContentRepeat {
+    value: String,
+    count: usize,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +162,42 @@ fn canonical_fixture_rejects_malformed_or_incomplete_events() {
         assert!(
             ChatEvent::decode(&bytes).is_err(),
             "{} unexpectedly decoded",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn canonical_fixture_matches_the_utf8_chat_content_boundary() {
+    let fixture = fixture();
+    let exact_multibyte = fixture
+        .content_validation
+        .iter()
+        .find(|case| case.name == "update_multibyte_exactly_2048_utf8_bytes")
+        .expect("shared fixture must lock the exact multibyte boundary");
+    let repeat = exact_multibyte
+        .content_repeat
+        .as_ref()
+        .expect("exact multibyte case uses repeated content");
+    assert_eq!(repeat.value.repeat(repeat.count).len(), 2048);
+    assert!(exact_multibyte.accepted);
+    for case in fixture.content_validation {
+        let mut event = fixture
+            .valid
+            .iter()
+            .find(|valid| valid.name == case.event)
+            .expect("content case base event")
+            .event
+            .clone();
+        let content = case.content.unwrap_or_else(|| {
+            let repeat = case.content_repeat.expect("literal or repeated content");
+            repeat.value.repeat(repeat.count)
+        });
+        event["message"]["content"] = Value::String(content);
+        assert_eq!(
+            ChatEvent::decode(event.to_string().as_bytes()).is_ok(),
+            case.accepted,
+            "{}",
             case.name
         );
     }

@@ -97,6 +97,14 @@ void UCitadelClientSubsystem::InvalidateChatConnectionState()
     if (ChatHistorySync != nullptr) ChatHistorySync->CancelAll();
 }
 
+ECitadelStatus UCitadelClientSubsystem::HandleConsumedPollTruncation(TArray<uint8>& OutPayload)
+{
+    OutPayload.Reset();
+    InvalidateChatConnectionState();
+    LastStatus = ECitadelStatus::Receive;
+    return LastStatus;
+}
+
 int64 UCitadelClientSubsystem::AllocateChatRequestId()
 {
     if (NextChatRequestId <= 0 || NextChatRequestId == TNumericLimits<int64>::Max())
@@ -288,9 +296,7 @@ ECitadelStatus UCitadelClientSubsystem::Poll(uint16& OutKind, TArray<uint8>& Out
     {
         if (bTruncated || Len > static_cast<uintptr_t>(PollBuffer.Num()))
         {
-            OutPayload.Reset();
-            LastStatus = ECitadelStatus::Receive;
-            return LastStatus;
+            return HandleConsumedPollTruncation(OutPayload);
         }
         OutKind = Kind;
         OutPayload.Reset();

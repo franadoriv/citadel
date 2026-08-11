@@ -50,6 +50,14 @@ function bytes(value) {
   return encoder.encode(typeof value === "string" ? value : JSON.stringify(value));
 }
 
+function contentValidationEvent(entry) {
+  const event = structuredClone(fixture.valid.find(({ name }) => name === entry.event).event);
+  event.message.content = entry.content_repeat
+    ? entry.content_repeat.value.repeat(entry.content_repeat.count)
+    : entry.content;
+  return event;
+}
+
 test("decodeChatEvent accepts all eight canonical v1 variants", () => {
   assert.equal(fixture.version, 1);
   assert.equal(fixture.valid.length, 8);
@@ -64,6 +72,22 @@ test("decodeChatEvent rejects every canonical invalid payload", () => {
   for (const entry of fixture.invalid) {
     const payload = entry.payload ?? entry.event;
     assert.equal(decodeChatEvent(bytes(payload)), null, entry.name);
+  }
+});
+
+test("decodeChatEvent matches the canonical UTF-8 chat content boundary", () => {
+  const exactMultibyte = fixture.content_validation.find(
+    ({ name }) => name === "update_multibyte_exactly_2048_utf8_bytes",
+  );
+  assert.ok(exactMultibyte, "shared fixture must lock the exact multibyte boundary");
+  assert.equal(encoder.encode(contentValidationEvent(exactMultibyte).message.content).byteLength, 2048);
+  assert.equal(exactMultibyte.accepted, true);
+  for (const entry of fixture.content_validation) {
+    assert.equal(
+      decodeChatEvent(bytes(contentValidationEvent(entry))) !== null,
+      entry.accepted,
+      entry.name,
+    );
   }
 });
 
@@ -82,6 +106,16 @@ test("decodeChatEvent rejects invalid u64 identifiers", () => {
   const tooLarge = U64_MAX + 1n;
   const payload = `{"version":1,"type":"message.create","channel_id":"ch_big","event_id":${tooLarge},"message":{"id":1,"sender":"alice","content":"invalid","created_at_unix_ms":1,"updated_at_unix_ms":1,"revision":1,"last_event_id":${tooLarge},"deleted":false}}`;
   assert.equal(decodeChatEvent(payload), null);
+});
+
+test("oversized kind-28 input is rejected before the lexical scan", () => {
+  const oversized = `[${"0,".repeat(2 * 1024 * 1024)}0]`;
+  const started = performance.now();
+  assert.equal(decodeChatEvent(oversized), null);
+  assert.ok(
+    performance.now() - started < 100,
+    "kind-28 rejection must not scan a multi-megabyte legal envelope body",
+  );
 });
 
 test("decodeChatEvent and cursor preserve the full u64 range with bigint", () => {

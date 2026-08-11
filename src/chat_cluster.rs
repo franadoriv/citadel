@@ -315,11 +315,14 @@ impl ChatPresenceDirectory {
         ) {
             return ChatDeliveryDisposition::Stale;
         }
-        if local_presence
+        match local_presence
             .subscribers_at_authority_epoch(&delivery.channel_id, delivery.authority_epoch)
-            .is_empty()
         {
-            return ChatDeliveryDisposition::Unknown;
+            Ok(subscribers) if subscribers.is_empty() => {
+                return ChatDeliveryDisposition::Unknown;
+            }
+            Err(_) => return ChatDeliveryDisposition::Unavailable,
+            Ok(_) => {}
         }
         ChatDeliveryDisposition::Delivered
     }

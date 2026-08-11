@@ -569,7 +569,7 @@ async fn mongodb_chat_0392_delivery_audit_and_rate_limits_use_real_rs0_transacti
         origin_node_id: "node-a".to_owned(),
         authority_epoch: 0,
         expires_at: TimestampMillis::from_unix_millis(100),
-        event_type: "message_sent",
+        event_type: "message.create",
     };
     let posted = repo
         .post_message_authorized_with_delivery(

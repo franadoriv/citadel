@@ -42,6 +42,17 @@
       "event": {"version":1,"type":"resync_required","channel_id":"ch_demo","watermark_event_id":9,"scopes":["history","presence"]}
     }
   ],
+  "content_validation": [
+    {"name":"create_empty_content","event":"message_create","content":"","accepted":false},
+    {"name":"update_whitespace_only_content","event":"message_update","content":"   ","accepted":false},
+    {"name":"create_prohibited_control_content","event":"message_create","content":"hello\u0007world","accepted":false},
+    {"name":"create_line_feed_content","event":"message_create","content":"hello\nworld","accepted":true},
+    {"name":"update_carriage_return_content","event":"message_update","content":"hello\rworld","accepted":true},
+    {"name":"create_exactly_2048_utf8_bytes","event":"message_create","content_repeat":{"value":"a","count":2048},"accepted":true},
+    {"name":"create_over_2048_utf8_bytes","event":"message_create","content_repeat":{"value":"a","count":2049},"accepted":false},
+    {"name":"update_multibyte_exactly_2048_utf8_bytes","event":"message_update","content_repeat":{"value":"é","count":1024},"accepted":true},
+    {"name":"update_multibyte_over_2048_utf8_bytes","event":"message_update","content_repeat":{"value":"é","count":1025},"accepted":false}
+  ],
   "invalid": [
     {"name":"malformed_json","payload":"{"},
     {"name":"unsupported_version","event":{"version":2,"type":"presence.join","channel_id":"ch_demo","presence":{"presence_id":"p","user_id":"u"}}},

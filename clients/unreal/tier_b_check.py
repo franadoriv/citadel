@@ -105,6 +105,15 @@ for needle in ("TryDecode", "KIND_CHAT_EVENT", "OnRawEnvelope.Broadcast", "OnCha
     require(cpp, needle, "CitadelChatLive.cpp")
 for needle in ("IMPLEMENT_SIMPLE_AUTOMATION_TEST", "chat-live-events-v1.json", "IPluginManager::Get()", "Valid", "Invalid", "Duplicate", "Gap", "Disconnect", "Rejoin", "Reconcile", "Revoked", "TypingExpiry", "RequestBuilders", "PollOwnerIntegration", "JoinCorrelation", "HistoryStableSnapshotAck", "HistoryMovingSnapshotRestart", "HistoryCorrelation"):
     require(test, needle, "CitadelChatLiveTests.cpp")
+for needle in (
+    "ConsumedPollTruncationFencesConnection",
+    "consumed truncation reports receive failure",
+    "consumed truncation fences chat authority like disconnect",
+    "consumed truncation fails pending join RPC",
+    "consumed truncation fails pending history RPC",
+    "consumed truncation makes late history RPC inert",
+):
+    require(test, needle, "CitadelChatLiveTests.cpp")
 for needle in ("class FCitadelChatJoinSyncTestAccess", "class FCitadelChatLiveStateTestAccess", "class FCitadelChatRpcRequestTestAccess", "class FCitadelChatHistorySyncTestAccess", "FCitadelChatJoinSyncTestAccess::BeginInitialJoin", "FCitadelChatJoinSyncTestAccess::HandleJoinResponse", "FCitadelChatLiveStateTestAccess::Apply", "FCitadelChatHistorySyncTestAccess::BeginReconcile", "FCitadelChatHistorySyncTestAccess::HandleRpcResponse", "AutomaticReconcileDriver", "durable gap automatically starts the reconcile driver", "explicit resync automatically starts the reconcile driver", "divergent rejoin automatically starts the reconcile driver", "only one reconcile generation may be in flight per channel", "history reconciliation authority is automation-accessor-only", "typed history factory seals exact transport provenance", "history reconciliation uses the exact chat.history method", "sealed history request builds a transport payload", "mutating sealed history method is rejected", "mutating sealed history payload cannot forge an ACK", "native disconnected send invalidates late join", "explicit disconnect invalidates even after disconnected status", "revocation cancels channel history", "revoked late history response is ignored", "mutating a typed sealed request cannot forge an early ACK"):
     require(test, needle, "CitadelChatLiveTests.cpp")
 if not re.search(
@@ -161,6 +170,28 @@ if "!State->HasChannel(ChannelId) || !State->NeedsReconcile(ChannelId)" not in s
 for needle in ("InvalidateChatConnectionState", "ChatJoinSync->OnDisconnect()", "ChatHistorySync->CancelAll()"):
     if needle not in subsystem_cpp + subsystem_h:
         errors.append(f"Unreal disconnect must centrally invalidate join/history/live state ({needle!r})")
+truncation_branch = re.search(
+    r"if\s*\(bTruncated\s*\|\|\s*Len\s*>[^)]*PollBuffer\.Num\(\)[^)]*\)\)\s*"
+    r"\{(?P<body>.*?)\}",
+    subsystem_cpp,
+    re.S,
+)
+if truncation_branch is None:
+    errors.append("CitadelClientSubsystem.cpp: missing consumed truncation/oversize branch")
+else:
+    body = truncation_branch.group("body")
+    if "return HandleConsumedPollTruncation(OutPayload);" not in body:
+        errors.append("CitadelClientSubsystem.cpp: consumed truncation must use the disconnect-equivalent fencing path")
+    if "citadel_client_poll" in body:
+        errors.append("CitadelClientSubsystem.cpp: consumed truncation must not repoll")
+if subsystem_cpp.count("citadel_client_poll(") != 1:
+    errors.append("CitadelClientSubsystem.cpp: Poll must remain one-shot with no truncation repoll")
+for needle in (
+    "HandleConsumedPollTruncation",
+    "InvalidateChatConnectionState();",
+    "LastStatus = ECitadelStatus::Receive;",
+):
+    require(subsystem_cpp, needle, "CitadelClientSubsystem.cpp")
 for needle in ("ChatHistorySync->CancelChannel(Event.ChannelId)", "void UCitadelChatHistorySync::CancelChannel"):
     if needle not in subsystem_cpp + cpp:
         errors.append(f"access revocation must cancel channel history before state removal ({needle!r})")

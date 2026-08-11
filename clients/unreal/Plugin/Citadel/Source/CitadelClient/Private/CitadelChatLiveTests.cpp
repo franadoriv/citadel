@@ -141,6 +141,12 @@ public:
     {
         return Client->ChatHistorySync;
     }
+    static ECitadelStatus HandleConsumedPollTruncation(
+        UCitadelClientSubsystem* Client,
+        TArray<uint8>& OutPayload)
+    {
+        return Client->HandleConsumedPollTruncation(OutPayload);
+    }
 };
 
 namespace
@@ -486,6 +492,60 @@ bool FCitadelChatPollOwnerIntegrationTest::RunTest(const FString& Parameters)
         Client->RouteInboundEnvelope(CitadelWire::KIND_CHAT_EVENT, Invalid));
     TestTrue(TEXT("non-chat raw envelopes remain routable"),
         Client->RouteInboundEnvelope(CitadelWire::KIND_NOTIFICATION, TArray<uint8>()));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCitadelChatConsumedPollTruncationTest,
+    "Citadel.Chat.Live.ConsumedPollTruncationFencesConnection",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FCitadelChatConsumedPollTruncationTest::RunTest(const FString& Parameters)
+{
+    UCitadelClientSubsystem* Client = NewObject<UCitadelClientSubsystem>();
+    FCitadelClientSubsystemChatTestAccess::EnsureChatObjects(Client);
+    UCitadelChatLiveState* State = Client->GetChatLiveState();
+    UCitadelChatJoinSync* JoinSync = FCitadelClientSubsystemChatTestAccess::JoinSync(Client);
+    UCitadelChatHistorySync* HistorySync = FCitadelClientSubsystemChatTestAccess::HistorySync(Client);
+    TestTrue(TEXT("channel is authoritative before consumed truncation"),
+        JoinState(State, TEXT("truncated"), 1, 700));
+
+    FCitadelChatLiveEvent Resync;
+    Resync.Type = ECitadelChatEventType::ResyncRequired;
+    Resync.ChannelId = TEXT("truncated");
+    Resync.WatermarkEventId = 2;
+    TestEqual(TEXT("history is required before consumed truncation"),
+        FCitadelChatLiveStateTestAccess::Apply(State, Resync),
+        ECitadelChatApplyResult::NeedsReconcile);
+    TestTrue(TEXT("pending history RPC starts before consumed truncation"),
+        FCitadelChatHistorySyncTestAccess::BeginReconcile(
+            HistorySync, TEXT("truncated"), 2, 2, 702).bValid);
+    TestTrue(TEXT("pending join RPC starts before consumed truncation"),
+        FCitadelChatJoinSyncTestAccess::BeginInitialJoin(JoinSync, 701));
+
+    TArray<uint8> OutPayload = { 1, 2, 3 };
+    TestEqual(TEXT("consumed truncation reports receive failure"),
+        FCitadelClientSubsystemChatTestAccess::HandleConsumedPollTruncation(Client, OutPayload),
+        ECitadelStatus::Receive);
+    TestTrue(TEXT("consumed truncation clears partial output"), OutPayload.IsEmpty());
+    TestFalse(TEXT("consumed truncation fences chat authority like disconnect"),
+        State->IsCurrent(TEXT("truncated")));
+    TestFalse(TEXT("consumed truncation fails pending history RPC"),
+        FCitadelChatHistorySyncTestAccess::IsReconciling(HistorySync, TEXT("truncated")));
+
+    FString Channel; int64 Required = -1; FString Error;
+    const FString Joined = TEXT("{\"channel_id\":\"late\",\"channel_type\":\"direct\",\"presence\":[],\"watermark_event_id\":1,\"subscription\":\"sub\"}");
+    TestEqual(TEXT("consumed truncation fails pending join RPC"),
+        FCitadelChatJoinSyncTestAccess::HandleJoinResponse(
+            JoinSync, RpcResponse(701, CitadelWire::RPC_STATUS_OK, Joined), State,
+            Channel, Required, Error),
+        ECitadelChatJoinResponseResult::Ignored);
+    FCitadelChatRpcRequest Next;
+    TestEqual(TEXT("consumed truncation makes late history RPC inert"),
+        FCitadelChatHistorySyncTestAccess::HandleRpcResponse(
+            HistorySync,
+            RpcResponse(702, CitadelWire::RPC_STATUS_OK,
+                TEXT("{\"items\":[],\"watermark_event_id\":2}")),
+            703, State, Next, Channel, Error),
+        ECitadelChatHistoryResponseResult::Ignored);
     return true;
 }
 

@@ -28,7 +28,7 @@ check when picking an engine.
 | Correlated generic RPC | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Relayed position/message traffic | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Durable notification inbox and local live stream | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Durable chat live events | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+| Durable chat live events | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Friends, groups, leaderboards, chat, wallet RPC | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Purchases, subscriptions, and external store validation | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
 
@@ -42,7 +42,7 @@ check when picking an engine.
 - **Correlated generic RPC** — The common route for domain, party, and matchmaker operations.
 - **Relayed position/message traffic** — All SDKs expose the base framed protocol; helpers vary by SDK.
 - **Durable notification inbox and local live stream** — Read/ack by RPC and consume KIND_NOTIFICATION with client-side deduplication.
-- **Durable chat live events** — All released clients expose KIND_CHAT_EVENT (28) through their normal inbound envelope path; join/history and exact event semantics are documented. Delivery spans current authenticated cluster leases and remains at-least-once, so clients deduplicate by channel/event id.
+- **Durable chat live events** — All released SDKs provide typed closed-schema KIND_CHAT_EVENT lifecycle, deduplication, reconnect/revocation fencing, transactional history application, and private correlated acknowledgement. Durable delivery uses a local-first transactional cluster outbox and remains at-least-once with history reconciliation.
 - **Friends, groups, leaderboards, chat, wallet RPC** — Authenticated generic RPC works across all current client targets.
 - **Purchases, subscriptions, and external store validation** — No player-facing purchase surface yet.
 

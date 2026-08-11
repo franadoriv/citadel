@@ -46,6 +46,7 @@ pub enum ChatEventKind {
 
 /// Identity attached to presence, typing, and access-revocation events.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatPresence {
     pub presence_id: String,
     pub user_id: String,
@@ -53,6 +54,7 @@ pub struct ChatPresence {
 
 /// Exact durable message state serialized by Citadel's chat repository.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub id: u64,
     pub sender: String,
@@ -226,38 +228,71 @@ impl ChatEventKind {
             Self::ResyncRequired => "resync_required",
         }
     }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "presence.join" => Some(Self::PresenceJoin),
-            "presence.leave" => Some(Self::PresenceLeave),
-            "typing" => Some(Self::Typing),
-            "message.create" => Some(Self::MessageCreate),
-            "message.update" => Some(Self::MessageUpdate),
-            "message.remove" => Some(Self::MessageRemove),
-            "access.revoked" => Some(Self::AccessRevoked),
-            "resync_required" => Some(Self::ResyncRequired),
-            _ => None,
-        }
-    }
-
-    const fn is_durable(self) -> bool {
-        matches!(
-            self,
-            Self::MessageCreate | Self::MessageUpdate | Self::MessageRemove
-        )
-    }
-
-    const fn requires_presence(self) -> bool {
-        matches!(
-            self,
-            Self::PresenceJoin | Self::PresenceLeave | Self::Typing | Self::AccessRevoked
-        )
-    }
 }
 
-/// A validated version-1 chat event. Unknown fields are retained in [`Self::raw`]
-/// for additive server evolution, while unknown versions/types fail closed.
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum ChatEventWire {
+    #[serde(rename = "presence.join")]
+    PresenceJoin {
+        version: u64,
+        channel_id: String,
+        channel_type: String,
+        presence: ChatPresence,
+    },
+    #[serde(rename = "presence.leave")]
+    PresenceLeave {
+        version: u64,
+        channel_id: String,
+        presence: ChatPresence,
+    },
+    #[serde(rename = "typing")]
+    Typing {
+        version: u64,
+        channel_id: String,
+        presence: ChatPresence,
+        typing: bool,
+        expires_at: u64,
+    },
+    #[serde(rename = "message.create")]
+    MessageCreate {
+        version: u64,
+        channel_id: String,
+        event_id: u64,
+        message: ChatMessage,
+    },
+    #[serde(rename = "message.update")]
+    MessageUpdate {
+        version: u64,
+        channel_id: String,
+        event_id: u64,
+        message: ChatMessage,
+    },
+    #[serde(rename = "message.remove")]
+    MessageRemove {
+        version: u64,
+        channel_id: String,
+        event_id: u64,
+        message: ChatMessage,
+    },
+    #[serde(rename = "access.revoked")]
+    AccessRevoked {
+        version: u64,
+        channel_id: String,
+        presence: ChatPresence,
+    },
+    #[serde(rename = "resync_required")]
+    ResyncRequired {
+        version: u64,
+        channel_id: String,
+        watermark_event_id: u64,
+        #[serde(default)]
+        scopes: Option<Vec<String>>,
+    },
+}
+
+/// A validated version-1 chat event. Every variant has a closed schema;
+/// unknown or duplicate fields fail closed before typed authority is created.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatEvent {
     kind: ChatEventKind,
@@ -274,58 +309,193 @@ pub struct ChatEvent {
 impl ChatEvent {
     /// Decode and validate a UTF-8 JSON body from a kind-28 envelope.
     pub fn decode(body: &[u8]) -> Result<Self, ChatEventError> {
+        let wire: ChatEventWire =
+            serde_json::from_slice(body).map_err(|_| ChatEventError::InvalidJson)?;
         let raw: Value = serde_json::from_slice(body).map_err(|_| ChatEventError::InvalidJson)?;
-        let object = raw.as_object().ok_or(ChatEventError::ExpectedObject)?;
+        let (
+            kind,
+            version,
+            channel_id,
+            event_id,
+            watermark_event_id,
+            expires_at,
+            typing,
+            presence,
+            message,
+        ) = match wire {
+            ChatEventWire::PresenceJoin {
+                version,
+                channel_id,
+                channel_type,
+                presence,
+            } => {
+                if !matches!(channel_type.as_str(), "direct" | "group" | "room") {
+                    return Err(ChatEventError::InvalidField("channel_type"));
+                }
+                validate_presence(&presence)?;
+                (
+                    ChatEventKind::PresenceJoin,
+                    version,
+                    channel_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(presence),
+                    None,
+                )
+            }
+            ChatEventWire::PresenceLeave {
+                version,
+                channel_id,
+                presence,
+            } => {
+                validate_presence(&presence)?;
+                (
+                    ChatEventKind::PresenceLeave,
+                    version,
+                    channel_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(presence),
+                    None,
+                )
+            }
+            ChatEventWire::Typing {
+                version,
+                channel_id,
+                presence,
+                typing,
+                expires_at,
+            } => {
+                validate_presence(&presence)?;
+                if !typing && expires_at != 0 {
+                    return Err(ChatEventError::InvalidField("expires_at"));
+                }
+                (
+                    ChatEventKind::Typing,
+                    version,
+                    channel_id,
+                    None,
+                    None,
+                    Some(expires_at),
+                    Some(typing),
+                    Some(presence),
+                    None,
+                )
+            }
+            ChatEventWire::MessageCreate {
+                version,
+                channel_id,
+                event_id,
+                message,
+            } => {
+                validate_wire_message(&message, ChatEventKind::MessageCreate, event_id)?;
+                (
+                    ChatEventKind::MessageCreate,
+                    version,
+                    channel_id,
+                    Some(event_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(message),
+                )
+            }
+            ChatEventWire::MessageUpdate {
+                version,
+                channel_id,
+                event_id,
+                message,
+            } => {
+                validate_wire_message(&message, ChatEventKind::MessageUpdate, event_id)?;
+                (
+                    ChatEventKind::MessageUpdate,
+                    version,
+                    channel_id,
+                    Some(event_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(message),
+                )
+            }
+            ChatEventWire::MessageRemove {
+                version,
+                channel_id,
+                event_id,
+                message,
+            } => {
+                validate_wire_message(&message, ChatEventKind::MessageRemove, event_id)?;
+                (
+                    ChatEventKind::MessageRemove,
+                    version,
+                    channel_id,
+                    Some(event_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(message),
+                )
+            }
+            ChatEventWire::AccessRevoked {
+                version,
+                channel_id,
+                presence,
+            } => {
+                validate_presence(&presence)?;
+                (
+                    ChatEventKind::AccessRevoked,
+                    version,
+                    channel_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(presence),
+                    None,
+                )
+            }
+            ChatEventWire::ResyncRequired {
+                version,
+                channel_id,
+                watermark_event_id,
+                scopes,
+            } => {
+                if let Some(scopes) = scopes {
+                    let mut unique = std::collections::HashSet::with_capacity(scopes.len());
+                    if scopes
+                        .iter()
+                        .any(|scope| scope.trim().is_empty() || !unique.insert(scope))
+                    {
+                        return Err(ChatEventError::InvalidField("scopes"));
+                    }
+                }
+                (
+                    ChatEventKind::ResyncRequired,
+                    version,
+                    channel_id,
+                    None,
+                    Some(watermark_event_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        };
 
-        let version = object
-            .get("version")
-            .and_then(Value::as_u64)
-            .ok_or(ChatEventError::MissingField("version"))?;
         if version != 1 {
             return Err(ChatEventError::UnsupportedVersion(version));
         }
-        let type_name = non_empty_string(object, "type")?;
-        let kind = ChatEventKind::parse(type_name)
-            .ok_or_else(|| ChatEventError::UnknownType(type_name.to_owned()))?;
-        let channel_id = non_empty_string(object, "channel_id")?.to_owned();
-
-        let presence = kind
-            .requires_presence()
-            .then(|| decode_presence(object))
-            .transpose()?;
-
-        let (event_id, message) = if kind.is_durable() {
-            let id = positive_u64(object, "event_id")?;
-            let message = decode_message(object, kind, id)?;
-            (Some(id), Some(message))
-        } else {
-            (None, None)
-        };
-
-        let (typing, expires_at) = if kind == ChatEventKind::Typing {
-            let state = object
-                .get("typing")
-                .and_then(Value::as_bool)
-                .ok_or(ChatEventError::MissingField("typing"))?;
-            let expiry = object
-                .get("expires_at")
-                .and_then(Value::as_u64)
-                .ok_or(ChatEventError::MissingField("expires_at"))?;
-            (Some(state), Some(expiry))
-        } else {
-            (None, None)
-        };
-
-        let watermark_event_id = if kind == ChatEventKind::ResyncRequired {
-            Some(
-                object
-                    .get("watermark_event_id")
-                    .and_then(Value::as_u64)
-                    .ok_or(ChatEventError::MissingField("watermark_event_id"))?,
-            )
-        } else {
-            None
-        };
+        if channel_id.trim().is_empty() {
+            return Err(ChatEventError::InvalidField("channel_id"));
+        }
 
         Ok(Self {
             kind,
@@ -413,20 +583,18 @@ fn positive_u64(object: &Map<String, Value>, field: &'static str) -> Result<u64,
         .ok_or(ChatEventError::MissingField(field))
 }
 
-fn decode_presence(object: &Map<String, Value>) -> Result<ChatPresence, ChatEventError> {
-    let value = object
-        .get("presence")
-        .ok_or(ChatEventError::MissingField("presence"))?;
-    decode_presence_value(value)
-}
-
 fn decode_presence_value(value: &Value) -> Result<ChatPresence, ChatEventError> {
     let presence: ChatPresence = serde_json::from_value(value.clone())
         .map_err(|_| ChatEventError::InvalidField("presence"))?;
+    validate_presence(&presence)?;
+    Ok(presence)
+}
+
+fn validate_presence(presence: &ChatPresence) -> Result<(), ChatEventError> {
     if presence.presence_id.trim().is_empty() || presence.user_id.trim().is_empty() {
         return Err(ChatEventError::InvalidField("presence"));
     }
-    Ok(presence)
+    Ok(())
 }
 
 fn decode_json_object(body: &[u8]) -> Result<Map<String, Value>, ChatEventError> {
@@ -437,25 +605,37 @@ fn decode_json_object(body: &[u8]) -> Result<Map<String, Value>, ChatEventError>
         .ok_or(ChatEventError::ExpectedObject)
 }
 
-fn decode_message(
-    object: &Map<String, Value>,
+fn validate_wire_message(
+    message: &ChatMessage,
     kind: ChatEventKind,
     event_id: u64,
-) -> Result<ChatMessage, ChatEventError> {
-    let value = object
-        .get("message")
-        .ok_or(ChatEventError::MissingField("message"))?;
-    let message = decode_message_value(value)?;
+) -> Result<(), ChatEventError> {
+    const MAX_CHAT_CONTENT_BYTES: usize = 2_048;
+
+    if event_id == 0
+        || message.id == 0
+        || message.sender.trim().is_empty()
+        || message.updated_at_unix_ms < message.created_at_unix_ms
+    {
+        return Err(ChatEventError::InvalidField("message"));
+    }
     if message.last_event_id != event_id {
         return Err(ChatEventError::InvalidField("message"));
     }
+    let valid_content = !message.content.trim().is_empty()
+        && message.content.len() <= MAX_CHAT_CONTENT_BYTES
+        && !message
+            .content
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r'));
     let state_matches_kind = match kind {
         ChatEventKind::MessageCreate => {
-            !message.deleted
+            valid_content
+                && !message.deleted
                 && message.revision == 1
                 && message.created_at_unix_ms == message.updated_at_unix_ms
         }
-        ChatEventKind::MessageUpdate => !message.deleted && message.revision > 1,
+        ChatEventKind::MessageUpdate => valid_content && !message.deleted && message.revision > 1,
         ChatEventKind::MessageRemove => {
             message.deleted && message.content.is_empty() && message.revision > 1
         }
@@ -464,7 +644,7 @@ fn decode_message(
     if !state_matches_kind {
         return Err(ChatEventError::InvalidField("message"));
     }
-    Ok(message)
+    Ok(())
 }
 
 fn decode_message_value(value: &Value) -> Result<ChatMessage, ChatEventError> {

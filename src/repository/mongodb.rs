@@ -8138,7 +8138,16 @@ mod tests {
         assert_eq!(spec("chat_events").indexes.len(), 1);
         assert_eq!(spec("chat_moderation_audit").indexes.len(), 1);
         assert_eq!(spec("chat_rate_limits").indexes.len(), 2);
-        assert_eq!(spec("chat_delivery_outbox").indexes.len(), 2);
+        assert_eq!(spec("chat_delivery_outbox").indexes.len(), 3);
+        assert_eq!(
+            spec("chat_delivery_outbox").indexes[2].keys,
+            [
+                ("origin_node_id", 1),
+                ("expires_at_unix_ms", 1),
+                ("channel_id", 1),
+                ("event_id", 1),
+            ]
+        );
         assert_eq!(
             spec("chat_messages").indexes[1].keys,
             [("channel_id", 1), ("created_at_unix_ms", 1), ("id", 1)]

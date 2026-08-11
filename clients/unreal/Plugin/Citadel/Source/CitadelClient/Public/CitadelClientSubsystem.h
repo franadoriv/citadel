@@ -298,6 +298,8 @@ private:
     int64 AllocateChatRequestId();
     /** Idempotently fail closed all connection-scoped chat state. */
     void InvalidateChatConnectionState();
+    /** A destructive one-shot poll loss is connection-equivalent for chat authority. */
+    ECitadelStatus HandleConsumedPollTruncation(TArray<uint8>& OutPayload);
     /** Internal-only: resync can start only after authorized state requested it. */
     ECitadelStatus BeginChatReconcile(const FString& ChannelId, int64 RequiredWatermarkEventId, int32 PageLimit);
 
