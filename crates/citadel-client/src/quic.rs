@@ -12,13 +12,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+
 use std::time::Duration;
 
 use bytes::BytesMut;
-use citadel_wire::protocol::{
-    KIND_RPC_REQUEST, KIND_RPC_RESPONSE, decode_rpc_response, encode_rpc_request,
-};
+use citadel_wire::protocol::{KIND_RPC_REQUEST, encode_rpc_request};
 use citadel_wire::{Envelope, decode_datagram, decode_framed};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint};
@@ -26,6 +24,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
+use crate::rpc::RpcResponsePump;
 use crate::{ClientError, ClientResult};
 
 /// ALPN protocol identifier; must match the server's `citadel/0`.
@@ -106,7 +105,7 @@ pub struct QuicClient {
     #[allow(dead_code)]
     endpoint: Endpoint,
     /// Monotonic source of RPC correlation ids for [`QuicClient::call_rpc`].
-    next_request_id: AtomicU64,
+    next_request_id: u64,
 }
 
 /// Cap the QUIC handshake so a dead or unreachable server fails fast instead of
@@ -142,7 +141,7 @@ impl QuicClient {
         Ok(Self {
             connection,
             endpoint,
-            next_request_id: AtomicU64::new(1),
+            next_request_id: 1,
         })
     }
 
@@ -208,45 +207,33 @@ impl QuicClient {
     ///
     /// Sends a [`KIND_RPC_REQUEST`] reliably (fresh, monotonically increasing
     /// `request_id`), then accepts server-opened unidirectional streams until the
-    /// matching [`KIND_RPC_RESPONSE`] arrives. Returns the handler's reply bytes
+    /// matching RPC response arrives. Returns the handler's reply bytes
     /// on success, or [`ClientError::Rpc`] if the server answered with an error
     /// status.
     ///
-    /// Correlation and usage notes mirror [`crate::WsClient::call_rpc`]: the reply
-    /// is matched by `request_id` (a stale/duplicate id is skipped), any non-RPC
-    /// envelopes carried on the accepted streams (e.g. relayed reliable peer
-    /// messages) are discarded while awaiting the reply, and no timeout is
-    /// imposed — wrap the call in [`tokio::time::timeout`] to bound the wait.
-    /// Apps that also consume the relay stream should poll and dispatch by kind
-    /// instead of using this helper.
-    pub async fn call_rpc(&self, method: &str, payload: &[u8]) -> ClientResult<Vec<u8>> {
-        // `Relaxed` is sufficient: we only need uniqueness, not ordering against
-        // other memory. Wrapping is defensive; 2^64 calls is unreachable.
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+    /// Correlation and usage notes mirror [`crate::WsClient::call_rpc`]: every
+    /// envelope other than the matching response is synchronously delivered to
+    /// `on_envelope`. The mutable borrow makes this the sole inbound poll owner.
+    pub async fn call_rpc<F>(
+        &mut self,
+        method: &str,
+        payload: &[u8],
+        mut on_envelope: F,
+    ) -> ClientResult<Vec<u8>>
+    where
+        F: FnMut(Envelope) -> ClientResult<()>,
+    {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
 
         let body = encode_rpc_request(request_id, method, payload);
         self.send_reliable(&Envelope::new(KIND_RPC_REQUEST, body))
             .await?;
+        let mut pump = RpcResponsePump::new(request_id, &mut on_envelope);
 
         loop {
-            for env in self.recv_uni().await? {
-                if env.kind != KIND_RPC_RESPONSE {
-                    // Unrelated relayed message: skip it.
-                    continue;
-                }
-                let Some(response) = decode_rpc_response(&env.body) else {
-                    continue;
-                };
-                if response.request_id != request_id {
-                    continue;
-                }
-                if response.is_ok() {
-                    return Ok(response.payload.to_vec());
-                }
-                return Err(ClientError::Rpc {
-                    request_id,
-                    message: String::from_utf8_lossy(response.payload).into_owned(),
-                });
+            if let Some(reply) = pump.handle_batch(self.recv_uni().await?)? {
+                return Ok(reply);
             }
         }
     }

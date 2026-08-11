@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "valid": [
+    {
+      "name": "presence_join",
+      "kind": "presence.join",
+      "event": {"version":1,"type":"presence.join","channel_id":"ch_demo","channel_type":"direct","presence":{"presence_id":"p_alice","user_id":"alice"}}
+    },
+    {
+      "name": "presence_leave",
+      "kind": "presence.leave",
+      "event": {"version":1,"type":"presence.leave","channel_id":"ch_demo","presence":{"presence_id":"p_alice","user_id":"alice"}}
+    },
+    {
+      "name": "typing",
+      "kind": "typing",
+      "event": {"version":1,"type":"typing","channel_id":"ch_demo","presence":{"presence_id":"p_alice","user_id":"alice"},"typing":true,"expires_at":1735689630000}
+    },
+    {
+      "name": "message_create",
+      "kind": "message.create",
+      "event": {"version":1,"type":"message.create","channel_id":"ch_demo","event_id":5,"message":{"id":1,"sender":"alice","content":"hello","created_at_unix_ms":1000,"updated_at_unix_ms":1000,"revision":1,"last_event_id":5,"deleted":false}}
+    },
+    {
+      "name": "message_update",
+      "kind": "message.update",
+      "event": {"version":1,"type":"message.update","channel_id":"ch_demo","event_id":6,"message":{"id":1,"sender":"alice","content":"edited","created_at_unix_ms":1000,"updated_at_unix_ms":1100,"revision":2,"last_event_id":6,"deleted":false}}
+    },
+    {
+      "name": "message_remove",
+      "kind": "message.remove",
+      "event": {"version":1,"type":"message.remove","channel_id":"ch_demo","event_id":7,"message":{"id":1,"sender":"alice","content":"","created_at_unix_ms":1000,"updated_at_unix_ms":1200,"revision":3,"last_event_id":7,"deleted":true}}
+    },
+    {
+      "name": "access_revoked",
+      "kind": "access.revoked",
+      "event": {"version":1,"type":"access.revoked","channel_id":"ch_demo","presence":{"presence_id":"p_alice","user_id":"alice"}}
+    },
+    {
+      "name": "resync_required",
+      "kind": "resync_required",
+      "event": {"version":1,"type":"resync_required","channel_id":"ch_demo","watermark_event_id":9,"scopes":["history","presence"]}
+    }
+  ],
+  "content_validation": [
+    {"name":"create_empty_content","event":"message_create","content":"","accepted":false},
+    {"name":"update_whitespace_only_content","event":"message_update","content":"   ","accepted":false},
+    {"name":"create_prohibited_control_content","event":"message_create","content":"hello\u0007world","accepted":false},
+    {"name":"create_line_feed_content","event":"message_create","content":"hello\nworld","accepted":true},
+    {"name":"update_carriage_return_content","event":"message_update","content":"hello\rworld","accepted":true},
+    {"name":"create_exactly_2048_utf8_bytes","event":"message_create","content_repeat":{"value":"a","count":2048},"accepted":true},
+    {"name":"create_over_2048_utf8_bytes","event":"message_create","content_repeat":{"value":"a","count":2049},"accepted":false},
+    {"name":"update_multibyte_exactly_2048_utf8_bytes","event":"message_update","content_repeat":{"value":"é","count":1024},"accepted":true},
+    {"name":"update_multibyte_over_2048_utf8_bytes","event":"message_update","content_repeat":{"value":"é","count":1025},"accepted":false}
+  ],
+  "invalid": [
+    {"name":"malformed_json","payload":"{"},
+    {"name":"unsupported_version","event":{"version":2,"type":"presence.join","channel_id":"ch_demo","presence":{"presence_id":"p","user_id":"u"}}},
+    {"name":"unknown_type","event":{"version":1,"type":"future.event","channel_id":"ch_demo"}},
+    {"name":"empty_channel","event":{"version":1,"type":"presence.join","channel_id":"","presence":{"presence_id":"p","user_id":"u"}}},
+    {"name":"missing_presence","event":{"version":1,"type":"presence.leave","channel_id":"ch_demo"}},
+    {"name":"missing_event_id","event":{"version":1,"type":"message.create","channel_id":"ch_demo","message":{}}},
+    {"name":"empty_message","event":{"version":1,"type":"message.create","channel_id":"ch_demo","event_id":5,"message":{}}},
+    {"name":"scalar_message","event":{"version":1,"type":"message.update","channel_id":"ch_demo","event_id":6,"message":"bad"}},
+    {"name":"mismatched_last_event_id","event":{"version":1,"type":"message.update","channel_id":"ch_demo","event_id":6,"message":{"id":1,"sender":"alice","content":"edited","created_at_unix_ms":1000,"updated_at_unix_ms":1100,"revision":2,"last_event_id":5,"deleted":false}}},
+    {"name":"zero_message_revision","event":{"version":1,"type":"message.update","channel_id":"ch_demo","event_id":6,"message":{"id":1,"sender":"alice","content":"edited","created_at_unix_ms":1000,"updated_at_unix_ms":1100,"revision":0,"last_event_id":6,"deleted":false}}},
+    {"name":"message_time_reversal","event":{"version":1,"type":"message.update","channel_id":"ch_demo","event_id":6,"message":{"id":1,"sender":"alice","content":"edited","created_at_unix_ms":1100,"updated_at_unix_ms":1000,"revision":2,"last_event_id":6,"deleted":false}}},
+    {"name":"create_revision_two","event":{"version":1,"type":"message.create","channel_id":"ch_demo","event_id":5,"message":{"id":1,"sender":"alice","content":"hello","created_at_unix_ms":1000,"updated_at_unix_ms":1000,"revision":2,"last_event_id":5,"deleted":false}}},
+    {"name":"create_timestamp_changed","event":{"version":1,"type":"message.create","channel_id":"ch_demo","event_id":5,"message":{"id":1,"sender":"alice","content":"hello","created_at_unix_ms":1000,"updated_at_unix_ms":1001,"revision":1,"last_event_id":5,"deleted":false}}},
+    {"name":"update_revision_one","event":{"version":1,"type":"message.update","channel_id":"ch_demo","event_id":6,"message":{"id":1,"sender":"alice","content":"edited","created_at_unix_ms":1000,"updated_at_unix_ms":1100,"revision":1,"last_event_id":6,"deleted":false}}},
+    {"name":"remove_revision_one","event":{"version":1,"type":"message.remove","channel_id":"ch_demo","event_id":7,"message":{"id":1,"sender":"alice","content":"","created_at_unix_ms":1000,"updated_at_unix_ms":1200,"revision":1,"last_event_id":7,"deleted":true}}},
+    {"name":"create_is_deleted","event":{"version":1,"type":"message.create","channel_id":"ch_demo","event_id":5,"message":{"id":1,"sender":"alice","content":"","created_at_unix_ms":1000,"updated_at_unix_ms":1000,"revision":1,"last_event_id":5,"deleted":true}}},
+    {"name":"remove_has_content","event":{"version":1,"type":"message.remove","channel_id":"ch_demo","event_id":7,"message":{"id":1,"sender":"alice","content":"secret remains","created_at_unix_ms":1000,"updated_at_unix_ms":1200,"revision":3,"last_event_id":7,"deleted":true}}},
+    {"name":"typing_without_expiry","event":{"version":1,"type":"typing","channel_id":"ch_demo","presence":{"presence_id":"p","user_id":"u"},"typing":true}},
+    {"name":"resync_without_watermark","event":{"version":1,"type":"resync_required","channel_id":"ch_demo"}},
+    {"name":"numeric_string_event_id","payload":"{\"version\":1,\"type\":\"message.create\",\"channel_id\":\"ch_demo\",\"event_id\":\"5\",\"message\":{\"id\":1,\"sender\":\"alice\",\"content\":\"hello\",\"created_at_unix_ms\":1000,\"updated_at_unix_ms\":1000,\"revision\":1,\"last_event_id\":5,\"deleted\":false}}"},
+    {"name":"fractional_revision","payload":"{\"version\":1,\"type\":\"message.create\",\"channel_id\":\"ch_demo\",\"event_id\":5,\"message\":{\"id\":1,\"sender\":\"alice\",\"content\":\"hello\",\"created_at_unix_ms\":1000,\"updated_at_unix_ms\":1000,\"revision\":1.5,\"last_event_id\":5,\"deleted\":false}}"},
+    {"name":"unknown_variant_field","payload":"{\"version\":1,\"type\":\"presence.leave\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"},\"force_current\":true}"},
+    {"name":"duplicate_type","payload":"{\"version\":1,\"type\":\"presence.leave\",\"type\":\"presence.leave\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"}}"},
+    {"name":"unknown_hyphenated_field","payload":"{\"version\":1,\"type\":\"presence.leave\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"},\"force-current\":true}"},
+    {"name":"typing_false_nonzero_expiry","payload":"{\"version\":1,\"type\":\"typing\",\"channel_id\":\"ch_demo\",\"presence\":{\"presence_id\":\"p\",\"user_id\":\"u\"},\"typing\":false,\"expires_at\":10}"},
+    {"name":"duplicate_resync_scope","payload":"{\"version\":1,\"type\":\"resync_required\",\"channel_id\":\"ch_demo\",\"watermark_event_id\":9,\"scopes\":[\"history\",\"history\"]}"}
+  ]
+}

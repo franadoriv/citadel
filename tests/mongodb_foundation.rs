@@ -566,9 +566,10 @@ async fn mongodb_chat_0392_delivery_audit_and_rate_limits_use_real_rs0_transacti
     }
     let repo = db.mongo_chat_repository();
     let delivery = ChatDeliveryRequest {
+        origin_node_id: "node-a".to_owned(),
         authority_epoch: 0,
         expires_at: TimestampMillis::from_unix_millis(100),
-        event_type: "message_sent",
+        event_type: "message.create",
     };
     let posted = repo
         .post_message_authorized_with_delivery(
@@ -585,30 +586,43 @@ async fn mongodb_chat_0392_delivery_audit_and_rate_limits_use_real_rs0_transacti
         .await
         .expect("authorized delivery post");
     assert_eq!(posted.last_event_id, 1);
+    assert!(
+        repo.active_delivery_outbox("node-b", TimestampMillis::from_unix_millis(2), 10)
+            .await
+            .expect("foreign worker cannot see delivery")
+            .is_empty()
+    );
+    assert!(
+        !repo
+            .acknowledge_delivery_outbox("node-b", "delivery-rs0", posted.last_event_id)
+            .await
+            .expect("foreign worker cannot acknowledge delivery")
+    );
     let pending = repo
-        .active_delivery_outbox(TimestampMillis::from_unix_millis(2), 10)
+        .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(2), 10)
         .await
         .expect("first worker sees delivery");
     assert_eq!(pending.len(), 1);
     assert_eq!(
-        repo.active_delivery_outbox(TimestampMillis::from_unix_millis(3), 10)
+        repo.active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(3), 10)
             .await
             .expect("failed worker can retry before the exclusive deadline"),
         pending,
     );
     assert!(
-        repo.acknowledge_delivery_outbox("delivery-rs0", posted.last_event_id)
+        repo.acknowledge_delivery_outbox("node-a", "delivery-rs0", posted.last_event_id)
             .await
             .expect("ack delivery")
     );
     assert!(
-        repo.active_delivery_outbox(TimestampMillis::from_unix_millis(3), 10)
+        repo.active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(3), 10)
             .await
             .expect("ack removes pending delivery")
             .is_empty()
     );
 
     let duplicate = ChatDeliveryOutboxRecord {
+        origin_node_id: "node-a".to_owned(),
         channel_id: "concurrent-outbox".to_owned(),
         event_id: 7,
         authority_epoch: 0,
@@ -650,7 +664,7 @@ async fn mongodb_chat_0392_delivery_audit_and_rate_limits_use_real_rs0_transacti
         .is_err()
     );
     assert_eq!(
-        repo.active_delivery_outbox(TimestampMillis::from_unix_millis(5), 10)
+        repo.active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(5), 10)
             .await
             .expect("authorization failure creates no delivery")
             .len(),
@@ -799,6 +813,7 @@ async fn mongodb_chat_session_bound_lifecycle_methods_read_their_writes_and_roll
     }
     let repo = db.mongo_chat_repository();
     let live = |channel: &str, event_id| ChatDeliveryOutboxRecord {
+        origin_node_id: "node-a".to_owned(),
         channel_id: channel.to_owned(),
         event_id,
         authority_epoch: 0,
@@ -817,14 +832,14 @@ async fn mongodb_chat_session_bound_lifecycle_methods_read_their_writes_and_roll
     );
     assert_eq!(
         tx_repo
-            .active_delivery_outbox(TimestampMillis::from_unix_millis(2), 10)
+            .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(2), 10)
             .await
             .expect("session reads staged outbox"),
         vec![live("tx-stage", 1)]
     );
     uow.rollback().await.expect("abort staging UoW");
     assert!(
-        repo.active_delivery_outbox(TimestampMillis::from_unix_millis(2), 10)
+        repo.active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(2), 10)
             .await
             .expect("aborted stage is not visible")
             .is_empty()
@@ -839,20 +854,20 @@ async fn mongodb_chat_session_bound_lifecycle_methods_read_their_writes_and_roll
     let tx_repo = uow.mongo_chat_repository();
     assert!(
         tx_repo
-            .acknowledge_delivery_outbox("tx-ack", 2)
+            .acknowledge_delivery_outbox("node-a", "tx-ack", 2)
             .await
             .expect("acknowledge in enclosing session")
     );
     assert!(
         tx_repo
-            .active_delivery_outbox(TimestampMillis::from_unix_millis(2), 10)
+            .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(2), 10)
             .await
             .expect("session reads acknowledged outbox")
             .is_empty()
     );
     uow.rollback().await.expect("abort acknowledgement UoW");
     assert_eq!(
-        repo.active_delivery_outbox(TimestampMillis::from_unix_millis(2), 10)
+        repo.active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(2), 10)
             .await
             .expect("aborted acknowledgement does not leak"),
         vec![live("tx-ack", 2)]
@@ -963,6 +978,7 @@ async fn mongodb_chat_session_bound_lifecycle_sequence_commits_atomically() {
         .expect("clear lifecycle commit fixture");
     let repo = db.mongo_chat_repository();
     let retained = ChatDeliveryOutboxRecord {
+        origin_node_id: "node-a".to_owned(),
         channel_id: "tx-sequence".to_owned(),
         event_id: 1,
         authority_epoch: 0,
@@ -971,6 +987,7 @@ async fn mongodb_chat_session_bound_lifecycle_sequence_commits_atomically() {
         expires_at: TimestampMillis::from_unix_millis(100),
     };
     let expired = ChatDeliveryOutboxRecord {
+        origin_node_id: "node-a".to_owned(),
         channel_id: "tx-sequence".to_owned(),
         event_id: 2,
         authority_epoch: 0,
@@ -993,7 +1010,7 @@ async fn mongodb_chat_session_bound_lifecycle_sequence_commits_atomically() {
     let tx_repo = uow.mongo_chat_repository();
     assert!(
         tx_repo
-            .acknowledge_delivery_outbox("tx-sequence", 1)
+            .acknowledge_delivery_outbox("node-a", "tx-sequence", 1)
             .await
             .expect("ack retained outbox")
     );
@@ -1006,7 +1023,7 @@ async fn mongodb_chat_session_bound_lifecycle_sequence_commits_atomically() {
     );
     assert!(
         tx_repo
-            .active_delivery_outbox(TimestampMillis::from_unix_millis(3), 10)
+            .active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(3), 10)
             .await
             .expect("sequence reads its own writes")
             .is_empty()
@@ -1015,7 +1032,7 @@ async fn mongodb_chat_session_bound_lifecycle_sequence_commits_atomically() {
         .await
         .expect("commit lifecycle sequence atomically");
     assert!(
-        repo.active_delivery_outbox(TimestampMillis::from_unix_millis(3), 10)
+        repo.active_delivery_outbox("node-a", TimestampMillis::from_unix_millis(3), 10)
             .await
             .expect("committed sequence persists")
             .is_empty()

@@ -6,8 +6,7 @@
 
 use bytes::BytesMut;
 use citadel_wire::protocol::{
-    KIND_AUTH, KIND_AUTH_RESULT, KIND_RPC_REQUEST, KIND_RPC_RESPONSE, decode_auth_result,
-    decode_rpc_response, encode_rpc_request,
+    KIND_AUTH, KIND_AUTH_RESULT, KIND_RPC_REQUEST, decode_auth_result, encode_rpc_request,
 };
 use citadel_wire::{Envelope, decode_framed};
 use futures_util::{SinkExt, StreamExt};
@@ -15,6 +14,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::rpc::RpcResponsePump;
 use crate::{AuthOutcome, ClientError, ClientResult};
 
 /// A connected WebSocket client.
@@ -140,51 +140,41 @@ impl WsClient {
     ///
     /// Generates a fresh, monotonically increasing `request_id`, sends a
     /// [`KIND_RPC_REQUEST`] carrying `method` + `payload` (reliable, ordered),
-    /// then reads envelopes until the matching [`KIND_RPC_RESPONSE`] arrives.
+    /// then pumps envelopes until the matching RPC response arrives.
     /// Returns the handler's reply bytes on success, or [`ClientError::Rpc`] if
     /// the server answered with an error status.
     ///
     /// Correlation and usage notes:
     ///
-    /// - The reply is matched by `request_id`, so a stale/duplicate response for
-    ///   a different id is skipped rather than mistaken for this call's reply.
-    /// - This helper is intended for a connection that is not concurrently used
-    ///   for other receives: any non-RPC envelopes (e.g. relayed peer positions)
-    ///   that arrive while awaiting the reply are discarded. Apps that also need
-    ///   the relay stream should instead poll and dispatch by kind (as the Unity
-    ///   sample's `RpcClient` does) rather than call this helper.
+    /// - The reply is matched by `request_id`; every other envelope, including a
+    ///   stale response, is delivered synchronously to `on_envelope`.
+    /// - The mutable borrow gives this call sole ownership of inbound polling.
     /// - It does not impose a timeout; wrap the call in
     ///   [`tokio::time::timeout`] to bound how long you wait.
-    pub async fn call_rpc(&mut self, method: &str, payload: &[u8]) -> ClientResult<Vec<u8>> {
+    pub async fn call_rpc<F>(
+        &mut self,
+        method: &str,
+        payload: &[u8],
+        mut on_envelope: F,
+    ) -> ClientResult<Vec<u8>>
+    where
+        F: FnMut(Envelope) -> ClientResult<()>,
+    {
         let request_id = self.next_request_id;
         // Wrapping is defensive only: 2^64 calls per connection is unreachable.
         self.next_request_id = self.next_request_id.wrapping_add(1);
 
         let body = encode_rpc_request(request_id, method, payload);
         self.send(&Envelope::new(KIND_RPC_REQUEST, body)).await?;
+        let mut pump = RpcResponsePump::new(request_id, &mut on_envelope);
 
         loop {
             match self.recv().await? {
-                Some(env) if env.kind == KIND_RPC_RESPONSE => {
-                    let Some(response) = decode_rpc_response(&env.body) else {
-                        // Malformed response body: cannot correlate it; keep
-                        // waiting for a well-formed one.
-                        continue;
-                    };
-                    if response.request_id != request_id {
-                        // A response for a different (e.g. superseded) call.
-                        continue;
+                Some(envelope) => {
+                    if let Some(reply) = pump.handle(envelope)? {
+                        return Ok(reply);
                     }
-                    if response.is_ok() {
-                        return Ok(response.payload.to_vec());
-                    }
-                    return Err(ClientError::Rpc {
-                        request_id,
-                        message: String::from_utf8_lossy(response.payload).into_owned(),
-                    });
                 }
-                // Unrelated envelope (e.g. a relayed peer position): skip it.
-                Some(_) => continue,
                 None => {
                     return Err(ClientError::Receive(
                         "connection closed before the RPC response arrived".to_string(),

@@ -23,6 +23,7 @@ use std::sync::Mutex;
 
 use base64::Engine as _;
 use citadel_wire::protocol;
+use serde::Serialize;
 
 use crate::chat_cluster::{
     ChatDeliveryDisposition, ChatPresenceDirectory, LocalChatPresenceAnnouncer, RemoteChatDelivery,
@@ -369,6 +370,86 @@ pub struct DomainRpcServices {
     pub node_id: String,
     /// Player-owned wallet reads.
     pub wallet: Arc<WalletService>,
+}
+
+#[derive(Serialize)]
+struct ChatCreateResponse<'a> {
+    message: &'a crate::repository::ChatMessage,
+    event_id: u64,
+}
+
+impl<'a> From<&'a crate::repository::ChatMessage> for ChatCreateResponse<'a> {
+    fn from(message: &'a crate::repository::ChatMessage) -> Self {
+        Self {
+            message,
+            event_id: message.last_event_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ChatEditResponse<'a> {
+    message: &'a crate::repository::ChatMessage,
+    event_id: u64,
+}
+
+impl<'a> From<&'a crate::repository::ChatMessage> for ChatEditResponse<'a> {
+    fn from(message: &'a crate::repository::ChatMessage) -> Self {
+        Self {
+            message,
+            event_id: message.last_event_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ChatDeleteResponse {
+    deleted: bool,
+    message_id: u64,
+    event_id: Option<u64>,
+}
+
+impl ChatDeleteResponse {
+    const fn deleted(message_id: u64, event_id: u64) -> Self {
+        Self {
+            deleted: true,
+            message_id,
+            event_id: Some(event_id),
+        }
+    }
+
+    const fn not_deleted(message_id: u64) -> Self {
+        Self {
+            deleted: false,
+            message_id,
+            event_id: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ChatModerateResponse {
+    deleted: bool,
+    message_id: u64,
+    event_id: Option<u64>,
+}
+
+impl ChatModerateResponse {
+    const fn deleted(message_id: u64, event_id: u64) -> Self {
+        Self {
+            deleted: true,
+            message_id,
+            event_id: Some(event_id),
+        }
+    }
+
+    const fn not_deleted(message_id: u64) -> Self {
+        Self {
+            deleted: false,
+            message_id,
+            event_id: None,
+        }
+    }
 }
 
 /// A domain-RPC method name reserved for the server's built-in handlers.
@@ -862,7 +943,7 @@ impl DomainRpcServices {
 
     async fn chat_send(
         &self,
-        registry: &SessionRegistry,
+        _registry: &SessionRegistry,
         sender: ParticipantId,
         user: &str,
         payload: &[u8],
@@ -893,8 +974,7 @@ impl DomainRpcServices {
         {
             return Self::err(&error.to_string());
         }
-        let delivery = match Self::chat_delivery_request(lease.access_epoch, "message.create", now)
-        {
+        let delivery = match self.chat_delivery_request(lease.access_epoch, "message.create", now) {
             Ok(delivery) => delivery,
             Err(error) => return Self::err(&error),
         };
@@ -913,18 +993,9 @@ impl DomainRpcServices {
             .await
         {
             Ok(message) => message,
-            Err(error) => return Self::err(&error.to_string()),
+            Err(error) => return Self::chat_mutation_failure(&error),
         };
-        let event_id = message.last_event_id;
-        self.fan_out_durable_event(
-            registry,
-            &channel,
-            lease.access_epoch,
-            "message.create",
-            &message,
-            event_id,
-        );
-        Self::ok(serde_json::json!({"message": message, "event_id": event_id}))
+        Self::ok(ChatCreateResponse::from(&message))
     }
 
     /// Broadcast a server-authorized, non-durable typing indication to the
@@ -977,9 +1048,13 @@ impl DomainRpcServices {
             "typing": typing,
             "expires_at": expires_at,
         });
-        let recipients = self
+        let Ok(recipients) = self
             .chat_presence
             .subscribers_at_authority_epoch(&channel.id, lease.access_epoch)
+        else {
+            return Self::err("CHAT_UNAVAILABLE");
+        };
+        let recipients = recipients
             .into_iter()
             .filter(|entry| entry.participant != sender)
             .collect::<Vec<_>>();
@@ -1057,7 +1132,7 @@ impl DomainRpcServices {
 
     async fn chat_edit(
         &self,
-        registry: &SessionRegistry,
+        _registry: &SessionRegistry,
         sender: ParticipantId,
         user: &str,
         payload: &[u8],
@@ -1091,8 +1166,7 @@ impl DomainRpcServices {
             return Self::err(&error.to_string());
         }
         let now = SystemClock.now();
-        let delivery = match Self::chat_delivery_request(lease.access_epoch, "message.update", now)
-        {
+        let delivery = match self.chat_delivery_request(lease.access_epoch, "message.update", now) {
             Ok(delivery) => delivery,
             Err(error) => return Self::err(&error),
         };
@@ -1112,25 +1186,14 @@ impl DomainRpcServices {
             )
             .await
         {
-            Ok(message) => {
-                let event_id = message.last_event_id;
-                self.fan_out_durable_event(
-                    registry,
-                    &channel,
-                    lease.access_epoch,
-                    "message.update",
-                    &message,
-                    event_id,
-                );
-                Self::ok(serde_json::json!({"message": message, "event_id": event_id}))
-            }
-            Err(error) => Self::err(&error.to_string()),
+            Ok(message) => Self::ok(ChatEditResponse::from(&message)),
+            Err(error) => Self::chat_mutation_failure(&error),
         }
     }
 
     async fn chat_delete(
         &self,
-        registry: &SessionRegistry,
+        _registry: &SessionRegistry,
         sender: ParticipantId,
         user: &str,
         payload: &[u8],
@@ -1161,8 +1224,7 @@ impl DomainRpcServices {
             return Self::err(&error.to_string());
         }
         let now = SystemClock.now();
-        let delivery = match Self::chat_delivery_request(lease.access_epoch, "message.remove", now)
-        {
+        let delivery = match self.chat_delivery_request(lease.access_epoch, "message.remove", now) {
             Ok(delivery) => delivery,
             Err(error) => return Self::err(&error),
         };
@@ -1183,28 +1245,17 @@ impl DomainRpcServices {
         {
             Ok(message) => {
                 let Some(message) = message else {
-                    return Self::ok(serde_json::json!({"message_id": id, "deleted": false}));
+                    return Self::ok(ChatDeleteResponse::not_deleted(id));
                 };
-                let event_id = message.last_event_id;
-                self.fan_out_durable_event(
-                    registry,
-                    &channel,
-                    lease.access_epoch,
-                    "message.remove",
-                    &message,
-                    event_id,
-                );
-                Self::ok(
-                    serde_json::json!({"message_id": id, "deleted": true, "event_id": event_id}),
-                )
+                Self::ok(ChatDeleteResponse::deleted(id, message.last_event_id))
             }
-            Err(error) => Self::err(&error.to_string()),
+            Err(error) => Self::chat_mutation_failure(&error),
         }
     }
 
     async fn chat_moderate(
         &self,
-        registry: &SessionRegistry,
+        _registry: &SessionRegistry,
         sender: ParticipantId,
         user: &str,
         payload: &[u8],
@@ -1253,10 +1304,16 @@ impl DomainRpcServices {
         {
             return Self::err(&error.to_string());
         }
+        let now = SystemClock.now();
+        let delivery = match self.chat_delivery_request(lease.access_epoch, "message.remove", now) {
+            Ok(delivery) => delivery,
+            Err(error) => return Self::err(&error),
+        };
         match self
             .chat
-            .moderate_delete_message_authorized(
+            .moderate_delete_message_authorized_with_delivery(
                 &channel.id,
+                channel.channel_type,
                 id,
                 "group_admin",
                 user,
@@ -1265,44 +1322,14 @@ impl DomainRpcServices {
                 lease.access_epoch,
                 "",
                 &self.node_id,
-                SystemClock.now(),
+                &delivery,
+                now,
             )
             .await
         {
-            Ok(deleted) => {
-                if !deleted {
-                    return Self::ok(serde_json::json!({"message_id": id, "deleted": false}));
-                }
-                let message = match self
-                    .chat
-                    .authorized_messages(
-                        &channel.id,
-                        0,
-                        None,
-                        &lease.channel.access_key,
-                        lease.access_epoch,
-                    )
-                    .await
-                    .ok()
-                    .and_then(|items| items.into_iter().find(|message| message.id == id))
-                {
-                    Some(message) => message,
-                    None => return Self::err("CHAT_UNAVAILABLE"),
-                };
-                let event_id = message.last_event_id;
-                self.fan_out_durable_event(
-                    registry,
-                    &channel,
-                    lease.access_epoch,
-                    "message.remove",
-                    &message,
-                    event_id,
-                );
-                Self::ok(
-                    serde_json::json!({"message_id": id, "deleted": true, "event_id": event_id}),
-                )
-            }
-            Err(error) => Self::err(&error.to_string()),
+            Ok(Some(message)) => Self::ok(ChatModerateResponse::deleted(id, message.last_event_id)),
+            Ok(None) => Self::ok(ChatModerateResponse::not_deleted(id)),
+            Err(error) => Self::chat_mutation_failure(&error),
         }
     }
 
@@ -1439,6 +1466,7 @@ impl DomainRpcServices {
 
     /// Bound durable remote retries independently of a socket's lifetime.
     fn chat_delivery_request(
+        &self,
         authority_epoch: u64,
         event_type: &'static str,
         now: TimestampMillis,
@@ -1448,44 +1476,10 @@ impl DomainRpcServices {
             .checked_add(DurationMillis::from_millis(RETRY_WINDOW_MS))
             .map_err(|_| "CHAT_UNAVAILABLE".to_owned())?;
         Ok(crate::services::ChatDeliveryRequest {
+            origin_node_id: self.node_id.clone(),
             authority_epoch,
             expires_at,
             event_type,
-        })
-    }
-
-    fn fan_out_durable_event(
-        &self,
-        registry: &SessionRegistry,
-        channel: &crate::repository::ChatChannel,
-        authority_epoch: u64,
-        event_type: &str,
-        message: &crate::repository::ChatMessage,
-        event_id: u64,
-    ) {
-        let event = Self::durable_chat_event(channel, event_type, message, event_id);
-        let subscriptions = self
-            .chat_presence
-            .subscribers_at_authority_epoch(&channel.id, authority_epoch);
-        self.send_chat_event(registry, &channel.id, &subscriptions, event, event_id);
-    }
-
-    /// Construct the exact durable event body used for local and future remote
-    /// fan-out. Keeping it centralized prevents an outbox row from drifting
-    /// from the client-visible `KIND_CHAT_EVENT` contract.
-    fn durable_chat_event(
-        channel: &crate::repository::ChatChannel,
-        event_type: &str,
-        message: &crate::repository::ChatMessage,
-        event_id: u64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "version": 1,
-            "type": event_type,
-            "channel_id": channel.id,
-            "channel_type": channel.channel_type.as_str(),
-            "event_id": event_id,
-            "message": message,
         })
     }
 
@@ -2197,8 +2191,15 @@ impl DomainRpcServices {
     }
 
     /// A successful response: `RPC_STATUS_OK` + the JSON body bytes.
-    fn ok(body: serde_json::Value) -> (u8, Vec<u8>) {
-        (protocol::RPC_STATUS_OK, body.to_string().into_bytes())
+    fn ok(body: impl Serialize) -> (u8, Vec<u8>) {
+        match serde_json::to_vec(&body) {
+            Ok(body) => (protocol::RPC_STATUS_OK, body),
+            Err(_) => Self::err("CHAT_UNAVAILABLE"),
+        }
+    }
+
+    fn chat_mutation_failure(_error: &crate::error::AppError) -> (u8, Vec<u8>) {
+        Self::err("CHAT_UNAVAILABLE")
     }
 
     /// An error response: `RPC_STATUS_ERROR` + a short UTF-8 message.
@@ -3494,6 +3495,54 @@ impl Gateway {
         &self.registry
     }
 
+    pub fn deliver_local_chat(
+        &self,
+        origin_node: &NodeId,
+        delivery: RemoteChatDelivery,
+    ) -> ChatDeliveryDisposition {
+        if delivery.deadline <= SystemClock.now() {
+            return ChatDeliveryDisposition::Rejected;
+        }
+        let Some(event) = Self::validated_durable_chat_event(&delivery) else {
+            return ChatDeliveryDisposition::Rejected;
+        };
+        let Some(domain) = &self.domain else {
+            return ChatDeliveryDisposition::Unavailable;
+        };
+        if origin_node.as_str() != domain.node_id {
+            return ChatDeliveryDisposition::Rejected;
+        }
+        let Ok(subscriptions) = domain
+            .chat_presence
+            .subscribers_at_authority_epoch(&delivery.channel_id, delivery.authority_epoch)
+        else {
+            return ChatDeliveryDisposition::Unavailable;
+        };
+        if subscriptions.is_empty() {
+            return ChatDeliveryDisposition::Unknown;
+        }
+        domain.send_chat_event(
+            &self.registry,
+            &delivery.channel_id,
+            &subscriptions,
+            event,
+            delivery.event_id,
+        );
+        ChatDeliveryDisposition::Delivered
+    }
+
+    fn validated_durable_chat_event(delivery: &RemoteChatDelivery) -> Option<serde_json::Value> {
+        let event: crate::repository::chat::ChatDeliveryEvent =
+            serde_json::from_str(&delivery.payload).ok()?;
+        if event.channel_id != delivery.channel_id
+            || event.event_id != delivery.event_id
+            || crate::repository::chat::validate_delivery_event_state(&event).is_err()
+        {
+            return None;
+        }
+        serde_json::to_value(event).ok()
+    }
+
     /// Apply one already-authenticated typed remote chat command to current
     /// local subscriptions. The caller owns mTLS peer validation; this method
     /// enforces the destination lease and authority fences before it can touch
@@ -3504,8 +3553,14 @@ impl Gateway {
         directory: &ChatPresenceDirectory,
         delivery: RemoteChatDelivery,
     ) -> ChatDeliveryDisposition {
+        if delivery.deadline <= SystemClock.now() {
+            return ChatDeliveryDisposition::Rejected;
+        }
+        let Some(event) = Self::validated_durable_chat_event(&delivery) else {
+            return ChatDeliveryDisposition::Rejected;
+        };
         let Some(domain) = &self.domain else {
-            return ChatDeliveryDisposition::Unknown;
+            return ChatDeliveryDisposition::Unavailable;
         };
         let disposition = directory.validate_local_delivery(
             local_node,
@@ -3516,13 +3571,12 @@ impl Gateway {
         if disposition != ChatDeliveryDisposition::Delivered {
             return disposition;
         }
-        let Ok(event @ serde_json::Value::Object(_)) = serde_json::from_str(&delivery.payload)
-        else {
-            return ChatDeliveryDisposition::Rejected;
-        };
-        let subscriptions = domain
+        let Ok(subscriptions) = domain
             .chat_presence
-            .subscribers_at_authority_epoch(&delivery.channel_id, delivery.authority_epoch);
+            .subscribers_at_authority_epoch(&delivery.channel_id, delivery.authority_epoch)
+        else {
+            return ChatDeliveryDisposition::Unavailable;
+        };
         domain.send_chat_event(
             &self.registry,
             &delivery.channel_id,
@@ -10643,6 +10697,86 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    fn response_message() -> crate::repository::ChatMessage {
+        crate::repository::ChatMessage {
+            id: 7,
+            sender: "alice".to_owned(),
+            content: "hello".to_owned(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 11,
+            revision: 2,
+            last_event_id: 9,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn durable_chat_mutation_repository_errors_are_private() {
+        const SENTINEL: &str = "postgres password=hunter2 table=chat_messages";
+        let failure = crate::error::AppError::database(SENTINEL).with_detail(SENTINEL);
+
+        for operation in ["create", "edit", "delete", "moderate"] {
+            let (status, body) = DomainRpcServices::chat_mutation_failure(&failure);
+            assert_eq!(status, protocol::RPC_STATUS_ERROR, "{operation}");
+            assert_eq!(body, b"CHAT_UNAVAILABLE", "{operation}");
+            assert!(
+                !String::from_utf8_lossy(&body).contains(SENTINEL),
+                "{operation} leaked repository detail"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_chat_message_mutation_responses_preserve_wire_schema() {
+        let message = response_message();
+        let create = serde_json::to_value(ChatCreateResponse::from(&message))
+            .expect("create response serializes");
+        let edit = serde_json::to_value(ChatEditResponse::from(&message))
+            .expect("edit response serializes");
+
+        for response in [create, edit] {
+            assert_eq!(
+                response["message"],
+                serde_json::to_value(&message).expect("message")
+            );
+            assert_eq!(response["event_id"], 9);
+            assert_eq!(response.as_object().expect("object").len(), 2);
+        }
+    }
+
+    #[test]
+    fn typed_delete_and_moderate_responses_always_emit_nullable_event_id() {
+        let delete_success = serde_json::to_value(ChatDeleteResponse::deleted(7, 9))
+            .expect("delete response serializes");
+        let delete_noop = serde_json::to_value(ChatDeleteResponse::not_deleted(7))
+            .expect("delete no-op serializes");
+        let moderate_success = serde_json::to_value(ChatModerateResponse::deleted(7, 9))
+            .expect("moderate response serializes");
+        let moderate_noop = serde_json::to_value(ChatModerateResponse::not_deleted(7))
+            .expect("moderate no-op serializes");
+
+        for response in [delete_success, moderate_success] {
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "deleted": true,
+                    "message_id": 7,
+                    "event_id": 9,
+                })
+            );
+        }
+        for response in [delete_noop, moderate_noop] {
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "deleted": false,
+                    "message_id": 7,
+                    "event_id": null,
+                })
+            );
+        }
+    }
+
     /// The bridge must reuse the server runtime from a worker thread.
     ///
     /// Every other test in this module runs on a current-thread runtime and so
@@ -11281,7 +11415,7 @@ mod domain_rpc_tests {
     };
     use crate::realtime::registry::{ParticipantIdentity, SessionHandle};
     use crate::repository::{
-        InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
+        ChatRepository, InMemoryBackend, InMemoryChatRepository, InMemoryFriendsRepository,
         InMemoryGroupsRepository, InMemoryLeaderboardsRepository, InMemoryStorageRepository,
         InMemoryWalletRepository,
     };
@@ -11301,7 +11435,7 @@ mod domain_rpc_tests {
     use tokio::sync::mpsc;
 
     /// A gateway whose only wiring is an in-memory friends service.
-    fn friends_gateway() -> Gateway {
+    fn friends_gateway_with_chat_repository() -> (Gateway, Arc<dyn ChatRepository>) {
         let friends = Arc::new(FriendsService::new(Arc::new(
             InMemoryFriendsRepository::new(),
         )));
@@ -11309,7 +11443,8 @@ mod domain_rpc_tests {
             Arc::new(InMemoryGroupsRepository::new()),
         ));
         let backend = Arc::new(InMemoryBackend::new());
-        Gateway::new().with_domain_services(DomainRpcServices {
+        let chat_repository: Arc<dyn ChatRepository> = Arc::new(InMemoryChatRepository::new());
+        let gateway = Gateway::new().with_domain_services(DomainRpcServices {
             chat_authorizer: Arc::new(ChatChannelAuthorizer::new(
                 Arc::clone(&friends),
                 Arc::clone(&groups),
@@ -11324,11 +11459,134 @@ mod domain_rpc_tests {
             leaderboards: Arc::new(LeaderboardService::new(Arc::new(
                 InMemoryLeaderboardsRepository::new(),
             ))),
-            chat: Arc::new(ChatService::new(Arc::new(InMemoryChatRepository::new()))),
+            chat: Arc::new(ChatService::new(Arc::clone(&chat_repository))),
             wallet: Arc::new(WalletService::new(
                 Arc::new(InMemoryWalletRepository::new()),
             )),
-        })
+        });
+        (gateway, chat_repository)
+    }
+
+    fn friends_gateway() -> Gateway {
+        friends_gateway_with_chat_repository().0
+    }
+
+    fn local_chat_dispatcher(
+        gateway: &Arc<Gateway>,
+        repository: Arc<dyn ChatRepository>,
+    ) -> crate::chat_cluster::ChatDeliveryDispatcher {
+        let source = NodeId::new("test-node".to_owned()).expect("node id");
+        let delivery_gateway = Arc::clone(gateway);
+        let delivery_source = source.clone();
+        crate::chat_cluster::ChatDeliveryDispatcher::new_with_local_delivery(
+            source,
+            repository,
+            Arc::new(ChatPresenceDirectory::default()),
+            Arc::new(move |delivery| {
+                Ok(delivery_gateway.deliver_local_chat(&delivery_source, delivery))
+            }),
+            Arc::new(|_, _| Ok(ChatDeliveryDisposition::Unknown)),
+        )
+    }
+
+    async fn dispatch_local_chat(
+        dispatcher: &crate::chat_cluster::ChatDeliveryDispatcher,
+    ) -> crate::chat_cluster::ChatDeliveryDispatchStats {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatcher.dispatch_once(SystemClock.now(), 16),
+        )
+        .await
+        .expect("chat outbox dispatch before deadline")
+        .expect("chat outbox dispatch succeeds")
+    }
+
+    #[tokio::test]
+    async fn poisoned_local_presence_defers_outbox_then_retry_delivers() {
+        let (gateway, repository) = friends_gateway_with_chat_repository();
+        let gateway = Arc::new(gateway);
+        let (participant, mut outbound) = register(&gateway, Some("alice"));
+        let presence = Arc::clone(
+            &gateway
+                .domain
+                .as_ref()
+                .expect("domain services")
+                .chat_presence,
+        );
+        presence.join(
+            "ch_poisoned_presence",
+            participant,
+            "alice",
+            ChatTarget::CurrentRoom { room_id: 7 },
+            4,
+        );
+        let now = SystemClock.now();
+        repository
+            .stage_delivery_outbox(crate::repository::ChatDeliveryOutboxRecord {
+                origin_node_id: "test-node".to_owned(),
+                channel_id: "ch_poisoned_presence".to_owned(),
+                event_id: 1,
+                authority_epoch: 4,
+                payload: serde_json::json!({
+                    "version": 1,
+                    "type": "message.create",
+                    "channel_id": "ch_poisoned_presence",
+                    "event_id": 1,
+                    "message": {
+                        "id": 1,
+                        "sender": "alice",
+                        "content": "retained",
+                        "created_at_unix_ms": now.unix_millis(),
+                        "updated_at_unix_ms": now.unix_millis(),
+                        "revision": 1,
+                        "last_event_id": 1,
+                        "deleted": false
+                    }
+                })
+                .to_string(),
+                created_at: now,
+                expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+            })
+            .await
+            .expect("stage source-local delivery row");
+        presence.poison_state_for_test();
+        let dispatcher = local_chat_dispatcher(&gateway, Arc::clone(&repository));
+
+        let first = dispatch_local_chat(&dispatcher).await;
+        assert_eq!(first.acknowledged, 0);
+        assert_eq!(first.deferred, 1);
+        assert!(outbound.try_recv().is_err(), "poison must not fan out");
+        assert_eq!(
+            repository
+                .active_delivery_outbox("test-node", now, 8)
+                .await
+                .expect("retained source-local row")
+                .len(),
+            1
+        );
+
+        let retry = dispatch_local_chat(&dispatcher).await;
+        assert_eq!(retry.acknowledged, 1);
+        assert_eq!(retry.deferred, 0);
+        let delivered = recv_outbound_before_deadline(&mut outbound, "recovered delivery").await;
+        assert_eq!(delivered.envelope.kind, KIND_CHAT_EVENT);
+        assert!(
+            repository
+                .active_delivery_outbox("test-node", now, 8)
+                .await
+                .expect("acknowledged source-local row")
+                .is_empty()
+        );
+    }
+
+    async fn recv_outbound_before_deadline(
+        receiver: &mut mpsc::Receiver<Outbound>,
+        context: &str,
+    ) -> Outbound {
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect(context)
+            .expect(context)
     }
 
     /// Register a session, authenticated as `user` unless `user` is `None`.
@@ -11724,6 +11982,118 @@ mod domain_rpc_tests {
         assert_eq!(listed["friends"][0]["state"], "invited_sent");
     }
 
+    #[test]
+    fn remote_chat_delivery_validates_before_missing_domain_is_unavailable() {
+        let gateway = Gateway::new();
+        let local_node = NodeId::new("node-b".to_owned()).expect("node");
+        let directory = crate::chat_cluster::ChatPresenceDirectory::default();
+        let valid = crate::chat_cluster::RemoteChatDelivery {
+            event_id: 9,
+            channel_id: "ch_remote".to_owned(),
+            destination_generation: OwnershipGeneration::new(2),
+            authority_epoch: 4,
+            payload: r#"{"version":1,"type":"message.create","channel_id":"ch_remote","event_id":9,"message":{"id":1,"sender":"alice","content":"hello","created_at_unix_ms":1000,"updated_at_unix_ms":1000,"revision":1,"last_event_id":9,"deleted":false}}"#.to_owned(),
+            deadline: TimestampMillis::from_unix_millis(u64::MAX),
+        };
+        let invalid_deliveries = [
+            crate::chat_cluster::RemoteChatDelivery {
+                deadline: TimestampMillis::from_unix_millis(0),
+                ..valid.clone()
+            },
+            crate::chat_cluster::RemoteChatDelivery {
+                payload: "not-json".to_owned(),
+                ..valid.clone()
+            },
+            crate::chat_cluster::RemoteChatDelivery {
+                payload: "null".to_owned(),
+                ..valid.clone()
+            },
+            crate::chat_cluster::RemoteChatDelivery {
+                payload: r#"{"version":1,"type":"message.create","channel_id":"ch_remote","event_id":9,"message":{"id":1,"sender":"alice","content":"hello","created_at_unix_ms":1000,"updated_at_unix_ms":1000,"revision":1,"last_event_id":9,"deleted":false},"force_current":true}"#.to_owned(),
+                ..valid.clone()
+            },
+            crate::chat_cluster::RemoteChatDelivery {
+                payload: r#"{"version":1,"type":"message.create","type":"message.create","channel_id":"ch_remote","event_id":9,"message":{"id":1,"sender":"alice","content":"hello","created_at_unix_ms":1000,"updated_at_unix_ms":1000,"revision":1,"last_event_id":9,"deleted":false}}"#.to_owned(),
+                ..valid.clone()
+            },
+            crate::chat_cluster::RemoteChatDelivery {
+                payload: r#"{"version":1,"type":"message.create","channel_id":"ch_other","event_id":9,"message":{"last_event_id":9}}"#.to_owned(),
+                ..valid.clone()
+            },
+        ];
+
+        for invalid in invalid_deliveries {
+            assert_eq!(
+                gateway.deliver_remote_chat(&local_node, &directory, invalid),
+                crate::chat_cluster::ChatDeliveryDisposition::Rejected
+            );
+        }
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/chat-live-events-v1.json"
+        ))
+        .expect("canonical chat fixture");
+        let exact_multibyte = fixture["content_validation"]
+            .as_array()
+            .expect("content validation cases")
+            .iter()
+            .find(|case| case["name"] == "update_multibyte_exactly_2048_utf8_bytes")
+            .expect("shared fixture must lock the exact multibyte boundary");
+        assert_eq!(exact_multibyte["content_repeat"]["value"], "é");
+        assert_eq!(exact_multibyte["content_repeat"]["count"], 1024);
+        assert_eq!(exact_multibyte["accepted"], true);
+        for case in fixture["content_validation"]
+            .as_array()
+            .expect("content validation cases")
+        {
+            let base_name = case["event"].as_str().expect("base event name");
+            let mut event = fixture["valid"]
+                .as_array()
+                .expect("valid events")
+                .iter()
+                .find(|candidate| candidate["name"] == base_name)
+                .expect("content base event")["event"]
+                .clone();
+            let content = if let Some(content) = case["content"].as_str() {
+                content.to_owned()
+            } else {
+                case["content_repeat"]["value"]
+                    .as_str()
+                    .expect("repeat value")
+                    .repeat(
+                        case["content_repeat"]["count"]
+                            .as_u64()
+                            .and_then(|count| usize::try_from(count).ok())
+                            .expect("repeat count"),
+                    )
+            };
+            event["channel_id"] = serde_json::Value::String(valid.channel_id.clone());
+            event["event_id"] = serde_json::Value::from(valid.event_id);
+            event["message"]["last_event_id"] = serde_json::Value::from(valid.event_id);
+            event["message"]["content"] = serde_json::Value::String(content);
+            let candidate = crate::chat_cluster::RemoteChatDelivery {
+                payload: event.to_string(),
+                ..valid.clone()
+            };
+            let expected = if case["accepted"].as_bool().expect("accepted flag") {
+                crate::chat_cluster::ChatDeliveryDisposition::Unavailable
+            } else {
+                crate::chat_cluster::ChatDeliveryDisposition::Rejected
+            };
+            assert_eq!(
+                gateway.deliver_remote_chat(&local_node, &directory, candidate),
+                expected,
+                "{}",
+                case["name"].as_str().expect("case name")
+            );
+        }
+        assert_eq!(
+            gateway.deliver_remote_chat(&local_node, &directory, valid),
+            crate::chat_cluster::ChatDeliveryDisposition::Unavailable,
+            "a live gateway without domain authority cannot decide subscriber absence"
+        );
+    }
+
     #[tokio::test]
     async fn remote_chat_delivery_rechecks_fences_before_local_fanout() {
         let gateway = friends_gateway();
@@ -11755,15 +12125,113 @@ mod domain_rpc_tests {
             channel_id: "ch_remote".to_owned(),
             destination_generation: OwnershipGeneration::new(2),
             authority_epoch: 4,
-            payload: r#"{"version":1,"type":"message.create"}"#.to_owned(),
+            payload: serde_json::json!({
+                "version": 1,
+                "type": "message.create",
+                "channel_id": "ch_remote",
+                "event_id": 9,
+                "message": {
+                    "id": 1,
+                    "sender": "alice",
+                    "content": "hello",
+                    "created_at_unix_ms": 1000,
+                    "updated_at_unix_ms": 1000,
+                    "revision": 1,
+                    "last_event_id": 9,
+                    "deleted": false
+                }
+            })
+            .to_string(),
             deadline: TimestampMillis::from_unix_millis(u64::MAX),
         };
         assert_eq!(
-            gateway.deliver_remote_chat(&local_node, &directory, delivery),
+            gateway.deliver_remote_chat(&local_node, &directory, delivery.clone()),
             crate::chat_cluster::ChatDeliveryDisposition::Delivered
         );
         let event = alice_rx.recv().await.expect("remote event");
         assert_eq!(event.envelope.kind, KIND_CHAT_EVENT);
+
+        let invalid_deliveries = [
+            (
+                "expired deadline",
+                crate::chat_cluster::RemoteChatDelivery {
+                    deadline: TimestampMillis::from_unix_millis(0),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "malformed JSON",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: "not-json".to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "malformed JSON despite absent authority",
+                crate::chat_cluster::RemoteChatDelivery {
+                    authority_epoch: 5,
+                    payload: "not-json".to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "non-object JSON",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: "null".to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "missing correlated fields",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: r#"{"version":1,"type":"message.create"}"#.to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "wrong version",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: r#"{"version":2,"type":"message.create","channel_id":"ch_remote","event_id":9,"message":{"last_event_id":9}}"#.to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "wrong type",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: r#"{"version":1,"type":"message.hijack","channel_id":"ch_remote","event_id":9,"message":{"last_event_id":9}}"#.to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "wrong channel",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: r#"{"version":1,"type":"message.create","channel_id":"ch_other","event_id":9,"message":{"last_event_id":9}}"#.to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "wrong event",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: r#"{"version":1,"type":"message.create","channel_id":"ch_remote","event_id":10,"message":{"last_event_id":9}}"#.to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+            (
+                "wrong message last event",
+                crate::chat_cluster::RemoteChatDelivery {
+                    payload: r#"{"version":1,"type":"message.create","channel_id":"ch_remote","event_id":9,"message":{"last_event_id":10}}"#.to_owned(),
+                    ..delivery.clone()
+                },
+            ),
+        ];
+        for (reason, invalid) in invalid_deliveries {
+            assert_eq!(
+                gateway.deliver_remote_chat(&local_node, &directory, invalid),
+                crate::chat_cluster::ChatDeliveryDisposition::Rejected,
+                "{reason} must fail closed"
+            );
+            assert!(alice_rx.try_recv().is_err(), "{reason} must not fan out");
+        }
 
         assert_eq!(
             gateway.deliver_remote_chat(
@@ -11776,7 +12244,7 @@ mod domain_rpc_tests {
                         channel_id: "ch_remote".to_owned(),
                         destination_generation: OwnershipGeneration::new(2),
                         authority_epoch: 4,
-                        payload: "{}".to_owned(),
+                        payload: r#"{"version":1,"type":"message.create","channel_id":"ch_remote","event_id":10,"message":{"id":2,"sender":"alice","content":"again","created_at_unix_ms":1100,"updated_at_unix_ms":1100,"revision":1,"last_event_id":10,"deleted":false}}"#.to_owned(),
                         deadline: TimestampMillis::from_unix_millis(u64::MAX),
                     }
                 }
@@ -11999,7 +12467,9 @@ mod domain_rpc_tests {
 
     #[tokio::test]
     async fn chat_join_send_and_leave_use_local_presence_and_reliable_events() {
-        let gateway = friends_gateway();
+        let (gateway, chat_repository) = friends_gateway_with_chat_repository();
+        let gateway = Arc::new(gateway);
+        let dispatcher = local_chat_dispatcher(&gateway, chat_repository);
         let (alice, mut alice_rx) = register(&gateway, Some("alice"));
         let (bob, mut bob_rx) = register(&gateway, Some("bob"));
 
@@ -12053,17 +12523,30 @@ mod domain_rpc_tests {
                 serde_json::json!({"channel_id": channel_id, "content": "hello"}),
             ),
         );
-        let alice_event = alice_rx.recv().await.expect("sender live event");
-        let bob_event = bob_rx.recv().await.expect("recipient live event");
+        let (_, status, body) = tokio::time::timeout(Duration::from_secs(2), recv(&mut alice_rx))
+            .await
+            .expect("chat.send response before deadline");
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        assert_eq!(json(&body)["event_id"], 1);
+
+        let stats = dispatch_local_chat(&dispatcher).await;
+        assert_eq!(stats.loaded, 1);
+        assert_eq!(stats.acknowledged, 1);
+
+        let alice_event = tokio::time::timeout(Duration::from_secs(2), alice_rx.recv())
+            .await
+            .expect("sender live event before deadline")
+            .expect("sender session open");
+        let bob_event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+            .await
+            .expect("recipient live event before deadline")
+            .expect("recipient session open");
         for event in [&alice_event, &bob_event] {
             assert_eq!(event.delivery, Delivery::Reliable);
             assert_eq!(event.envelope.kind, KIND_CHAT_EVENT);
             assert_eq!(json(&event.envelope.body)["type"], "message.create");
             assert_eq!(json(&event.envelope.body)["message"]["content"], "hello");
         }
-        let (_, status, body) = recv(&mut alice_rx).await;
-        assert_eq!(status, protocol::RPC_STATUS_OK);
-        assert_eq!(json(&body)["event_id"], 1);
 
         gateway.handle_inbound(
             bob,
@@ -12207,7 +12690,9 @@ mod domain_rpc_tests {
 
     #[tokio::test]
     async fn chat_queue_drop_requires_history_ack_before_live_delivery_resumes() {
-        let gateway = friends_gateway();
+        let (gateway, chat_repository) = friends_gateway_with_chat_repository();
+        let gateway = Arc::new(gateway);
+        let dispatcher = local_chat_dispatcher(&gateway, chat_repository);
         let (alice, mut alice_rx) = register(&gateway, Some("alice"));
         let (bob, mut bob_rx) = register_with_capacity(&gateway, Some("bob"), 1);
         for (sender, request_id, other) in [(alice, 1, "bob"), (bob, 2, "alice")] {
@@ -12259,11 +12744,20 @@ mod domain_rpc_tests {
                     serde_json::json!({"channel_id": channel_id, "content": content}),
                 ),
             );
-            let _ = alice_rx.recv().await.expect("sender event");
-            let (_, status, _) = recv(&mut alice_rx).await;
+            let (_, status, _) = tokio::time::timeout(Duration::from_secs(2), recv(&mut alice_rx))
+                .await
+                .expect("chat.send response before deadline");
             assert_eq!(status, protocol::RPC_STATUS_OK);
+            let stats = dispatch_local_chat(&dispatcher).await;
+            assert_eq!(stats.loaded, 1);
+            assert_eq!(stats.acknowledged, 1);
+            let sender_event = recv_outbound_before_deadline(&mut alice_rx, "sender event").await;
+            assert_eq!(
+                json(&sender_event.envelope.body)["message"]["content"],
+                content
+            );
         }
-        let first = bob_rx.recv().await.expect("first queued event");
+        let first = recv_outbound_before_deadline(&mut bob_rx, "first queued event").await;
         assert_eq!(json(&first.envelope.body)["type"], "message.create");
 
         gateway.handle_inbound(
@@ -12274,9 +12768,15 @@ mod domain_rpc_tests {
                 serde_json::json!({"channel_id": channel_id, "content": "resync"}),
             ),
         );
-        let _ = alice_rx.recv().await.expect("sender event");
-        let _ = recv(&mut alice_rx).await;
-        let resync = bob_rx.recv().await.expect("resync event");
+        let (_, status, _) = tokio::time::timeout(Duration::from_secs(2), recv(&mut alice_rx))
+            .await
+            .expect("resync chat.send response before deadline");
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        let stats = dispatch_local_chat(&dispatcher).await;
+        assert_eq!(stats.loaded, 1);
+        assert_eq!(stats.acknowledged, 1);
+        let _ = recv_outbound_before_deadline(&mut alice_rx, "sender resync event").await;
+        let resync = recv_outbound_before_deadline(&mut bob_rx, "resync event").await;
         assert_eq!(resync.envelope.kind, KIND_CHAT_EVENT);
         let resync_body = json(&resync.envelope.body);
         assert_eq!(resync_body["type"], "resync_required");
@@ -12304,9 +12804,15 @@ mod domain_rpc_tests {
                 serde_json::json!({"channel_id": channel_id, "content": "resumed"}),
             ),
         );
-        let _ = alice_rx.recv().await.expect("sender event");
-        let _ = recv(&mut alice_rx).await;
-        let resumed = bob_rx.recv().await.expect("resumed live event");
+        let (_, status, _) = tokio::time::timeout(Duration::from_secs(2), recv(&mut alice_rx))
+            .await
+            .expect("resumed chat.send response before deadline");
+        assert_eq!(status, protocol::RPC_STATUS_OK);
+        let stats = dispatch_local_chat(&dispatcher).await;
+        assert_eq!(stats.loaded, 1);
+        assert_eq!(stats.acknowledged, 1);
+        let _ = recv_outbound_before_deadline(&mut alice_rx, "sender resumed event").await;
+        let resumed = recv_outbound_before_deadline(&mut bob_rx, "resumed live event").await;
         assert_eq!(json(&resumed.envelope.body)["type"], "message.create");
         assert_eq!(
             json(&resumed.envelope.body)["message"]["content"],

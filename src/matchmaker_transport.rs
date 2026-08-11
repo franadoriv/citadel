@@ -1051,9 +1051,21 @@ fn receive(
     {
         return response;
     }
-    let response = dispatch(state, envelope.source_node.clone(), envelope.command)
-        .unwrap_or(ControlResponse::Rejected);
-    if let Ok(mut dedupe) = state.dedupe.lock() {
+    let chat_delivery = matches!(&envelope.command, NodeCommand::DeliverChat(_));
+    let response = match dispatch(state, envelope.source_node.clone(), envelope.command) {
+        Ok(response) => response,
+        Err(_) if chat_delivery => ControlResponse::ChatDelivery {
+            disposition: ChatDeliveryDisposition::Unavailable,
+        },
+        Err(_) => ControlResponse::Rejected,
+    };
+    let cacheable = !matches!(
+        response,
+        ControlResponse::ChatDelivery {
+            disposition: ChatDeliveryDisposition::Unavailable
+        }
+    );
+    if cacheable && let Ok(mut dedupe) = state.dedupe.lock() {
         dedupe.insert(envelope.source_node, envelope.command_id, response.clone());
     }
     response
@@ -1212,14 +1224,20 @@ fn dispatch(
                     disposition: ChatDeliveryDisposition::Rejected,
                 });
             }
-            let handler = state
-                .chat_delivery_handler
-                .lock()
-                .map_err(|_| MatchmakerRouterError::Unavailable(state.local_node.clone()))?
-                .clone();
+            let handler = match state.chat_delivery_handler.lock() {
+                Ok(handler) => handler.clone(),
+                Err(poisoned) => {
+                    let handler = poisoned.into_inner();
+                    state.chat_delivery_handler.clear_poison();
+                    drop(handler);
+                    return Ok(ControlResponse::ChatDelivery {
+                        disposition: ChatDeliveryDisposition::Unavailable,
+                    });
+                }
+            };
             Ok(ControlResponse::ChatDelivery {
                 disposition: state.chat_dedupe.evaluate(source.clone(), &delivery, || {
-                    handler.map_or(ChatDeliveryDisposition::Unknown, |handler| {
+                    handler.map_or(ChatDeliveryDisposition::Unavailable, |handler| {
                         handler(source, delivery.clone())
                     })
                 }),
@@ -1399,10 +1417,12 @@ fn tls_error(message: &str, source: impl std::fmt::Display) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_cluster::{ChatDeliveryDispatcher, ChatPresenceDirectory};
     use crate::matchmaker::TicketId;
     use crate::matchmaker_cluster::{MatchmakerShardLease, QueueShardId};
     use crate::realtime::chat_presence::ChatPresenceRegistry;
     use crate::realtime::registry::ParticipantId;
+    use crate::repository::{ChatDeliveryOutboxRecord, InMemoryChatRepository};
     use crate::services::ChatTarget;
     use crate::services::party_directory::PartyOwnerLease;
     use crate::session::OwnershipGeneration;
@@ -1442,6 +1462,176 @@ mod tests {
             payload: r#"{\"type\":\"message.create\"}"#.to_owned(),
             deadline: TimestampMillis::from_unix_millis(u64::MAX),
         }
+    }
+
+    #[tokio::test]
+    async fn poisoned_chat_handler_lock_defers_outbox_and_same_command_retry_delivers() {
+        let (_, cert_a) = identity();
+        let (identity_b, _) = identity();
+        let node_a = node("node-a");
+        let node_b = node("node-b");
+        let router = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_b.clone(),
+                identity_b,
+                BTreeMap::from([(node_a.clone(), cert_a)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router"),
+        );
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let deliveries_for_handler = Arc::clone(&deliveries);
+        router.register_chat_delivery_handler(Arc::new(move |_, _| {
+            deliveries_for_handler.fetch_add(1, Ordering::SeqCst);
+            ChatDeliveryDisposition::Delivered
+        }));
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let router = Arc::clone(&router);
+            move || {
+                let _guard = router
+                    .state
+                    .chat_delivery_handler
+                    .lock()
+                    .expect("chat handler lock before poisoning");
+                assert!(
+                    router.state.chat_delivery_handler.is_poisoned(),
+                    "deliberately poison the chat delivery handler mutex"
+                );
+            }
+        }));
+        assert!(poison.is_err(), "poisoning assertion must unwind");
+
+        let now = TimestampMillis::from_unix_millis(10);
+        let repository = Arc::new(InMemoryChatRepository::new());
+        repository
+            .stage_delivery_outbox(ChatDeliveryOutboxRecord {
+                origin_node_id: node_a.as_str().to_owned(),
+                channel_id: "channel-42".to_owned(),
+                event_id: 44,
+                authority_epoch: 8,
+                payload: r#"{\"version\":1,\"type\":\"message.create\"}"#.to_owned(),
+                created_at: now,
+                expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+            })
+            .expect("stage remote delivery row");
+        let directory = Arc::new(ChatPresenceDirectory::default());
+        assert_eq!(
+            directory.advertise(
+                ChatPresenceLease {
+                    channel_id: "channel-42".to_owned(),
+                    node_id: node_b.clone(),
+                    generation: OwnershipGeneration::new(3),
+                    expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                },
+                now,
+            ),
+            ChatLeaseUpdate::Applied
+        );
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = ChatDeliveryDispatcher::new_with_local_delivery(
+            node_a.clone(),
+            repository.clone(),
+            directory,
+            Arc::new(|_| Ok(ChatDeliveryDisposition::Unknown)),
+            {
+                let router = Arc::clone(&router);
+                let node_a = node_a.clone();
+                let node_b = node_b.clone();
+                let responses = Arc::clone(&responses);
+                Arc::new(move |_, delivery| {
+                    let response = receive(
+                        &router.state,
+                        Some(node_a.clone()),
+                        ControlEnvelope {
+                            protocol_version: CONTROL_PROTOCOL_VERSION,
+                            command_id: "poisoned-handler-command".to_owned(),
+                            source_node: node_a.clone(),
+                            destination_node: node_b.clone(),
+                            issued_at_ms: now.unix_millis(),
+                            deadline_ms: u64::MAX,
+                            trace_context: None,
+                            command: NodeCommand::DeliverChat(delivery),
+                        },
+                    );
+                    responses
+                        .lock()
+                        .expect("response recorder")
+                        .push(response.clone());
+                    match response {
+                        ControlResponse::ChatDelivery { disposition } => Ok(disposition),
+                        _ => Err(()),
+                    }
+                })
+            },
+        );
+
+        let first = dispatcher
+            .dispatch_once(now, 8)
+            .await
+            .expect("poisoned pass");
+        assert_eq!(first.acknowledged, 0);
+        assert_eq!(first.deferred, 1);
+        assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            responses.lock().expect("response recorder").as_slice(),
+            [ControlResponse::ChatDelivery {
+                disposition: ChatDeliveryDisposition::Unavailable
+            }]
+        ));
+        assert!(
+            router
+                .state
+                .dedupe
+                .lock()
+                .expect("outer control dedupe")
+                .get(&node_a, "poisoned-handler-command")
+                .is_none(),
+            "outer control dedupe must not cache unavailable"
+        );
+        assert_eq!(
+            repository
+                .active_delivery_outbox(node_a.as_str(), now, 8)
+                .expect("retained remote row")
+                .len(),
+            1
+        );
+
+        let retry = dispatcher
+            .dispatch_once(now, 8)
+            .await
+            .expect("recovered pass");
+        assert_eq!(retry.acknowledged, 1);
+        assert_eq!(retry.deferred, 0);
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            responses.lock().expect("response recorder").as_slice(),
+            [
+                ControlResponse::ChatDelivery {
+                    disposition: ChatDeliveryDisposition::Unavailable
+                },
+                ControlResponse::ChatDelivery {
+                    disposition: ChatDeliveryDisposition::Delivered
+                }
+            ]
+        ));
+        assert!(matches!(
+            router
+                .state
+                .dedupe
+                .lock()
+                .expect("outer control dedupe")
+                .get(&node_a, "poisoned-handler-command"),
+            Some(ControlResponse::ChatDelivery {
+                disposition: ChatDeliveryDisposition::Delivered
+            })
+        ));
+        assert!(
+            repository
+                .active_delivery_outbox(node_a.as_str(), now, 8)
+                .expect("acknowledged remote row")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1554,6 +1744,63 @@ mod tests {
             Ok(ControlResponse::RuntimePropagation { accepted: false })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn chat_delivery_before_handler_registration_is_retried_after_startup() {
+        let (identity_a, cert_a) = identity();
+        let (identity_b, cert_b) = identity();
+        let node_a = node("node-a");
+        let node_b = node("node-b");
+        let router_b = Arc::new(
+            TlsMatchmakerHandoffRouter::new(
+                node_b.clone(),
+                identity_b,
+                BTreeMap::from([(node_a.clone(), cert_a)]),
+                BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .expect("router b"),
+        );
+        let listener = router_b
+            .serve("127.0.0.1:0".parse().expect("loopback"))
+            .expect("listener");
+        let router_a = TlsMatchmakerHandoffRouter::new(
+            node_a,
+            identity_a,
+            BTreeMap::from([(node_b.clone(), cert_b)]),
+            BTreeMap::from([(
+                node_b.clone(),
+                MatchmakerControlEndpoint {
+                    address: listener.local_addr(),
+                    server_name: "localhost".to_owned(),
+                },
+            )]),
+            Duration::from_secs(2),
+        )
+        .expect("router a");
+        let delivery = chat_delivery();
+
+        assert_eq!(
+            router_a
+                .deliver_chat(&node_b, delivery.clone())
+                .expect("startup delivery response"),
+            ChatDeliveryDisposition::Unavailable
+        );
+
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let deliveries_for_handler = Arc::clone(&deliveries);
+        router_b.register_chat_delivery_handler(Arc::new(move |_source, _delivery| {
+            deliveries_for_handler.fetch_add(1, Ordering::SeqCst);
+            ChatDeliveryDisposition::Delivered
+        }));
+        assert_eq!(
+            router_a
+                .deliver_chat(&node_b, delivery)
+                .expect("delivery after handler registration"),
+            ChatDeliveryDisposition::Delivered
+        );
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
     }
 
     #[test]

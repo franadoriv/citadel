@@ -78,19 +78,141 @@ export interface AuthResult {
 export type EnvelopeHandler = (payload: Uint8Array, env: Envelope) => void;
 export type AnyHandler = (env: Envelope) => void;
 
-/** Decoded JSON body of a `KIND_CHAT_EVENT` envelope. */
-export interface ChatEvent {
-  version: number;
-  type: string;
+export type ChatChannelType = "direct" | "group" | "room";
+/** Unsigned 64-bit JSON integer. Safe values remain numbers; larger values decode as bigint. */
+export type ChatU64 = number | bigint;
+
+export interface ChatPresence {
+  presence_id: string;
+  user_id: string;
+}
+
+export interface ChatMessage {
+  id: ChatU64;
+  sender: string;
+  content: string;
+  created_at_unix_ms: ChatU64;
+  updated_at_unix_ms: ChatU64;
+  revision: ChatU64;
+  last_event_id: ChatU64;
+  deleted: boolean;
+}
+
+interface ChatEventBase {
+  readonly version: 1;
   channel_id: string;
-  event_id?: number;
-  watermark_event_id?: number;
   [field: string]: unknown;
 }
 
+export interface ChatPresenceJoinEvent extends ChatEventBase {
+  type: "presence.join";
+  channel_type: ChatChannelType;
+  presence: ChatPresence;
+}
+export interface ChatPresenceLeaveEvent extends ChatEventBase {
+  type: "presence.leave";
+  presence: ChatPresence;
+}
+export interface ChatTypingEvent extends ChatEventBase {
+  type: "typing";
+  presence: ChatPresence;
+  typing: boolean;
+  expires_at: ChatU64;
+}
+export interface ChatMessageCreateEvent extends ChatEventBase {
+  type: "message.create";
+  event_id: ChatU64;
+  message: ChatMessage;
+}
+export interface ChatMessageUpdateEvent extends ChatEventBase {
+  type: "message.update";
+  event_id: ChatU64;
+  message: ChatMessage;
+}
+export interface ChatMessageRemoveEvent extends ChatEventBase {
+  type: "message.remove";
+  event_id: ChatU64;
+  message: ChatMessage;
+}
+export interface ChatAccessRevokedEvent extends ChatEventBase {
+  type: "access.revoked";
+  presence: ChatPresence;
+}
+export interface ChatResyncRequiredEvent extends ChatEventBase {
+  type: "resync_required";
+  watermark_event_id: ChatU64;
+  scopes?: string[];
+}
+
+/** Closed, version-1 discriminated union decoded from KIND_CHAT_EVENT. */
+export type ChatEvent =
+  | ChatPresenceJoinEvent
+  | ChatPresenceLeaveEvent
+  | ChatTypingEvent
+  | ChatMessageCreateEvent
+  | ChatMessageUpdateEvent
+  | ChatMessageRemoveEvent
+  | ChatAccessRevokedEvent
+  | ChatResyncRequiredEvent;
+
+export function decodeChatEvent(body: Uint8Array | ArrayBuffer | string): ChatEvent | null;
+
+export type ChatCursorState = "live" | "rejoin_required" | "reconcile_required" | "ack_required" | "revoked";
+export type ChatEventDisposition =
+  | { type: "apply"; event_id: ChatU64 }
+  | { type: "duplicate"; event_id: ChatU64 }
+  | { type: "reconcile_gap"; current_watermark: ChatU64; observed_event_id: ChatU64 }
+  | { type: "resync_required"; watermark_event_id: ChatU64 }
+  | { type: "typing"; presence: ChatPresence; typing: boolean; expires_at: ChatU64 }
+  | { type: "access_revoked"; presence: ChatPresence }
+  | { type: "ephemeral" };
+
+export class ChatEventCursor {
+  constructor(channelId: string, watermark?: ChatU64);
+  readonly channelId: string;
+  readonly watermark: ChatU64;
+  readonly state: ChatCursorState;
+  readonly requiredWatermark: ChatU64 | null;
+  disconnected(): void;
+  rejoined(joinResult: Pick<ChatJoinResult, "channel_id" | "watermark_event_id">): void;
+  observe(event: ChatEvent, now?: ChatU64): ChatEventDisposition;
+  expireTyping(now?: ChatU64): Array<ChatPresence & { typing: false }>;
+}
+
+export type ChatTarget =
+  | { kind: "direct"; other_user_id: string }
+  | { kind: "group"; group_id: ChatU64 }
+  | { kind: "room" };
+
+export interface ChatJoinResult {
+  channel_id: string;
+  channel_type: ChatChannelType;
+  presence: ChatPresence[];
+  watermark_event_id: ChatU64;
+  subscription: string;
+}
 export interface ChatTypingResult {
   typing: boolean;
-  expires_at: number;
+  expires_at: ChatU64;
+}
+export interface ChatMutationResult { message: ChatMessage; event_id: ChatU64; }
+export interface ChatRemoveResult { message_id: ChatU64; deleted: true; event_id: ChatU64; }
+export interface ChatHistoryResult { items: ChatMessage[]; watermark_event_id: ChatU64; }
+/** Complete reconciliation snapshot. Replace application state atomically on every callback. */
+export interface ChatHistorySnapshot {
+  readonly messages: readonly ChatMessage[];
+  readonly watermark_event_id: ChatU64;
+  readonly replace: true;
+  /** Monotonically increasing within one reconcileChat call, including watermark retries. */
+  readonly generation: number;
+}
+export interface ChatHistoryOptions {
+  limit?: number;
+  beforeMessageId?: ChatU64;
+  timeoutMs?: number;
+}
+export interface ChatReconcileOptions extends Omit<ChatHistoryOptions, "beforeMessageId"> {
+  maxAttempts?: number;
 }
 
 /** A connected Citadel realtime client. WebSocket is reliable-only; WebTransport adds datagrams. */
@@ -117,7 +239,20 @@ export class CitadelClient {
   onRoomJoined(handler: (room: RoomInfo) => void): () => void;
   onRoomLeft(handler: (roomId: bigint) => void): () => void;
   onChatEvent(handler: (event: ChatEvent) => void): () => void;
+  joinChat(target: ChatTarget, opts?: { timeoutMs?: number }): Promise<ChatJoinResult>;
+  leaveChat(channelId: string, opts?: { timeoutMs?: number }): Promise<{ left: boolean }>;
+  sendChatMessage(channelId: string, content: string, opts?: { timeoutMs?: number }): Promise<ChatMutationResult>;
+  getChatHistory(channelId: string, options?: ChatHistoryOptions): Promise<ChatHistoryResult>;
+  editChatMessage(channelId: string, messageId: ChatU64, content: string, opts?: { timeoutMs?: number }): Promise<ChatMutationResult>;
+  deleteChatMessage(channelId: string, messageId: ChatU64, opts?: { timeoutMs?: number }): Promise<ChatRemoveResult>;
+  moderateChatMessage(channelId: string, messageId: ChatU64, opts?: { timeoutMs?: number }): Promise<ChatRemoveResult>;
   setChatTyping(channelId: string, typing: boolean, opts?: { timeoutMs?: number }): Promise<ChatTypingResult>;
+  rejoinChat(target: ChatTarget, cursor: ChatEventCursor, opts?: { timeoutMs?: number }): Promise<ChatJoinResult>;
+  reconcileChat(
+    cursor: ChatEventCursor,
+    applyHistory: (snapshot: ChatHistorySnapshot) => void | Promise<void>,
+    options?: ChatReconcileOptions,
+  ): Promise<ChatHistoryResult>;
   callRpc(method: string, payload?: Uint8Array, opts?: { timeoutMs?: number }): Promise<Uint8Array>;
   close(code?: number, reason?: string): void;
 }

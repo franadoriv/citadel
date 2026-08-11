@@ -1,6 +1,6 @@
 ---
 title: Use secure durable chat
-description: Join an authorized local chat channel, consume durable live events, and reconcile safely.
+description: Join an authorized chat channel, consume cluster live events, and reconcile safely.
 ---
 
 Citadel chat is durable first and has live delivery across authenticated cluster
@@ -18,21 +18,21 @@ at-least-once, not a replacement for history: deduplicate it by
    same channel again from the same connection is idempotent.
 3. Register the released SDK's inbound handler for `KIND_CHAT_EVENT` (28) before
    rendering live activity. Its UTF-8 JSON body has a `type`: `presence.join`,
-   `presence.leave`, `message.create`, `message.update`, `message.remove`,
+   `presence.leave`, `typing`, `message.create`, `message.update`, `message.remove`,
    `access.revoked`, or `resync_required`.
 4. Use only that returned `channel_id` with `chat.send`, `chat.history`,
    `chat.edit`, `chat.delete`, and `chat.moderate`. A copied id grants no access:
    Citadel reauthorizes the connection on every operation.
-5. If an event is duplicated, retain only the larger durable event for its
-   `(channel_id, event_id)` key. If `resync_required` arrives, call
-   `chat.history` and pass the returned `watermark_event_id` as
-   `acknowledge_watermark`; do not clear the local warning based only on a
-   partial older page.
+5. Pass kind 28 to the SDK's typed chat dispatcher. It deduplicates durable
+   `(channel_id, event_id)` values, fences disconnect/revocation, and starts one
+   bounded reconciliation generation for a gap or `resync_required`. Apply the
+   complete replacement snapshot through the supplied opaque operation; the SDK
+   sends the correlated acknowledgement only after that application succeeds.
 6. Call `chat.leave` when the chat view no longer needs delivery. Disconnects,
    blocks, group kicks/leaves/deletes, and room-access revocation remove local
    subscriptions and emit the appropriate presence/revocation event. Remote
-   delivery retries only within its 30-second bounded window; afterward history
-   is the recovery path.
+   delivery retries within its bounded outbox deadline; afterward history is the
+   recovery path.
 
 **Expected result:** `chat.join` returns one opaque `channel_id`; a permitted
 `chat.send` commits a message and each joined recipient on a current cluster
@@ -40,7 +40,8 @@ lease receives a
 `KIND_CHAT_EVENT`. If a private join returns `CHAT_UNAVAILABLE`, treat it as a
 normal unavailable target—do not reveal whether friendship, membership, or a
 block caused it. On `resync_required`, fetch history and acknowledge its returned
-watermark before trusting the live view again.
+watermark through the SDK's snapshot-application operation before trusting the
+live view again.
 
 ```json
 {
@@ -66,4 +67,5 @@ Content must be non-empty valid UTF-8 text no longer than 2,048 bytes. Sends,
 edits, deletes, and history reads use durable multi-key limits. Author edits are
 allowed for five minutes; author deletes for 24 hours. Group moderation is
 limited to eligible group admins and superadmins; it writes a redacted durable
-audit record. Typing is not part of this delivery feature.
+audit record. Typing is ephemeral and source-node local; durable create, update,
+remove, and moderation tombstone events use the cluster outbox.

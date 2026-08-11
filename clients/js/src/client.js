@@ -7,6 +7,17 @@
 // Chromium browser path with an injectable implementation for tests.
 
 import { Envelope } from "./envelope.js";
+import { ChatEventCursor, decodeChatEvent } from "./chat.js";
+import { equalU64, isU64, parseChatJsonText, stringifyChatJson } from "./chat-json.js";
+import {
+  abortChatHistoryApply,
+  abortChatRequest,
+  acceptChatAck,
+  acceptChatHistory,
+  beginChatAck,
+  beginChatHistory,
+  completeChatHistoryApply,
+} from "./chat-internal.js";
 import {
   WebSocketTransport,
   WebTransportTransport,
@@ -36,6 +47,69 @@ import {
 
 /** Default timeout (ms) for handshake / RPC awaits. */
 const DEFAULT_TIMEOUT_MS = 10_000;
+const CHAT_ENCODER = new TextEncoder();
+const CHAT_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isSafeUint(value, positive = false) {
+  return Number.isSafeInteger(value) && value >= (positive ? 1 : 0);
+}
+
+function assertChannelId(channelId) {
+  if (!isNonEmptyString(channelId)) throw new TypeError("channelId must be a non-empty string");
+}
+
+function assertMessageId(messageId) {
+  if (!isU64(messageId, true)) throw new TypeError("messageId must be a positive unsigned 64-bit integer");
+}
+
+function validPresence(value) {
+  return isObject(value) && isNonEmptyString(value.presence_id) && isNonEmptyString(value.user_id);
+}
+
+function validMessage(value) {
+  return isObject(value)
+    && isU64(value.id, true)
+    && isNonEmptyString(value.sender)
+    && typeof value.content === "string"
+    && isU64(value.created_at_unix_ms)
+    && isU64(value.updated_at_unix_ms)
+    && value.updated_at_unix_ms >= value.created_at_unix_ms
+    && isU64(value.revision, true)
+    && isU64(value.last_event_id, true)
+    && typeof value.deleted === "boolean"
+    && (!value.deleted || value.content.length === 0);
+}
+
+function validHistoryResult(value) {
+  return Array.isArray(value.items) && value.items.every(validMessage)
+    && isU64(value.watermark_event_id);
+}
+
+function parseChatJson(body, method) {
+  try {
+    const value = parseChatJsonText(CHAT_DECODER.decode(body));
+    if (!isObject(value)) throw new Error();
+    return value;
+  } catch {
+    throw new Error(`malformed ${method} response`);
+  }
+}
+
+function validateChatTarget(target) {
+  if (!isObject(target)) throw new TypeError("chat target must be an object");
+  if (target.kind === "direct" && isNonEmptyString(target.other_user_id)) return;
+  if (target.kind === "group" && isU64(target.group_id, true)) return;
+  if (target.kind === "room") return;
+  throw new TypeError("invalid chat target");
+}
 
 /** @param {Promise<unknown>} promise @param {number} timeoutMs @param {() => void} onTimeout */
 function waitWithTimeout(promise, timeoutMs, onTimeout) {
@@ -372,32 +446,193 @@ export class CitadelClient {
    * @returns {() => void}
    */
   onChatEvent(handler) {
-    const decoder = new TextDecoder();
     return this.on(KIND_CHAT_EVENT, (payload) => {
-      try {
-        const event = JSON.parse(decoder.decode(payload));
-        if (event && typeof event === "object") handler(event);
-      } catch {
-        // The generic `on(KIND_CHAT_EVENT, ...)` route remains available for
-        // diagnostics when a peer violates the JSON event contract.
-      }
+      const event = decodeChatEvent(payload);
+      if (event !== null) handler(event);
     });
   }
 
+  async joinChat(target, opts = {}) {
+    validateChatTarget(target);
+    return this._callChatJson("chat.join", { target }, (value) => {
+      if (!isNonEmptyString(value.channel_id)
+        || !["direct", "group", "room"].includes(value.channel_type)
+        || !Array.isArray(value.presence) || value.presence.some((entry) => !validPresence(entry))
+        || !isU64(value.watermark_event_id)
+        || !isNonEmptyString(value.subscription)) return false;
+      return true;
+    }, opts);
+  }
+
+  async leaveChat(channelId, opts = {}) {
+    assertChannelId(channelId);
+    return this._callChatJson("chat.leave", { channel_id: channelId },
+      (value) => typeof value.left === "boolean", opts);
+  }
+
+  async sendChatMessage(channelId, content, opts = {}) {
+    assertChannelId(channelId);
+    if (typeof content !== "string") throw new TypeError("content must be a string");
+    return this._callChatJson("chat.send", { channel_id: channelId, content },
+      (value) => isU64(value.event_id, true) && validMessage(value.message)
+        && value.message.last_event_id === value.event_id, opts);
+  }
+
+  async getChatHistory(channelId, options = {}) {
+    assertChannelId(channelId);
+    const { limit, beforeMessageId, timeoutMs } = options;
+    if (Object.hasOwn(options, "acknowledgeWatermark")) {
+      throw new TypeError("acknowledgeWatermark is not supported by ordinary history");
+    }
+    const request = { channel_id: channelId };
+    if (limit !== undefined) {
+      if (!isSafeUint(limit, true) || limit > 200) {
+        throw new TypeError("limit must be a safe positive integer no greater than 200");
+      }
+      request.limit = limit;
+    }
+    if (beforeMessageId !== undefined) {
+      assertMessageId(beforeMessageId);
+      request.before_message_id = beforeMessageId;
+    }
+
+    return this._callChatJson("chat.history", request, (value) => {
+      if (!validHistoryResult(value) || value.items.length > (limit ?? 50)) return false;
+      if (!value.items.every((message, index) => index === 0 || value.items[index - 1].id > message.id)) {
+        return false;
+      }
+      return beforeMessageId === undefined || value.items.every(({ id }) => id < beforeMessageId);
+    }, { timeoutMs });
+  }
+
+  async editChatMessage(channelId, messageId, content, opts = {}) {
+    assertChannelId(channelId);
+    assertMessageId(messageId);
+    if (typeof content !== "string") throw new TypeError("content must be a string");
+    return this._callChatJson("chat.edit", {
+      channel_id: channelId, message_id: messageId, content,
+    }, (value) => isU64(value.event_id, true) && validMessage(value.message)
+      && equalU64(value.message.id, messageId) && value.message.last_event_id === value.event_id, opts);
+  }
+
+  async deleteChatMessage(channelId, messageId, opts = {}) {
+    return this._chatRemove("chat.delete", channelId, messageId, opts);
+  }
+
+  async moderateChatMessage(channelId, messageId, opts = {}) {
+    return this._chatRemove("chat.moderate", channelId, messageId, opts);
+  }
+
   /**
-   * Set this connection's ephemeral typing state for an already-joined chat
-   * channel. Receivers clear a true indication at the server-provided
-   * `expires_at` timestamp; call with `false` when input is abandoned.
-   *
-   * @param {string} channelId
-   * @param {boolean} typing
-   * @param {{ timeoutMs?: number }} [opts]
-   * @returns {Promise<{typing: boolean, expires_at: number}>}
+   * Set this connection's ephemeral typing state for an already-joined channel.
    */
   async setChatTyping(channelId, typing, opts = {}) {
-    const payload = new TextEncoder().encode(JSON.stringify({ channel_id: channelId, typing }));
-    const response = await this.callRpc("chat.typing", payload, opts);
-    return JSON.parse(new TextDecoder().decode(response));
+    assertChannelId(channelId);
+    if (typeof typing !== "boolean") throw new TypeError("typing must be a boolean");
+    return this._callChatJson("chat.typing", { channel_id: channelId, typing },
+      (value) => typeof value.typing === "boolean" && isU64(value.expires_at), opts);
+  }
+
+  /** Rejoin a cursor's channel after reconnect without advancing its watermark. */
+  async rejoinChat(target, cursor, opts = {}) {
+    if (!(cursor instanceof ChatEventCursor)) throw new TypeError("cursor must be a ChatEventCursor");
+    const joined = await this.joinChat(target, opts);
+    cursor.rejoined(joined);
+    return joined;
+  }
+
+  /**
+   * Reconcile and acknowledge a cursor. If the watermark races forward while
+   * history is loading, retry a bounded number of times rather than falsely
+   * treating an older acknowledgement as complete.
+   */
+  async reconcileChat(cursor, applyHistory, options = {}) {
+    if (!(cursor instanceof ChatEventCursor)) throw new TypeError("cursor must be a ChatEventCursor");
+    if (cursor.state !== "reconcile_required") throw new Error("chat cursor does not require reconciliation");
+    if (typeof applyHistory !== "function") throw new TypeError("applyHistory callback is required");
+    const { limit = 50, maxAttempts = 3, timeoutMs } = options;
+    if (!isSafeUint(limit, true) || limit > 200) {
+      throw new TypeError("limit must be a safe positive integer no greater than 200");
+    }
+    if (!isSafeUint(maxAttempts, true) || maxAttempts > 10) {
+      throw new TypeError("maxAttempts must be a safe positive integer no greater than 10");
+    }
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const items = [];
+      let terminalHandle;
+      let snapshotWatermark;
+      let restart = false;
+
+      while (!terminalHandle) {
+        const handle = beginChatHistory(cursor, limit);
+        const request = { channel_id: cursor.channelId, limit };
+        if (handle.beforeMessageId !== null) request.before_message_id = handle.beforeMessageId;
+        let page;
+        let accepted;
+        try {
+          page = await this._callChatJson("chat.history", request, validHistoryResult, { timeoutMs });
+          accepted = acceptChatHistory(cursor, handle, page);
+        } catch (error) {
+          abortChatRequest(cursor, handle);
+          throw error;
+        }
+        if (accepted.restart) {
+          restart = true;
+          break;
+        }
+        items.push(...page.items);
+        snapshotWatermark = accepted.watermark;
+        if (accepted.terminal) terminalHandle = handle;
+      }
+      if (restart) continue;
+
+      try {
+        await applyHistory(Object.freeze({
+          messages: Object.freeze([...items]),
+          watermark_event_id: snapshotWatermark,
+          replace: true,
+          generation: attempt + 1,
+        }));
+        completeChatHistoryApply(cursor, terminalHandle);
+      } catch (error) {
+        abortChatHistoryApply(cursor, terminalHandle);
+        throw error;
+      }
+
+      const ackHandle = beginChatAck(cursor);
+      let acknowledgement;
+      let acceptedAck;
+      try {
+        acknowledgement = await this._callChatJson("chat.history", {
+          channel_id: cursor.channelId,
+          limit: 1,
+          acknowledge_watermark: ackHandle.watermark,
+        }, validHistoryResult, { timeoutMs });
+        acceptedAck = acceptChatAck(cursor, ackHandle, acknowledgement);
+      } catch (error) {
+        abortChatRequest(cursor, ackHandle);
+        throw error;
+      }
+      if (acceptedAck.restart) continue;
+      return { items, watermark_event_id: acknowledgement.watermark_event_id };
+    }
+    throw new Error("chat reconciliation watermark did not stabilize");
+  }
+
+  async _chatRemove(method, channelId, messageId, opts) {
+    assertChannelId(channelId);
+    assertMessageId(messageId);
+    return this._callChatJson(method, { channel_id: channelId, message_id: messageId },
+      (value) => equalU64(value.message_id, messageId) && value.deleted === true
+        && isU64(value.event_id, true), opts);
+  }
+
+  async _callChatJson(method, request, validate, opts = {}) {
+    const response = await this.callRpc(method, CHAT_ENCODER.encode(stringifyChatJson(request)), opts);
+    const value = parseChatJson(response, method);
+    if (!validate(value)) throw new Error(`malformed ${method} response`);
+    return value;
   }
 
   /**

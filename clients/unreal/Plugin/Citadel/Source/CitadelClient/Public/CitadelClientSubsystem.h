@@ -26,6 +26,7 @@
 // Wire-protocol constants (envelope kinds / RPC statuses / byte counts) that
 // live in citadel-wire rather than the C header.
 #include "CitadelWire.h"
+#include "CitadelChatLive.h"
 
 #include "CitadelClientSubsystem.generated.h"
 
@@ -239,6 +240,29 @@ public:
     /** Send an envelope of `Kind` with `Payload` bytes. (C++ API.) */
     ECitadelStatus Send(uint16 Kind, const TArray<uint8>& Payload, bool bReliable);
 
+    /** Allocate a correlated handle and reliably send a typed chat request. */
+    UFUNCTION(BlueprintCallable, Category = "Citadel|Chat")
+    ECitadelStatus SendChatRequest(const FCitadelChatRpcRequest& Request, int64& OutRequestId);
+
+    /** Re-send a typed chat.join request fenced to one disconnected channel. */
+    UFUNCTION(BlueprintCallable, Category = "Citadel|Chat")
+    ECitadelStatus RejoinChatChannel(
+        const FString& ChannelId,
+        const FCitadelChatRpcRequest& JoinRequest,
+        int64& OutRequestId);
+
+    /** Dispatcher fed by the unique inbound queue owner; also preserves raw envelopes. */
+    UFUNCTION(BlueprintPure, Category = "Citadel|Chat")
+    UCitadelChatLiveEventDispatcher* GetChatLiveDispatcher();
+
+    /** Per-channel typed live state used by the integrated resync driver. */
+    UFUNCTION(BlueprintPure, Category = "Citadel|Chat")
+    UCitadelChatLiveState* GetChatLiveState();
+
+
+    /** Route one already-polled envelope without reading the shared queue again. */
+    bool RouteInboundEnvelope(uint16 Kind, const TArray<uint8>& Payload);
+
     /**
      * Poll the next inbound envelope (non-blocking). On Ok, fills `OutKind` and
      * `OutPayload`. Returns Again when nothing is ready, Disconnected when the
@@ -249,10 +273,14 @@ public:
     /** The last native error message for the current handle, or empty. (C++ API.) */
     FString LastError();
 
+    virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     // USubsystem lifecycle: free the native handle on teardown.
     virtual void Deinitialize() override;
 
 private:
+#if WITH_DEV_AUTOMATION_TESTS
+    friend class FCitadelClientSubsystemChatTestAccess;
+#endif
     // Shared device/custom auth: POST {BaseUrl}{Path} with the id-based body and
     // route the JSON response into the delegates.
     void Authenticate(const FString& BaseUrl, const FString& Path, const FString& Id, bool bCreate, const FString& Username);
@@ -265,9 +293,27 @@ private:
     void OnPlayerResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedOk, EPlayerRequest Kind);
     static bool ParseProfile(const TSharedPtr<FJsonObject>& Json, FCitadelPublicProfile& OutProfile);
 
+    UFUNCTION()
+    void ApplyChatLiveEvent(const FCitadelChatLiveEvent& Event);
+    int64 AllocateChatRequestId();
+    /** Idempotently fail closed all connection-scoped chat state. */
+    void InvalidateChatConnectionState();
+    /** A destructive one-shot poll loss is connection-equivalent for chat authority. */
+    ECitadelStatus HandleConsumedPollTruncation(TArray<uint8>& OutPayload);
+    /** Internal-only: resync can start only after authorized state requested it. */
+    ECitadelStatus BeginChatReconcile(const FString& ChannelId, int64 RequiredWatermarkEventId, int32 PageLimit);
+
     // The opaque native handle from the C ABI. Owned by this subsystem.
     CitadelClient* Handle = nullptr;
 
     // Status of the most recent connect/send/poll call.
     ECitadelStatus LastStatus = ECitadelStatus::Disconnected;
+
+    UPROPERTY(Transient) UCitadelChatLiveEventDispatcher* ChatLiveDispatcher = nullptr;
+    UPROPERTY(Transient) UCitadelChatLiveState* ChatLiveState = nullptr;
+    UPROPERTY(Transient) UCitadelChatJoinSync* ChatJoinSync = nullptr;
+    UPROPERTY(Transient) UCitadelChatHistorySync* ChatHistorySync = nullptr;
+    int64 NextChatRequestId = 1;
+    /** Reused canonical reliable-frame bound; prevents destructive FFI truncation. */
+    TArray<uint8> PollBuffer;
 };

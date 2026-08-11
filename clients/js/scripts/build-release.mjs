@@ -62,6 +62,7 @@ async function verifyStage(stage) {
     "dist/citadel-client.min.mjs.gz",
     "dist/citadel-client.min.mjs.br",
     "index.d.ts",
+    "chat.d.ts",
     "README.md",
     "examples/threejs-starter/index.html",
     "examples/threejs-starter/app.js",
@@ -134,6 +135,7 @@ await writeFile(`${bundlePath}.br`, await brotliCompressAsync(bundle, {
 }));
 
 await cp(resolve(sdkDir, "index.d.ts"), resolve(stage, "index.d.ts"));
+await cp(resolve(sdkDir, "chat.d.ts"), resolve(stage, "chat.d.ts"));
 await cp(resolve(sdkDir, "README.md"), resolve(stage, "README.md"));
 await cp(resolve(sdkDir, "examples", "threejs-starter"), resolve(stage, "examples", "threejs-starter"), {
   recursive: true,
