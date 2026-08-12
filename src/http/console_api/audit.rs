@@ -11,7 +11,7 @@ use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
-use crate::services::{AuditEntry, AuditFilter, ConsoleIdentity};
+use crate::services::{AuditEntry, AuditFilter, ConsolePrincipal};
 
 /// The Audit Logs section route.
 pub const AUDIT_PATH: &str = "/console/v1/audit";
@@ -52,7 +52,7 @@ fn effective_limit(requested: Option<usize>) -> usize {
 /// `GET /console/v1/audit`: read the trail newest-first with filters.
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(query): Query<AuditQuery>,
 ) -> Json<AuditPage> {
     app.metrics().record_http_request();

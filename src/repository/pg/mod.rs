@@ -45,12 +45,14 @@ use crate::database_explorer::{DatabaseExplorer, PgMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
-    GroupsRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
-    SessionRepository, StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, FriendsRepository,
+    GameScriptRepository, GroupsRepository, LeaderboardsRepository, NotificationsRepository,
+    PurchasesRepository, SessionRepository, StorageRepository, TournamentsRepository,
+    UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
+mod api_keys;
 mod chat;
 mod friends;
 mod gamescript;
@@ -65,6 +67,7 @@ mod storage;
 mod tournaments;
 mod wallet;
 
+pub use api_keys::PgApiKeyRepository;
 pub use chat::PgChatRepository;
 pub use friends::PgFriendsRepository;
 pub use gamescript::PgGameScriptRepository;
@@ -189,6 +192,7 @@ pub struct PgDatabase {
 /// coverage test below makes a new entry fail fast unless its table is also
 /// present in the CRDB migration set.
 const TEST_RESET_TABLES: &[&str] = &[
+    "api_keys",
     "gamescript_outbox",
     "gamescript_audit",
     "gamescript_activations",
@@ -244,6 +248,11 @@ fn normalize_pg_scheme(url: &str) -> std::borrow::Cow<'_, str> {
 }
 
 impl PgDatabase {
+    #[must_use]
+    pub fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        Arc::new(PgApiKeyRepository::new(self.pool.clone()))
+    }
+
     /// Connect to PostgreSQL (or a CockroachDB cluster over the PostgreSQL wire
     /// protocol) and apply migrations.
     ///
@@ -587,6 +596,10 @@ impl PgUnitOfWork {
 
 #[async_trait]
 impl BackendTrait for PgDatabase {
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        PgDatabase::api_key_repository(self)
+    }
+
     fn kind(&self) -> BackendKind {
         match self.flavor {
             PgFlavor::Postgres => BackendKind::Postgres,
@@ -712,6 +725,8 @@ impl UnitOfWork for PgUnitOfWork {
 mod tests {
     use super::*;
 
+    const CRDB_API_KEYS: &str =
+        include_str!("../../../migrations-crdb/20260811120000_create_api_keys.sql");
     const CRDB_STORAGE: &str =
         include_str!("../../../migrations-crdb/20260702090000_create_storage_objects.sql");
     const CRDB_IDENTITY_SESSION: &str =
@@ -785,6 +800,7 @@ mod tests {
     #[test]
     fn cockroach_migrations_cover_every_contract_reset_table() {
         let coverage = [
+            ("api_keys", CRDB_API_KEYS),
             ("gamescript_outbox", CRDB_GAMESCRIPT),
             ("gamescript_audit", CRDB_GAMESCRIPT),
             ("gamescript_activations", CRDB_GAMESCRIPT),

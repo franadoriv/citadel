@@ -8,7 +8,7 @@ HTML document served by the node itself (no build step, no CDN, works
 offline). **Every sidebar section is live**: the SPA signs in against
 `/console/v1/login`, drives the operator-only **console API** under
 **`/console/v1`** for accounts, groups, chat, notifications, storage,
-leaderboards, matches, purchases, configuration, runtime, audit logs, the error
+leaderboards, matches, purchases, API keys, configuration, runtime, audit logs, the error
 journal, and the read-only Database Explorer, and
 its **Status** section renders live node gauges from the public `/status`
 endpoint (no login required for that data source).
@@ -47,6 +47,11 @@ Two roles exist:
 | `admin` | `console.password` | Read everything, perform mutations. |
 | `viewer` | `console.viewer_password` (optional) | Read-only; mutations return `403 forbidden`. |
 
+These human sessions are short-lived opaque bearer tokens, not JWTs. Durable
+machine credentials are separate principals with explicit read scopes; see
+[API keys and service accounts](/reference/admin-api/api-keys/). Only a human
+`admin` session can manage them.
+
 Failure behavior is deliberately uniform: a wrong username, wrong password,
 missing header, malformed header, unknown token, and expired token all return
 the same `401 authentication_failed` — the boundary is not a credential
@@ -83,6 +88,10 @@ exposing a node beyond localhost.
 | `/console/v1/leaderboards` | GET | bearer | Leaderboard administration (live — see below). |
 | `/console/v1/purchases` | GET | bearer | Validated purchase records (live — see below). |
 | `/console/v1/subscriptions` | GET | bearer | Subscription records (live — see below). |
+| `/console/v1/api-keys` | GET, POST | human admin bearer | List metadata or create a machine credential; see [API keys](/reference/admin-api/api-keys/). |
+| `/console/v1/api-keys/{id}` | GET | human admin bearer | Read API-key metadata (never a secret). |
+| `/console/v1/api-keys/{id}/rotate` | POST | human admin bearer | Rotate and reveal a replacement secret once. |
+| `/console/v1/api-keys/{id}/revoke` | POST | human admin bearer | Revoke the current generation. |
 
 A section whose backend has not landed yet answers
 `501 { "code": "not_implemented" }` — authenticated and routed, never a `404` —

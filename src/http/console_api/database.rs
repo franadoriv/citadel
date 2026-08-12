@@ -16,13 +16,14 @@ use crate::database_explorer::{
 };
 use crate::error::AppError;
 use crate::http::error::ApiError;
-use crate::services::{AuditEntry, ConsoleIdentity};
+use crate::services::{AuditEntry, ConsolePrincipal};
 use crate::time::{Clock, SystemClock};
 
 pub const DATABASE_PATH: &str = "/console/v1/database";
 pub const DATABASE_TABLE_PATH: &str = "/console/v1/database/:schema/:table";
 pub const DATABASE_ROWS_PATH: &str = "/console/v1/database/rows";
 pub const DATABASE_ROW_PATH: &str = "/console/v1/database/row";
+const API_KEYS_RELATION: &str = "api_keys";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TablesResponse {
@@ -40,33 +41,48 @@ fn bounded_json<T: Serialize>(value: T) -> Result<Json<T>, ApiError> {
     Ok(Json(value))
 }
 
-fn record_read(app: &App, operator: &ConsoleIdentity, action: &str, target: String) {
-    app.audit_log().record(AuditEntry::new(
+fn record_read(app: &App, operator: &ConsolePrincipal, action: &str, target: String) {
+    app.audit_log().record(AuditEntry::for_principal(
         SystemClock.now(),
-        operator.username.clone(),
-        operator.role.as_str(),
+        operator,
         action,
         target,
         "read-only database explorer request",
     ));
 }
 
-fn admit(app: &App, operator: &ConsoleIdentity) -> Result<(), ApiError> {
+fn admit(app: &App, operator: &ConsolePrincipal) -> Result<(), ApiError> {
     app.database_explorer_rate_limiter()
-        .admit(&operator.username)
+        .admit(&operator.actor_id())
         .map_err(ApiError::rate_limited)
+}
+
+fn may_inspect_api_keys(operator: &ConsolePrincipal) -> bool {
+    operator.require_admin().is_ok()
+}
+
+fn guard_table(operator: &ConsolePrincipal, table: &TableRef) -> Result<(), ApiError> {
+    if table.table == API_KEYS_RELATION && !may_inspect_api_keys(operator) {
+        return Err(
+            AppError::permission("only a human administrator may inspect API-key storage").into(),
+        );
+    }
+    Ok(())
 }
 
 pub(super) async fn tables_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
 ) -> Result<Json<TablesResponse>, ApiError> {
     app.metrics().record_http_request();
     admit(&app, &operator)?;
-    let tables = explorer(&app)?
+    let mut tables = explorer(&app)?
         .list_tables()
         .await
         .map_err(ApiError::from)?;
+    if !may_inspect_api_keys(&operator) {
+        tables.retain(|summary| summary.table.table != API_KEYS_RELATION);
+    }
     record_read(
         &app,
         &operator,
@@ -78,12 +94,13 @@ pub(super) async fn tables_handler(
 
 pub(super) async fn table_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((schema, table)): Path<(String, String)>,
 ) -> Result<Json<TableDescription>, ApiError> {
     app.metrics().record_http_request();
     admit(&app, &operator)?;
     let table_ref = TableRef::new(schema, table).map_err(ApiError::from)?;
+    guard_table(&operator, &table_ref)?;
     let description = explorer(&app)?
         .describe_table(&table_ref)
         .await
@@ -94,7 +111,7 @@ pub(super) async fn table_handler(
 
 pub(super) async fn rows_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<ListRowsRequest>, JsonRejection>,
 ) -> Result<Json<RowsPage>, ApiError> {
     app.metrics().record_http_request();
@@ -105,6 +122,7 @@ pub(super) async fn rows_handler(
                 .with_detail(rejection.body_text())
         })?
         .0;
+    guard_table(&operator, &request.table)?;
     let target = request.table.table.clone();
     let page = explorer(&app)?
         .list_rows(&request)
@@ -116,7 +134,7 @@ pub(super) async fn rows_handler(
 
 pub(super) async fn row_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<RowDetailRequest>, JsonRejection>,
 ) -> Result<Json<DatabaseRow>, ApiError> {
     app.metrics().record_http_request();
@@ -127,6 +145,7 @@ pub(super) async fn row_handler(
                 .with_detail(rejection.body_text())
         })?
         .0;
+    guard_table(&operator, &request.table)?;
     let target = request.table.table.clone();
     let row = explorer(&app)?
         .get_row(&request)

@@ -9,7 +9,7 @@ use axum::extract::State;
 
 use crate::app::App;
 use crate::host_telemetry::HostTelemetrySnapshot;
-use crate::services::ConsoleIdentity;
+use crate::services::ConsolePrincipal;
 
 /// Authenticated host-resource telemetry route.
 pub const TELEMETRY_PATH: &str = "/console/v1/telemetry";
@@ -20,7 +20,7 @@ pub const TELEMETRY_PATH: &str = "/console/v1/telemetry";
 /// route performs no mutation and records the request in node metrics.
 pub(super) async fn get_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
 ) -> Json<HostTelemetrySnapshot> {
     app.metrics().record_http_request();
     Json(app.host_telemetry().await)

@@ -12,7 +12,7 @@ use crate::http::error::ApiError;
 use crate::repository::{
     CreateTournamentRequest, Tournament, TournamentEntry, TournamentResult, TournamentState,
 };
-use crate::services::{AuditEntry, ConsoleIdentity};
+use crate::services::{AuditEntry, ConsolePrincipal};
 use crate::time::{Clock, SystemClock, TimestampMillis};
 
 pub const TOURNAMENTS_PATH: &str = "/console/v1/tournaments";
@@ -111,7 +111,7 @@ async fn require_tournament(app: &App, id: &str) -> Result<(), ApiError> {
 
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
 ) -> Result<Json<TournamentsResponse>, ApiError> {
     app.metrics().record_http_request();
     let items: Vec<_> = app
@@ -128,7 +128,7 @@ pub(super) async fn list_handler(
 
 pub(super) async fn create_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<CreateBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TournamentRow>), ApiError> {
     app.metrics().record_http_request();
@@ -156,8 +156,8 @@ pub(super) async fn create_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "tournaments.create",
         tournament.id.clone(),
         "created tournament",
@@ -167,7 +167,7 @@ pub(super) async fn create_handler(
 
 pub(super) async fn detail_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<TournamentRow>, ApiError> {
     app.metrics().record_http_request();
@@ -182,7 +182,7 @@ pub(super) async fn detail_handler(
 
 pub(super) async fn transition_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(id): Path<String>,
     body: Result<Json<TransitionBody>, JsonRejection>,
 ) -> Result<Json<TournamentRow>, ApiError> {
@@ -203,8 +203,8 @@ pub(super) async fn transition_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "tournaments.transition",
         id,
         format!("state={}", state.as_str()),
@@ -214,7 +214,7 @@ pub(super) async fn transition_handler(
 
 pub(super) async fn entries_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<EntriesResponse>, ApiError> {
     app.metrics().record_http_request();
@@ -226,7 +226,7 @@ pub(super) async fn entries_handler(
 
 pub(super) async fn results_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(id): Path<String>,
 ) -> Result<Json<ResultsResponse>, ApiError> {
     app.metrics().record_http_request();

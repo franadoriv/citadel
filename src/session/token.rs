@@ -20,7 +20,7 @@ use crate::error::{AppError, AppResult};
 use crate::validate;
 
 /// Maximum byte length for a token secret (generous enough for signed tokens).
-const MAX_TOKEN_SECRET_LEN: usize = 4096;
+pub(crate) const MAX_TOKEN_SECRET_LEN: usize = 4096;
 /// Maximum byte length for a token reference handle.
 const MAX_TOKEN_REF_LEN: usize = 256;
 
