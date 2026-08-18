@@ -36,6 +36,17 @@ bind = "127.0.0.1:7350"
 # certificate_file = "/etc/citadel/tls/fullchain.pem"
 # private_key_file = "/etc/citadel/tls/privkey.pem"
 
+# [metrics]
+# Prometheus is disabled by default. When enabled it uses a dedicated listener,
+# never the public game/console HTTP listener. Every scrape requires a bearer
+# API key with only the telemetry:read scope; keep its secret in the scraper's
+# secret store. The dedicated listener is loopback-only until its own TLS or
+# trusted-proxy configuration exists; the API-key check remains mandatory.
+# enabled = true
+# bind = "127.0.0.1:9464"
+# path = "/metrics"
+# require_api_key_on_non_loopback = true
+
 # [console]
 # Credentials for the operator console at /dashboard and its /console/v1/* API.
 # The built-in default (admin/password) exists so the local demo runs with zero

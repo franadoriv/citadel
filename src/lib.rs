@@ -29,6 +29,7 @@ pub mod matchmaker_transport;
 pub mod observability;
 pub mod party;
 pub mod party_presence;
+pub mod prometheus;
 pub mod realtime;
 pub mod repository;
 pub mod runtime;

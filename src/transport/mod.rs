@@ -417,6 +417,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         transform_hub.as_ref().map(|(hub, _, _)| Arc::clone(hub)),
         Arc::clone(app.runtime_event_bus()),
         Arc::clone(app.runtime_shared_cache()),
+        Arc::clone(app.runtime_metrics()),
         readiness_source.as_ref(),
     )?;
     // Build the realtime authenticator from the node's session service and the
@@ -1170,6 +1171,7 @@ pub(crate) fn validate_runtime_for_check(config: &Config) -> AppResult<()> {
             ),
             Arc::new(crate::observability::NodeMetrics::new()),
         )),
+        Arc::new(crate::runtime::RuntimeMetrics::default()),
     )?;
     Ok(())
 }
@@ -1268,6 +1270,7 @@ fn build_runtime(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    runtime_metrics: Arc<crate::runtime::RuntimeMetrics>,
 ) -> AppResult<BuiltRuntime> {
     build_runtime_with_readiness(
         config,
@@ -1276,6 +1279,7 @@ fn build_runtime(
         transform_hub,
         event_bus,
         shared_cache,
+        runtime_metrics,
         None,
     )
 }
@@ -1299,6 +1303,7 @@ fn build_runtime_with_readiness(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    runtime_metrics: Arc<crate::runtime::RuntimeMetrics>,
     readiness: Option<&crate::runtime::InProcessRuntimeSource>,
 ) -> AppResult<BuiltRuntime> {
     let rc = &config.runtime;
@@ -1379,7 +1384,8 @@ fn build_runtime_with_readiness(
                     }
                     .with_maps(maps)
                     .with_event_bus(Arc::clone(&event_bus))
-                    .with_shared_cache(Arc::clone(&shared_cache));
+                    .with_shared_cache(Arc::clone(&shared_cache))
+                    .with_metrics(Arc::clone(&runtime_metrics));
                     let runtime = match transform_hub {
                         Some(hub) => runtime.with_transform_hub(hub),
                         None => runtime,
@@ -1397,13 +1403,29 @@ fn build_runtime_with_readiness(
             }
         }
         RuntimeLanguage::Python => Ok(
-            match load_python_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)? {
+            match load_python_runtime(
+                rc,
+                domain,
+                maps,
+                transform_hub,
+                event_bus,
+                shared_cache,
+                Arc::clone(&runtime_metrics),
+            )? {
                 Some(runtime) => BuiltRuntime::embedded(runtime),
                 None => BuiltRuntime::none(),
             },
         ),
         RuntimeLanguage::Js => Ok(
-            match load_js_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)? {
+            match load_js_runtime(
+                rc,
+                domain,
+                maps,
+                transform_hub,
+                event_bus,
+                shared_cache,
+                Arc::clone(&runtime_metrics),
+            )? {
                 Some(runtime) => BuiltRuntime::embedded(runtime),
                 None => BuiltRuntime::none(),
             },
@@ -1437,6 +1459,7 @@ fn load_python_runtime(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    runtime_metrics: Arc<crate::runtime::RuntimeMetrics>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     match PythonRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
@@ -1458,7 +1481,8 @@ fn load_python_runtime(
             }
             .with_maps(maps)
             .with_event_bus(event_bus)
-            .with_shared_cache(shared_cache);
+            .with_shared_cache(shared_cache)
+            .with_metrics(runtime_metrics);
             let runtime = match transform_hub {
                 Some(hub) => runtime.with_transform_hub(hub),
                 None => runtime,
@@ -1484,6 +1508,7 @@ fn load_python_runtime(
     _transform_hub: Option<Arc<TransformHub>>,
     _event_bus: Arc<crate::runtime::RuntimeEventBus>,
     _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    _runtime_metrics: Arc<crate::runtime::RuntimeMetrics>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,
@@ -1502,6 +1527,7 @@ fn load_js_runtime(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    runtime_metrics: Arc<crate::runtime::RuntimeMetrics>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     match JsRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
@@ -1523,7 +1549,8 @@ fn load_js_runtime(
             }
             .with_maps(maps)
             .with_event_bus(event_bus)
-            .with_shared_cache(shared_cache);
+            .with_shared_cache(shared_cache)
+            .with_metrics(runtime_metrics);
             let runtime = match transform_hub {
                 Some(hub) => runtime.with_transform_hub(hub),
                 None => runtime,
@@ -1549,6 +1576,7 @@ fn load_js_runtime(
     _transform_hub: Option<Arc<TransformHub>>,
     _event_bus: Arc<crate::runtime::RuntimeEventBus>,
     _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    _runtime_metrics: Arc<crate::runtime::RuntimeMetrics>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,
@@ -1857,6 +1885,53 @@ mod tests {
         fn transport_kind(&self) -> TransportKind {
             self.kind
         }
+    }
+
+    #[test]
+    fn embedded_lua_runtime_uses_the_supplied_node_runtime_metrics() {
+        let scripts =
+            std::env::temp_dir().join(format!("citadel-runtime-metrics-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scripts).expect("temporary scripts directory");
+        std::fs::write(
+            scripts.join("main.lua"),
+            r#"
+                citadel.on_message(1, function()
+                    citadel.metrics.counter("matches_started", 1)
+                end)
+            "#,
+        )
+        .expect("write Lua script");
+        let mut config = Config::default();
+        config.runtime.enabled = true;
+        config.runtime.scripts_dir = scripts.display().to_string();
+        let node_metrics = Arc::new(crate::observability::NodeMetrics::new());
+        let runtime_metrics = Arc::new(crate::runtime::RuntimeMetrics::default());
+        let built = build_runtime(
+            &config,
+            None,
+            Arc::new(crate::maps::MapCatalog::empty()),
+            None,
+            Arc::new(crate::runtime::RuntimeEventBus::new(
+                crate::runtime::RuntimeEventPolicy::from(&config.runtime.capabilities.events),
+                Arc::clone(&node_metrics),
+            )),
+            Arc::new(crate::runtime::RuntimeSharedCache::new(
+                crate::runtime::RuntimeSharedCachePolicy::from(
+                    &config.runtime.capabilities.shared_cache,
+                ),
+                node_metrics,
+            )),
+            Arc::clone(&runtime_metrics),
+        )
+        .expect("build runtime");
+        let runtime = built.runtime.expect("Lua runtime selected");
+        assert!(runtime.dispatch(1, None, 1, b"").is_empty());
+        assert!(matches!(
+            runtime_metrics.snapshot().as_slice(),
+            [crate::runtime::RuntimeMetricSnapshot::Counter { name, value: 1 }]
+                if name == "matches_started"
+        ));
+        std::fs::remove_dir_all(scripts).expect("remove temporary scripts directory");
     }
 
     #[test]

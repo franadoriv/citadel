@@ -122,3 +122,25 @@ fn text_policy_is_a_shipped_cross_runtime_contract() {
         assert_eq!(api.since, "unreleased");
     }
 }
+
+#[test]
+fn custom_metrics_are_a_shipped_cross_runtime_contract() {
+    let expected = [
+        ("metrics.counter", &["name:string", "value:u64"][..]),
+        ("metrics.gauge", &["name:string", "value:f64"][..]),
+        ("metrics.timer", &["name:string", "seconds:f64"][..]),
+    ];
+
+    for (name, params) in expected {
+        let api = HOST_API_SURFACE
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("custom metrics API is declared");
+
+        assert_eq!(api.category, HostApiCategory::Metrics);
+        assert_eq!(api.params, params);
+        assert_eq!(api.returns, "void");
+        assert_eq!(api.status, HostApiStatus::Shipped);
+        assert_eq!(api.since, "IMPL-20260818-RUNTIME-CUSTOM-METRICS");
+    }
+}

@@ -643,6 +643,39 @@
     "since": "TASK-0417"
   },
   {
+    "name": "metrics.counter",
+    "category": "metrics",
+    "params": [
+      "name:string",
+      "value:u64"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "IMPL-20260818-RUNTIME-CUSTOM-METRICS"
+  },
+  {
+    "name": "metrics.gauge",
+    "category": "metrics",
+    "params": [
+      "name:string",
+      "value:f64"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "IMPL-20260818-RUNTIME-CUSTOM-METRICS"
+  },
+  {
+    "name": "metrics.timer",
+    "category": "metrics",
+    "params": [
+      "name:string",
+      "seconds:f64"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "IMPL-20260818-RUNTIME-CUSTOM-METRICS"
+  },
+  {
     "name": "cache.get",
     "category": "storage",
     "params": [

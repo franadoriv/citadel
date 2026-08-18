@@ -30,8 +30,8 @@ use crate::runtime::{
     RealtimeAfterOutcome, RealtimeInterception, Runtime, RuntimeEvent, RuntimeEventBus,
     RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint,
     RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest,
-    RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
-    append_runtime_event_commands, disabled_runtime_event_bus_handle,
+    RuntimeHttpResponse, RuntimeMetrics, RuntimeSharedCache, RuntimeSharedCacheHandle,
+    ScriptCommandBatch, append_runtime_event_commands, disabled_runtime_event_bus_handle,
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
     script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
@@ -514,6 +514,8 @@ pub struct LuaRuntime {
     http_endpoint_policy: RuntimeHttpEndpointPolicy,
     event_bus_handle: RuntimeEventBusHandle,
     shared_cache_handle: RuntimeSharedCacheHandle,
+    /// Rust-owned custom metric registry retained through source-only reloads.
+    runtime_metrics: Arc<RuntimeMetrics>,
     /// Where this runtime's authoritative-bridge answers land (the gateway),
     /// held weakly to avoid an `Arc` cycle. Lives on the runtime rather than in
     /// VM app data so it survives a hot-reload's whole-VM swap. `None` until the
@@ -661,6 +663,7 @@ impl LuaRuntime {
             http_endpoint_policy,
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics: Arc::new(RuntimeMetrics::default()),
             bridge_sink: Mutex::new(None),
         }))
     }
@@ -712,6 +715,7 @@ impl LuaRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics: Arc::new(RuntimeMetrics::default()),
             bridge_sink: Mutex::new(None),
         })
     }
@@ -762,6 +766,7 @@ impl LuaRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics: Arc::new(RuntimeMetrics::default()),
             bridge_sink: Mutex::new(None),
         })
     }
@@ -794,6 +799,17 @@ impl LuaRuntime {
     #[must_use]
     pub fn with_shared_cache(self, cache: Arc<RuntimeSharedCache>) -> Self {
         set_runtime_shared_cache(&self.shared_cache_handle, cache);
+        self
+    }
+
+    /// Attach the node-owned Rust metric registry and retain it across reloads.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<RuntimeMetrics>) -> Self {
+        self.runtime_metrics = metrics;
+        {
+            let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+            guard.lua.set_app_data(Arc::clone(&self.runtime_metrics));
+        }
         self
     }
 
@@ -1031,8 +1047,8 @@ impl LuaRuntime {
                 return ReloadOutcome::Rejected;
             }
         };
-        // Re-apply the domain-services seam so `citadel.friends_*` keeps working
-        // after the swap (the rebuilt VM starts with fresh app-data).
+        // Re-apply node-owned host services after the fresh VM is built.
+        fresh.set_app_data(Arc::clone(&self.runtime_metrics));
         apply_domain_host(&fresh, &self.domain);
         apply_map_catalog(&fresh, &self.maps);
         apply_transform_hub(&fresh, &self.transform_hub);
@@ -2526,6 +2542,42 @@ fn install_host_api(
     cache.set("cas", cas)?;
     citadel.set("cache", cache)?;
 
+    let metrics = lua.create_table()?;
+    let counter = lua.create_function(|lua, (name, value): (String, u64)| {
+        let Some(metrics) = lua.app_data_ref::<Arc<RuntimeMetrics>>() else {
+            return Err(mlua::Error::RuntimeError(
+                "runtime metrics are unavailable".to_string(),
+            ));
+        };
+        metrics
+            .counter(&name, value)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+    })?;
+    metrics.set("counter", counter)?;
+    let gauge = lua.create_function(|lua, (name, value): (String, f64)| {
+        let Some(metrics) = lua.app_data_ref::<Arc<RuntimeMetrics>>() else {
+            return Err(mlua::Error::RuntimeError(
+                "runtime metrics are unavailable".to_string(),
+            ));
+        };
+        metrics
+            .gauge(&name, value)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+    })?;
+    metrics.set("gauge", gauge)?;
+    let timer = lua.create_function(|lua, (name, seconds): (String, f64)| {
+        let Some(metrics) = lua.app_data_ref::<Arc<RuntimeMetrics>>() else {
+            return Err(mlua::Error::RuntimeError(
+                "runtime metrics are unavailable".to_string(),
+            ));
+        };
+        metrics
+            .timer(&name, seconds)
+            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+    })?;
+    metrics.set("timer", timer)?;
+    citadel.set("metrics", metrics)?;
+
     // Lifecycle + tick handlers are single functions stored under fixed registry
     // keys (re-registering replaces the prior handler).
     for (name, key) in [
@@ -3924,6 +3976,7 @@ fn build_lua(
     lua.set_app_data(NpcPatrols::default());
     lua.set_app_data(Arc::clone(&capability_policies.event_bus_handle));
     lua.set_app_data(Arc::clone(&capability_policies.shared_cache_handle));
+    lua.set_app_data(Arc::new(RuntimeMetrics::default()));
     let text_policy = TextPolicyCatalog::new(static_data.clone());
     install_host_api(
         &lua,
@@ -5023,6 +5076,9 @@ mod tests {
             "cache.set",
             "cache.delete",
             "cache.cas",
+            "metrics.counter",
+            "metrics.gauge",
+            "metrics.timer",
         ]
         .into_iter()
         .collect();

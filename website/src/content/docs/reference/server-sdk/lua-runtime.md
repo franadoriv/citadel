@@ -1513,3 +1513,25 @@ operations, capacity, role, and pending-state violations raise Lua errors.
 local pending = citadel.groups_call("owner", "invite", '{"group_id":7,"user_id":"player-42"}')
 local group = citadel.groups_call("player-42", "accept_invitation", '{"group_id":7}')
 ```
+
+
+---
+
+## citadel.metrics
+
+Trusted game logic can publish bounded node-local Prometheus metrics. The API
+contains exactly three calls and never accepts labels:
+
+```lua
+citadel.metrics.counter("matches_started", 1)
+citadel.metrics.gauge("queue_depth", 4)
+citadel.metrics.timer("match_tick", 0.016)
+```
+
+`counter(name, value)` adds a non-negative integer, `gauge(name, value)` sets a
+finite number, and `timer(name, seconds)` observes a finite, non-negative
+duration in seconds. Names must be concise lower-case ASCII identifiers using
+letters, digits, and underscores; they are emitted with the fixed
+`citadel_runtime_custom_` prefix. A name cannot change metric type. Invalid
+names, values, or type changes raise a runtime error. Scripts cannot attach
+player, session, room, match, ticket, or arbitrary label data.

@@ -176,6 +176,7 @@ mongodb = "3.8"
 # and disk collectors are enabled: no process list, users, network, or sensor
 # probing is needed for the status snapshot.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+prometheus-client = "0.25.0"
 
 [target.'cfg(windows)'.dependencies]
 # Scoped Win32 FFI for the supervised runtime worker (job objects, restrictive

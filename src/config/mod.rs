@@ -58,6 +58,8 @@ pub struct Config {
     pub http: HttpConfig,
     /// Logging and tracing settings.
     pub logging: LoggingConfig,
+    /// Prometheus scrape listener settings.
+    pub metrics: MetricsConfig,
     /// Local incident-journal retention settings.
     pub errors: ErrorJournalConfig,
     /// Realtime transport listener settings.
@@ -1519,6 +1521,48 @@ impl HttpTlsConfig {
     }
 }
 
+/// Prometheus scrape listener settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Enables the dedicated Prometheus scrape listener.
+    pub enabled: bool,
+    /// Socket address for the scrape listener.
+    pub bind: String,
+    /// Absolute scrape path served by the listener.
+    pub path: String,
+    /// Retained for forward-compatible configuration parsing; API keys are always required.
+    pub require_api_key_on_non_loopback: bool,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:9464".to_owned(),
+            path: "/metrics".to_owned(),
+            require_api_key_on_non_loopback: true,
+        }
+    }
+}
+
+impl MetricsConfig {
+    fn validate(&self) -> AppResult<()> {
+        validate_socket_addr("metrics.bind", &self.bind)?;
+        if self.path != "/metrics" {
+            return Err(AppError::config(
+                "metrics.path must be exactly /metrics so API-key authorization remains fixed and auditable",
+            ));
+        }
+        if self.enabled && !bind_is_loopback_only(&self.bind) {
+            return Err(AppError::config(
+                "metrics.bind must remain loopback-only until the dedicated listener supports TLS or a trusted proxy",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl HttpConfig {
     /// Whether [`Self::bind`] can only be reached from this host.
     #[must_use]
@@ -1982,6 +2026,7 @@ impl Config {
         self.database.validate()?;
         self.console.validate()?;
         self.http.tls.validate()?;
+        self.metrics.validate()?;
         self.validate_console_exposure()?;
         self.validate_http_exposure()?;
         Ok(())

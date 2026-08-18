@@ -33,11 +33,11 @@ use crate::runtime::{
     RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
     RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
     RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
-    RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
-    append_runtime_event_commands, bridge_event_json, bridge_input_outcome_from_json,
-    disabled_runtime_event_bus_handle, disabled_runtime_shared_cache_handle, runtime_event_bus,
-    runtime_shared_cache, script_command_from_outbound, set_runtime_event_bus,
-    set_runtime_shared_cache,
+    RuntimeIntrospection, RuntimeMetrics, RuntimeSharedCache, RuntimeSharedCacheHandle,
+    ScriptCommandBatch, append_runtime_event_commands, bridge_event_json,
+    bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
+    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
+    script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use citadel_physics::{PhysicsConfig, Shape};
@@ -135,6 +135,9 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "cache.set",
     "cache.delete",
     "cache.cas",
+    "metrics.counter",
+    "metrics.gauge",
+    "metrics.timer",
 ];
 
 /// The Python-side `citadel` module. Keeping this in Python avoids Rust-side
@@ -372,6 +375,23 @@ class _Cache:
             str(namespace), str(key), version, _bytes(value), int(ttl_ms)))
 
 cache = _Cache()
+
+class _Metrics:
+    def _bridge(self):
+        if "_metrics_bridge" not in globals():
+            raise RuntimeError("runtime metrics host not available")
+        return _metrics_bridge
+
+    def counter(self, name, value):
+        self._bridge().counter(str(name), int(value))
+
+    def gauge(self, name, value):
+        self._bridge().gauge(str(name), float(value))
+
+    def timer(self, name, seconds):
+        self._bridge().timer(str(name), float(seconds))
+
+metrics = _Metrics()
 
 def _push(command, body_len=0):
     global _total_bytes, _overflowed
@@ -886,6 +906,12 @@ struct RuntimeSharedCacheBridge {
     interceptor_mode: Arc<AtomicBool>,
 }
 
+/// Narrow Python bridge for the Rust-owned custom metrics registry.
+#[pyclass]
+struct RuntimeMetricsBridge {
+    metrics: Arc<RuntimeMetrics>,
+}
+
 /// Registration bridge that validates script declarations while keeping the
 /// authoritative endpoint snapshot outside the Python heap.
 #[pyclass]
@@ -1049,6 +1075,27 @@ fn outbound_http_state_to_python(
         _ => {}
     }
     Ok(result.unbind())
+}
+
+#[pymethods]
+impl RuntimeMetricsBridge {
+    fn counter(&self, name: &str, value: u64) -> PyResult<()> {
+        self.metrics
+            .counter(name, value)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn gauge(&self, name: &str, value: f64) -> PyResult<()> {
+        self.metrics
+            .gauge(name, value)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn timer(&self, name: &str, seconds: f64) -> PyResult<()> {
+        self.metrics
+            .timer(name, seconds)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
 }
 
 #[pymethods]
@@ -1646,6 +1693,8 @@ pub struct PythonRuntime {
     http_endpoint_policy: RuntimeHttpEndpointPolicy,
     event_bus_handle: RuntimeEventBusHandle,
     shared_cache_handle: RuntimeSharedCacheHandle,
+    /// Rust-owned custom metrics registry retained through source-only reloads.
+    runtime_metrics: Arc<RuntimeMetrics>,
     /// Persisted-domain-services seam exposed to `citadel.friends_*` host calls
     ///, or `None` when no services are attached. Retained so a
     /// hot-reload re-applies it to the fresh VM.
@@ -1734,6 +1783,7 @@ impl PythonRuntime {
         let static_data = StaticDataCatalog::new(static_data_dir, static_data_max_file_bytes)?;
         let event_bus_handle = disabled_runtime_event_bus_handle();
         let shared_cache_handle = disabled_runtime_shared_cache_handle();
+        let runtime_metrics = Arc::new(RuntimeMetrics::default());
         let vm = build_python(
             &source,
             &source_label,
@@ -1748,6 +1798,7 @@ impl PythonRuntime {
                 http_endpoint_policy,
                 event_bus_handle: Arc::clone(&event_bus_handle),
                 shared_cache_handle: Arc::clone(&shared_cache_handle),
+                runtime_metrics: Arc::clone(&runtime_metrics),
             },
         )?;
         Ok(Some(Self {
@@ -1761,6 +1812,7 @@ impl PythonRuntime {
             http_endpoint_policy,
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1779,6 +1831,7 @@ impl PythonRuntime {
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
         let event_bus_handle = disabled_runtime_event_bus_handle();
         let shared_cache_handle = disabled_runtime_shared_cache_handle();
+        let runtime_metrics = Arc::new(RuntimeMetrics::default());
         let vm = build_python(
             source,
             &source_label,
@@ -1793,6 +1846,7 @@ impl PythonRuntime {
                 http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
                 event_bus_handle: Arc::clone(&event_bus_handle),
                 shared_cache_handle: Arc::clone(&shared_cache_handle),
+                runtime_metrics: Arc::clone(&runtime_metrics),
             },
         )?;
         Ok(Self {
@@ -1806,6 +1860,7 @@ impl PythonRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1825,6 +1880,7 @@ impl PythonRuntime {
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
         let event_bus_handle = disabled_runtime_event_bus_handle();
         let shared_cache_handle = disabled_runtime_shared_cache_handle();
+        let runtime_metrics = Arc::new(RuntimeMetrics::default());
         let vm = build_python(
             source,
             &source_label,
@@ -1839,6 +1895,7 @@ impl PythonRuntime {
                 http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
                 event_bus_handle: Arc::clone(&event_bus_handle),
                 shared_cache_handle: Arc::clone(&shared_cache_handle),
+                runtime_metrics: Arc::clone(&runtime_metrics),
             },
         )?;
         Ok(Self {
@@ -1852,6 +1909,7 @@ impl PythonRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1891,6 +1949,22 @@ impl PythonRuntime {
     #[must_use]
     pub fn with_shared_cache(self, cache: Arc<RuntimeSharedCache>) -> Self {
         set_runtime_shared_cache(&self.shared_cache_handle, cache);
+        self
+    }
+
+    /// Attach the node-owned Rust metric registry and retain it across reloads.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<RuntimeMetrics>) -> Self {
+        self.runtime_metrics = metrics;
+        let guard = self.vm.lock().unwrap_or_else(|error| error.into_inner());
+        Python::attach(|py| {
+            if let Err(error) =
+                install_runtime_metrics(guard.citadel.bind(py), Arc::clone(&self.runtime_metrics))
+            {
+                tracing::error!(error = %error, "failed to attach Python runtime metrics bridge");
+            }
+        });
+        drop(guard);
         self
     }
 
@@ -1973,6 +2047,7 @@ impl PythonRuntime {
                 http_endpoint_policy: self.http_endpoint_policy,
                 event_bus_handle: Arc::clone(&self.event_bus_handle),
                 shared_cache_handle: Arc::clone(&self.shared_cache_handle),
+                runtime_metrics: Arc::clone(&self.runtime_metrics),
             },
         ) {
             Ok(vm) => vm,
@@ -2925,6 +3000,13 @@ fn install_http_endpoint_registration(
     )
 }
 
+fn install_runtime_metrics(
+    citadel: &Bound<'_, PyModule>,
+    metrics: Arc<RuntimeMetrics>,
+) -> PyResult<()> {
+    citadel.setattr("_metrics_bridge", RuntimeMetricsBridge { metrics })
+}
+
 fn install_runtime_events(
     citadel: &Bound<'_, PyModule>,
     event_bus_handle: RuntimeEventBusHandle,
@@ -2987,6 +3069,7 @@ struct PythonBuildOptions<'a> {
     http_endpoint_policy: RuntimeHttpEndpointPolicy,
     event_bus_handle: RuntimeEventBusHandle,
     shared_cache_handle: RuntimeSharedCacheHandle,
+    runtime_metrics: Arc<RuntimeMetrics>,
 }
 
 fn build_python(
@@ -3005,6 +3088,7 @@ fn build_python(
         http_endpoint_policy,
         event_bus_handle,
         shared_cache_handle,
+        runtime_metrics,
     } = options;
     let prelude = cstring(PYTHON_HOST_PRELUDE, "python host prelude")?;
     let source = cstring(source, "python source")?;
@@ -3039,6 +3123,7 @@ fn build_python(
             Arc::clone(&interceptor_mode),
             outbound_http_policy,
         )?;
+        install_runtime_metrics(&citadel, runtime_metrics)?;
         install_runtime_events(
             &citadel,
             Arc::clone(&event_bus_handle),

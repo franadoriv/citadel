@@ -34,11 +34,12 @@ use crate::runtime::{
     RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime, RuntimeEvent,
     RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
     RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
-    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
-    RuntimeSharedCacheHandle, ScriptCommandBatch, StorageWriteInput, append_runtime_event_commands,
-    bridge_event_json, bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
-    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
-    script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
+    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeMetrics,
+    RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch, StorageWriteInput,
+    append_runtime_event_commands, bridge_event_json, bridge_input_outcome_from_json,
+    disabled_runtime_event_bus_handle, disabled_runtime_shared_cache_handle, runtime_event_bus,
+    runtime_shared_cache, script_command_from_outbound, set_runtime_event_bus,
+    set_runtime_shared_cache,
 };
 use citadel_physics::{PhysicsConfig, Shape};
 
@@ -127,6 +128,9 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "cache.set",
     "cache.delete",
     "cache.cas",
+    "metrics.counter",
+    "metrics.gauge",
+    "metrics.timer",
 ];
 
 const JS_HOST_PRELUDE: &str = r#"
@@ -364,6 +368,26 @@ const JS_HOST_PRELUDE: &str = r#"
       bodyCommand("send", [toSessionString(session), Number(kind), body, Boolean(unreliable)], 2);
     },
     log,
+    metrics: {
+      counter(name, value) {
+        if (typeof globalThis.__citadel_metrics_counter !== "function") {
+          throw new Error("runtime metrics host not available");
+        }
+        globalThis.__citadel_metrics_counter(String(name), Number(value));
+      },
+      gauge(name, value) {
+        if (typeof globalThis.__citadel_metrics_gauge !== "function") {
+          throw new Error("runtime metrics host not available");
+        }
+        globalThis.__citadel_metrics_gauge(String(name), Number(value));
+      },
+      timer(name, seconds) {
+        if (typeof globalThis.__citadel_metrics_timer !== "function") {
+          throw new Error("runtime metrics host not available");
+        }
+        globalThis.__citadel_metrics_timer(String(name), Number(seconds));
+      },
+    },
     http: {
       fetch(url, opts) {
         if (globalThis.__citadel_realtime_interceptor) {
@@ -997,6 +1021,8 @@ pub struct JsRuntime {
     http_endpoint_policy: RuntimeHttpEndpointPolicy,
     event_bus_handle: RuntimeEventBusHandle,
     shared_cache_handle: RuntimeSharedCacheHandle,
+    /// Rust-owned custom metrics registry retained through source-only reloads.
+    runtime_metrics: Arc<RuntimeMetrics>,
     /// Persisted-domain-services seam exposed to `citadel.friends_*` host calls
     ///, or `None` when no services are attached. Retained so a
     /// reload re-applies it to the fresh context.
@@ -1088,6 +1114,7 @@ impl JsRuntime {
         let static_data = StaticDataCatalog::new(static_data_dir, static_data_max_file_bytes)?;
         let event_bus_handle = disabled_runtime_event_bus_handle();
         let shared_cache_handle = disabled_runtime_shared_cache_handle();
+        let runtime_metrics = Arc::new(RuntimeMetrics::default());
         let vm = build_js(
             &source,
             &source_label,
@@ -1099,6 +1126,7 @@ impl JsRuntime {
                 http_endpoint_policy,
                 event_bus_handle: Arc::clone(&event_bus_handle),
                 shared_cache_handle: Arc::clone(&shared_cache_handle),
+                runtime_metrics: Arc::clone(&runtime_metrics),
             },
         )?;
         Ok(Some(Self {
@@ -1112,6 +1140,7 @@ impl JsRuntime {
             http_endpoint_policy,
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1130,6 +1159,7 @@ impl JsRuntime {
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
         let event_bus_handle = disabled_runtime_event_bus_handle();
         let shared_cache_handle = disabled_runtime_shared_cache_handle();
+        let runtime_metrics = Arc::new(RuntimeMetrics::default());
         let vm = build_js(
             source,
             &source_label,
@@ -1141,6 +1171,7 @@ impl JsRuntime {
                 http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
                 event_bus_handle: Arc::clone(&event_bus_handle),
                 shared_cache_handle: Arc::clone(&shared_cache_handle),
+                runtime_metrics: Arc::clone(&runtime_metrics),
             },
         )?;
         Ok(Self {
@@ -1154,6 +1185,7 @@ impl JsRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1173,6 +1205,7 @@ impl JsRuntime {
             StaticDataCatalog::new(None, crate::runtime::DEFAULT_STATIC_DATA_MAX_FILE_BYTES)?;
         let event_bus_handle = disabled_runtime_event_bus_handle();
         let shared_cache_handle = disabled_runtime_shared_cache_handle();
+        let runtime_metrics = Arc::new(RuntimeMetrics::default());
         let vm = build_js(
             source,
             &source_label,
@@ -1184,6 +1217,7 @@ impl JsRuntime {
                 http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
                 event_bus_handle: Arc::clone(&event_bus_handle),
                 shared_cache_handle: Arc::clone(&shared_cache_handle),
+                runtime_metrics: Arc::clone(&runtime_metrics),
             },
         )?;
         Ok(Self {
@@ -1197,6 +1231,7 @@ impl JsRuntime {
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
             event_bus_handle,
             shared_cache_handle,
+            runtime_metrics,
             domain: None,
             maps: None,
             transform_hub: None,
@@ -1231,6 +1266,20 @@ impl JsRuntime {
     #[must_use]
     pub fn with_shared_cache(self, cache: Arc<RuntimeSharedCache>) -> Self {
         set_runtime_shared_cache(&self.shared_cache_handle, cache);
+        self
+    }
+
+    /// Attach the node-owned Rust metric registry and retain it across reloads.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<RuntimeMetrics>) -> Self {
+        self.runtime_metrics = metrics;
+        let guard = lock_mutex(&self.vm);
+        guard.context.with(|ctx| {
+            if let Err(error) = install_runtime_metrics(&ctx, Arc::clone(&self.runtime_metrics)) {
+                tracing::error!(error = %error, "failed to attach JavaScript runtime metrics bridge");
+            }
+        });
+        drop(guard);
         self
     }
 
@@ -1310,6 +1359,7 @@ impl JsRuntime {
                 http_endpoint_policy: self.http_endpoint_policy,
                 event_bus_handle: Arc::clone(&self.event_bus_handle),
                 shared_cache_handle: Arc::clone(&self.shared_cache_handle),
+                runtime_metrics: Arc::clone(&self.runtime_metrics),
             },
         ) {
             Ok(vm) => vm,
@@ -2551,6 +2601,49 @@ fn install_http_endpoint_registration(
     Ok(())
 }
 
+/// Install the Rust-owned custom metrics bridge.
+fn install_runtime_metrics(ctx: &Ctx<'_>, metrics: Arc<RuntimeMetrics>) -> JsHostResult<()> {
+    let counter_metrics = Arc::clone(&metrics);
+    let counter = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |_ctx: Ctx<'_>, name: String, value: u64| -> rquickjs::Result<()> {
+                counter_metrics.counter(&name, value).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("metrics", "counter", error.to_string())
+                })
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_metrics_counter", counter))?;
+    let gauge_metrics = Arc::clone(&metrics);
+    let gauge = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |_ctx: Ctx<'_>, name: String, value: f64| -> rquickjs::Result<()> {
+                gauge_metrics.gauge(&name, value).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("metrics", "gauge", error.to_string())
+                })
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_metrics_gauge", gauge))?;
+    let timer = caught(
+        ctx,
+        Function::new(
+            ctx.clone(),
+            move |_ctx: Ctx<'_>, name: String, seconds: f64| -> rquickjs::Result<()> {
+                metrics.timer(&name, seconds).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("metrics", "timer", error.to_string())
+                })
+            },
+        ),
+    )?;
+    caught(ctx, ctx.globals().set("__citadel_metrics_timer", timer))?;
+    Ok(())
+}
+
 /// Install the local event-bus bridge. JavaScript retains callbacks in its VM;
 /// Rust owns validation, queue bounds, and the node-local delivery snapshot.
 fn install_runtime_events(
@@ -2852,6 +2945,7 @@ struct JsBuildOptions<'a> {
     http_endpoint_policy: RuntimeHttpEndpointPolicy,
     event_bus_handle: RuntimeEventBusHandle,
     shared_cache_handle: RuntimeSharedCacheHandle,
+    runtime_metrics: Arc<RuntimeMetrics>,
 }
 
 fn build_js(
@@ -2867,6 +2961,7 @@ fn build_js(
         http_endpoint_policy,
         event_bus_handle,
         shared_cache_handle,
+        runtime_metrics,
     } = options;
     let module_root = module_root.map(canonical_esm_root).transpose()?;
     let module_paths = Arc::new(Mutex::new(BTreeSet::new()));
@@ -2904,6 +2999,7 @@ fn build_js(
                 &ctx,
                 ctx.eval_with_options::<(), _>(JS_HOST_PRELUDE.as_bytes().to_vec(), prelude_opts),
             )?;
+            install_runtime_metrics(&ctx, runtime_metrics)?;
             install_static_data(&ctx, static_data.clone())?;
             install_text_policy(&ctx, text_policy.clone())?;
             install_outbound_http(&ctx, Arc::clone(&interceptor_mode), outbound_http_policy)?;

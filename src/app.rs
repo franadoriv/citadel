@@ -18,7 +18,9 @@ use crate::error_journal::ErrorJournal;
 use crate::error_reporting;
 use crate::host_telemetry::{HostTelemetryService, HostTelemetrySnapshot};
 use crate::observability::NodeMetrics;
+use crate::prometheus::PrometheusMetrics;
 use crate::repository::{Backend, BackendKind, InMemoryBackend, select_backend};
+use crate::runtime::RuntimeMetrics;
 use crate::services::{
     ApiKeyService, AuditLog, AuthenticationRateLimitPolicy, AuthenticationService,
     AuthenticationServiceImpl, ChatAccessCoordinator, ChatRateLimitPolicy, ChatService,
@@ -51,6 +53,8 @@ pub struct App {
     config: Config,
     started_at: Instant,
     metrics: Arc<NodeMetrics>,
+    prometheus_metrics: Arc<PrometheusMetrics>,
+    runtime_metrics: Arc<RuntimeMetrics>,
     host_telemetry: Arc<HostTelemetryService>,
     backend: Arc<dyn Backend>,
     auth: Arc<dyn AuthenticationService>,
@@ -123,6 +127,8 @@ impl App {
             None
         };
         let metrics = Arc::new(NodeMetrics::new());
+        let prometheus_metrics = Arc::new(PrometheusMetrics::new());
+        let runtime_metrics = Arc::new(RuntimeMetrics::default());
         let sessions: SharedSessionService = Arc::new(InMemorySessionService::with_secure_issuer(
             backend.session_repository(),
         ));
@@ -171,6 +177,8 @@ impl App {
             config,
             started_at: Instant::now(),
             metrics,
+            prometheus_metrics,
+            runtime_metrics,
             host_telemetry: Arc::new(HostTelemetryService::new()),
             backend,
             auth,
@@ -302,6 +310,18 @@ impl App {
     #[must_use]
     pub fn metrics(&self) -> &Arc<NodeMetrics> {
         &self.metrics
+    }
+
+    /// The application-owned Prometheus registry used by the scrape listener.
+    #[must_use]
+    pub fn prometheus_metrics(&self) -> &Arc<PrometheusMetrics> {
+        &self.prometheus_metrics
+    }
+
+    /// Bounded custom metrics registered by trusted game logic.
+    #[must_use]
+    pub fn runtime_metrics(&self) -> &Arc<RuntimeMetrics> {
+        &self.runtime_metrics
     }
 
     /// Return host CPU, memory, and filesystem capacity telemetry.

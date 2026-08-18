@@ -51,6 +51,7 @@ pub mod http_endpoint;
 #[cfg(feature = "runtime-js")]
 pub mod js;
 pub mod lua;
+pub mod metrics;
 pub mod outbound_http;
 #[cfg(feature = "runtime-python")]
 pub mod python;
@@ -109,6 +110,9 @@ pub use js::{JS_ENTRYPOINT, JsRuntime};
 pub use lua::{
     DEFAULT_DEADLINE_MS, LifecycleHook, LuaRuntime, OutboundCommand, PhysicsOptions, ReloadOutcome,
     RoomSpec, RpcOutcome, RuntimeIntrospection,
+};
+pub use metrics::{
+    RuntimeMetricError, RuntimeMetricSnapshot, RuntimeMetrics, is_valid_runtime_metric_name,
 };
 #[cfg(feature = "runtime-python")]
 pub use python::PythonRuntime;

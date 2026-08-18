@@ -11,6 +11,7 @@ pub mod console_api;
 pub mod dashboard;
 pub mod error;
 mod headers;
+pub mod metrics;
 pub mod player;
 mod runtime_endpoint;
 pub mod tls;
@@ -37,6 +38,7 @@ pub use auth::{
 pub use console_api::{CONSOLE_API_PREFIX, LOGIN_PATH, ME_PATH, SECTION_PATHS};
 pub use dashboard::{DASHBOARD_PATH, NodeStatus, STATUS_PATH};
 pub use error::{ApiError, ErrorBody};
+pub use metrics::METRICS_PATH;
 pub use player::{ACCOUNT_PATH, PLAYER_LOOKUP_PATH, SESSION_LOGOUT_PATH, SESSION_REFRESH_PATH};
 
 /// Path for the liveness/health endpoint.
@@ -83,21 +85,88 @@ pub fn health_status_code(health: Health) -> StatusCode {
 
 /// Build the Citadel HTTP router with the given application as shared state.
 pub fn router(app: App) -> Router {
-    Router::new()
+    let router = Router::new()
         .route(HEALTH_PATH, get(health_handler))
         .route(STATUS_PATH, get(dashboard::status_handler))
         .route(DASHBOARD_PATH, get(console::console_handler))
         .merge(auth::routes())
         .merge(player::routes())
         .merge(console_api::routes())
-        .merge(runtime_endpoint::routes())
-        // Applied last so it wraps every route above, including the console SPA
-        // and the 404 fallback.
+        .merge(runtime_endpoint::routes());
+    // Applied last so it wraps every route above, including the console SPA
+    // and the 404 fallback.
+    router
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
             headers::apply,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            metrics::observe_public_http,
+        ))
         .with_state(app)
+}
+
+/// Build the dedicated Prometheus scrape router.
+///
+/// It is intentionally separate from the game and console HTTP surface. The
+/// listener is only bound when `[metrics].enabled` is set; every request uses
+/// the existing API-key authorization boundary and requires `telemetry:read`.
+pub fn metrics_router(app: App) -> Router {
+    Router::new()
+        .route(METRICS_PATH, get(metrics::get_handler))
+        .with_state(app)
+}
+
+/// Bind the dedicated Prometheus scrape listener.
+pub async fn bind_metrics(app: &App) -> AppResult<TcpListener> {
+    let bind = &app.config().metrics.bind;
+    // App constructors intentionally accept resolved configuration for tests and
+    // embedders. Reassert the transport security invariant at the side-effecting
+    // bind boundary so an unvalidated Config can never expose plaintext scrapes.
+    if !crate::config::bind_is_loopback_only(bind) {
+        return Err(AppError::config(
+            "metrics.bind must remain loopback-only until the dedicated listener supports TLS or a trusted proxy",
+        ));
+    }
+    let addr: SocketAddr = bind.parse().map_err(|e: std::net::AddrParseError| {
+        AppError::config(format!(
+            "metrics.bind is not a valid socket address: {bind}"
+        ))
+        .with_detail(e.to_string())
+    })?;
+    TcpListener::bind(addr).await.map_err(|e| {
+        AppError::new(
+            crate::error::ErrorCategory::Transport,
+            format!("failed to bind Prometheus listener on {bind}"),
+        )
+        .with_detail(e.to_string())
+    })
+}
+
+/// Serve Prometheus scrapes until the shared cancellation token is cancelled.
+pub async fn serve_metrics(
+    listener: TcpListener,
+    app: App,
+    cancel: crate::lifecycle::CancellationToken,
+) -> AppResult<()> {
+    let api_keys = Arc::clone(app.api_keys());
+    let serve_result = axum::serve(
+        listener,
+        metrics_router(app).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { cancel.cancelled().await })
+    .await
+    .map_err(|e| {
+        AppError::new(
+            crate::error::ErrorCategory::Transport,
+            "Prometheus listener terminated with an error",
+        )
+        .with_detail(e.to_string())
+    });
+    let flush_result = api_keys.flush_last_used().await;
+    serve_result?;
+    flush_result
 }
 
 /// Health endpoint handler: a thin adapter over application health.
@@ -232,6 +301,11 @@ pub async fn shutdown_signal() {
 /// and joins the transports. The binary stays thin by delegating here.
 pub async fn run(app: App) -> AppResult<()> {
     let listener = bind(&app).await?;
+    let metrics_listener = if app.config().metrics.enabled {
+        Some(bind_metrics(&app).await?)
+    } else {
+        None
+    };
     let local_addr = listener.local_addr().map_err(|e| {
         AppError::new(
             crate::error::ErrorCategory::Transport,
@@ -252,6 +326,11 @@ pub async fn run(app: App) -> AppResult<()> {
     // they stop together with the HTTP server.
     let cancel = crate::lifecycle::CancellationToken::new();
     let mut transports = crate::transport::start_enabled(&app, cancel.clone()).await?;
+    let metrics_task = metrics_listener.map(|listener| {
+        let metrics_app = app.clone();
+        let metrics_cancel = cancel.clone();
+        tokio::spawn(async move { serve_metrics(listener, metrics_app, metrics_cancel).await })
+    });
     // Deferred writes are a separately supervised service: normal repository
     // calls remain synchronous and never pass through this worker.
     if let Some(writer) = app.deferred_storage() {
@@ -276,7 +355,17 @@ pub async fn run(app: App) -> AppResult<()> {
     // Ensure transports are signalled and joined regardless of the HTTP result.
     cancel.cancel();
     let transport_result = transports.shutdown().await;
-    http_result.and(transport_result)
+    let metrics_result = match metrics_task {
+        Some(task) => task.await.map_err(|error| {
+            AppError::new(
+                crate::error::ErrorCategory::Internal,
+                "Prometheus listener task failed",
+            )
+            .with_detail(error.to_string())
+        })?,
+        None => Ok(()),
+    };
+    http_result.and(transport_result).and(metrics_result)
 }
 
 #[cfg(test)]

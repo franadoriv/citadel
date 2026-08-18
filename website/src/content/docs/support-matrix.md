@@ -298,7 +298,7 @@ language columns show which embedded game-logic runtimes expose it.
 | Friends, groups, leaderboards, chat, wallet, notifications host APIs | — | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Before/after API and realtime interception hooks | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Matchmaker callbacks, leaderboard/tournament reset callbacks | 🟡 | 🟡 | 🟡 | 🟡 | ⬜ | ⬜ |
-| Runtime outbound HTTP, custom HTTP endpoints, events, shared cache | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
+| Runtime outbound HTTP, custom HTTP endpoints, events, shared cache, metrics | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Dashboard and authenticated operator API | ✅ | — | — | — | — | — |
 | Console MFA, user lifecycle, password reset, ACL templates | ⬜ | — | — | — | — | — |
 | Cluster discovery, load balancing, generalized node routing | ⬜ | — | — | — | — | — |
@@ -317,7 +317,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Friends, groups, leaderboards, chat, wallet, notifications host APIs** — Friends/notifications have direct functions; remaining domain calls use validated bridges.
 - **Before/after API and realtime interception hooks** — Post-handshake before hooks can veto eligible envelopes; after hooks observe the synchronous local delivery outcome without mutation or side effects.
 - **Matchmaker callbacks, leaderboard/tournament reset callbacks** — A durable, supervised leaderboard-reset scheduler delivers on_leaderboard_reset to Lua, Python, and JavaScript under fenced backend leases; matchmaker matched callbacks and tournament-reset callbacks are not shipped.
-- **Runtime outbound HTTP, custom HTTP endpoints, events, shared cache** — Trusted Lua, Python, and JavaScript expose Rust-owned asynchronous http.start/poll/cancel with explicit egress policy, DNS rebinding defenses, and shared rate/concurrency limits. They can also register bounded endpoints under /ext when enabled, use opt-in best-effort events, and share an opt-in non-durable cache with fenced cluster fan-out.
+- **Runtime outbound HTTP, custom HTTP endpoints, events, shared cache, metrics** — Trusted Lua, Python, and JavaScript expose Rust-owned asynchronous http.start/poll/cancel with explicit egress policy, DNS rebinding defenses, and shared rate/concurrency limits. They can also register bounded endpoints under /ext when enabled, use opt-in best-effort events, share an opt-in non-durable cache with fenced cluster fan-out, and publish bounded node-local counter, gauge, and timer metrics without labels.
 - **Dashboard and authenticated operator API** — Accounts, storage, groups, chat, notifications, leaderboards, matches, runtime, config, purchases, audit, and the error journal.
 - **Console MFA, user lifecycle, password reset, ACL templates** — Operator authentication roles ship; these advanced controls do not.
 - **Cluster discovery, load balancing, generalized node routing** — Ownership and fencing groundwork is not a deployable cluster product.

@@ -1,0 +1,59 @@
+---
+title: Prometheus telemetry
+description: Securely scrape bounded Citadel node metrics.
+---
+
+Citadel exposes Prometheus metrics through a dedicated listener. It is disabled
+by default and is deliberately separate from the game and console HTTP listener.
+
+## Enable a local scrape listener
+
+```toml
+[metrics]
+enabled = true
+bind = "127.0.0.1:9464"
+path = "/metrics"
+```
+
+The listener currently accepts **loopback binds only**. Citadel refuses a
+non-loopback `metrics.bind` until the dedicated listener has its own TLS or
+trusted-proxy configuration. Do not tunnel the listener to an untrusted network.
+
+Every scrape requires an existing API key whose only necessary scope is
+`telemetry:read`:
+
+```sh
+curl -H "Authorization: Bearer $CITADEL_TELEMETRY_API_KEY" \
+  http://127.0.0.1:9464/metrics
+```
+
+Citadel rejects player session tokens and console bearer tokens at this endpoint.
+Treat the telemetry API key as a secret: do not place it in a dashboard URL,
+source tree, metric label, or log output.
+
+## Metric catalog and cardinality
+
+The exporter emits node-local state and event metrics with a `citadel_` prefix.
+Names, units, and labels are fixed by the server; Citadel never emits user,
+account, session, room, match, ticket, request path, raw URL, query, exception,
+or secret values as labels.
+
+Representative series:
+
+- `citadel_http_requests_total` — monotonically increasing requests served.
+- `citadel_realtime_connections_active` — currently open realtime connections.
+- `citadel_metrics_scrape_duration_seconds` — fixed-bucket histogram for scrape
+  generation latency.
+- `citadel_runtime_custom_*` — bounded game-runtime metrics; these are emitted
+  only through the trusted runtime metrics API and cannot create arbitrary labels.
+
+The `/status` JSON endpoint remains unchanged. Prometheus data is in-process and
+is never persisted to the application database.
+
+## Starter Grafana queries
+
+Use `rate(citadel_http_requests_total[5m])` for HTTP request throughput,
+`citadel_realtime_connections_active` for concurrent realtime connections, and
+`histogram_quantile(0.95, sum by (le) (rate(citadel_metrics_scrape_duration_seconds_bucket[5m])))`
+for scrape latency. Keep Grafana variables bounded to known deployment metadata;
+do not derive variables from player or room identifiers.

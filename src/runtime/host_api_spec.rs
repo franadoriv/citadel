@@ -54,6 +54,8 @@ pub enum HostApiCategory {
     Http,
     /// Local best-effort runtime event publication and subscription.
     Event,
+    /// Bounded custom metric emission for trusted game logic.
+    Metrics,
     /// Read-only loaded-map query.
     Map,
     /// Server-authoritative navigation query over a loaded map's baked mesh.
@@ -594,6 +596,30 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         returns: "handler:function",
         status: HostApiStatus::Shipped,
         since: "TASK-0417",
+    },
+    HostApiFn {
+        name: "metrics.counter",
+        category: HostApiCategory::Metrics,
+        params: &["name:string", "value:u64"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "IMPL-20260818-RUNTIME-CUSTOM-METRICS",
+    },
+    HostApiFn {
+        name: "metrics.gauge",
+        category: HostApiCategory::Metrics,
+        params: &["name:string", "value:f64"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "IMPL-20260818-RUNTIME-CUSTOM-METRICS",
+    },
+    HostApiFn {
+        name: "metrics.timer",
+        category: HostApiCategory::Metrics,
+        params: &["name:string", "seconds:f64"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "IMPL-20260818-RUNTIME-CUSTOM-METRICS",
     },
     HostApiFn {
         name: "cache.get",
