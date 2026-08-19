@@ -129,6 +129,30 @@ allowed_ports = [80, 443]
 # Only enable for an operator-controlled private integration.
 allow_private_networks = false
 
+# Server-owned receipt-validation egress. The only enabled validator is custom
+# development receipts; Apple, Google, and Huawei remain disabled until their
+# dedicated verified adapters ship. credential_env names an environment variable
+# but never places its secret value in TOML or configuration output.
+[purchases]
+max_receipt_bytes = 65536
+max_concurrent_requests = 16
+max_requests_per_minute = 120
+timeout_ms = 5000
+max_retries = 2
+allowed_hosts = ["api.storekit.itunes.apple.com", "androidpublisher.googleapis.com"]
+
+[purchases.apple]
+enabled = false
+# credential_env = "CITADEL_APPLE_PRIVATE_KEY"
+
+[purchases.google]
+enabled = false
+# credential_env = "CITADEL_GOOGLE_SERVICE_ACCOUNT_JSON"
+
+[purchases.huawei]
+enabled = false
+# credential_env = "CITADEL_HUAWEI_CLIENT_SECRET"
+
 # Secure chat fixed-window policies. Every value must be positive; limits are
 # shared by nodes that use the same durable database.
 [chat.limits]
@@ -576,6 +600,30 @@ aggregate header bytes, five-second wall-clock deadline, and 128 retained or
 outstanding async handles per runtime. Network/runtime results returned by
 `poll` use stable, redacted `error_code` values. Local language argument or
 option validation can instead raise a language-visible validation message.
+
+### `[purchases]`
+
+Server-owned receipt-validation policy. This foundation never gives a game
+runtime a provider credential, a raw socket, or a way to bypass the configured
+HTTPS hosts. It applies a receipt-size cap before provider dispatch, blocks
+redirects/proxies/private-network targets through the shared client, records
+aggregate-only validation metrics, and exposes only sanitized failures.
+
+All real providers are intentionally disabled in this release. Setting
+`apple.enabled`, `google.enabled`, or `huawei.enabled` to `true` is a config
+error until that provider's verified adapter lands. The custom deterministic
+validator remains available for local prototypes and console tests.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `max_receipt_bytes` | integer | `65536` | Raw receipt cap before parsing or egress; must be `1..=1048576`. |
+| `max_concurrent_requests` | integer | `16` | Server-owned simultaneous provider request bound; must be `1..=1024`. |
+| `max_requests_per_minute` | integer | `120` | Server-owned rolling 60-second provider request bound; must be `1..=1000000`. |
+| `timeout_ms` | integer | `5000` | Per-provider request deadline; must be `1..=60000`. |
+| `max_retries` | integer | `2` | Reserved retry budget for future explicitly idempotent provider operations; `0..=3`. This foundation never retries arbitrary POSTs. |
+| `allowed_hosts` | hostname array | Apple/Google endpoints | Exact public DNS host allowlist; required, at most 16 entries. HTTPS port 443 only. |
+| `apple.enabled`, `google.enabled`, `huawei.enabled` | bool | `false` | Rejected if `true` until each provider adapter ships. |
+| `*.credential_env` | optional string | unset | Environment-variable **name** for a future provider credential; no credential value is accepted in TOML. |
 
 Restart the node after changing this policy. Validate the exact
 `citadel.toml` before deployment:

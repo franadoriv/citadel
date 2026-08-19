@@ -81,6 +81,143 @@ pub struct Config {
     /// Public HTTP authentication abuse controls. This is distinct from
     /// `transport.auth`, which configures realtime handshake behavior.
     pub authentication: AuthenticationAbuseConfig,
+    /// Server-owned production receipt-validation policy. Provider credentials
+    /// are referenced by environment-variable name, never stored in this config.
+    pub purchases: PurchaseValidationConfig,
+}
+
+/// Receipt-validation policy owned by the server rather than game runtimes.
+///
+/// Real store providers deliberately default disabled. Their implementation
+/// tasks must provide fixtures and provider-specific verification before an
+/// operator can enable them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PurchaseValidationConfig {
+    /// Maximum raw receipt bytes accepted at the validation boundary.
+    pub max_receipt_bytes: usize,
+    /// Maximum simultaneous provider HTTP requests.
+    pub max_concurrent_requests: u32,
+    /// Maximum provider HTTP requests per minute on this node.
+    pub max_requests_per_minute: u32,
+    /// Per-provider request deadline in milliseconds.
+    pub timeout_ms: u64,
+    /// Maximum retry attempts reserved for idempotent provider operations.
+    pub max_retries: u8,
+    /// Exact provider DNS names permitted for receipt-validation egress.
+    pub allowed_hosts: Vec<String>,
+    /// Apple provider configuration (disabled until Apple JWS ships).
+    pub apple: ReceiptProviderConfig,
+    /// Google provider configuration (disabled until Google Play ships).
+    pub google: ReceiptProviderConfig,
+    /// Huawei provider configuration (disabled until its implementation ships).
+    pub huawei: ReceiptProviderConfig,
+}
+
+impl Default for PurchaseValidationConfig {
+    fn default() -> Self {
+        Self {
+            max_receipt_bytes: 64 * 1024,
+            max_concurrent_requests: 16,
+            max_requests_per_minute: 120,
+            timeout_ms: 5_000,
+            max_retries: 2,
+            allowed_hosts: vec![
+                "api.storekit.itunes.apple.com".to_string(),
+                "androidpublisher.googleapis.com".to_string(),
+            ],
+            apple: ReceiptProviderConfig::default(),
+            google: ReceiptProviderConfig::default(),
+            huawei: ReceiptProviderConfig::default(),
+        }
+    }
+}
+
+/// One store provider's non-secret bootstrap configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReceiptProviderConfig {
+    /// Provider activation remains false until its verified adapter ships.
+    pub enabled: bool,
+    /// Name of an environment variable containing the provider secret. The
+    /// secret value itself is never accepted in TOML or emitted in diagnostics.
+    pub credential_env: Option<String>,
+}
+
+impl PurchaseValidationConfig {
+    const MAX_RECEIPT_BYTES: usize = 1024 * 1024;
+    const MAX_CONCURRENT_REQUESTS: u32 = 1_024;
+    const MAX_REQUESTS_PER_MINUTE: u32 = 1_000_000;
+    const MAX_TIMEOUT_MS: u64 = 60_000;
+
+    fn validate(&self) -> AppResult<()> {
+        if self.max_receipt_bytes == 0 || self.max_receipt_bytes > Self::MAX_RECEIPT_BYTES {
+            return Err(AppError::config(format!(
+                "purchases.max_receipt_bytes must be between 1 and {}",
+                Self::MAX_RECEIPT_BYTES
+            )));
+        }
+        if self.max_concurrent_requests == 0
+            || self.max_concurrent_requests > Self::MAX_CONCURRENT_REQUESTS
+        {
+            return Err(AppError::config(format!(
+                "purchases.max_concurrent_requests must be between 1 and {}",
+                Self::MAX_CONCURRENT_REQUESTS
+            )));
+        }
+        if self.max_requests_per_minute == 0
+            || self.max_requests_per_minute > Self::MAX_REQUESTS_PER_MINUTE
+        {
+            return Err(AppError::config(format!(
+                "purchases.max_requests_per_minute must be between 1 and {}",
+                Self::MAX_REQUESTS_PER_MINUTE
+            )));
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > Self::MAX_TIMEOUT_MS {
+            return Err(AppError::config(format!(
+                "purchases.timeout_ms must be between 1 and {}",
+                Self::MAX_TIMEOUT_MS
+            )));
+        }
+        if self.max_retries > 3 {
+            return Err(AppError::config(
+                "purchases.max_retries must be between 0 and 3",
+            ));
+        }
+        if self.allowed_hosts.is_empty() || self.allowed_hosts.len() > 16 {
+            return Err(AppError::config(
+                "purchases.allowed_hosts must contain between 1 and 16 hostnames",
+            ));
+        }
+        for host in &self.allowed_hosts {
+            if !RuntimeConfig::is_valid_outbound_http_hostname(host) {
+                return Err(AppError::config(format!(
+                    "purchases.allowed_hosts contains invalid hostname '{host}'"
+                )));
+            }
+        }
+        for (name, provider) in [
+            ("apple", &self.apple),
+            ("google", &self.google),
+            ("huawei", &self.huawei),
+        ] {
+            if provider.enabled {
+                return Err(AppError::config(format!(
+                    "purchases.{name}.enabled is unavailable until its provider adapter ships",
+                )));
+            }
+            if provider
+                .credential_env
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(AppError::config(format!(
+                    "purchases.{name}.credential_env must not be empty when set",
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Authentication-specific abuse-control configuration.
@@ -2073,6 +2210,7 @@ impl Config {
             return Err(AppError::config("logging.level must not be empty"));
         }
         self.errors.validate()?;
+        self.purchases.validate()?;
         self.cluster
             .validate(&self.server.node_id, &self.database)?;
         self.transport.tls.validate()?;
@@ -2602,6 +2740,32 @@ mod tests {
         let serialized = toml::to_string(&original).expect("serialize");
         let parsed: Config = toml::from_str(&serialized).expect("deserialize");
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn purchase_validation_defaults_disable_real_providers_and_reject_early_enablement() {
+        let config = Config::default();
+        assert!(!config.purchases.apple.enabled);
+        assert!(!config.purchases.google.enabled);
+        assert!(!config.purchases.huawei.enabled);
+        assert_eq!(config.purchases.allowed_hosts.len(), 2);
+        assert_eq!(config.purchases.max_retries, 2);
+        assert!(config.validate().is_ok());
+
+        let mut excessive_retries = config.clone();
+        excessive_retries.purchases.max_retries = 4;
+        let error = excessive_retries
+            .validate()
+            .expect_err("retry budget must remain bounded");
+        assert!(error.message().contains("purchases.max_retries"));
+
+        let mut enabled = config;
+        enabled.purchases.apple.enabled = true;
+        let error = enabled
+            .validate()
+            .expect_err("an unimplemented real-store adapter must not be enabled");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+        assert!(error.message().contains("purchases.apple.enabled"));
     }
 
     #[test]

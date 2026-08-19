@@ -9,12 +9,11 @@
 //! Postgres and SQLite backends (the in-memory backend stays non-durable by
 //! design).
 //!
-//! Only the deterministic [`DevReceiptValidator`] ships today: it parses a JSON
-//! "receipt" (`{"transaction_id", "product_id", "subscription_expiry_unix_ms"?}`)
-//! with no network calls, which keeps validation honest for prototyping and
-//! tests. Real App Store / Google Play validators are explicit follow-up work
-//! (they require outbound HTTPS and store credentials) — see the follow-up task
-//! filed by  and the technical-debt register.
+//! The assembled node uses [`CompositeReceiptValidator`]: only the deterministic
+//! custom development validator is enabled today, while Apple, Google, and Huawei
+//! adapters fail closed until their dedicated verified tasks ship. The custom
+//! validator parses a JSON receipt with no network calls, keeping local
+//! prototyping/tests honest without claiming real-store validation.
 //!
 //! Invariants: a `transaction_id` is recorded at most once (a replayed receipt is
 //! a `Conflict`, enforced by the repository's primary key), and the raw receipt
@@ -27,12 +26,19 @@
 //! console/HTTP consumers keep their `crate::services::…` paths.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::config::PurchaseValidationConfig;
 use crate::error::{AppError, AppResult};
+use crate::observability::NodeMetrics;
 use crate::repository::PurchasesRepository;
+use crate::runtime::outbound_http::{
+    OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpResponse, TrustedHttpClient,
+};
 use crate::time::TimestampMillis;
 
 // Persistence value types live in the repository module; re-exported so
@@ -55,12 +61,177 @@ pub struct ValidatedReceipt {
 ///
 /// Implementations must be deterministic w.r.t. their inputs and must not
 /// panic on hostile receipts — validation failure is a `Validation` error.
+#[async_trait]
 pub trait ReceiptValidator: Send + Sync {
     /// Validate `receipt` for `store`, extracting the purchase facts.
     ///
     /// # Errors
-    /// `Validation` when the receipt is malformed or fails verification.
-    fn validate(&self, store: PurchaseStore, receipt: &str) -> AppResult<ValidatedReceipt>;
+    /// Returns a sanitized typed error when the receipt is malformed, its
+    /// provider is disabled, or remote validation cannot complete.
+    async fn validate(&self, store: PurchaseStore, receipt: &str) -> AppResult<ValidatedReceipt>;
+}
+
+/// Stable, sanitized receipt-validation outcomes for logs and metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptValidationErrorCode {
+    PayloadTooLarge,
+    HttpsRequired,
+    ProviderDisabled,
+    ProviderUnavailable,
+    ProviderTimedOut,
+}
+
+impl ReceiptValidationErrorCode {
+    /// Stable lowercase label; never contains provider payloads or credentials.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::HttpsRequired => "https_required",
+            Self::ProviderDisabled => "provider_disabled",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderTimedOut => "provider_timed_out",
+        }
+    }
+
+    fn app_error(self) -> AppError {
+        match self {
+            Self::PayloadTooLarge => {
+                AppError::validation("receipt validation payload is too large")
+            }
+            Self::HttpsRequired => AppError::validation("receipt validation requires HTTPS"),
+            Self::ProviderDisabled => {
+                AppError::permission("receipt validation provider is disabled")
+            }
+            Self::ProviderUnavailable => AppError::new(
+                crate::error::ErrorCategory::Transport,
+                "receipt validation provider is unavailable",
+            ),
+            Self::ProviderTimedOut => AppError::new(
+                crate::error::ErrorCategory::Deadline,
+                "receipt validation provider timed out",
+            ),
+        }
+    }
+}
+
+/// Server-owned HTTP boundary reserved for future real receipt providers.
+///
+/// It reuses Citadel's bounded Rust-owned HTTPS client: no runtime receives its
+/// credentials or a socket, redirects and proxies stay disabled, DNS rebinding
+/// is fenced, and both concurrency and request rate are limited.
+#[derive(Clone, Debug)]
+pub struct ReceiptValidationHttpClient {
+    client: TrustedHttpClient,
+    timeout: Duration,
+    // Provider adapters may retry only explicitly idempotent operations within
+    // this small policy budget; the foundation does not retry arbitrary POSTs.
+    _max_retries: u8,
+    metrics: Arc<NodeMetrics>,
+}
+
+impl ReceiptValidationHttpClient {
+    /// Build from the validated non-secret purchase policy.
+    #[must_use]
+    pub fn from_config(config: &PurchaseValidationConfig, metrics: Arc<NodeMetrics>) -> Self {
+        let policy = OutboundHttpPolicy {
+            enabled: true,
+            max_concurrent_requests: config.max_concurrent_requests,
+            max_requests_per_minute: config.max_requests_per_minute,
+            allowed_hosts: config.allowed_hosts.clone(),
+            allowed_ports: vec![443],
+            allow_private_networks: false,
+        };
+        let client = TrustedHttpClient::new_with_policy(policy)
+            .expect("validated purchase policy builds a bounded HTTP client");
+        Self {
+            client,
+            timeout: Duration::from_millis(config.timeout_ms),
+            _max_retries: config.max_retries,
+            metrics,
+        }
+    }
+
+    /// Execute one provider request under the shared bounded egress policy.
+    ///
+    /// Provider adapters call this method rather than constructing a networking
+    /// client themselves. Transport internals are deliberately collapsed into a
+    /// small redacted error taxonomy.
+    pub async fn execute(&self, request: OutboundHttpRequest) -> AppResult<OutboundHttpResponse> {
+        self.metrics.record_purchase_validation_request();
+        if !request.url.starts_with("https://") {
+            self.metrics.record_purchase_validation_failure();
+            return Err(ReceiptValidationErrorCode::HttpsRequired.app_error());
+        }
+        match tokio::time::timeout(self.timeout, self.client.execute(request)).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_error)) => {
+                self.metrics.record_purchase_validation_failure();
+                Err(ReceiptValidationErrorCode::ProviderUnavailable.app_error())
+            }
+            Err(_) => {
+                self.metrics.record_purchase_validation_failure();
+                Err(ReceiptValidationErrorCode::ProviderTimedOut.app_error())
+            }
+        }
+    }
+}
+
+/// Composite provider boundary. Real providers remain absent until their own
+/// verified implementation tasks install adapters; the custom dev path remains
+/// available for local prototypes and tests.
+#[derive(Clone)]
+pub struct CompositeReceiptValidator {
+    max_receipt_bytes: usize,
+    custom: Arc<dyn ReceiptValidator>,
+    apple: Option<Arc<dyn ReceiptValidator>>,
+    google: Option<Arc<dyn ReceiptValidator>>,
+    huawei: Option<Arc<dyn ReceiptValidator>>,
+    _http: ReceiptValidationHttpClient,
+}
+
+impl std::fmt::Debug for CompositeReceiptValidator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompositeReceiptValidator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CompositeReceiptValidator {
+    /// Assemble the default-safe provider set from configuration.
+    #[must_use]
+    pub fn from_config(config: &PurchaseValidationConfig, metrics: Arc<NodeMetrics>) -> Self {
+        Self {
+            max_receipt_bytes: config.max_receipt_bytes,
+            custom: Arc::new(DevReceiptValidator),
+            apple: None,
+            google: None,
+            huawei: None,
+            _http: ReceiptValidationHttpClient::from_config(config, metrics),
+        }
+    }
+
+    fn provider(&self, store: PurchaseStore) -> Option<&Arc<dyn ReceiptValidator>> {
+        match store {
+            PurchaseStore::Custom => Some(&self.custom),
+            PurchaseStore::Apple => self.apple.as_ref(),
+            PurchaseStore::Google => self.google.as_ref(),
+            PurchaseStore::Huawei => self.huawei.as_ref(),
+        }
+    }
+}
+
+#[async_trait]
+impl ReceiptValidator for CompositeReceiptValidator {
+    async fn validate(&self, store: PurchaseStore, receipt: &str) -> AppResult<ValidatedReceipt> {
+        if receipt.len() > self.max_receipt_bytes {
+            return Err(ReceiptValidationErrorCode::PayloadTooLarge.app_error());
+        }
+        let Some(provider) = self.provider(store) else {
+            return Err(ReceiptValidationErrorCode::ProviderDisabled.app_error());
+        };
+        provider.validate(store, receipt).await
+    }
 }
 
 /// The deterministic development validator: the "receipt" is a JSON document.
@@ -81,11 +252,11 @@ struct DevReceipt {
     subscription_expiry_unix_ms: Option<u64>,
 }
 
+#[async_trait]
 impl ReceiptValidator for DevReceiptValidator {
-    fn validate(&self, _store: PurchaseStore, receipt: &str) -> AppResult<ValidatedReceipt> {
-        let parsed: DevReceipt = serde_json::from_str(receipt).map_err(|e| {
-            AppError::validation("receipt failed validation").with_detail(e.to_string())
-        })?;
+    async fn validate(&self, _store: PurchaseStore, receipt: &str) -> AppResult<ValidatedReceipt> {
+        let parsed: DevReceipt = serde_json::from_str(receipt)
+            .map_err(|_| AppError::validation("receipt failed validation"))?;
         if parsed.transaction_id.trim().is_empty() || parsed.product_id.trim().is_empty() {
             return Err(AppError::validation(
                 "receipt failed validation: transaction_id and product_id are required",
@@ -114,11 +285,18 @@ impl std::fmt::Debug for PurchaseService {
 }
 
 impl PurchaseService {
-    /// Create a store over a purchases repository (from the selected backend)
-    /// using the default [`DevReceiptValidator`].
+    /// Create a store over a purchases repository with the fail-closed default
+    /// provider set. Only custom development receipts are accepted until a real
+    /// store adapter is installed by its dedicated implementation task.
     #[must_use]
     pub fn new(repo: Arc<dyn PurchasesRepository>) -> Self {
-        Self::with_validator(repo, Arc::new(DevReceiptValidator))
+        Self::with_validator(
+            repo,
+            Arc::new(CompositeReceiptValidator::from_config(
+                &PurchaseValidationConfig::default(),
+                Arc::new(NodeMetrics::new()),
+            )),
+        )
     }
 
     /// Create a store over an explicit validator (tests may inject one).
@@ -143,7 +321,7 @@ impl PurchaseService {
         receipt: &str,
         now: TimestampMillis,
     ) -> AppResult<Purchase> {
-        let validated = self.validator.validate(store, receipt)?;
+        let validated = self.validator.validate(store, receipt).await?;
         let purchase = Purchase {
             transaction_id: validated.transaction_id,
             user_id: user_id.to_string(),
@@ -200,10 +378,26 @@ fn sha256_hex(receipt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use crate::repository::InMemoryPurchasesRepository;
 
     fn service() -> PurchaseService {
         PurchaseService::new(Arc::new(InMemoryPurchasesRepository::new()))
+    }
+
+    fn dev_service() -> PurchaseService {
+        PurchaseService::with_validator(
+            Arc::new(InMemoryPurchasesRepository::new()),
+            Arc::new(DevReceiptValidator),
+        )
+    }
+
+    fn composite() -> CompositeReceiptValidator {
+        CompositeReceiptValidator::from_config(
+            &PurchaseValidationConfig::default(),
+            Arc::new(NodeMetrics::new()),
+        )
     }
 
     fn ts(v: u64) -> TimestampMillis {
@@ -272,6 +466,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_dev_receipts_do_not_retain_attacker_controlled_parse_detail() {
+        let error = DevReceiptValidator
+            .validate(
+                PurchaseStore::Custom,
+                r#"{"transaction_id":"tx","product_id":"gold","receipt_canary":"secret"}"#,
+            )
+            .await
+            .expect_err("unknown fields must fail validation");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Validation);
+        assert_eq!(
+            error.log_detail(),
+            None,
+            "receipt parse detail must stay redacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn purchase_service_default_rejects_real_store_labeled_dev_json() {
+        let error = service()
+            .validate_and_record(
+                "u-1",
+                PurchaseStore::Google,
+                &receipt("tx-google", "gold", None),
+                ts(1),
+            )
+            .await
+            .expect_err("the default constructor must not claim Google validation");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Permission);
+        assert_eq!(error.message(), "receipt validation provider is disabled");
+    }
+
+    #[tokio::test]
     async fn listing_filters_by_user_newest_first() {
         let service = service();
         for (n, user) in [(1, "u-1"), (2, "u-2"), (3, "u-1")] {
@@ -291,8 +517,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_store_providers_are_disabled_by_default_but_custom_dev_receipts_work() {
+        let validator = composite();
+
+        let error = validator
+            .validate(
+                PurchaseStore::Apple,
+                r#"{"transaction_id":"tx-1","product_id":"gold"}"#,
+            )
+            .await
+            .expect_err("Apple validation must stay disabled until its provider task ships");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Permission);
+        assert_eq!(error.message(), "receipt validation provider is disabled");
+        assert_eq!(
+            error.log_detail(),
+            None,
+            "receipt material is never retained in errors"
+        );
+
+        let receipt = validator
+            .validate(
+                PurchaseStore::Custom,
+                r#"{"transaction_id":"dev-1","product_id":"gold"}"#,
+            )
+            .await
+            .expect("the deterministic custom development validator remains available");
+        assert_eq!(receipt.transaction_id, "dev-1");
+    }
+
+    #[tokio::test]
+    async fn receipt_validation_http_client_refuses_non_https_before_network_io() {
+        let metrics = Arc::new(NodeMetrics::new());
+        let client = ReceiptValidationHttpClient::from_config(
+            &PurchaseValidationConfig::default(),
+            Arc::clone(&metrics),
+        );
+        let error = client
+            .execute(OutboundHttpRequest {
+                method: "GET".to_string(),
+                url: "http://api.storekit.itunes.apple.com/".to_string(),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("receipt validation egress must require HTTPS");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Validation);
+        assert_eq!(error.message(), "receipt validation requires HTTPS");
+        assert_eq!(metrics.snapshot().purchase_validation_requests_total, 1);
+        assert_eq!(metrics.snapshot().purchase_validation_failures_total, 1);
+    }
+
+    #[tokio::test]
+    async fn composite_validator_rejects_oversized_receipts_before_provider_dispatch() {
+        let mut config = PurchaseValidationConfig::default();
+        config.max_receipt_bytes = 3;
+        let validator =
+            CompositeReceiptValidator::from_config(&config, Arc::new(NodeMetrics::new()));
+
+        let error = validator
+            .validate(PurchaseStore::Custom, "four")
+            .await
+            .expect_err("payload limit must reject before parsing or egress");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Validation);
+        assert_eq!(error.message(), "receipt validation payload is too large");
+    }
+
+    #[tokio::test]
     async fn subscription_status_derives_from_expiry() {
-        let service = service();
+        let service = dev_service();
         service
             .validate_and_record(
                 "u-1",

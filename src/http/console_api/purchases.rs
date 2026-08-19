@@ -2,8 +2,8 @@
 //!
 //! Read surfaces over the validated-purchase store, plus the console-side
 //! producer that runs a receipt through the node's
-//! [`ReceiptValidator`](crate::services::ReceiptValidator) (the deterministic
-//! dev validator today; real store validators are follow-up work):
+//! [`ReceiptValidator`](crate::services::ReceiptValidator) (the composite
+//! validator keeps real stores disabled today; custom dev receipts remain available):
 //!
 //! - `GET /console/v1/purchases?user_id&limit` — newest-first purchases.
 //! - `POST /console/v1/purchases` — validate + record a receipt (admin,

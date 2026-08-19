@@ -205,7 +205,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Read-only console database explorer** — Viewer/admin dashboard browsing for the configured SQLite, PostgreSQL, CockroachDB, or MongoDB database: allowlisted metadata, structured bound filters, opaque keyset/row handles, server-side redaction, audit records, deadlines and per-operator node limits. No SQL text, MongoDB commands, mutation, export, or system schemas.
 - **Wallet balances and ledger** — Clients read balances/ledger; trusted logic adjusts under invariants.
 - **Purchase record persistence and replay rejection** — Durable receipts are hashed; transaction ids cannot be replayed.
-- **Production store receipt validation** — Only a deterministic development validator ships; provider integrations are pending.
+- **Production store receipt validation** — An asynchronous server-owned validation foundation, redacted configuration, bounded provider egress, and disabled-provider guard ship; Apple, Google, and Huawei adapters remain pending. Only custom deterministic development receipts are enabled.
 - **Subscriptions and provider lifecycle** — Admin view derives active/expired state; provider renewal/refund events are pending.
 - **Event and telemetry ingestion** — No player event ingestion or telemetry pipeline. Runtime-local best-effort callbacks are available separately to trusted Lua, Python, and JavaScript.
 
