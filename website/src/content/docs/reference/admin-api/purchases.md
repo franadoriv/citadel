@@ -14,15 +14,15 @@ console conventions. A client-facing purchase-submission API is not
 implemented.
 :::
 
-:::caution[Dev validator only — real store validators pending]
-Citadel validates receipts through a pluggable `ReceiptValidator` trait, but
-today only the **deterministic dev validator** ships. It parses the "receipt"
-as a JSON document and performs **no network calls** — it does not talk to the
-Apple App Store, Google Play, or Huawei AppGallery, regardless of which
-`store` value you pass. This is honest for prototyping and tests, not
-production purchase verification. Real App Store / Google Play validators
-(outbound HTTPS + store credentials) are tracked as follow-up work
- and are **not implemented yet**.
+:::caution[Development receipts only — real store validators pending]
+Citadel now has an asynchronous, server-owned receipt-validation foundation:
+provider egress is bounded, credential values are never accepted from TOML, and
+Apple/Google/Huawei adapters are disabled until their dedicated verified
+implementations ship. The only enabled validator is the deterministic **custom**
+development validator, which parses a JSON receipt and makes no network call.
+Submitting an `apple`, `google`, or `huawei` receipt to the current node returns
+a sanitized provider-disabled error; it never claims to validate a real store.
+Production App Store / Google Play validation remains unimplemented.
 :::
 
 Validated purchases are **persisted behind the storage backend**:

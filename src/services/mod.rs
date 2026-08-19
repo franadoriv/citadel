@@ -74,8 +74,9 @@ pub use player_notifications::{
     PlayerNotificationService, SendPlayerNotification, SendPlayerNotificationOutcome,
 };
 pub use purchases::{
-    DevReceiptValidator, Purchase, PurchaseService, PurchaseStore, ReceiptValidator,
-    SubscriptionRow, ValidatedReceipt,
+    CompositeReceiptValidator, DevReceiptValidator, Purchase, PurchaseService, PurchaseStore,
+    ReceiptValidationErrorCode, ReceiptValidationHttpClient, ReceiptValidator, SubscriptionRow,
+    ValidatedReceipt,
 };
 pub use wallet::{LedgerEntry, WalletService};
 

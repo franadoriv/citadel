@@ -166,6 +166,32 @@ max_entries = 1024
 max_value_bytes = 65536
 max_ttl_ms = 3600000
 
+# Production receipt-validation foundation. Citadel owns provider egress and
+# credentials; secrets are referenced only by environment-variable name, never
+# placed in this file. Every real store remains disabled until its verified
+# adapter ships. The custom development receipt validator remains available for
+# local prototypes and tests.
+[purchases]
+max_receipt_bytes = 65536
+max_concurrent_requests = 16
+max_requests_per_minute = 120
+timeout_ms = 5000
+# Future adapters may retry only idempotent provider operations within this bound.
+max_retries = 2
+allowed_hosts = ["api.storekit.itunes.apple.com", "androidpublisher.googleapis.com"]
+
+[purchases.apple]
+enabled = false
+# credential_env = "CITADEL_APPLE_PRIVATE_KEY"
+
+[purchases.google]
+enabled = false
+# credential_env = "CITADEL_GOOGLE_SERVICE_ACCOUNT_JSON"
+
+[purchases.huawei]
+enabled = false
+# credential_env = "CITADEL_HUAWEI_CLIENT_SECRET"
+
 # Realtime transports. Each is independently enabled and bound. QUIC is the
 # primary native transport, WebTransport serves browsers over HTTP/3, and
 # WebSocket is the broadest-compatibility fallback. All three are enabled here so

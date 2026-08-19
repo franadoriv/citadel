@@ -28,9 +28,9 @@ use crate::repository::{
 use crate::services::{
     ApiKeyService, AuditLog, AuthenticationRateLimitPolicy, AuthenticationService,
     AuthenticationServiceImpl, ChatAccessCoordinator, ChatRateLimitPolicy, ChatService,
-    ConsoleTokenStore, DatabaseExplorerRateLimiter, FriendsService, GroupsService, Health,
-    InMemorySessionService, LeaderboardService, NotificationService, PlayerNotificationService,
-    PurchaseService, SharedSessionService, WalletService,
+    CompositeReceiptValidator, ConsoleTokenStore, DatabaseExplorerRateLimiter, FriendsService,
+    GroupsService, Health, InMemorySessionService, LeaderboardService, NotificationService,
+    PlayerNotificationService, PurchaseService, SharedSessionService, WalletService,
 };
 use crate::time::{Clock, SystemClock, TimestampMillis};
 
@@ -179,7 +179,13 @@ impl App {
         let notifications = Arc::new(NotificationService::new(backend.notifications_repository()));
         let player_notifications = Arc::new(PlayerNotificationService::new(Arc::clone(&backend)));
         let wallet = Arc::new(WalletService::new(backend.wallet_repository()));
-        let purchases = Arc::new(PurchaseService::new(backend.purchases_repository()));
+        let purchases = Arc::new(PurchaseService::with_validator(
+            backend.purchases_repository(),
+            Arc::new(CompositeReceiptValidator::from_config(
+                &config.purchases,
+                Arc::clone(&metrics),
+            )),
+        ));
         let lag_diagnostics = Arc::new(
             crate::lag_diagnostics::LagDiagnosticsService::new(
                 config.lag_diagnostics.clone(),

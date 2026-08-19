@@ -46,6 +46,10 @@ pub struct NodeMetrics {
     runtime_events_queued_total: AtomicU64,
     runtime_events_dropped_total: AtomicU64,
     runtime_shared_cache_evictions_total: AtomicU64,
+    /// Provider-validation requests started by the server-owned purchase client.
+    purchase_validation_requests_total: AtomicU64,
+    /// Provider-validation requests that did not produce a validated response.
+    purchase_validation_failures_total: AtomicU64,
     party_owner_lease_acquire_total: AtomicU64,
     party_owner_lease_renew_total: AtomicU64,
     party_owner_failover_total: AtomicU64,
@@ -286,6 +290,19 @@ impl NodeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one server-owned receipt-validation request. This counter never
+    /// includes account ids, receipt contents, tokens, or provider credentials.
+    pub fn record_purchase_validation_request(&self) {
+        self.purchase_validation_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one redacted provider-validation failure or deadline.
+    pub fn record_purchase_validation_failure(&self) {
+        self.purchase_validation_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a durable party-owner lease acquisition. No party, account, or
     /// request identifiers are retained in node metrics.
     pub fn record_party_owner_lease_acquire(&self) {
@@ -366,6 +383,12 @@ impl NodeMetrics {
             runtime_shared_cache_evictions_total: self
                 .runtime_shared_cache_evictions_total
                 .load(Ordering::Relaxed),
+            purchase_validation_requests_total: self
+                .purchase_validation_requests_total
+                .load(Ordering::Relaxed),
+            purchase_validation_failures_total: self
+                .purchase_validation_failures_total
+                .load(Ordering::Relaxed),
             party_owner_lease_acquire_total: self
                 .party_owner_lease_acquire_total
                 .load(Ordering::Relaxed),
@@ -443,6 +466,10 @@ pub struct NodeMetricsSnapshot {
     pub runtime_events_dropped_total: u64,
     /// Entries evicted because the node-local runtime cache reached its entry bound.
     pub runtime_shared_cache_evictions_total: u64,
+    /// Server-owned receipt-validation requests; aggregate-only and redacted.
+    pub purchase_validation_requests_total: u64,
+    /// Receipt-validation failures or deadlines; aggregate-only and redacted.
+    pub purchase_validation_failures_total: u64,
     /// Durable party-owner lease acquisitions on this node.
     pub party_owner_lease_acquire_total: u64,
     /// Durable party-owner lease renewals on this node.
@@ -553,6 +580,8 @@ mod tests {
         m.session_opened();
         m.record_message_in(100);
         m.record_message_out(40);
+        m.record_purchase_validation_request();
+        m.record_purchase_validation_failure();
 
         let snap = m.snapshot();
         assert_eq!(snap.http_requests_total, 2);
@@ -567,6 +596,8 @@ mod tests {
         assert_eq!(snap.bytes_in_total, 100);
         assert_eq!(snap.messages_out_total, 1);
         assert_eq!(snap.bytes_out_total, 40);
+        assert_eq!(snap.purchase_validation_requests_total, 1);
+        assert_eq!(snap.purchase_validation_failures_total, 1);
     }
 
     #[test]
