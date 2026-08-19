@@ -436,6 +436,9 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         runtime.clone(),
         authenticator,
     );
+    if let Some(recorder) = app.authoritative_decision_recorder() {
+        gateway = gateway.with_authoritative_decision_recorder(recorder);
+    }
     if let Some(readiness) = &script_readiness {
         gateway = gateway.with_script_readiness(Arc::clone(readiness));
         // A require_script node runs authoritative matches: enable the gameplay

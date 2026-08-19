@@ -43,6 +43,12 @@ format = "pretty"
 max_bytes = 8388608
 max_entries = 2000
 
+[telemetry.authoritative_decisions]
+# Process-local recorder for already-validated authoritative decisions.
+# It retains no payloads, replies, commands, corrected values, or identities.
+enabled = true
+capacity = 1024
+
 [transport.quic]
 # QUIC is the primary realtime transport (datagrams + reliable streams, TLS 1.3).
 enabled = false
@@ -242,6 +248,21 @@ fields = ["score", "region"]
 | --- | --- | --- | --- |
 | `level` | string | `"info"` | Tracing directive. Must not be empty. |
 | `format` | enum | `"pretty"` | `"pretty"` or `"json"`. |
+
+### `[telemetry.authoritative_decisions]`
+
+This node-local recorder observes only decisions that have already passed the
+authoritative bridge validator at the gateway. It retains a bounded FIFO of
+opaque numeric match/batch/event correlations, generic `accepted`/`rejected`/
+`corrected` outcomes, and an opaque numeric rejection code when supplied. It
+never retains client payloads, replies, script commands, corrected values,
+participant IDs, or account IDs. The first release deliberately provides no
+public HTTP endpoint or console view.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Composes the process-local recorder at application startup. |
+| `capacity` | integer | `1024` | Retained records; must be `1..=100000` when enabled. On overflow, the oldest record is deterministically evicted first. |
 
 ### `[errors]`
 
