@@ -414,6 +414,184 @@ async fn dashboard_modals_manage_keyboard_focus_accessibly() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn dashboard_lag_diagnostics_uses_redacted_keysets_and_admin_raw_modals() {
+    let (addr, tx, server) = spawn_server(App::new(console_config())).await;
+
+    let dashboard = get(addr, http::DASHBOARD_PATH, None).await;
+    assert_eq!(dashboard.status, 200);
+    for required in [
+        "label: 'Operations'",
+        "id: 'lag-diagnostics'",
+        "title: 'Lag Diagnostics'",
+        "'/console/v1/lag/reports?limit=20'",
+        "'/console/v1/lag/captures?limit=20'",
+        "page.next_after",
+        "next_after",
+        "not RTT or packet-loss measurements",
+        "Clock uncertainty",
+        "Recorder overflow",
+        "p95",
+        "overflow",
+        "Decoder / analyzer",
+        "UTC correlation metadata",
+        "raw path",
+        "raw bytes",
+        "no_analysis",
+        "no_data",
+        "pending",
+        "insufficient_samples",
+        "raw_expired",
+        "raw_deleted",
+        "raw unavailable",
+        "fmtUtc",
+    ] {
+        assert!(
+            dashboard.body.contains(required),
+            "lag diagnostics dashboard is missing {required:?}"
+        );
+    }
+    assert!(
+        !dashboard.body.contains("raw_path"),
+        "the browser must not receive a raw filesystem path"
+    );
+
+    let dashboard_view = function_source(&dashboard.body, "renderLagDiagnostics", "loadLagReports");
+    assert!(dashboard_view.contains("loadLagReports(true)"));
+    assert!(dashboard_view.contains("loadLagCaptures(true)"));
+    let report_loader = function_source(&dashboard.body, "loadLagReports", "loadLagCaptures");
+    let capture_loader = function_source(&dashboard.body, "loadLagCaptures", "renderLagDashboard");
+    for loader in [report_loader, capture_loader] {
+        assert!(loader.contains("var viewGeneration = state.viewGeneration;"));
+        assert!(loader.contains("viewGeneration !== state.viewGeneration"));
+    }
+
+    let raw_modal = function_source(&dashboard.body, "openLagRaw", "loadLagRaw");
+    assert!(raw_modal.contains("if (!isAdmin())"));
+    assert!(raw_modal.contains("openModal('Raw diagnostic artifacts'"));
+    assert!(raw_modal.contains("Opaque handles only"));
+    assert!(raw_modal.contains("beginLagKeysetGeneration();"));
+
+    let raw_loader = function_source(&dashboard.body, "loadLagRaw", "renderLagRawList");
+    assert!(raw_loader.contains("var rawSession = lag.raw;"));
+    assert!(raw_loader.contains("lagOperationContext(rawSession"));
+    assert!(raw_loader.contains("lagOperationIsCurrent(context)"));
+    assert!(raw_loader.contains("!qs('lag-raw-body')"));
+
+    let raw_download = function_source(&dashboard.body, "downloadLagRaw", "deleteLagRaw");
+    assert!(raw_download.contains("response.blob()"));
+    assert!(raw_download.contains("if (!blob || !lagOperationIsCurrent(context)) return;"));
+
+    let raw_delete = function_source(&dashboard.body, "deleteLagRaw", "openLagRegenerate");
+    assert!(raw_delete.contains("if (!lagOperationIsCurrent(context)) return;"));
+
+    let raw_list = function_source(&dashboard.body, "renderLagRawList", "downloadLagRaw");
+    for required in [
+        "data-act=\"lag-raw-download\"",
+        "data-act=\"lag-raw-regenerate\"",
+        "data-act=\"lag-raw-delete\"",
+        "data-confirm",
+        "data-handle",
+    ] {
+        assert!(
+            raw_list.contains(required),
+            "admin raw lifecycle is missing {required:?}"
+        );
+    }
+
+    let regeneration = function_source(&dashboard.body, "openLagRegenerate", "showApp");
+    for required in [
+        "role=\"alert\"",
+        "aria-live=\"polite\"",
+        "Number.isInteger",
+        "max_windows",
+        "/regenerate",
+        "lagSafeError",
+    ] {
+        assert!(
+            regeneration.contains(required),
+            "accessible bounded regeneration flow is missing {required:?}"
+        );
+    }
+    assert!(regeneration.contains("var rawSession = lag.raw;"));
+    assert!(regeneration.contains("if (!lagOperationIsCurrent(context)) return;"));
+
+    let _ = tx.send(());
+    let _ = server.await;
+}
+
+#[test]
+fn lag_dashboard_rejects_stale_keysets_and_downloads_after_context_changes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dashboard = std::fs::read_to_string(root.join("src/http/assets/console.html"))
+        .expect("read console shell");
+    let is_current = function_source(&dashboard, "lagIsCurrent", "beginLagKeysetGeneration");
+    let begin_generation = function_source(
+        &dashboard,
+        "beginLagKeysetGeneration",
+        "lagOperationContext",
+    );
+    let report_path = function_source(&dashboard, "lagReportPath", "lagCapturePath");
+    let load_reports = function_source(&dashboard, "loadLagReports", "loadLagCaptures");
+    let operation_context =
+        function_source(&dashboard, "lagOperationContext", "lagOperationIsCurrent");
+    let operation_current = function_source(&dashboard, "lagOperationIsCurrent", "lagNum");
+    let raw_base = function_source(&dashboard, "rawBasePath", "openLagRaw");
+    let download = function_source(&dashboard, "downloadLagRaw", "deleteLagRaw");
+
+    let mut harness = String::from(
+        "var route = 'lag-diagnostics';\n\
+         var state = { user: { role: 'admin' }, sessionGeneration: 1, viewGeneration: 4 };\n\
+         var lag = { reports: [], reportsNext: null, reportsLoading: false, capturesLoading: false, raw: { modalGeneration: 8 } };\n\
+         var modalGeneration = 8;\n\
+         function currentRoute() { return route; }\n\
+         function token() { return 'console-token'; }\n\
+         function isAdmin() { return !!(state.user && state.user.role === 'admin'); }\n\
+         function renderLagDashboard() {}\n\
+         function toast() {}\n\
+         function lagSafeError() { return 'safe'; }\n\
+         var pending = [];\n\
+         function api() { return { then: function(resolve) { pending.push(resolve); return { catch: function() {} }; } }; }\n",
+    );
+    harness.push_str(is_current);
+    harness.push_str(begin_generation);
+    harness.push_str(report_path);
+    harness.push_str(load_reports);
+    harness.push_str(
+        "\nloadLagReports(true);\n\
+         if (!lag.reportsLoading || pending.length !== 1) throw new Error('first request was not admitted');\n\
+         beginLagKeysetGeneration();\n\
+         loadLagReports(true);\n\
+         if (!lag.reportsLoading || pending.length !== 2) throw new Error('refresh did not start a replacement request');\n\
+         pending[0]({ items: [{ report_id: 'stale' }], next_after: 'stale' });\n\
+         if (!lag.reportsLoading || lag.reports.length !== 0) throw new Error('stale response changed the refreshed view');\n\
+         pending[1]({ items: [{ report_id: 'fresh' }], next_after: null });\n\
+         if (lag.reportsLoading || lag.reports.length !== 1 || lag.reports[0].report_id !== 'fresh') throw new Error('fresh response was not rendered');\n",
+    );
+    harness.push_str(operation_context);
+    harness.push_str(operation_current);
+    harness.push_str(raw_base);
+    harness.push_str(download);
+    harness.push_str(
+        "\nvar clicks = 0;\n\
+         var URL = { createObjectURL: function() { clicks += 100; return 'blob:raw'; }, revokeObjectURL: function() {} };\n\
+         var document = { body: { appendChild: function() {} }, createElement: function() { return { click: function() { clicks += 1; }, remove: function() {} }; } };\n\
+         function fetch() { return Promise.resolve({ ok: true, blob: function() { state.user = null; state.sessionGeneration += 1; return Promise.resolve({}); } }); }\n\
+         downloadLagRaw('capture', 'lc1-0123456789abcdef0123456789abcdef');\n\
+         setTimeout(function() { if (clicks !== 0) throw new Error('stale download minted an object URL or clicked'); }, 0);\n",
+    );
+
+    let output = Command::new("node")
+        .args(["--input-type=commonjs", "-e", &harness])
+        .output()
+        .expect("execute dashboard stale-context regression with Node.js");
+    assert!(
+        output.status.success(),
+        "lag stale-context regression failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn api_key_documentation_covers_the_v1_security_contract() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

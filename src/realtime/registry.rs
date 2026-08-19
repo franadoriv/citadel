@@ -533,6 +533,20 @@ impl SessionRegistry {
         handle: SessionHandle,
         initial: Option<Outbound>,
     ) -> LatestOutboundReceiver {
+        self.register_with_initials(handle, initial.into_iter().collect())
+    }
+
+    /// Register a session and atomically seed an ordered reliable prefix.
+    ///
+    /// This is the multi-envelope form of [`Self::register_with_initial`]. It
+    /// preserves the caller-provided order under the same close fence, which is
+    /// required for the backwards-compatible `AUTH_RESULT` then `SERVER_TIME`
+    /// handshake extension. No application/lifecycle send can overtake it.
+    pub fn register_with_initials(
+        &self,
+        handle: SessionHandle,
+        initials: Vec<Outbound>,
+    ) -> LatestOutboundReceiver {
         let (sender, receiver) = latest_outbound_channel();
         if let Ok(mut map) = self.unreliable.lock() {
             map.insert(handle.id, sender);
@@ -547,9 +561,9 @@ impl SessionRegistry {
             if revoked {
                 return receiver;
             }
-            if let Some(initial) = initial {
-                // The channel is new and therefore cannot be full. Keep the
-                // result best-effort so a closed writer still follows normal
+            for initial in initials {
+                // The channel is new and therefore cannot be full. Keep every
+                // send best-effort so a closed writer still follows normal
                 // transport teardown instead of failing registration.
                 let _ = handle
                     .outbound
@@ -706,6 +720,29 @@ impl SessionRegistry {
             .identity
             .as_ref()
             .map(|identity| identity.user_id.as_str().to_string())
+    }
+
+    /// Whether this exact live connection is authenticated. Diagnostics uses
+    /// this gate before accepting an SDK capability assertion; a guest cannot
+    /// opt in through a forged post-auth control frame.
+    #[must_use]
+    pub fn is_authenticated(&self, id: ParticipantId) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&id).map(|entry| entry.handle.is_authenticated()))
+            .unwrap_or(false)
+    }
+
+    /// Snapshot currently connected participant ids. The caller may make
+    /// bounded sends after this returns; the snapshot itself never holds a
+    /// registry lock across transport work.
+    #[must_use]
+    pub fn participants(&self) -> Vec<ParticipantId> {
+        self.sessions
+            .lock()
+            .map(|map| map.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Resolve one active participant for an authenticated account. When an

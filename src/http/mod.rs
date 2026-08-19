@@ -11,6 +11,7 @@ pub mod console_api;
 pub mod dashboard;
 pub mod error;
 mod headers;
+pub mod lag_diagnostics;
 pub mod player;
 mod runtime_endpoint;
 pub mod tls;
@@ -90,6 +91,7 @@ pub fn router(app: App) -> Router {
         .merge(auth::routes())
         .merge(player::routes())
         .merge(console_api::routes())
+        .merge(lag_diagnostics::routes())
         .merge(runtime_endpoint::routes())
         // Applied last so it wraps every route above, including the console SPA
         // and the 404 fallback.

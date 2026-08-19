@@ -27,13 +27,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use citadel_wire::protocol::KIND_AUTH_RESULT;
+use citadel_wire::protocol::{KIND_AUTH_RESULT, KIND_DIAG_SERVER_TIME};
 use quinn::{Connection as QuinnConnection, Endpoint};
 use tokio::sync::mpsc;
 
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::lifecycle::{AsyncService, CancellationToken};
 use crate::realtime::{Gateway, LatestOutboundReceiver, Outbound, SessionHandle};
+use crate::time::{Clock, SystemClock};
 use crate::transport::codec::{Envelope, decode_datagram, decode_framed};
 use crate::transport::metrics::TransportMetrics;
 use crate::transport::{
@@ -287,22 +288,38 @@ async fn handle_connection(
     let (tx, rx) = mpsc::channel::<Outbound>(OUTBOUND_CAPACITY);
     // The registry fences this protocol reply before publishing the session,
     // retaining reliable-first ordering without a raw, unfenced sender path.
-    let initial = (!handshake.replay_first).then(|| {
-        Outbound::reliable(Envelope::new(
+    let mut initials = Vec::with_capacity(2);
+    if !handshake.replay_first {
+        initials.push(Outbound::reliable(Envelope::new(
             KIND_AUTH_RESULT,
             handshake.outcome.result_body(),
-        ))
-    });
-    let unreliable = gateway.register_session_with_initial(
+        )));
+    }
+    match gateway.issue_diagnostics_server_time(session_id, SystemClock.now()) {
+        Ok(server_time) => match server_time.encode() {
+            Ok(body) => initials.push(Outbound::reliable(Envelope::new(
+                KIND_DIAG_SERVER_TIME,
+                body,
+            ))),
+            Err(error) => {
+                tracing::error!(conn = %id, %session_id, error = %error, "failed to encode diagnostics server-time offer")
+            }
+        },
+        Err(error) => {
+            tracing::error!(conn = %id, %session_id, error = %error, "failed to issue diagnostics server-time offer")
+        }
+    }
+    let unreliable = gateway.register_session_with_initials(
         SessionHandle {
             id: session_id,
             kind: TransportKind::Quic,
             outbound: tx,
             identity,
         },
-        initial,
+        initials,
     );
     if !gateway.accepts_work(session_id) {
+        gateway.abandon_diagnostics_session(session_id);
         connection.close(0u32.into(), b"session revoked");
         metrics.connection_closed();
         gateway.connection_closed();

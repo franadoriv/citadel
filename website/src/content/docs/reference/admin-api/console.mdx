@@ -92,11 +92,60 @@ exposing a node beyond localhost.
 | `/console/v1/api-keys/{id}` | GET | human admin bearer | Read API-key metadata (never a secret). |
 | `/console/v1/api-keys/{id}/rotate` | POST | human admin bearer | Rotate and reveal a replacement secret once. |
 | `/console/v1/api-keys/{id}/revoke` | POST | human admin bearer | Revoke the current generation. |
+| `/console/v1/lag/reports` | GET | bearer | Redacted, keyset-paged derived lag reports. |
+| `/console/v1/lag/reports/{report_id}` | GET | bearer | One redacted derived report. |
+| `/console/v1/lag/reports/{report_id}/windows` | GET | bearer | Bounded aggregate timeline windows, never packet rows. |
+| `/console/v1/lag/captures` | GET | bearer | Redacted, keyset-paged capture overview. |
+| `/console/v1/lag/captures/{capture_id}/raw` | GET | admin | Paged opaque raw-artifact handles. |
+| `/console/v1/lag/captures/{capture_id}/raw/{handle}` | GET, DELETE | admin | Download a private attachment or delete it while retaining reports. |
+| `/console/v1/lag/captures/{capture_id}/regenerate` | POST | admin | Regenerate from a currently retained opaque raw handle. |
 
 A section whose backend has not landed yet answers
 `501 { "code": "not_implemented" }` — authenticated and routed, never a `404` —
 so the SPA treats every section uniformly. Section documentation is added to
 this page as each backend ships.
+
+## Lag diagnostics
+
+**Operations > Lag Diagnostics** shows compact derived reports and capture
+overviews. Both `viewer` and `admin` can read report lists, a report detail,
+bounded histogram/timeline windows, and redacted capture summaries. The report
+surface has no raw paths, artifact digest, token, MIME grant, packet body,
+packet row, player/session identity, or raw availability state for viewers.
+Pages use opaque keyset cursors: pass `after` from `next_after` with a bounded
+`limit`, rather than treating cursors as filesystem paths or database ids.
+
+The report surface requires SQLite, PostgreSQL, or CockroachDB durable report
+storage. MongoDB deployments can expose the admin raw-artifact lifecycle but
+reject `analyze = true`; they never substitute a process-local report cache for
+an empty or durable report list.
+
+Only `admin` can list raw handles, download an artifact, delete retained raw
+evidence, or request regeneration. A raw download is an
+`application/octet-stream` attachment with `Cache-Control: no-store`, not a
+JSON endpoint and not a static URL. Handles are opaque (`lc1-...`) and do not
+reveal a disk path. `viewer` gets `403 forbidden` for every raw or regeneration
+operation, including an attempted request.
+
+Deleting raw bytes preserves existing derived reports and marks their raw
+availability unavailable; regeneration then returns a conflict until a new
+capture is collected. Raw lifecycle attempts, including failed or denied
+operations, are audited without recording paths, raw bytes, upload grants, or
+tokens. A report’s `raw_available` field is admin-only and means only that
+retained material is currently usable; the API does not expose whether it was
+expired or manually deleted.
+
+Interpret charts as diagnostic correlation, not a latency verdict. The UI
+shows samples, exclusions, overflows/truncation, percentiles, decoder/analyzer
+versions, and UTC-clock uncertainty. `no_analysis`, `pending`, `no_data`,
+`partial`, `complete`, and `failed` are explicit report outcomes. Raw
+unavailability is a separate admin-only retention projection, deliberately
+without an expiry-versus-deletion reason. None should silently turn into a
+healthy-network result. Lag reports do not claim RTT, one-way latency,
+asymmetric latency, or packet loss.
+
+For the private-root, quota, and cluster restrictions, see
+[Lag diagnostics operations](/reference/operations/lag-diagnostics/).
 
 ## Configuration browser
 

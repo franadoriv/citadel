@@ -41,6 +41,7 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
     "time",
+    "fs",
 ] }
 # HTTP server stack for health/admin/API routes ( wires the listener).
 axum = "0.7"
@@ -112,6 +113,10 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
 # SHA-256 of the dev cert for the browser `serverCertificateHashes` flow.
 sha2 = "0.10"
+# Bounded gzip validation for the diagnostics ingest boundary. The streamed
+# request is staged privately first; this decoder never receives an unbounded
+# in-memory body.
+flate2 = "1"
 # HMAC-SHA-256 authenticates the private parent/worker bootstrap challenge.
 hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }

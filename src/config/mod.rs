@@ -13,9 +13,11 @@
 //! [`Config`](crate::error::ErrorCategory::Config) error category. Diagnostics
 //! never print secrets.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
@@ -56,6 +58,8 @@ pub struct Config {
     pub server: ServerConfig,
     /// HTTP listener settings.
     pub http: HttpConfig,
+    /// Opt-in capture and private artifact ingestion for lag diagnostics.
+    pub lag_diagnostics: LagDiagnosticsConfig,
     /// Logging and tracing settings.
     pub logging: LoggingConfig,
     /// Local incident-journal retention settings.
@@ -1481,6 +1485,191 @@ pub struct HttpConfig {
     pub behind_tls_proxy: bool,
 }
 
+/// Server-owned capture/upload policy for opt-in lag diagnostics.
+///
+/// The feature is deliberately disabled by default. Enabling it requires a
+/// private filesystem root and an explicit HMAC keyring; it never falls back to
+/// a process-generated key because that would make restart/replay semantics
+/// ambiguous.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LagDiagnosticsConfig {
+    /// Enables native capture control and its state-gated HTTP ingest route.
+    pub enabled: bool,
+    /// Absolute filesystem root for raw artifacts, manifests, staging, and
+    /// replay markers. It must not be a public static-file directory.
+    pub raw_root: Option<String>,
+    /// Active key id used to sign newly minted one-use upload capabilities.
+    pub active_key_id: Option<String>,
+    /// Base64url-no-padding HMAC-SHA256 keyring. Keys are redacted from Debug.
+    pub upload_hmac_keys: BTreeMap<String, String>,
+    /// Exact browser origins allowed to perform a bearer upload. Empty means
+    /// CORS is disabled; native/same-origin clients may still upload.
+    pub allowed_origins: Vec<String>,
+    /// Global compressed-body cap, also narrowed per grant.
+    pub max_compressed_bytes: u32,
+    /// Maximum decompressed CLAG bytes after gzip validation.
+    pub max_decompressed_bytes: u32,
+    /// Maximum decompressed/compressed expansion ratio.
+    pub max_decompression_ratio: u32,
+    /// Simultaneous uploads admitted by this node.
+    pub max_concurrent_uploads: u16,
+    /// Private raw artifact quota across this node's raw root.
+    pub max_raw_bytes: u64,
+    /// Age after which unreferenced raw artifacts may be removed by maintenance.
+    pub retention_hours: u64,
+    /// Set only when a shared, non-database raw store plus capture control plane
+    /// makes a clustered upload route safe. Node-local raw disk fails closed.
+    pub shared_raw_store: bool,
+}
+
+impl std::fmt::Debug for LagDiagnosticsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LagDiagnosticsConfig")
+            .field("enabled", &self.enabled)
+            .field("raw_root", &self.raw_root)
+            .field("active_key_id", &self.active_key_id)
+            .field("upload_hmac_keys", &"[redacted]")
+            .field("allowed_origins", &self.allowed_origins)
+            .field("max_compressed_bytes", &self.max_compressed_bytes)
+            .field("max_decompressed_bytes", &self.max_decompressed_bytes)
+            .field("max_decompression_ratio", &self.max_decompression_ratio)
+            .field("max_concurrent_uploads", &self.max_concurrent_uploads)
+            .field("max_raw_bytes", &self.max_raw_bytes)
+            .field("retention_hours", &self.retention_hours)
+            .field("shared_raw_store", &self.shared_raw_store)
+            .finish()
+    }
+}
+
+impl Default for LagDiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            raw_root: None,
+            active_key_id: None,
+            upload_hmac_keys: BTreeMap::new(),
+            allowed_origins: Vec::new(),
+            max_compressed_bytes: 4 * 1024 * 1024,
+            max_decompressed_bytes: 64 * 1024 * 1024,
+            max_decompression_ratio: 32,
+            max_concurrent_uploads: 4,
+            max_raw_bytes: 4 * 1024 * 1024 * 1024,
+            retention_hours: 168,
+            shared_raw_store: false,
+        }
+    }
+}
+
+impl LagDiagnosticsConfig {
+    fn validate(&self, cluster_enabled: bool) -> AppResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let raw_root = self
+            .raw_root
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| AppError::config("lag_diagnostics.raw_root is required when enabled"))?;
+        if !Path::new(raw_root).is_absolute() {
+            return Err(AppError::config(
+                "lag_diagnostics.raw_root must be an absolute private filesystem path",
+            ));
+        }
+        let active_key_id = self
+            .active_key_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::config("lag_diagnostics.active_key_id is required when enabled")
+            })?;
+        if !valid_key_id(active_key_id)
+            || !self.upload_hmac_keys.keys().all(|key| valid_key_id(key))
+        {
+            return Err(AppError::config(
+                "lag_diagnostics upload key ids must be 1-64 ASCII alphanumeric, '-' or '_' bytes",
+            ));
+        }
+        let key = self.upload_hmac_keys.get(active_key_id).ok_or_else(|| {
+            AppError::config("lag_diagnostics.active_key_id is absent from upload_hmac_keys")
+        })?;
+        let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(key)
+            .map_err(|_| AppError::config("lag_diagnostics active HMAC key is not base64url"))?;
+        if key_bytes.len() < 32 {
+            return Err(AppError::config(
+                "lag_diagnostics active HMAC key must decode to at least 32 bytes",
+            ));
+        }
+        if self.max_compressed_bytes == 0
+            || self.max_decompressed_bytes == 0
+            || self.max_compressed_bytes > self.max_decompressed_bytes
+            || self.max_decompressed_bytes > 64 * 1024 * 1024
+            || self.max_decompression_ratio == 0
+            || self.max_decompression_ratio > 128
+            || self.max_concurrent_uploads == 0
+            || self.max_concurrent_uploads > 64
+            || self.max_raw_bytes < u64::from(self.max_compressed_bytes)
+            || self.retention_hours == 0
+            || self.retention_hours > 24 * 365
+        {
+            return Err(AppError::config("invalid lag_diagnostics upload limits"));
+        }
+        if self
+            .allowed_origins
+            .iter()
+            .any(|origin| !valid_diagnostics_origin(origin))
+        {
+            return Err(AppError::config(
+                "lag_diagnostics.allowed_origins must contain exact HTTPS origins (or loopback HTTP origins), never wildcards, paths, queries, or fragments",
+            ));
+        }
+        // This implementation owns its pending/consumed leases and raw artifacts on
+        // the local filesystem. Merely declaring a shared root would not make the
+        // one-use token state or recovery protocol cluster-safe, so keep the MVP
+        // fail-closed until a shared store *and* capture control plane exist.
+        if cluster_enabled {
+            return Err(AppError::config(
+                "lag_diagnostics.enabled rejects cluster mode: the current raw ingest implementation is node-local",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_diagnostics_origin(value: &str) -> bool {
+    if value.is_empty()
+        || value.contains('*')
+        || value.contains('/') && !value.starts_with("https://") && !value.starts_with("http://")
+    {
+        return false;
+    }
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    match scheme {
+        "https" => true,
+        "http" => {
+            authority.eq_ignore_ascii_case("localhost")
+                || authority.starts_with("localhost:")
+                || authority.starts_with("127.0.0.1:")
+                || authority.starts_with("[::1]")
+        }
+        _ => false,
+    }
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -1982,6 +2171,7 @@ impl Config {
         self.database.validate()?;
         self.console.validate()?;
         self.http.tls.validate()?;
+        self.lag_diagnostics.validate(self.cluster.enabled)?;
         self.validate_console_exposure()?;
         self.validate_http_exposure()?;
         Ok(())
@@ -2417,6 +2607,27 @@ mod tests {
     #[test]
     fn default_config_validates() {
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_lag_ingest_fails_closed_in_cluster_mode() {
+        use base64::Engine as _;
+
+        let mut config = Config::default();
+        config.cluster.enabled = true;
+        config.lag_diagnostics.enabled = true;
+        config.lag_diagnostics.raw_root = Some(std::env::temp_dir().display().to_string());
+        config.lag_diagnostics.active_key_id = Some("current".to_string());
+        config.lag_diagnostics.upload_hmac_keys.insert(
+            "current".to_string(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9_u8; 32]),
+        );
+
+        let error = config
+            .lag_diagnostics
+            .validate(true)
+            .expect_err("node-local ingest must fail closed");
+        assert!(error.message().contains("node-local"));
     }
 
     #[test]

@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod chat_presence;
+pub mod diagnostics;
 pub mod gateway;
 pub mod identity;
 pub mod netpeer;
@@ -23,6 +24,10 @@ pub mod transform;
 
 pub use auth::{AuthOutcome, Authenticator, PresentedCredential, RejectReason};
 pub use chat_presence::{ChatJoin, ChatLeave, ChatPresenceRegistry, ChatSubscription};
+pub use diagnostics::{
+    LagCaptureError, LagCaptureFlush, LagCaptureManager, LagCaptureParticipantState,
+    LagCaptureParticipantStatus, LagCaptureStart, LagCaptureStatus,
+};
 pub use gateway::{
     DomainRpcServices, Gateway, Handshake, KIND_AUTH, KIND_AUTH_RESULT, KIND_PEER_POSITION,
     KIND_POSITION, shared,

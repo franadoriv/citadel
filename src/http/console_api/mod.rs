@@ -32,6 +32,7 @@ pub mod config;
 pub mod database;
 pub mod errors;
 pub mod groups;
+pub mod lag_diagnostics;
 pub mod leaderboards;
 pub mod matches;
 pub mod notifications;
@@ -338,6 +339,34 @@ pub(super) fn routes() -> Router<App> {
             post(api_keys::revoke_handler),
         )
         .route(audit::AUDIT_PATH, get(audit::list_handler))
+        .route(
+            lag_diagnostics::LAG_REPORTS_PATH,
+            get(lag_diagnostics::list_reports_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_REPORT_DETAIL_PATH,
+            get(lag_diagnostics::report_detail_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_REPORT_WINDOWS_PATH,
+            get(lag_diagnostics::windows_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURES_PATH,
+            get(lag_diagnostics::list_captures_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURE_RAW_PATH,
+            get(lag_diagnostics::list_raw_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURE_RAW_HANDLE_PATH,
+            get(lag_diagnostics::download_raw_handler).delete(lag_diagnostics::delete_raw_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURE_REGENERATE_PATH,
+            post(lag_diagnostics::regenerate_handler),
+        )
         .route(errors::ERRORS_PATH, get(errors::list_handler))
         .route(telemetry::TELEMETRY_PATH, get(telemetry::get_handler))
         .route(config::CONFIG_PATH, get(config::get_handler))

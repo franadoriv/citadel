@@ -60,6 +60,18 @@ export const KIND_MATCHMAKER_MATCHED = 26;
 export const KIND_NOTIFICATION = 27;
 /** Server-to-client authorized chat presence, ephemeral typing, and live mutation event (UTF-8 JSON). */
 export const KIND_CHAT_EVENT = 28;
+/** Server-to-client UTC correlation offer, delivered after `KIND_AUTH_RESULT`. */
+export const KIND_DIAG_SERVER_TIME = 34;
+/** Client-to-server local opt-in diagnostics capability assertion. */
+export const KIND_DIAG_CAPABILITIES = 35;
+/** Bounded NTP-style diagnostics clock correlation exchange. */
+export const KIND_DIAG_CLOCK_SYNC = 36;
+/** Server-to-client constrained lag-capture start control. */
+export const KIND_DIAG_START = 37;
+/** Server-to-client one-use lag-capture upload grant. */
+export const KIND_DIAG_FLUSH = 38;
+/** Client-to-server capture lifecycle/status counters. */
+export const KIND_DIAG_STATUS = 39;
 
 // Reserved-range bounds (inclusive), for callers that want to test membership.
 export const TSYNC_KIND_MIN = 7;

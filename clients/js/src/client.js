@@ -24,9 +24,25 @@ import {
   webTransportCertificateHash,
 } from "./transport.js";
 import {
+  LagRecorder,
+  DIAG_DELIVERY_DATAGRAM,
+  DIAG_DELIVERY_RELIABLE,
+  DIAG_DIRECTION_OUTBOUND,
+  decodeDiagClockSyncResponse,
+  decodeDiagFlush,
+  decodeDiagServerTime,
+  decodeDiagStart,
+} from "./lag-recorder.js";
+import {
   KIND_AUTH,
   KIND_AUTH_RESULT,
   KIND_CHAT_EVENT,
+  KIND_DIAG_CAPABILITIES,
+  KIND_DIAG_CLOCK_SYNC,
+  KIND_DIAG_FLUSH,
+  KIND_DIAG_SERVER_TIME,
+  KIND_DIAG_START,
+  KIND_DIAG_STATUS,
   KIND_ROOM_CREATE,
   KIND_ROOM_JOIN,
   KIND_ROOM_JOINED,
@@ -60,6 +76,20 @@ function isNonEmptyString(value) {
 
 function isSafeUint(value, positive = false) {
   return Number.isSafeInteger(value) && value >= (positive ? 1 : 0);
+}
+
+function diagnosticUploadOrigin(realtimeUrl) {
+  try {
+    const url = new URL(realtimeUrl);
+    if (url.protocol === "ws:") url.protocol = "http:";
+    else if (url.protocol === "wss:") url.protocol = "https:";
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return url.origin;
+  } catch { return null; }
+}
+
+function lagRecorderEnabled(options) {
+  return options?.diagnostics?.lagRecorder?.enabled === true;
 }
 
 function assertChannelId(channelId) {
@@ -138,7 +168,7 @@ export class CitadelClient {
    * @param {WebSocket | WebSocketTransport | WebTransportTransport} transport
    * @private
    */
-  constructor(transport) {
+  constructor(transport, options = {}) {
     /** @type {WebSocketTransport | WebTransportTransport} @private */
     this._transport = transport?.kind && typeof transport.setHandlers === "function"
       ? transport
@@ -163,11 +193,23 @@ export class CitadelClient {
     this._roomJoinedHandlers = new Set();
     /** @type {Set<(roomId: bigint) => void>} @private */
     this._roomLeftHandlers = new Set();
+    /** @type {boolean} @private */
+    this._diagnosticsAuthenticated = false;
+    /** @type {LagRecorder | null} @private */
+    this._lagRecorder = lagRecorderEnabled(options) && typeof options._diagnosticUploadOrigin === "string"
+      ? new LagRecorder({
+        sendStatus: (body) => this.send(KIND_DIAG_STATUS, body),
+        sendClockSync: (body) => this.send(KIND_DIAG_CLOCK_SYNC, body),
+        uploadOrigin: options._diagnosticUploadOrigin,
+      })
+      : null;
 
     this._transport.setHandlers({
       onEnvelope: (env) => this._dispatch(env),
+      onDiagnosticEnvelope: (env, flags) => this._recordDiagnosticEnvelope(env, flags),
       onClose: (error) => {
         this.closed = true;
+        this._lagRecorder?.cancel();
         this._failAll(error);
       },
     });
@@ -177,7 +219,7 @@ export class CitadelClient {
    * Connect to a Citadel WebSocket endpoint, e.g. `ws://127.0.0.1:7352/`.
    *
    * @param {string} url
-   * @param {{ WebSocket?: typeof WebSocket, timeoutMs?: number }} [opts]
+   * @param {{ WebSocket?: typeof WebSocket, timeoutMs?: number, diagnostics?: { lagRecorder?: { enabled?: boolean } } }} [opts]
    * @returns {Promise<CitadelClient>}
    */
   static connect(url, opts = {}) {
@@ -201,7 +243,7 @@ export class CitadelClient {
       }, timeoutMs);
       ws.addEventListener("open", () => {
         clearTimeout(timer);
-        resolve(new CitadelClient(ws));
+        resolve(new CitadelClient(ws, { diagnostics: opts.diagnostics, _diagnosticUploadOrigin: diagnosticUploadOrigin(url) }));
       }, { once: true });
       ws.addEventListener("error", () => {
         clearTimeout(timer);
@@ -219,7 +261,7 @@ export class CitadelClient {
    * WebTransport listener. Omit it for a CA-trusted production certificate.
    *
    * @param {string} url
-   * @param {{ WebTransport?: typeof WebTransport, timeoutMs?: number, serverCertificateHashes?: Array<{ algorithm: "sha-256", value: BufferSource }>, serverCertificateHashBase64?: string, [key: string]: unknown }} [opts]
+   * @param {{ WebTransport?: typeof WebTransport, timeoutMs?: number, serverCertificateHashes?: Array<{ algorithm: "sha-256", value: BufferSource }>, serverCertificateHashBase64?: string, diagnostics?: { lagRecorder?: { enabled?: boolean } }, [key: string]: unknown }} [opts]
    * @returns {Promise<CitadelClient>}
    */
   static async connectWebTransport(url, opts = {}) {
@@ -256,7 +298,10 @@ export class CitadelClient {
       try { webTransport.close(); } catch { /* noop */ }
       throw error;
     }
-    return new CitadelClient(new WebTransportTransport(webTransport));
+    return new CitadelClient(new WebTransportTransport(webTransport), {
+      diagnostics: opts.diagnostics,
+      _diagnosticUploadOrigin: diagnosticUploadOrigin(url),
+    });
   }
 
   /**
@@ -266,13 +311,14 @@ export class CitadelClient {
    * to the other. The SDK never migrates a connected/authenticated client.
    *
    * @param {{ webTransportUrl?: string, webSocketUrl?: string }} endpoints
-   * @param {{ fallbackToWebSocket?: boolean, webTransport?: object, webSocket?: ConnectOptions }} [opts]
+   * @param {{ fallbackToWebSocket?: boolean, diagnostics?: { lagRecorder?: { enabled?: boolean } }, webTransport?: object, webSocket?: ConnectOptions }} [opts]
    * @returns {Promise<CitadelClient>}
    */
   static async connectAuto(endpoints, opts = {}) {
     const { webTransportUrl, webSocketUrl } = endpoints || {};
     const {
       fallbackToWebSocket = true,
+      diagnostics,
       webTransport: webTransportOptions = {},
       webSocket: webSocketOptions = {},
     } = opts;
@@ -280,13 +326,19 @@ export class CitadelClient {
     let webTransportError;
     if (webTransportUrl) {
       try {
-        return await CitadelClient.connectWebTransport(webTransportUrl, webTransportOptions);
+        return await CitadelClient.connectWebTransport(webTransportUrl, {
+          ...webTransportOptions,
+          diagnostics: webTransportOptions.diagnostics ?? diagnostics,
+        });
       } catch (error) {
         webTransportError = error;
       }
     }
     if (webSocketUrl && (!webTransportUrl || fallbackToWebSocket)) {
-      return CitadelClient.connect(webSocketUrl, webSocketOptions);
+      return CitadelClient.connect(webSocketUrl, {
+        ...webSocketOptions,
+        diagnostics: webSocketOptions.diagnostics ?? diagnostics,
+      });
     }
     if (webTransportError) throw webTransportError;
     throw new TypeError("connectAuto requires webTransportUrl, webSocketUrl, or both");
@@ -350,6 +402,8 @@ export class CitadelClient {
   sendEnvelope(env, opts = {}) {
     if (this.closed) throw new Error("cannot send on a closed client");
     const reliable = opts.reliable ?? true;
+    this._lagRecorder?.record(env.kind, env.body,
+      DIAG_DIRECTION_OUTBOUND | (reliable ? DIAG_DELIVERY_RELIABLE : DIAG_DELIVERY_DATAGRAM));
     const pending = this._transport.send(env, reliable);
     if (pending && typeof pending.then === "function") {
       void pending.catch((error) => this._transport.fail(error));
@@ -671,6 +725,7 @@ export class CitadelClient {
 
   /** Close the connection. */
   close(code, reason) {
+    this._lagRecorder?.cancel();
     this._transport.close(code, reason);
   }
 
@@ -679,6 +734,12 @@ export class CitadelClient {
    * @private
    */
   _dispatch(env) {
+    if (env.kind === KIND_AUTH_RESULT) {
+      const authResult = decodeAuthResult(env.body);
+      this._diagnosticsAuthenticated = authResult !== null && authResult.status !== 2;
+      this._lagRecorder?.setAuthenticated(this._diagnosticsAuthenticated);
+    }
+    if (this._handleDiagnosticsControl(env)) return;
     if (env.kind === KIND_ROOM_JOINED) {
       const room = decodeRoomJoined(env.body);
       if (room) {
@@ -726,6 +787,41 @@ export class CitadelClient {
     const set = this._handlers.get(env.kind);
     if (set) for (const cb of set) cb(env.body, env);
     for (const cb of this._anyHandlers) cb(env);
+  }
+
+  /** @param {Envelope} env @param {number} flags @private */
+  _recordDiagnosticEnvelope(env, flags) {
+    this._lagRecorder?.record(env.kind, env.body, flags);
+  }
+
+  /** Keep reserved diagnostics frames out of gameplay handlers. @param {Envelope} env @private */
+  _handleDiagnosticsControl(env) {
+    if (env.kind < KIND_DIAG_SERVER_TIME || env.kind > KIND_DIAG_STATUS) return false;
+    if (!this._lagRecorder || !this._diagnosticsAuthenticated) return true;
+    if (env.kind === KIND_DIAG_SERVER_TIME) {
+      const offer = decodeDiagServerTime(env.body);
+      const capabilities = offer && this._lagRecorder.acceptServerTime(offer);
+      if (capabilities) {
+        try { this.send(KIND_DIAG_CAPABILITIES, capabilities); } catch { /* transport closed */ }
+      }
+      return true;
+    }
+    if (env.kind === KIND_DIAG_CLOCK_SYNC) {
+      const response = decodeDiagClockSyncResponse(env.body);
+      if (response) this._lagRecorder.acceptClockSync(response);
+      return true;
+    }
+    if (env.kind === KIND_DIAG_START) {
+      const start = decodeDiagStart(env.body);
+      if (start) this._lagRecorder.start(start);
+      return true;
+    }
+    if (env.kind === KIND_DIAG_FLUSH) {
+      const flush = decodeDiagFlush(env.body);
+      if (flush) void this._lagRecorder.upload(flush);
+      return true;
+    }
+    return true;
   }
 
   /**

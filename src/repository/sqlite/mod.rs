@@ -56,10 +56,10 @@ use crate::database_explorer::{DatabaseExplorer, SqliteMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    ApiKeyRepository, AuthIdentityRepository, ChatRepository, FriendsRepository,
-    GameScriptRepository, GroupsRepository, LeaderboardsRepository, NotificationsRepository,
-    PurchasesRepository, SessionRepository, StorageRepository, TournamentsRepository,
-    UserRepository, WalletRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, DurableLagReportRepository,
+    FriendsRepository, GameScriptRepository, GroupsRepository, LeaderboardsRepository,
+    NotificationsRepository, PurchasesRepository, SessionRepository, SqliteLagReportRepository,
+    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
@@ -630,6 +630,10 @@ impl BackendTrait for SqliteDatabase {
 
     fn purchases_repository(&self) -> Arc<dyn PurchasesRepository> {
         SqliteDatabase::purchases_repository(self)
+    }
+
+    fn lag_report_repository(&self) -> Option<Arc<dyn DurableLagReportRepository>> {
+        Some(Arc::new(SqliteLagReportRepository::new(self.pool.clone())))
     }
 
     fn database_explorer(&self) -> Option<Arc<dyn DatabaseExplorer>> {

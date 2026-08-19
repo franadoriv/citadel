@@ -669,6 +669,41 @@ when the operator also needs to prevent other local processes from editing it.
 See [Use shared static gameplay data](/guides/static-game-data/) for the ordered
 setup and reload workflow.
 
+### `[lag_diagnostics]`
+
+Optional, server-owned ingestion for the explicit JavaScript lag-recorder
+debug feature. It is disabled by default. It has no player-facing HTTP API and
+does not enable recording remotely: opted-in, authenticated SDKs still require
+a trusted native `START` followed by a per-client `FLUSH` grant. See
+[Lag diagnostics operations](/reference/operations/lag-diagnostics/) for the
+collection lifecycle and metric limitations.
+
+Raw ingestion is node-local private filesystem storage. Derived analysis and
+the report Console require the SQLite, PostgreSQL, or CockroachDB report
+adapter. A MongoDB deployment may collect raw artifacts only; `analyze = true`
+is rejected fail-closed until MongoDB gains a durable report adapter. Set
+`analyze = false` for MongoDB captures.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Enables trusted capture control and state-gated ingest. Disabled nodes reject uploads. |
+| `raw_root` | absolute path | *(unset)* | Required when enabled. Private root for staging, manifests, leases, and compressed raw artifacts; never configure a served/public path. |
+| `active_key_id` | string | *(unset)* | Required when enabled. Selects the signing key for new one-use uploads. |
+| `upload_hmac_keys` | object | `{}` | Base64url-without-padding HMAC-SHA256 keyring. The active decoded key must be at least 32 bytes and is redacted from diagnostics. |
+| `allowed_origins` | string array | `[]` | Exact HTTPS browser origins; loopback HTTP is allowed only for local development. Empty disables CORS. Wildcards, paths, queries, and fragments are rejected. |
+| `max_compressed_bytes` | integer | `4194304` | Global gzip upload cap; every grant can narrow it. |
+| `max_decompressed_bytes` | integer | `67108864` | Bounded post-gzip `CLAG` validation cap. |
+| `max_decompression_ratio` | integer | `32` | Maximum decompressed/compressed expansion ratio (1–128). |
+| `max_concurrent_uploads` | integer | `4` | Node-local concurrent upload admissions (1–64). |
+| `max_raw_bytes` | integer | `4294967296` | Node-local raw-root quota; must cover at least one maximum upload. |
+| `retention_hours` | integer | `168` | Raw-artifact retention period (1 through 8760 hours). Derived reports may remain after raw removal. |
+| `shared_raw_store` | bool | `false` | Reserved compatibility field. It does not enable clustering today. |
+
+The current lease, replay-marker, recovery, and capture-control implementation
+is node-local. Therefore `lag_diagnostics.enabled = true` is rejected whenever
+`cluster.enabled = true`, even if `shared_raw_store` is set. This is a
+fail-closed safety rule, not a request to place raw files in the database.
+
 ### `[console]`
 
 Static operator credentials for the [admin console](/reference/admin-api/console/) and

@@ -27,6 +27,7 @@ check when picking an engine.
 | Player profile, exact lookup, session refresh, and logout | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Correlated generic RPC | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Relayed position/message traffic | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Opt-in lag diagnostics capture and upload | ⬜ | ⬜ | ⬜ | ✅ | ⬜ |
 | Durable notification inbox and local live stream | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Durable chat live events | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Friends, groups, leaderboards, chat, wallet RPC | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -41,6 +42,7 @@ check when picking an engine.
 - **Player profile, exact lookup, session refresh, and logout** — First-class HTTP lifecycle APIs preserve the sanitized backend error contract; the completion manifest checks their bindings and web anchors across all released SDKs. Refreshed token pairs stay caller-owned for atomic secure storage.
 - **Correlated generic RPC** — The common route for domain, party, and matchmaker operations.
 - **Relayed position/message traffic** — All SDKs expose the base framed protocol; helpers vary by SDK.
+- **Opt-in lag diagnostics capture and upload** — The Web / JavaScript SDK has a code-only opt-in recorder. When the server requests it, the SDK records the selected diagnostic packets in a bounded CLAG ring with server-clock correlation and uploads a compressed snapshot through an opaque signed one-use grant. Unity, Unreal, Godot, and Rust client SDKs do not yet expose this recorder or upload API.
 - **Durable notification inbox and local live stream** — Read/ack by RPC and consume KIND_NOTIFICATION with client-side deduplication.
 - **Durable chat live events** — All released SDKs provide typed closed-schema KIND_CHAT_EVENT lifecycle, deduplication, reconnect/revocation fencing, transactional history application, and private correlated acknowledgement. Durable delivery uses a local-first transactional cluster outbox and remains at-least-once with history reconciliation.
 - **Friends, groups, leaderboards, chat, wallet RPC** — Authenticated generic RPC works across all current client targets.
@@ -300,6 +302,7 @@ language columns show which embedded game-logic runtimes expose it.
 | Matchmaker callbacks, leaderboard/tournament reset callbacks | 🟡 | 🟡 | 🟡 | 🟡 | ⬜ | ⬜ |
 | Runtime outbound HTTP, custom HTTP endpoints, events, shared cache | ✅ | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 | Dashboard and authenticated operator API | ✅ | — | — | — | — | — |
+| Lag diagnostics capture, analysis, and Console reports | ✅ | — | — | — | — | — |
 | Console MFA, user lifecycle, password reset, ACL templates | ⬜ | — | — | — | — | — |
 | Cluster discovery, load balancing, generalized node routing | ⬜ | — | — | — | — | — |
 
@@ -319,6 +322,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Matchmaker callbacks, leaderboard/tournament reset callbacks** — A durable, supervised leaderboard-reset scheduler delivers on_leaderboard_reset to Lua, Python, and JavaScript under fenced backend leases; matchmaker matched callbacks and tournament-reset callbacks are not shipped.
 - **Runtime outbound HTTP, custom HTTP endpoints, events, shared cache** — Trusted Lua, Python, and JavaScript expose Rust-owned asynchronous http.start/poll/cancel with explicit egress policy, DNS rebinding defenses, and shared rate/concurrency limits. They can also register bounded endpoints under /ext when enabled, use opt-in best-effort events, and share an opt-in non-durable cache with fenced cluster fan-out.
 - **Dashboard and authenticated operator API** — Accounts, storage, groups, chat, notifications, leaderboards, matches, runtime, config, purchases, audit, and the error journal.
+- **Lag diagnostics capture, analysis, and Console reports** — Native server controls request opt-in client capture, issue signed one-use upload grants, retain raw artifacts privately, and optionally persist SQL-backed analysis reports for the Console. SQLite, PostgreSQL, and CockroachDB support reports; MongoDB accepts raw capture only with analysis disabled.
 - **Console MFA, user lifecycle, password reset, ACL templates** — Operator authentication roles ship; these advanced controls do not.
 - **Cluster discovery, load balancing, generalized node routing** — Ownership and fencing groundwork is not a deployable cluster product.
 
