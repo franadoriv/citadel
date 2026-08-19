@@ -158,7 +158,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Server bootstrap, CLI, TOML config, and first-run setup** — Run a standalone node with generated config, game directory, and SQLite defaults.
 - **Portable server releases and Linux deployment** — Versioned Windows, Linux x86_64 musl, and Linux ARM64 musl archives ship with SHA-256 checksums, CI package validation, and a systemd deployment template.
 - **Dockerfile and editable Docker workflow** — Dockerfile and Compose development assets remain available, but release CI/CD no longer builds, tests, attests, or publishes OCI images. Historical GHCR images are not updated by releases.
-- **Health, live status, observability, audit logs** — Health/status endpoints, structured logs, redacted local incident journaling, optional Sentry telemetry (including Bugsink), tracing seams, and operator audit records.
+- **Health, live status, observability, audit logs** — Health/status endpoints, structured logs, bounded process-local authoritative-decision telemetry with opaque correlations and generic outcomes, redacted local incident journaling, optional Sentry telemetry (including Bugsink), tracing seams, and operator audit records.
 - **Device authentication** — Creates or authenticates a device identity and issues a session.
 - **Custom-id authentication** — Application-owned identifiers map to accounts and sessions.
 - **Email/password authentication** — Transactional email/password registration and sign-in at /v1/auth/email; Argon2id PHC verifiers, durable hashed multi-key admission limits, and existing session tokens ship. Email verification, recovery/change-password, and linking remain pending.

@@ -28,6 +28,10 @@ use citadel_wire::diagnostics::{
 use citadel_wire::protocol;
 use serde::Serialize;
 
+use crate::authoritative_decision_telemetry::{
+    AuthoritativeDecisionCorrelation, AuthoritativeDecisionOutcome, AuthoritativeDecisionReason,
+    AuthoritativeDecisionRecorder,
+};
 use crate::chat_cluster::{
     ChatDeliveryDisposition, ChatPresenceDirectory, LocalChatPresenceAnnouncer, RemoteChatDelivery,
 };
@@ -2322,6 +2326,9 @@ pub struct Gateway {
     registry: SessionRegistry,
     ids: ParticipantIdGen,
     metrics: Arc<NodeMetrics>,
+    /// Optional bounded recorder for already-validated bridge outcomes.
+    /// It retains only generic classifications and opaque numeric correlations.
+    authoritative_decision_recorder: Option<Arc<AuthoritativeDecisionRecorder>>,
     /// Optional embedded script runtime. When present, inbound messages are
     /// dispatched to script handlers; when `None`, the built-in relay runs.
     runtime: Option<Arc<dyn Runtime>>,
@@ -2404,6 +2411,10 @@ impl std::fmt::Debug for Gateway {
             .field("registry", &self.registry)
             .field("ids", &self.ids)
             .field("metrics", &self.metrics)
+            .field(
+                "authoritative_decision_recorder",
+                &self.authoritative_decision_recorder.is_some(),
+            )
             .field("runtime_attached", &self.runtime.is_some())
             .field("authenticator", &self.authenticator)
             .field("transform", &self.transform)
@@ -2743,6 +2754,7 @@ impl Gateway {
             registry: SessionRegistry::new(),
             ids: ParticipantIdGen::new(),
             metrics,
+            authoritative_decision_recorder: None,
             runtime,
             authenticator,
             transform: None,
@@ -2794,6 +2806,19 @@ impl Gateway {
         capabilities: std::collections::HashSet<Capability>,
     ) -> Self {
         self.bridge = Some(Arc::new(GatewayBridge::new(quotas, capabilities)));
+        self
+    }
+
+    /// Attach the app-composed bounded recorder before the gateway is shared.
+    ///
+    /// The recorder is observed only after bridge validation succeeds; it has no
+    /// client, console, or runtime-host API surface.
+    #[must_use]
+    pub fn with_authoritative_decision_recorder(
+        mut self,
+        recorder: Arc<AuthoritativeDecisionRecorder>,
+    ) -> Self {
+        self.authoritative_decision_recorder = Some(recorder);
         self
     }
 
@@ -7934,6 +7959,40 @@ impl Gateway {
         0
     }
 
+    /// Record only already-validated per-event decisions at the gateway choke
+    /// point. The mapping intentionally omits the event payload, participant,
+    /// account, reply, correction, and script commands.
+    fn record_validated_decisions(&self, batch: &ValidatedBatch) {
+        let Some(recorder) = &self.authoritative_decision_recorder else {
+            return;
+        };
+        for validated in &batch.outcomes {
+            let (outcome, reason) = match &validated.decision {
+                Decision::Accept => (
+                    AuthoritativeDecisionOutcome::Accepted,
+                    AuthoritativeDecisionReason::NotApplicable,
+                ),
+                Decision::Reject { reason_code } => (
+                    AuthoritativeDecisionOutcome::Rejected,
+                    AuthoritativeDecisionReason::OpaqueCode(*reason_code),
+                ),
+                Decision::Correct { .. } => (
+                    AuthoritativeDecisionOutcome::Corrected,
+                    AuthoritativeDecisionReason::NotApplicable,
+                ),
+            };
+            recorder.record(
+                AuthoritativeDecisionCorrelation::new(
+                    batch.match_id,
+                    batch.batch_id,
+                    validated.event.event_id,
+                ),
+                outcome,
+                reason,
+            );
+        }
+    }
+
     /// Materialize one fully validated batch: apply each accepted/corrected
     /// outcome's canonical effect, then apply the script-originated commands
     /// room-scoped. Called only from [`BridgeCommandSink::deliver_command_batch`]
@@ -8329,8 +8388,10 @@ impl BridgeCommandSink for Gateway {
                 }
             }
         };
-        // The ledger lock is released before materialization, which locks the
-        // transform hub / registry (a different lock order).
+        // The ledger lock is released before recording/materialization, which
+        // lock independent process-local state and the transform hub/registry.
+        // Record only validated outcomes; rejected batches never reach here.
+        self.record_validated_decisions(&validated);
         self.materialize_validated_batch(room_id, validated);
     }
 }
@@ -10169,6 +10230,118 @@ mod transform_tests {
             hub.get_transform(2).expect("obj 2").position[0].abs() < 1e-3,
             "a client cannot move another player's object"
         );
+    }
+
+    #[test]
+    fn gateway_records_only_validated_authoritative_decisions() {
+        let recorder = Arc::new(AuthoritativeDecisionRecorder::new(8));
+        let gateway = Gateway::new()
+            .with_authoritative_decision_recorder(Arc::clone(&recorder))
+            .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new());
+        let bridge = gateway.bridge.as_ref().expect("bridge attached");
+        let batch = bridge
+            .ledgers
+            .lock()
+            .expect("ledger lock")
+            .entry(7)
+            .or_insert_with(|| PendingBatchLedger::new(7, 1, 1))
+            .issue(
+                vec![
+                    EventDraft::guest(
+                        10,
+                        NormalizedPayload::ActorStateReport {
+                            object_id: 10,
+                            transform: BridgeTransform::identity(),
+                        },
+                    ),
+                    EventDraft::guest(
+                        11,
+                        NormalizedPayload::ActorStateReport {
+                            object_id: 11,
+                            transform: BridgeTransform::identity(),
+                        },
+                    ),
+                    EventDraft::guest(
+                        12,
+                        NormalizedPayload::ActorStateReport {
+                            object_id: 12,
+                            transform: BridgeTransform::identity(),
+                        },
+                    ),
+                ],
+                99,
+            );
+        let mut answer = ScriptCommandBatch::answering(&batch);
+        answer.input_outcomes = vec![
+            crate::runtime::InputOutcome {
+                event_id: batch.events[0].event_id,
+                decision: Decision::Accept,
+                reply: None,
+            },
+            crate::runtime::InputOutcome {
+                event_id: batch.events[1].event_id,
+                decision: Decision::Reject { reason_code: 17 },
+                reply: None,
+            },
+            crate::runtime::InputOutcome {
+                event_id: batch.events[2].event_id,
+                decision: Decision::Correct {
+                    correction: Correction::Transform(BridgeTransform::identity()),
+                },
+                reply: None,
+            },
+        ];
+
+        gateway.deliver_command_batch(answer);
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].correlation.match_id, 7);
+        assert_eq!(records[0].correlation.batch_id, batch.batch_id);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.correlation.event_id)
+                .collect::<Vec<_>>(),
+            batch
+                .events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(records[0].outcome, AuthoritativeDecisionOutcome::Accepted);
+        assert_eq!(records[1].outcome, AuthoritativeDecisionOutcome::Rejected);
+        assert_eq!(
+            records[1].reason,
+            AuthoritativeDecisionReason::OpaqueCode(17)
+        );
+        assert_eq!(records[2].outcome, AuthoritativeDecisionOutcome::Corrected);
+        assert_eq!(recorder.metrics().recorded_total, 3);
+    }
+
+    #[test]
+    fn gateway_does_not_record_a_batch_that_fails_validation() {
+        let recorder = Arc::new(AuthoritativeDecisionRecorder::new(8));
+        let gateway = Gateway::new()
+            .with_authoritative_decision_recorder(Arc::clone(&recorder))
+            .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new());
+        let bridge = gateway.bridge.as_ref().expect("bridge attached");
+        let batch = bridge
+            .ledgers
+            .lock()
+            .expect("ledger lock")
+            .entry(7)
+            .or_insert_with(|| PendingBatchLedger::new(7, 1, 1))
+            .issue(
+                vec![EventDraft::guest(10, NormalizedPayload::ParticipantJoined)],
+                99,
+            );
+        let answer = ScriptCommandBatch::answering(&batch);
+
+        gateway.deliver_command_batch(answer);
+
+        assert!(recorder.records().is_empty());
+        assert_eq!(recorder.metrics().recorded_total, 0);
     }
 
     // ---- authoritative bridge: KIND_NA_STATE flows through the validator ----

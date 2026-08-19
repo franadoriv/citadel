@@ -8,6 +8,7 @@
 //! contracts (`identity`, `session`, `time`) landed in .
 
 pub mod app;
+pub mod authoritative_decision_telemetry;
 pub mod chat_cluster;
 pub mod cli;
 pub mod config;

@@ -61,6 +61,13 @@ format = "pretty"
 max_bytes = 8388608
 max_entries = 2000
 
+[telemetry.authoritative_decisions]
+# Node-local, bounded records for validated authoritative decisions. Only opaque
+# numeric correlations plus generic outcome/reason categories are retained; no
+# payload, reply, command, corrected value, participant, or account data.
+enabled = true
+capacity = 1024
+
 [database]
 # Persistence backend, selected by URL scheme:
 #   sqlite://<file>            -> embedded single-file SQLite (created on first run)

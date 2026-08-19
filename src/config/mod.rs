@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::authoritative_decision_telemetry::DEFAULT_AUTHORITATIVE_DECISION_CAPACITY;
 use crate::error::{AppError, AppResult};
 use crate::session::NodeId;
 use crate::storage::{
@@ -62,6 +63,8 @@ pub struct Config {
     pub lag_diagnostics: LagDiagnosticsConfig,
     /// Logging and tracing settings.
     pub logging: LoggingConfig,
+    /// Bounded, process-local telemetry retained without payloads or identities.
+    pub telemetry: TelemetryConfig,
     /// Local incident-journal retention settings.
     pub errors: ErrorJournalConfig,
     /// Realtime transport listener settings.
@@ -84,6 +87,52 @@ pub struct Config {
     /// Server-owned production receipt-validation policy. Provider credentials
     /// are referenced by environment-variable name, never stored in this config.
     pub purchases: PurchaseValidationConfig,
+}
+
+/// Bounded process-local telemetry settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Validated authoritative-decision telemetry.
+    pub authoritative_decisions: AuthoritativeDecisionTelemetryConfig,
+}
+
+/// Privacy-safe retention for validated authoritative decisions.
+///
+/// The recorder stores only opaque numeric correlations, generic outcomes, and
+/// opaque numeric reason codes. It never retains request payloads, replies,
+/// commands, corrected values, participant identity, or account identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthoritativeDecisionTelemetryConfig {
+    /// Enable the node-local recorder.
+    pub enabled: bool,
+    /// Maximum retained records. Oldest records are evicted first.
+    pub capacity: usize,
+}
+
+impl Default for AuthoritativeDecisionTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity: DEFAULT_AUTHORITATIVE_DECISION_CAPACITY,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    fn validate(&self) -> AppResult<()> {
+        const MAX_AUTHORITATIVE_DECISION_CAPACITY: usize = 100_000;
+        let config = &self.authoritative_decisions;
+        if config.enabled
+            && (config.capacity == 0 || config.capacity > MAX_AUTHORITATIVE_DECISION_CAPACITY)
+        {
+            return Err(AppError::config(format!(
+                "telemetry.authoritative_decisions.capacity must be between 1 and {MAX_AUTHORITATIVE_DECISION_CAPACITY} when enabled"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Receipt-validation policy owned by the server rather than game runtimes.
@@ -2210,6 +2259,7 @@ impl Config {
             return Err(AppError::config("logging.level must not be empty"));
         }
         self.errors.validate()?;
+        self.telemetry.validate()?;
         self.purchases.validate()?;
         self.cluster
             .validate(&self.server.node_id, &self.database)?;

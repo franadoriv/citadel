@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder;
 use crate::config::{Config, RuntimeConfig};
 use crate::deferred_storage::DeferredStorageWriter;
 use crate::error::{AppError, AppResult};
@@ -57,6 +58,7 @@ pub struct App {
     config: Config,
     started_at: Instant,
     metrics: Arc<NodeMetrics>,
+    authoritative_decision_recorder: Option<Arc<AuthoritativeDecisionRecorder>>,
     host_telemetry: Arc<HostTelemetryService>,
     backend: Arc<dyn Backend>,
     auth: Arc<dyn AuthenticationService>,
@@ -136,6 +138,12 @@ impl App {
             None
         };
         let metrics = Arc::new(NodeMetrics::new());
+        let authoritative_decision_recorder =
+            config.telemetry.authoritative_decisions.enabled.then(|| {
+                Arc::new(AuthoritativeDecisionRecorder::new(
+                    config.telemetry.authoritative_decisions.capacity,
+                ))
+            });
         let sessions: SharedSessionService = Arc::new(InMemorySessionService::with_secure_issuer(
             backend.session_repository(),
         ));
@@ -211,6 +219,7 @@ impl App {
             config,
             started_at: Instant::now(),
             metrics,
+            authoritative_decision_recorder,
             host_telemetry: Arc::new(HostTelemetryService::new()),
             backend,
             auth,
@@ -351,6 +360,15 @@ impl App {
     #[must_use]
     pub fn metrics(&self) -> &Arc<NodeMetrics> {
         &self.metrics
+    }
+
+    /// The optional bounded recorder for already-validated authoritative decisions.
+    ///
+    /// This is process-local telemetry only. It has no public endpoint and stores
+    /// no payload, reply, command, corrected value, participant, or account data.
+    #[must_use]
+    pub fn authoritative_decision_recorder(&self) -> Option<Arc<AuthoritativeDecisionRecorder>> {
+        self.authoritative_decision_recorder.clone()
     }
 
     /// Return host CPU, memory, and filesystem capacity telemetry.
