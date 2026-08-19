@@ -29,12 +29,13 @@ use tokio_tungstenite::tungstenite::Message;
 use std::time::Duration;
 
 use citadel_wire::Envelope;
-use citadel_wire::protocol::KIND_AUTH_RESULT;
+use citadel_wire::protocol::{KIND_AUTH_RESULT, KIND_DIAG_SERVER_TIME};
 
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::error_reporting;
 use crate::lifecycle::{AsyncService, CancellationToken};
 use crate::realtime::{Gateway, Outbound, SessionHandle};
+use crate::time::{Clock, SystemClock};
 use crate::transport::codec::decode_framed;
 use crate::transport::metrics::TransportMetrics;
 use crate::transport::{
@@ -306,22 +307,38 @@ async fn handle_connection(
     // Seed the accepted auth result through the registry-owned fence before
     // publishing this session. A revocation racing the writer can therefore
     // invalidate it just like every later outbound envelope.
-    let initial = (!handshake.replay_first).then(|| {
-        Outbound::reliable(Envelope::new(
+    let mut initials = Vec::with_capacity(2);
+    if !handshake.replay_first {
+        initials.push(Outbound::reliable(Envelope::new(
             KIND_AUTH_RESULT,
             handshake.outcome.result_body(),
-        ))
-    });
-    let unreliable = gateway.register_session_with_initial(
+        )));
+    }
+    match gateway.issue_diagnostics_server_time(session_id, SystemClock.now()) {
+        Ok(server_time) => match server_time.encode() {
+            Ok(body) => initials.push(Outbound::reliable(Envelope::new(
+                KIND_DIAG_SERVER_TIME,
+                body,
+            ))),
+            Err(error) => {
+                tracing::error!(conn = %id, %session_id, error = %error, "failed to encode diagnostics server-time offer")
+            }
+        },
+        Err(error) => {
+            tracing::error!(conn = %id, %session_id, error = %error, "failed to issue diagnostics server-time offer")
+        }
+    }
+    let unreliable = gateway.register_session_with_initials(
         SessionHandle {
             id: session_id,
             kind: TransportKind::WebSocket,
             outbound: tx,
             identity,
         },
-        initial,
+        initials,
     );
     if !gateway.accepts_work(session_id) {
+        gateway.abandon_diagnostics_session(session_id);
         metrics.connection_closed();
         gateway.connection_closed();
         return Ok(());

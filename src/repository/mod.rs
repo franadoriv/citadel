@@ -25,6 +25,7 @@ pub mod friends;
 pub mod gamescript;
 pub mod groups;
 pub mod identity;
+pub mod lag_reports;
 pub mod leaderboards;
 pub mod mongodb;
 pub mod notifications;
@@ -64,6 +65,9 @@ pub use groups::{
 pub use identity::{
     AuthIdentityRepository, InMemoryAuthIdentityRepository, InMemoryUserRepository, UserPage,
     UserRepository,
+};
+pub use lag_reports::{
+    DurableLagReportRepository, PgLagReportRepository, SqliteLagReportRepository,
 };
 pub use leaderboards::{
     CreateLeaderboardRequest, InMemoryLeaderboardsRepository, LeaderboardDefinition,

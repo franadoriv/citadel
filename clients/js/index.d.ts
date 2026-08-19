@@ -31,6 +31,17 @@ export class FrameDecoder {
 export interface ConnectOptions {
   WebSocket?: typeof WebSocket;
   timeoutMs?: number;
+  /** Explicit source-code opt-in for bounded, metadata-only lag diagnostics. */
+  diagnostics?: DiagnosticsOptions;
+}
+
+/** Debug-only recorder setting. It is never read from URL, storage, or server controls. */
+export interface LagRecorderDebugOptions {
+  enabled?: boolean;
+}
+
+export interface DiagnosticsOptions {
+  lagRecorder?: LagRecorderDebugOptions;
 }
 
 /** Request delivery over a reliable stream or (where available) a datagram. */
@@ -52,11 +63,15 @@ export interface WebTransportConnectOptions {
   serverCertificateHashes?: WebTransportCertificateHash[];
   /** Base64 SHA-256 development-certificate hash printed by Citadel at startup. */
   serverCertificateHashBase64?: string;
+  /** Explicit source-code opt-in for bounded, metadata-only lag diagnostics. */
+  diagnostics?: DiagnosticsOptions;
 }
 
 export interface AutoConnectOptions {
   /** Default true: use WebSocket only if WebTransport is unavailable or fails before ready. */
   fallbackToWebSocket?: boolean;
+  /** Applied to both transports unless that transport has its own diagnostics option. */
+  diagnostics?: DiagnosticsOptions;
   webTransport?: WebTransportConnectOptions;
   webSocket?: ConnectOptions;
 }
@@ -377,6 +392,12 @@ export const KIND_ROOM_MAP_READY: number;
 export const KIND_MATCHMAKER_MATCHED: number;
 export const KIND_NOTIFICATION: number;
 export const KIND_CHAT_EVENT: number;
+export const KIND_DIAG_SERVER_TIME: number;
+export const KIND_DIAG_CAPABILITIES: number;
+export const KIND_DIAG_CLOCK_SYNC: number;
+export const KIND_DIAG_START: number;
+export const KIND_DIAG_FLUSH: number;
+export const KIND_DIAG_STATUS: number;
 
 export const TSYNC_KIND_MIN: number;
 export const TSYNC_KIND_MAX: number;

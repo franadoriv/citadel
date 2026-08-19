@@ -45,10 +45,10 @@ use crate::database_explorer::{DatabaseExplorer, PgMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    ApiKeyRepository, AuthIdentityRepository, ChatRepository, FriendsRepository,
-    GameScriptRepository, GroupsRepository, LeaderboardsRepository, NotificationsRepository,
-    PurchasesRepository, SessionRepository, StorageRepository, TournamentsRepository,
-    UserRepository, WalletRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, DurableLagReportRepository,
+    FriendsRepository, GameScriptRepository, GroupsRepository, LeaderboardsRepository,
+    NotificationsRepository, PgLagReportRepository, PurchasesRepository, SessionRepository,
+    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
@@ -192,6 +192,7 @@ pub struct PgDatabase {
 /// coverage test below makes a new entry fail fast unless its table is also
 /// present in the CRDB migration set.
 const TEST_RESET_TABLES: &[&str] = &[
+    "lag_diagnostic_reports",
     "api_keys",
     "gamescript_outbox",
     "gamescript_audit",
@@ -665,6 +666,10 @@ impl BackendTrait for PgDatabase {
         PgDatabase::purchases_repository(self)
     }
 
+    fn lag_report_repository(&self) -> Option<Arc<dyn DurableLagReportRepository>> {
+        Some(Arc::new(PgLagReportRepository::new(self.pool.clone())))
+    }
+
     fn database_explorer(&self) -> Option<Arc<dyn DatabaseExplorer>> {
         Some(Arc::clone(&self.explorer) as Arc<dyn DatabaseExplorer>)
     }
@@ -771,6 +776,10 @@ mod tests {
         include_str!("../../../migrations-crdb/20260803142000_add_leaderboard_reset_snapshots.sql");
     const CRDB_GAMESCRIPT: &str =
         include_str!("../../../migrations-crdb/20260805100000_create_gamescript_revisions.sql");
+    const CRDB_LAG_DIAGNOSTIC_REPORTS: &str =
+        include_str!("../../../migrations-crdb/20260819130000_create_lag_diagnostic_reports.sql");
+    const PG_LAG_DIAGNOSTIC_REPORTS: &str =
+        include_str!("../../../migrations/20260819130000_create_lag_diagnostic_reports.sql");
 
     #[test]
     fn timestamp_round_trips_through_millis() {
@@ -800,6 +809,7 @@ mod tests {
     #[test]
     fn cockroach_migrations_cover_every_contract_reset_table() {
         let coverage = [
+            ("lag_diagnostic_reports", CRDB_LAG_DIAGNOSTIC_REPORTS),
             ("api_keys", CRDB_API_KEYS),
             ("gamescript_outbox", CRDB_GAMESCRIPT),
             ("gamescript_audit", CRDB_GAMESCRIPT),
@@ -905,6 +915,33 @@ mod tests {
             assert!(migration.contains("origin_node_id"));
             assert!(migration.contains("DELETE FROM chat_delivery_outbox"));
             assert!(migration.contains("chat_delivery_outbox_origin_active_idx"));
+        }
+    }
+
+    #[test]
+    fn lag_diagnostic_report_migrations_store_only_report_projections() {
+        for migration in [CRDB_LAG_DIAGNOSTIC_REPORTS, PG_LAG_DIAGNOSTIC_REPORTS] {
+            assert!(migration.contains("CREATE TABLE IF NOT EXISTS lag_diagnostic_reports"));
+            assert!(migration.contains("report_json"));
+            assert!(migration.contains("raw_available"));
+            for forbidden in [
+                "raw_path",
+                "filename",
+                "mime",
+                "upload_token",
+                "jti",
+                "payload",
+                "ip_address",
+                "user_agent",
+            ] {
+                assert!(
+                    !migration.lines().any(|line| {
+                        let line = line.trim_start();
+                        !line.starts_with("--") && line.starts_with(&format!("{forbidden} "))
+                    }),
+                    "report persistence must not retain {forbidden}"
+                );
+            }
         }
     }
 }

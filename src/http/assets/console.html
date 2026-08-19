@@ -289,6 +289,7 @@ table.tbl tr.deleted td { color: var(--text-dim); font-style: italic; }
   background: var(--navy-750); color: var(--text-muted); border: 1px solid var(--border);
 }
 .tag-soft.on { color: var(--ok); background: var(--ok-soft); border-color: rgba(53,200,143,0.3); }
+.tag-soft.warn { color: var(--warn); background: var(--warn-soft); border-color: rgba(224,166,58,0.35); }
 .tag-soft.off { color: var(--text-dim); }
 .tag-soft.bad { color: var(--bad); background: var(--bad-soft); border-color: rgba(229,96,95,0.3); }
 
@@ -357,6 +358,22 @@ pre.code {
   border-top: 1px solid var(--border); color: var(--text-dim); font-size: 12px;
 }
 .pager .grow { flex: 1; }
+
+/* ---- Lag diagnostics ------------------------------------------------------- */
+.lag-note { color: var(--text-dim); font-size: 12px; line-height: 1.55; margin: 0; }
+.lag-status { text-transform: none; }
+.lag-bars { display: flex; align-items: end; gap: 3px; height: 96px; padding: 8px 0 3px; border-bottom: 1px solid var(--border); }
+.lag-bars i { display: block; min-width: 5px; flex: 1 1 8px; max-width: 28px; background: linear-gradient(180deg, var(--accent-300), var(--accent-600)); border-radius: 3px 3px 0 0; }
+.lag-axis { display: flex; justify-content: space-between; gap: 8px; margin-top: 5px; color: var(--text-dim); font-size: 10.5px; font-family: var(--mono); }
+.lag-spark { display: flex; align-items: end; gap: 2px; height: 74px; padding-top: 6px; border-bottom: 1px solid var(--border); }
+.lag-spark i { display: block; min-width: 4px; flex: 1 1 5px; max-width: 14px; background: var(--ok); border-radius: 2px 2px 0 0; }
+.lag-spark i.warn { background: var(--warn); }
+.lag-spark i.bad { background: var(--bad); }
+.lag-cohort { display: grid; grid-template-columns: minmax(190px, 1.5fr) repeat(4, minmax(82px, .7fr)); gap: 8px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+.lag-cohort:last-child { border-bottom: 0; }
+.lag-cohort .cohort-key { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+.lag-muted { color: var(--text-dim); }
+@media (max-width: 720px) { .lag-cohort { grid-template-columns: 1fr 1fr; } }
 
 .updated { color: var(--text-dim); font-size: 12px; }
 .updated .dot-live { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-right: 6px; animation: pulse 2s infinite; vertical-align: middle; }
@@ -561,6 +578,10 @@ pre.code {
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
     return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
   }
+  function fmtUtc(ms) {
+    if (!ms || !isFinite(Number(ms))) return '—';
+    try { return new Date(Number(ms)).toISOString(); } catch (e) { return '—'; }
+  }
 
   // ---- Auth state + API helper ---------------------------------------------
   var TOKEN_KEY = 'citadel.console.token';
@@ -627,7 +648,9 @@ pre.code {
 
   // ---- Modal (inline dialog; native dialogs are never used) -----------------
   var modalReturnFocus = null;
+  var modalGeneration = 0;
   function openModal(title, bodyHtml) {
+    modalGeneration += 1;
     var modalRoot = qs('modal-root');
     if (!modalRoot.firstChild) modalReturnFocus = document.activeElement;
     modalRoot.innerHTML =
@@ -659,8 +682,10 @@ pre.code {
         first.focus();
       }
     });
+    return modalGeneration;
   }
   function closeModal() {
+    modalGeneration += 1;
     qs('modal-root').replaceChildren();
     if (modalReturnFocus && document.contains(modalReturnFocus)) modalReturnFocus.focus();
     modalReturnFocus = null;
@@ -838,6 +863,9 @@ pre.code {
     ]},
     { label: 'Commerce', items: [
       { id: 'purchases', title: 'Purchases & Subscriptions', icon: 'cart' }
+    ]},
+    { label: 'Operations', items: [
+      { id: 'lag-diagnostics', title: 'Lag Diagnostics', icon: 'activity' }
     ]},
     { label: 'System', items: [
       { id: 'configuration', title: 'Configuration', icon: 'settings' },
@@ -2450,6 +2478,405 @@ pre.code {
     }).catch(fail);
   }
 
+  // ==== Lag Diagnostics ========================================================
+  // This view intentionally renders derived arrival observations only. It never
+  // calls a raw path or treats inter-arrival spacing as RTT, loss, or a client
+  // network diagnosis. The server retains the raw CLAG lifecycle behind opaque
+  // handles for administrators only.
+  var lag = {
+    reports: [], reportsNext: null, reportsLoading: false,
+    captures: [], capturesNext: null, capturesLoading: false,
+    raw: { capture: null, items: [], next: null, loading: false }
+  };
+
+  function lagIsCurrent() { return currentRoute() === 'lag-diagnostics'; }
+  function beginLagKeysetGeneration() {
+    // Existing requests retain their captured generation. Clearing only these
+    // admission flags lets the new generation start immediately; stale
+    // completions cannot mutate them because every completion compares its
+    // captured generation first.
+    state.viewGeneration += 1;
+    lag.reportsLoading = false;
+    lag.capturesLoading = false;
+  }
+  function lagOperationContext(rawSession, capturedModalGeneration) {
+    return {
+      token: token(), sessionGeneration: state.sessionGeneration,
+      viewGeneration: state.viewGeneration, rawSession: rawSession,
+      modalGeneration: capturedModalGeneration
+    };
+  }
+  function lagOperationIsCurrent(context) {
+    return !!state.user && isAdmin()
+      && context.token === token()
+      && context.sessionGeneration === state.sessionGeneration
+      && context.viewGeneration === state.viewGeneration
+      && context.rawSession === lag.raw
+      && context.modalGeneration === modalGeneration;
+  }
+  function lagNum(value) { value = Number(value); return isFinite(value) && value >= 0 ? value : 0; }
+  function fmtMicros(value) {
+    if (value == null || !isFinite(Number(value))) return '—';
+    return fmtNum(Math.round(Number(value))) + ' µs';
+  }
+  function lagStatusTag(status) {
+    var value = String(status || 'Unknown');
+    var normalized = value.toLowerCase();
+    var cls = normalized === 'complete' ? 'on'
+      : (normalized === 'pending' || normalized === 'no_analysis' || normalized === 'no_data' ? 'off'
+        : (normalized === 'partial' || normalized === 'insufficient_samples' || normalized === 'raw_expired' || normalized === 'raw_deleted' ? 'warn' : 'bad'));
+    return '<span class="tag-soft lag-status ' + cls + '">' + esc(value) + '</span>';
+  }
+  function lagQualityTag(quality) {
+    var value = String((quality && quality.status) || 'unknown');
+    var cls = value === 'complete' ? 'on' : (value === 'partial' ? 'warn' : 'off');
+    return '<span class="tag-soft lag-status ' + cls + '">' + esc(value) + '</span>';
+  }
+  function lagRawState(item) {
+    if (!isAdmin()) return 'redacted for viewer';
+    if (item.raw_available === true) return 'retained';
+    // The v1 response deliberately exposes availability, not the private
+    // retention cause. Do not invent an expired/deleted cause from a boolean.
+    return item.raw_available === false ? 'raw unavailable (reason not provided)' : 'not retained';
+  }
+  function lagSafeError(error) {
+    if (!error) return 'Request failed. Refresh and try again.';
+    if (error.status === 403) return 'This action requires an administrator role.';
+    if (error.status === 404 || error.status === 409) return 'This artifact is no longer available. Refresh the capture list.';
+    return 'Request failed. Refresh and try again.';
+  }
+  function lagReportPath(after) {
+    return '/console/v1/lag/reports?limit=20' + (after ? '&after=' + encodeURIComponent(after) : '');
+  }
+  function lagCapturePath(after) {
+    return '/console/v1/lag/captures?limit=20' + (after ? '&after=' + encodeURIComponent(after) : '');
+  }
+
+  function renderLagDiagnostics() {
+    beginLagKeysetGeneration();
+    ACT = {}; FORM = {};
+    lag.reports = []; lag.reportsNext = null; lag.reportsLoading = false;
+    lag.captures = []; lag.capturesNext = null; lag.capturesLoading = false;
+    lag.raw = { capture: null, items: [], next: null, loading: false };
+    renderLagDashboard();
+    loadLagReports(true);
+    loadLagCaptures(true);
+  }
+
+  function loadLagReports(reset) {
+    if (lag.reportsLoading || (!reset && !lag.reportsNext)) return;
+    var after = reset ? null : lag.reportsNext;
+    var viewGeneration = state.viewGeneration;
+    lag.reportsLoading = true;
+    api('GET', lagReportPath(after)).then(function (page) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.reports = reset ? (page.items || []) : lag.reports.concat(page.items || []);
+      lag.reportsNext = page.next_after || null;
+      lag.reportsLoading = false;
+      renderLagDashboard();
+    }).catch(function (error) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.reportsLoading = false;
+      renderLagDashboard(); toast(lagSafeError(error), 'err');
+    });
+  }
+
+  function loadLagCaptures(reset) {
+    if (lag.capturesLoading || (!reset && !lag.capturesNext)) return;
+    var after = reset ? null : lag.capturesNext;
+    var viewGeneration = state.viewGeneration;
+    lag.capturesLoading = true;
+    api('GET', lagCapturePath(after)).then(function (page) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.captures = reset ? (page.items || []) : lag.captures.concat(page.items || []);
+      lag.capturesNext = page.next_after || null;
+      lag.capturesLoading = false;
+      renderLagDashboard();
+    }).catch(function (error) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.capturesLoading = false;
+      renderLagDashboard(); toast(lagSafeError(error), 'err');
+    });
+  }
+
+  function renderLagDashboard() {
+    ACT = {}; FORM = {};
+    var reports = lag.reports || [];
+    var captures = lag.captures || [];
+    var partial = reports.filter(function (report) { return String(report.status).toLowerCase() === 'partial'; }).length;
+    var unavailable = reports.filter(function (report) { return report.raw_available === false; }).length;
+    var utcLabel = reports.some(function (report) { return report.quality && report.quality.clock_uncertain; })
+      ? 'UTC correlation metadata · uncertainty present' : 'UTC correlation metadata';
+    var html = pageHead('Lag Diagnostics', 'Derived packet-arrival observations for diagnosing jitter. These metrics are not RTT or packet-loss measurements.')
+      + '<div class="toolbar"><span class="tag-soft">' + esc(utcLabel) + '</span><span class="tag-soft">derived data only</span><div class="grow"></div>'
+      + '<button class="btn" data-act="lag-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="stat-grid">'
+      + statCard('Reports loaded', 'activity', reports.length, 'keyset page', 'lag-reports')
+      + statCard('Captures loaded', 'database', captures.length, 'keyset page', 'lag-captures')
+      + statCard('Partial reports', 'alert', partial, 'quality exclusions or recorder overflow', 'lag-partial')
+      + statCard('Raw unavailable', 'inbox', isAdmin() ? unavailable : '—', isAdmin() ? 'retention unavailable; reports remain' : 'retention is redacted', 'lag-raw')
+      + '</div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Reports</h2><span class="sub">immutable analysis output · 20 per keyset page</span></div>';
+    var reportRows = '';
+    reports.forEach(function (report) {
+      var quality = report.quality || {};
+      reportRows += '<tr class="rowlink" data-act="lag-open-report" data-report="' + esc(report.report_id) + '">'
+        + '<td class="mono">' + esc(report.report_id) + '</td>'
+        + '<td class="mono">' + esc(report.capture_id) + '</td>'
+        + '<td>' + lagStatusTag(report.status) + '</td>'
+        + '<td>' + lagQualityTag(quality) + '</td>'
+        + '<td>' + esc(fmtNum(quality.sample_count || 0)) + ' / ' + esc(fmtNum(quality.excluded_count || 0)) + '</td>'
+        + '<td>' + esc(fmtUtc(report.created_at_unix_ms)) + '</td>'
+        + '<td>' + esc(lagRawState(report)) + '</td></tr>';
+    });
+    if (!reportRows && !lag.reportsLoading) reportRows = emptyRowHtml(7, 'No derived reports are retained for this keyset.');
+    if (!reportRows) reportRows = emptyRowHtml(7, 'Loading report keyset…');
+    html += tableHtml(['Report', 'Capture', 'Status', 'Quality', 'Samples / excluded', 'Created UTC', 'Raw lifecycle'], reportRows);
+    html += '<div class="pager"><span>' + esc(fmtNum(reports.length)) + ' loaded</span><div class="grow"></div>'
+      + (lag.reportsNext ? '<button class="btn small" data-act="lag-more-reports">Load more</button>' : '') + '</div></div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Capture overview</h2><span class="sub">report rows remain visible after raw retention ends</span></div>';
+    var captureRows = '';
+    captures.forEach(function (capture) {
+      var action = isAdmin()
+        ? '<button class="btn small" data-act="lag-open-raw" data-capture="' + esc(capture.capture_id) + '">Raw artifacts</button>'
+        : '<span class="lag-muted">viewer: no raw access</span>';
+      captureRows += '<tr><td class="mono">' + esc(capture.capture_id) + '</td>'
+        + '<td>' + esc(fmtNum(capture.generation || 0)) + '</td>'
+        + '<td>' + esc(fmtNum(capture.report_count || 0)) + '</td>'
+        + '<td>' + (capture.latest_report_status ? lagStatusTag(capture.latest_report_status) : '—') + '</td>'
+        + '<td>' + esc(lagRawState(capture)) + '</td>'
+        + '<td>' + (isAdmin() ? esc(fmtNum(capture.raw_artifact_count || 0)) + ' · ' + esc(fmtBytes(capture.raw_compressed_bytes || 0)) : 'redacted') + '</td>'
+        + '<td>' + action + '</td></tr>';
+    });
+    if (!captureRows && !lag.capturesLoading) captureRows = emptyRowHtml(7, 'No captures are retained for this keyset.');
+    if (!captureRows) captureRows = emptyRowHtml(7, 'Loading capture keyset…');
+    html += tableHtml(['Capture', 'Generation', 'Reports', 'Latest status', 'Raw lifecycle', 'Artifacts / compressed', 'Actions'], captureRows);
+    html += '<div class="pager"><span>' + esc(fmtNum(captures.length)) + ' loaded</span><div class="grow"></div>'
+      + (lag.capturesNext ? '<button class="btn small" data-act="lag-more-captures">Load more</button>' : '') + '</div></div>';
+    html += '<p class="lag-note">Report states include <span class="mono">pending</span>, <span class="mono">no_analysis</span>, <span class="mono">no_data</span>, <span class="mono">partial</span>, and <span class="mono">failed</span>; cohort quality can be <span class="mono">insufficient_samples</span>. The protocol names <span class="mono">raw_expired</span> and <span class="mono">raw_deleted</span>, while this API version exposes only raw availability and therefore does not infer either reason. Inter-arrival and identifier observations describe what the recorder accepted; none imply a network RTT or loss estimate.</p>';
+    setPage(html);
+    ACT['lag-refresh'] = function () { beginLagKeysetGeneration(); loadLagReports(true); loadLagCaptures(true); };
+    ACT['lag-more-reports'] = function () { loadLagReports(false); };
+    ACT['lag-more-captures'] = function () { loadLagCaptures(false); };
+    ACT['lag-open-report'] = function (data) { openLagReport(data.report); };
+    ACT['lag-open-raw'] = function (data) { openLagRaw(data.capture); };
+  }
+
+  function openLagReport(reportId) {
+    if (!reportId) return;
+    beginLagKeysetGeneration();
+    var generation = state.viewGeneration;
+    setPage(pageHead('Lag report', 'Loading bounded derived report details…') + loadingRows(5));
+    var base = '/console/v1/lag/reports/' + encodeURIComponent(reportId);
+    Promise.all([api('GET', base), api('GET', base + '/windows')]).then(function (responses) {
+      if (!lagIsCurrent() || generation !== state.viewGeneration) return;
+      renderLagReportDetail(responses[0], responses[1]);
+    }).catch(function (error) {
+      if (lagIsCurrent() && generation === state.viewGeneration) {
+        setPage(pageHead('Lag report', 'The report is unavailable.') + '<div class="panel">' + emptyBlock('alert', 'Could not load report', lagSafeError(error)) + '</div>');
+      }
+    });
+  }
+
+  function lagHistogram(summary) {
+    var histogram = summary.histogram || {};
+    var counts = histogram.counts || [];
+    var max = 1;
+    counts.forEach(function (count) { max = Math.max(max, lagNum(count)); });
+    var bars = '';
+    counts.forEach(function (count, index) {
+      var height = Math.max(3, Math.round((lagNum(count) / max) * 100));
+      var edge = histogram.edges_us && histogram.edges_us[index];
+      bars += '<i style="height:' + height + '%" title="≤ ' + esc(fmtMicros(edge)) + ': ' + esc(fmtNum(count)) + '"></i>';
+    });
+    if (!bars) bars = '<span class="lag-muted">No histogram samples</span>';
+    var last = histogram.edges_us && histogram.edges_us.length ? fmtMicros(histogram.edges_us[histogram.edges_us.length - 1]) : '—';
+    return '<div class="lag-bars" aria-label="Inter-arrival histogram in microseconds">' + bars + '</div>'
+      + '<div class="lag-axis"><span>0 µs</span><span>≤ ' + esc(last) + '</span><span>overflow ' + esc(fmtNum(histogram.overflow_count || 0)) + '</span></div>';
+  }
+
+  function lagCohortLabel(key) {
+    key = key || {};
+    return String(key.participant || 'participant') + ' · packet ' + String(key.packet_kind == null ? '—' : key.packet_kind)
+      + ' · ' + String(key.direction || '—') + '/' + String(key.delivery || '—') + ' · epoch ' + String(key.gameplay_epoch == null ? '—' : key.gameplay_epoch);
+  }
+
+  function lagWindowChart(windows) {
+    var max = 1;
+    windows.forEach(function (window) { max = Math.max(max, lagNum(window.mean_interarrival_us)); });
+    var html = '';
+    windows.forEach(function (window) {
+      var mean = lagNum(window.mean_interarrival_us);
+      var cls = window.arrival_reorder ? ' bad' : (window.observed_id_gap ? ' warn' : '');
+      var height = Math.max(3, Math.round((mean / max) * 100));
+      html += '<i class="' + cls + '" style="height:' + height + '%" title="'
+        + esc(fmtMicros(mean)) + ' mean inter-arrival · ' + esc(fmtNum(window.sample_count || 0)) + ' samples"></i>';
+    });
+    return html || '<span class="lag-muted">No bounded timeline windows.</span>';
+  }
+
+  function renderLagReportDetail(report, windowResponse) {
+    ACT = {}; FORM = {};
+    var quality = report.quality || {};
+    var summaries = report.summaries || [];
+    var windows = (windowResponse && windowResponse.windows) || [];
+    var html = pageHead('Lag report', 'Derived packet-arrival analysis. Values are microseconds (µs); they are not RTT or loss.')
+      + '<div class="toolbar">' + backBtn('lag-back') + '<div class="grow"></div>' + lagStatusTag(report.status) + '</div>'
+      + '<div class="stat-grid">'
+      + statCard('Accepted samples', 'activity', quality.sample_count || 0, 'derived records in this report', 'lag-samples')
+      + statCard('Excluded rows', 'alert', quality.excluded_count || 0, 'bounded decoder/analyzer exclusions', 'lag-excluded')
+      + statCard('Recorder overflow', 'inbox', quality.overwritten_count || 0, 'overwritten accepted rows', 'lag-overflow')
+      + statCard('Clock uncertainty', 'clock', quality.clock_uncertain ? 'present' : 'known', 'server UTC alignment quality', 'lag-clock')
+      + '</div>';
+    html += '<div class="panel"><div class="panel-head"><h2>Report provenance</h2><span class="sub">versioned derived result</span></div><div class="panel-body"><table class="kv">'
+      + kv('Report', report.report_id)
+      + kv('Capture', report.capture_id)
+      + kv('Generation', fmtNum(report.generation || 0))
+      + kvRaw('Analysis status', lagStatusTag(report.status))
+      + kvRaw('Metric quality', lagQualityTag(quality))
+      + kv('Decoder / analyzer', 'v' + (report.decoder_version || '—') + ' / v' + (report.analyzer_version || '—'))
+      + kv('Report created (UTC)', fmtUtc(report.created_at_unix_ms))
+      + kv('Clock uncertainty', quality.clock_uncertain ? 'UTC alignment uncertain; compare trends cautiously' : 'No initial UTC-clock uncertainty reported')
+      + kv('Malformed / overwritten', fmtNum(quality.malformed_count || 0) + ' / ' + fmtNum(quality.overwritten_count || 0))
+      + kv('Raw lifecycle', lagRawState(report))
+      + '</table></div></div>';
+    html += '<div class="panel"><div class="panel-head"><h2>Cohorts and histogram</h2><span class="sub">packet kind · direction · delivery · epoch</span></div><div class="panel-body">';
+    if (!summaries.length) html += emptyBlock('activity', 'No analysis samples', 'The report contains no bounded derived cohorts.');
+    summaries.forEach(function (summary) {
+      var cohort = summary.key || {};
+      html += '<div class="lag-cohort"><div class="cohort-key mono" title="' + esc(lagCohortLabel(cohort)) + '">' + esc(lagCohortLabel(cohort)) + '</div>'
+        + '<div><b>' + esc(fmtMicros(summary.p50_interarrival_us)) + '</b><br><span class="lag-muted">p50</span></div>'
+        + '<div><b>' + esc(fmtMicros(summary.p95_interarrival_us)) + '</b><br><span class="lag-muted">p95</span></div>'
+        + '<div><b>' + esc(fmtMicros(summary.p99_interarrival_us)) + '</b><br><span class="lag-muted">p99</span></div>'
+        + '<div><b>' + esc(fmtNum((summary.quality || {}).sample_count || 0)) + '</b><br><span class="lag-muted">samples</span></div></div>'
+        + lagHistogram(summary);
+    });
+    html += '</div></div>';
+    html += '<div class="panel"><div class="panel-head"><h2>Bounded arrival timeline</h2><span class="sub">mean inter-arrival per aggregate window</span></div><div class="panel-body">'
+      + '<div class="lag-spark" aria-label="Arrival timeline in microseconds">' + lagWindowChart(windows) + '</div>'
+      + '<div class="lag-axis"><span>first window</span><span>' + esc(fmtNum(windows.length)) + ' bounded windows' + (windowResponse && windowResponse.truncated ? ' · truncated' : '') + '</span><span>last window</span></div>'
+      + '<p class="lag-note" style="margin-top:12px">Orange bars contain observed identifier gaps; red bars contain arrival reordering. They are recorder observations, not packet-loss claims.</p></div></div>';
+    if (report.truncated) html += '<div class="notice">' + svg('alert') + '<div><b>Response projection bounded.</b> Additional cohorts were excluded from this Console response and the report quality is partial.</div></div>';
+    setPage(html);
+    ACT['lag-back'] = renderLagDiagnostics;
+  }
+
+  function rawBasePath(captureId) {
+    return '/console/v1/lag/captures/' + encodeURIComponent(captureId) + '/raw';
+  }
+  function openLagRaw(captureId) {
+    if (!isAdmin()) { toast('This action requires an administrator role.', 'err'); return; }
+    // Do not allow an in-flight report/capture list to replace this modal's
+    // action registry after it has been opened.
+    beginLagKeysetGeneration();
+    lag.raw = { capture: captureId, items: [], next: null, loading: false, modalGeneration: null };
+    lag.raw.modalGeneration = openModal('Raw diagnostic artifacts', '<p class="lag-note">Opaque handles only. Raw capture data is never embedded in this page.</p><div id="lag-raw-body">' + loadingRows(4) + '</div>');
+    loadLagRaw(true);
+  }
+  function loadLagRaw(reset) {
+    var rawSession = lag.raw;
+    if (!isAdmin() || !rawSession.capture || rawSession.loading || (!reset && !rawSession.next)) return;
+    var context = lagOperationContext(rawSession, rawSession.modalGeneration);
+    var after = reset ? null : rawSession.next;
+    rawSession.loading = true;
+    var path = rawBasePath(rawSession.capture) + '?limit=20' + (after ? '&after=' + encodeURIComponent(after) : '');
+    api('GET', path).then(function (page) {
+      if (!lagOperationIsCurrent(context) || !qs('lag-raw-body')) return;
+      rawSession.items = reset ? (page.items || []) : rawSession.items.concat(page.items || []);
+      rawSession.next = page.next_after || null;
+      rawSession.loading = false;
+      renderLagRawList();
+    }).catch(function (error) {
+      if (!lagOperationIsCurrent(context) || !qs('lag-raw-body')) return;
+      rawSession.loading = false;
+      setHtml('lag-raw-body', '<div class="inline-error" role="alert">' + esc(lagSafeError(error)) + '</div>');
+    });
+  }
+  function renderLagRawList() {
+    var rows = '';
+    lag.raw.items.forEach(function (artifact) {
+      rows += '<tr><td class="mono">' + esc(artifact.handle) + '</td><td>' + esc(fmtNum(artifact.generation || 0)) + '</td>'
+        + '<td>' + esc(fmtUtc(artifact.received_at_unix_ms)) + '</td><td>' + esc(fmtBytes(artifact.compressed_bytes || 0)) + '</td>'
+        + '<td>' + esc(fmtNum(artifact.record_count || 0)) + '</td><td><button class="btn small" data-act="lag-raw-download" data-handle="' + esc(artifact.handle) + '">' + svg('download') + 'Download</button> '
+        + '<button class="btn small" data-act="lag-raw-regenerate" data-handle="' + esc(artifact.handle) + '">' + svg('refresh') + 'Regenerate</button> '
+        + '<button class="btn small danger" data-act="lag-raw-delete" data-handle="' + esc(artifact.handle) + '" data-confirm>' + svg('trash') + 'Delete</button></td></tr>';
+    });
+    if (!rows) rows = emptyRowHtml(6, 'No retained raw artifacts for this capture.');
+    setHtml('lag-raw-body', tableHtml(['Opaque handle', 'Generation', 'Received UTC', 'Compressed', 'Records', 'Actions'], rows)
+      + '<div class="pager"><span>' + esc(fmtNum(lag.raw.items.length)) + ' loaded</span><div class="grow"></div>'
+      + (lag.raw.next ? '<button class="btn small" data-act="lag-raw-more">Load more</button>' : '') + '</div>');
+    ACT['lag-raw-more'] = function () { loadLagRaw(false); };
+    ACT['lag-raw-download'] = function (data) { downloadLagRaw(lag.raw.capture, data.handle); };
+    ACT['lag-raw-delete'] = function (data) { deleteLagRaw(lag.raw.capture, data.handle); };
+    ACT['lag-raw-regenerate'] = function (data) { openLagRegenerate(lag.raw.capture, data.handle); };
+  }
+  function downloadLagRaw(captureId, handle) {
+    if (!isAdmin()) return;
+    var context = lagOperationContext(lag.raw, lag.raw.modalGeneration);
+    var headers = { 'Accept': 'application/octet-stream', 'Authorization': 'Bearer ' + token() };
+    fetch(rawBasePath(captureId) + '/' + encodeURIComponent(handle), { headers: headers, cache: 'no-store' })
+      .then(function (response) {
+        if (!response.ok) { var error = new Error('download failed'); error.status = response.status; throw error; }
+        if (!lagOperationIsCurrent(context)) return null;
+        return response.blob();
+      }).then(function (blob) {
+        // A logout, role downgrade, route transition, or replacement modal
+        // may occur while the browser buffers the attachment. Never mint an
+        // object URL or trigger a download after that context becomes stale.
+        if (!blob || !lagOperationIsCurrent(context)) return;
+        var url = URL.createObjectURL(blob); var anchor = document.createElement('a');
+        anchor.href = url; anchor.download = 'lag-diagnostic.clag'; document.body.appendChild(anchor); anchor.click(); anchor.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        toast('Raw diagnostic download started.', 'ok');
+      }).catch(function (error) { toast(lagSafeError(error), 'err'); });
+  }
+  function deleteLagRaw(captureId, handle) {
+    if (!isAdmin()) return;
+    var context = lagOperationContext(lag.raw, lag.raw.modalGeneration);
+    api('DELETE', rawBasePath(captureId) + '/' + encodeURIComponent(handle)).then(function () {
+      if (!lagOperationIsCurrent(context)) return;
+      toast('Raw artifact deleted. Derived reports were preserved.', 'ok');
+      closeModal();
+      beginLagKeysetGeneration();
+      loadLagReports(true); loadLagCaptures(true);
+    }).catch(function (error) { if (lagOperationIsCurrent(context)) toast(lagSafeError(error), 'err'); });
+  }
+  function openLagRegenerate(captureId, handle) {
+    if (!isAdmin()) return;
+    var rawSession = lag.raw;
+    var regenerationModalGeneration = openModal('Regenerate derived report', '<p class="lag-note">This submits only an opaque handle and bounded analysis options. It does not place raw bytes or capture paths in the Console.</p>'
+      + '<form data-form="lag-regenerate"><div id="lag-regenerate-error" class="inline-error" role="alert" aria-live="polite" hidden></div>'
+      + '<input type="hidden" name="capture" value="' + esc(captureId) + '"><input type="hidden" name="handle" value="' + esc(handle) + '">'
+      + field('Send cadence (Hz, optional)', textIn('send_rate_hz', '', 'server-known only', 'number'))
+      + field('Maximum windows (1–64)', textIn('max_windows', '64', '64', 'number'))
+      + '<div class="toolbar" style="margin:0"><button class="btn primary" type="submit">' + svg('refresh') + 'Regenerate</button><button class="btn" type="button" data-act="modal-close">Cancel</button></div></form>');
+    FORM['lag-regenerate'] = function (values) {
+      var context = lagOperationContext(rawSession, regenerationModalGeneration);
+      if (!lagOperationIsCurrent(context)) return;
+      var error = qs('lag-regenerate-error');
+      var rate = values.send_rate_hz ? Number(values.send_rate_hz) : null;
+      var maxWindows = Number(values.max_windows || 64);
+      if ((rate != null && (!Number.isInteger(rate) || rate < 1 || rate > 65535)) || !Number.isInteger(maxWindows) || maxWindows < 1 || maxWindows > 64) {
+        error.textContent = 'Use a whole send cadence from 1–65535 Hz and 1–64 windows.'; error.removeAttribute('hidden'); return;
+      }
+      error.setAttribute('hidden', '');
+      api('POST', '/console/v1/lag/captures/' + encodeURIComponent(values.capture) + '/regenerate', {
+        handle: values.handle,
+        options: { send_rate_hz: rate, max_windows: maxWindows }
+      }).then(function (result) {
+        if (!lagOperationIsCurrent(context)) return;
+        closeModal(); beginLagKeysetGeneration();
+        toast(result && result.report_id ? 'Derived report regenerated.' : 'Regeneration request accepted.', 'ok');
+        loadLagReports(true); loadLagCaptures(true);
+      }).catch(function (apiError) {
+        if (!lagOperationIsCurrent(context)) return;
+        error.textContent = lagSafeError(apiError); error.removeAttribute('hidden');
+      });
+    };
+  }
+
   // ---- Section dispatch -------------------------------------------------------
   var SECTIONS = {
     status: renderStatusShell,
@@ -2462,6 +2889,7 @@ pre.code {
     leaderboards: renderLeaderboards,
     matches: renderMatches,
     purchases: renderPurchases,
+    'lag-diagnostics': renderLagDiagnostics,
     configuration: renderConfiguration,
     'api-keys': renderApiKeys,
     api: renderApi,

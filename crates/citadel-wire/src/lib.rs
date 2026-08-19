@@ -23,6 +23,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub mod baseline;
 pub mod bits;
 pub mod codec;
+pub mod diagnostics;
 pub mod interest;
 pub mod na;
 pub mod netpeer;

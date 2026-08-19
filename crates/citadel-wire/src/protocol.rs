@@ -195,6 +195,20 @@ pub const KIND_MATCH_CLOSED: u16 = 32;
 /// is taken by [`KIND_MATCH_CLOSED`]).
 pub const KIND_ROOM_REJECT: u16 = 33;
 
+/// Lag-diagnostics server UTC correlation offer (`S→C`, reliable).
+/// Delivered immediately after the unchanged `KIND_AUTH_RESULT` body.
+pub const KIND_DIAG_SERVER_TIME: u16 = 34;
+/// Lag-diagnostics SDK local-opt-in capability assertion (`C→S`, reliable).
+pub const KIND_DIAG_CAPABILITIES: u16 = 35;
+/// Lag-diagnostics bounded NTP-style clock correlation probe (`C↔S`, reliable).
+pub const KIND_DIAG_CLOCK_SYNC: u16 = 36;
+/// Lag-diagnostics server capture request (`S→C`, reliable).
+pub const KIND_DIAG_START: u16 = 37;
+/// Lag-diagnostics server flush request (`S→C`, reliable).
+pub const KIND_DIAG_FLUSH: u16 = 38;
+/// Lag-diagnostics client progress/terminal status (`C→S`, reliable).
+pub const KIND_DIAG_STATUS: u16 = 39;
+
 // Compile-time guarantees that the reserved ranges are disjoint and sit above the
 // legacy kinds (1..=6). A future edit that overlaps them fails to build rather
 // than silently colliding on the wire.
@@ -221,6 +235,8 @@ const _: () = assert!(KIND_MATCH_CLOSED > KIND_TSYNC_V2_INPUT);
 // collide with the transform-sync v2 kinds (29-31) or the match-closed
 // notification (32), which was merged first and keeps its discriminant.
 const _: () = assert!(KIND_ROOM_REJECT > KIND_MATCH_CLOSED);
+const _: () = assert!(KIND_DIAG_SERVER_TIME == KIND_ROOM_REJECT + 1);
+const _: () = assert!(KIND_DIAG_STATUS == KIND_DIAG_SERVER_TIME + 5);
 
 /// [`KIND_AUTH_RESULT`] status: the token validated; the connection is bound to
 /// the `user_id` that follows in the body.

@@ -22,12 +22,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use base64::Engine as _;
+use citadel_wire::diagnostics::{
+    Capabilities, CaptureId, CaptureStatus, ClockSync, FlushCapture, ServerTime, StartCapture,
+};
 use citadel_wire::protocol;
 use serde::Serialize;
 
 use crate::chat_cluster::{
     ChatDeliveryDisposition, ChatPresenceDirectory, LocalChatPresenceAnnouncer, RemoteChatDelivery,
 };
+use crate::lag_diagnostics::{CaptureFlushGrant, CaptureFlushPlan, LagDiagnosticsService};
 use crate::maps::MapCatalog;
 use crate::matchmaker::{Matchmaker, MatchmakerStats, TicketId, TicketRequest, TicketState};
 use crate::matchmaker_cluster::{
@@ -49,6 +53,9 @@ use crate::party_presence::{
 };
 use crate::realtime::auth::{AuthOutcome, Authenticator, PresentedCredential};
 use crate::realtime::chat_presence::{ChatPresenceRegistry, ChatSubscription};
+use crate::realtime::diagnostics::{
+    LagCaptureError, LagCaptureFlush, LagCaptureManager, LagCaptureStart, LagCaptureStatus,
+};
 use crate::realtime::netpeer::layout::RepLayout;
 use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot, Validated};
 use crate::realtime::registry::{
@@ -80,13 +87,14 @@ use crate::transport::{Delivery, Envelope};
 use citadel_wire::netpeer::{FieldDelta, RepSchema};
 
 pub use citadel_wire::protocol::{
-    KIND_AUTH, KIND_AUTH_RESULT, KIND_CHAT_EVENT, KIND_MATCHMAKER_MATCHED, KIND_NA_DESPAWN,
-    KIND_NA_PRESENCE, KIND_NA_SPAWN, KIND_NA_SPAWN_BATCH, KIND_NA_STATE, KIND_NOTIFICATION,
-    KIND_PEER_POSITION, KIND_POSITION, KIND_REP_ACK, KIND_REP_DELTA, KIND_ROOM_CREATE,
-    KIND_ROOM_JOIN, KIND_ROOM_JOINED, KIND_ROOM_LEAVE, KIND_ROOM_MAP_READY, KIND_RPC_REQUEST,
-    KIND_RPC_RESPONSE, KIND_TSYNC_ACK, KIND_TSYNC_HELLO, KIND_TSYNC_INPUT, KIND_TSYNC_REWIND,
-    KIND_TSYNC_ROLE, KIND_TSYNC_SNAPSHOT, KIND_TSYNC_V2_HELLO, KIND_TSYNC_V2_INPUT, ROOM_KIND_MAX,
-    ROOM_KIND_MIN, RPC_STATUS_OK,
+    KIND_AUTH, KIND_AUTH_RESULT, KIND_CHAT_EVENT, KIND_DIAG_CAPABILITIES, KIND_DIAG_CLOCK_SYNC,
+    KIND_DIAG_FLUSH, KIND_DIAG_SERVER_TIME, KIND_DIAG_START, KIND_DIAG_STATUS,
+    KIND_MATCHMAKER_MATCHED, KIND_NA_DESPAWN, KIND_NA_PRESENCE, KIND_NA_SPAWN, KIND_NA_SPAWN_BATCH,
+    KIND_NA_STATE, KIND_NOTIFICATION, KIND_PEER_POSITION, KIND_POSITION, KIND_REP_ACK,
+    KIND_REP_DELTA, KIND_ROOM_CREATE, KIND_ROOM_JOIN, KIND_ROOM_JOINED, KIND_ROOM_LEAVE,
+    KIND_ROOM_MAP_READY, KIND_RPC_REQUEST, KIND_RPC_RESPONSE, KIND_TSYNC_ACK, KIND_TSYNC_HELLO,
+    KIND_TSYNC_INPUT, KIND_TSYNC_REWIND, KIND_TSYNC_ROLE, KIND_TSYNC_SNAPSHOT, KIND_TSYNC_V2_HELLO,
+    KIND_TSYNC_V2_INPUT, ROOM_KIND_MAX, ROOM_KIND_MIN, RPC_STATUS_OK,
 };
 
 const MATCHMAKER_HANDOFF_TTL_MS: u64 = 30_000;
@@ -97,6 +105,20 @@ pub(crate) const REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE: &str =
 const CHAT_TYPING_TTL_MS: u64 = 5_000;
 const PARTY_OWNER_LEASE_MS: u64 = 15_000;
 const PARTY_PRESENCE_LEASE_MS: u64 = 15_000;
+
+/// Native result for a secure FLUSH. Unlike the legacy base lifecycle result,
+/// this carries a distinct redacted grant for every realtime participant so a
+/// bearer cannot be replayed by another client in the same capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LagCaptureUploadFlush {
+    /// Per-participant FLUSH bodies to enqueue on the matching session only.
+    pub grants: Vec<CaptureFlushGrant>,
+    /// Sessions whose bounded queues accepted their own FLUSH body.
+    pub requested: Vec<ParticipantId>,
+    /// Sessions whose queue could not accept a body; their grants were
+    /// durably consumed and removed from the expected-upload denominator.
+    pub enqueue_failed: Vec<ParticipantId>,
+}
 
 /// Session-node presence state. It is intentionally separate from the durable
 /// party directory: it contains only local sockets and is discarded on crash.
@@ -2371,6 +2393,9 @@ pub struct Gateway {
     /// executors. `None` preserves the non-authoritative relay path byte for
     /// byte, so every existing (bridge-less) deployment and test is unchanged.
     bridge: Option<Arc<GatewayBridge>>,
+    /// Trusted native lag-diagnostics lifecycle and post-auth capability state.
+    /// It is intentionally not exposed to the embedded GameScript runtime.
+    diagnostics: LagCaptureManager,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -2396,6 +2421,7 @@ impl std::fmt::Debug for Gateway {
             .field("handoffs", &"[redacted]")
             .field("script_readiness", &self.script_readiness.is_some())
             .field("bridge", &self.bridge.is_some())
+            .field("diagnostics", &self.diagnostics)
             .finish()
     }
 }
@@ -2737,6 +2763,7 @@ impl Gateway {
             handoffs: Mutex::new(MatchmakerHandoffs::default()),
             script_readiness: None,
             bridge: None,
+            diagnostics: LagCaptureManager::default(),
         }
     }
 
@@ -3495,6 +3522,258 @@ impl Gateway {
         &self.registry
     }
 
+    /// Mint the post-auth `SERVER_TIME` offer for a transport session. The
+    /// transport must enqueue the resulting envelope immediately after the
+    /// unchanged `AUTH_RESULT`; the offer is bound to `participant` and cannot
+    /// enable diagnostics by itself.
+    pub fn issue_diagnostics_server_time(
+        &self,
+        participant: ParticipantId,
+        now: TimestampMillis,
+    ) -> Result<ServerTime, LagCaptureError> {
+        self.diagnostics.issue_server_time(participant, now)
+    }
+
+    /// Drop an offer made for a transport registration that lost its close or
+    /// revocation race before becoming a live session.
+    pub fn abandon_diagnostics_session(&self, participant: ParticipantId) {
+        self.diagnostics.abandon_session(participant);
+    }
+
+    /// Start an opt-in diagnostics capture using the production UTC correlation
+    /// clock. This is a trusted native Gateway API, never a GameScript command.
+    pub fn start_lag_capture(
+        &self,
+        request: StartCapture,
+    ) -> Result<LagCaptureStart, LagCaptureError> {
+        self.start_lag_capture_at(request, SystemClock.now())
+    }
+
+    /// Start a capture at an explicit UTC instant for deterministic callers and
+    /// tests. A local outbound queue accepting START is recorded as `Requested`,
+    /// never as a client receipt or expected upload.
+    pub fn start_lag_capture_at(
+        &self,
+        request: StartCapture,
+        now: TimestampMillis,
+    ) -> Result<LagCaptureStart, LagCaptureError> {
+        let body = request
+            .encode()
+            .map_err(|_| LagCaptureError::InvalidRequest)?;
+        let result_request = request.clone();
+        let connected = self.registry.participants();
+        let (candidates, ineligible) = self.diagnostics.begin(request, &connected, now)?;
+        let mut requested = Vec::new();
+        let mut enqueue_failed = Vec::new();
+        for participant in candidates {
+            let queued = self.send_reliable(participant, KIND_DIAG_START, body.clone());
+            self.diagnostics.mark_start_enqueue(participant, queued);
+            if queued {
+                requested.push(participant);
+            } else {
+                enqueue_failed.push(participant);
+            }
+        }
+        let _ = self.diagnostics.finish_if_terminal();
+        Ok(LagCaptureStart {
+            request: result_request,
+            requested,
+            ineligible,
+            enqueue_failed,
+        })
+    }
+
+    /// Start a capture together with the private raw-ingest lifecycle. The
+    /// ingest reservation is native-only and is rolled back if the realtime
+    /// START is rejected before any client can observe it.
+    pub fn start_lag_capture_with_ingest_at(
+        &self,
+        ingest: &LagDiagnosticsService,
+        request: StartCapture,
+        now: TimestampMillis,
+    ) -> Result<LagCaptureStart, LagCaptureError> {
+        if !ingest.is_enabled() {
+            return Err(LagCaptureError::IngestUnavailable);
+        }
+        ingest
+            .register_recording(
+                request.capture_id,
+                request.generation,
+                request.deadline_server_utc_ms,
+            )
+            .map_err(|_| LagCaptureError::IngestUnavailable)?;
+        match self.start_lag_capture_at(request.clone(), now) {
+            Ok(start) => Ok(start),
+            Err(error) => {
+                let _ = ingest.discard_recording(request.capture_id, request.generation);
+                Err(error)
+            }
+        }
+    }
+
+    /// Request a flush from only clients that authenticated `Recording`. Upload
+    /// URL/token material belongs to the capture-ingest layer and is deliberately
+    /// absent from `CaptureStatus` and this base lifecycle API.
+    pub fn flush_lag_capture(
+        &self,
+        request: FlushCapture,
+    ) -> Result<LagCaptureFlush, LagCaptureError> {
+        self.flush_lag_capture_at(request, SystemClock.now())
+    }
+
+    /// Deterministic-time form of [`Self::flush_lag_capture`].
+    pub fn flush_lag_capture_at(
+        &self,
+        request: FlushCapture,
+        now: TimestampMillis,
+    ) -> Result<LagCaptureFlush, LagCaptureError> {
+        let status = self
+            .diagnostics
+            .status(request.capture_id)
+            .ok_or(LagCaptureError::UnknownCapture)?;
+        if status
+            .participants
+            .iter()
+            .filter(|participant| {
+                participant.state == crate::realtime::LagCaptureParticipantState::Recording
+            })
+            .count()
+            != 1
+        {
+            return Err(LagCaptureError::PerParticipantGrantRequired);
+        }
+        let body = request
+            .encode()
+            .map_err(|_| LagCaptureError::InvalidRequest)?;
+        let targets = self.diagnostics.prepare_flush(&request, now)?;
+        let mut requested = Vec::new();
+        let mut enqueue_failed = Vec::new();
+        for participant in targets {
+            let queued = self.send_reliable(participant, KIND_DIAG_FLUSH, body.clone());
+            self.diagnostics.mark_flush_enqueue(participant, queued);
+            if queued {
+                requested.push(participant);
+            } else {
+                enqueue_failed.push(participant);
+            }
+        }
+        let _ = self.diagnostics.finish_if_terminal();
+        Ok(LagCaptureFlush {
+            request,
+            requested,
+            enqueue_failed,
+        })
+    }
+
+    /// Secure native FLUSH path. It obtains the exact server-observed
+    /// `Recording` population, mints one one-use signed grant per participant,
+    /// and sends a different FLUSH body to every bounded transport queue.
+    ///
+    /// The supplied plan's identity bindings are trusted native data from the
+    /// match/session owner. Unselected bindings are ignored; a missing binding
+    /// aborts before any grant is issued.
+    pub fn flush_lag_capture_with_ingest_at(
+        &self,
+        ingest: &LagDiagnosticsService,
+        mut plan: CaptureFlushPlan,
+        now: TimestampMillis,
+    ) -> Result<LagCaptureUploadFlush, LagCaptureError> {
+        if !ingest.is_enabled() {
+            return Err(LagCaptureError::IngestUnavailable);
+        }
+        let capture_id = plan.capture_id;
+        let generation = plan.generation;
+        let attempt_id = plan.attempt_id;
+        let upload_deadline = plan.upload_deadline_server_utc_ms;
+        let targets = self.diagnostics.prepare_flush_identity(
+            capture_id,
+            generation,
+            attempt_id,
+            upload_deadline,
+            now,
+        )?;
+        if targets.is_empty() {
+            return Ok(LagCaptureUploadFlush {
+                grants: Vec::new(),
+                requested: Vec::new(),
+                enqueue_failed: Vec::new(),
+            });
+        }
+        let mut bindings = plan
+            .participants
+            .drain(..)
+            .map(|binding| (binding.participant_id, binding))
+            .collect::<HashMap<_, _>>();
+        let mut selected = Vec::with_capacity(targets.len());
+        for participant in &targets {
+            let Some(binding) = bindings.remove(&participant.get()) else {
+                self.diagnostics
+                    .rollback_flush_identity(capture_id, generation, attempt_id);
+                return Err(LagCaptureError::InvalidFlush);
+            };
+            selected.push(binding);
+        }
+        plan.participants = selected;
+        let grants = match ingest.open_flush(plan, now) {
+            Ok(grants) => grants,
+            Err(_) => {
+                self.diagnostics
+                    .rollback_flush_identity(capture_id, generation, attempt_id);
+                return Err(LagCaptureError::IngestUnavailable);
+            }
+        };
+        let mut requested = Vec::with_capacity(grants.len());
+        let mut enqueue_failed = Vec::new();
+        let mut delivered = Vec::with_capacity(grants.len());
+        for grant in grants {
+            let participant = ParticipantId::from_raw(grant.participant_id);
+            let queued = grant
+                .flush
+                .encode()
+                .map(|body| self.send_reliable(participant, KIND_DIAG_FLUSH, body))
+                .unwrap_or(false);
+            self.diagnostics.mark_flush_enqueue(participant, queued);
+            if queued {
+                requested.push(participant);
+                delivered.push(grant);
+            } else {
+                enqueue_failed.push(participant);
+            }
+        }
+        let _ = self.diagnostics.finish_if_terminal();
+        Ok(LagCaptureUploadFlush {
+            grants: delivered,
+            requested,
+            enqueue_failed,
+        })
+    }
+
+    /// Return the active capture's native lifecycle snapshot. It distinguishes
+    /// queueing, client start acknowledgement, upload start, completion, and
+    /// disconnect rather than inferring any of them from transport success.
+    #[must_use]
+    pub fn lag_capture_status(&self, capture_id: CaptureId) -> Option<LagCaptureStatus> {
+        self.diagnostics.status(capture_id)
+    }
+
+    /// Advance the active capture's server-UTC deadline state. This must be
+    /// called by trusted match/capture maintenance, not by client input.
+    pub fn expire_lag_capture_deadline(&self) -> usize {
+        self.expire_lag_capture_deadline_at(SystemClock.now())
+    }
+
+    /// Deterministic-time deadline transition for maintenance and tests.
+    pub fn expire_lag_capture_deadline_at(&self, now: TimestampMillis) -> usize {
+        self.diagnostics.expire_deadline(now)
+    }
+
+    /// Complete an all-settled capture early (for example after the ingest
+    /// layer records every expected upload). The terminal snapshot remains
+    /// queryable by id while the next match may start a fresh capture.
+    pub fn complete_lag_capture_if_terminal(&self) -> bool {
+        self.diagnostics.finish_if_terminal()
+    }
+
     pub fn deliver_local_chat(
         &self,
         origin_node: &NodeId,
@@ -3665,13 +3944,25 @@ impl Gateway {
         handle: SessionHandle,
         initial: Option<Outbound>,
     ) -> LatestOutboundReceiver {
+        self.register_session_with_initials(handle, initial.into_iter().collect())
+    }
+
+    /// Register a session with an ordered reliable protocol prefix. This is
+    /// used by transports to preserve `AUTH_RESULT` then `SERVER_TIME` without
+    /// changing the legacy auth-result body or allowing lifecycle messages to
+    /// overtake either envelope.
+    pub fn register_session_with_initials(
+        &self,
+        handle: SessionHandle,
+        initials: Vec<Outbound>,
+    ) -> LatestOutboundReceiver {
         let id = handle.id;
         let authenticated = handle.is_authenticated();
         let authenticated_user = handle
             .identity
             .as_ref()
             .map(|identity| identity.user_id.as_str().to_owned());
-        let unreliable = self.registry.register_with_initial(handle, initial);
+        let unreliable = self.registry.register_with_initials(handle, initials);
         // A durable revocation that completed after token validation but before
         // publication leaves a registry tombstone. Do not run lifecycle work or
         // alter gauges for that rejected registration.
@@ -3804,6 +4095,9 @@ impl Gateway {
         if !self.registry.claim_cleanup(id) {
             return;
         }
+        // Freeze the diagnostics participant state before lifecycle hooks or
+        // registry removal can make a disconnect look like a missing upload.
+        self.diagnostics.disconnect(id);
         // Run the leave hook while the participant (and its identity) is still
         // registered, so `ctx.user_id` is available to the handler.
         self.dispatch_lifecycle(LifecycleHook::Leave, id);
@@ -3988,6 +4282,13 @@ impl Gateway {
             return 0;
         }
 
+        // Diagnostics controls are a trusted native protocol surface. They are
+        // handled before runtime interception/dispatch and never fall through
+        // to relay or GameScript handlers, including malformed and stale input.
+        if self.handle_diagnostics_control(sender, env) {
+            return 0;
+        }
+
         // Realtime interception starts only after a transport has completed the
         // handshake and registered a participant. The reserved auth guard above
         // deliberately keeps credentials and re-auth attempts out of script code.
@@ -4079,6 +4380,63 @@ impl Gateway {
             );
         }
         delivered
+    }
+
+    /// Handle all diagnostics kinds before any script/runtime path. The return
+    /// value means the kind was reserved (even if the particular body failed
+    /// validation), so no untrusted diagnostics bytes become gameplay input.
+    fn handle_diagnostics_control(&self, sender: ParticipantId, env: &Envelope) -> bool {
+        match env.kind {
+            KIND_DIAG_CAPABILITIES => {
+                let accepted = self.registry.is_authenticated(sender)
+                    && Capabilities::decode(&env.body)
+                        .ok()
+                        .is_some_and(|capabilities| {
+                            self.diagnostics.accept_capabilities(sender, capabilities)
+                        });
+                tracing::debug!(%sender, accepted, "processed diagnostics capability assertion");
+                true
+            }
+            KIND_DIAG_CLOCK_SYNC => {
+                let Ok(request) = ClockSync::decode(&env.body) else {
+                    tracing::debug!(%sender, "dropped malformed diagnostics clock probe");
+                    return true;
+                };
+                if !self.registry.is_authenticated(sender)
+                    || !self.diagnostics.accepts_clock_sync(sender)
+                {
+                    tracing::debug!(%sender, "dropped unauthorised diagnostics clock probe");
+                    return true;
+                }
+                let received_utc_us = SystemClock::now_utc_micros();
+                let sent_utc_us = SystemClock::now_utc_micros();
+                if let Some(response) =
+                    LagCaptureManager::reply_clock_sync(request, received_utc_us, sent_utc_us)
+                    && let Ok(body) = response.encode()
+                {
+                    let _ = self.send_reliable(sender, KIND_DIAG_CLOCK_SYNC, body);
+                }
+                true
+            }
+            KIND_DIAG_STATUS => {
+                let result = if self.registry.is_authenticated(sender) {
+                    CaptureStatus::decode(&env.body)
+                        .map_err(|_| LagCaptureError::InvalidRequest)
+                        .and_then(|status| self.diagnostics.apply_status(sender, status))
+                } else {
+                    Err(LagCaptureError::NotCapable)
+                };
+                if result.is_ok() {
+                    let _ = self.diagnostics.finish_if_terminal();
+                }
+                tracing::debug!(%sender, accepted = result.is_ok(), "processed diagnostics capture status");
+                true
+            }
+            // These are server-to-client-only kinds. A client echo, replay, or
+            // forged control is reserved and dropped before runtime dispatch.
+            KIND_DIAG_SERVER_TIME | KIND_DIAG_START | KIND_DIAG_FLUSH => true,
+            _ => false,
+        }
     }
 
     /// Handle a `KIND_RPC_REQUEST`: run the runtime RPC handler and reply to the
@@ -10696,6 +11054,7 @@ mod tests {
     use crate::transport::TransportKind;
     use std::time::Duration;
     use tokio::sync::mpsc;
+    use uuid::Uuid;
 
     fn response_message() -> crate::repository::ChatMessage {
         crate::repository::ChatMessage {
@@ -10830,6 +11189,228 @@ mod tests {
             session_id: SessionId::new(format!("session-{user_id}")).expect("session id"),
             expires_at: TimestampMillis::from_unix_millis(9_999_999_999),
         }
+    }
+
+    #[derive(Default)]
+    struct DiagnosticsDispatchProbe {
+        dispatches: Mutex<usize>,
+    }
+
+    impl Runtime for DiagnosticsDispatchProbe {
+        fn dispatch(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _kind: u16,
+            _body: &[u8],
+        ) -> Vec<OutboundCommand> {
+            *self.dispatches.lock().expect("dispatch lock") += 1;
+            Vec::new()
+        }
+
+        fn dispatch_lifecycle(
+            &self,
+            _hook: LifecycleHook,
+            _sender: u64,
+            _user_id: Option<&str>,
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn tick(&self, _dt: Duration, _budget: Duration) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn call_rpc(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _method: &str,
+            _body: &[u8],
+        ) -> RpcOutcome {
+            RpcOutcome::Err("unavailable".to_owned())
+        }
+
+        fn call_room_create(
+            &self,
+            _sender: u64,
+            _user_id: Option<&str>,
+            _params: &[u8],
+        ) -> Option<crate::runtime::RoomSpec> {
+            None
+        }
+
+        fn call_room_join(&self, _sender: u64, _user_id: Option<&str>, _room_id: u64) -> bool {
+            true
+        }
+
+        fn has_tick_handler(&self) -> bool {
+            false
+        }
+
+        fn budget(&self) -> Duration {
+            Duration::from_millis(50)
+        }
+
+        fn introspect(&self) -> crate::runtime::RuntimeIntrospection {
+            crate::runtime::RuntimeIntrospection {
+                source: "diagnostics-probe".to_owned(),
+                reloadable: false,
+                deadline_ms: 50,
+                rpcs: Vec::new(),
+                message_kinds: Vec::new(),
+                hooks: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_controls_are_reserved_before_runtime_dispatch() {
+        let probe = Arc::new(DiagnosticsDispatchProbe::default());
+        let gateway = Gateway::with_metrics_and_runtime(
+            Arc::new(NodeMetrics::new()),
+            Some(Arc::clone(&probe) as Arc<dyn Runtime>),
+        );
+        let participant = gateway.next_participant_id();
+        let (tx, _rx) = mpsc::channel(8);
+        gateway.register_session(SessionHandle {
+            id: participant,
+            kind: TransportKind::WebSocket,
+            outbound: tx,
+            identity: Some(test_identity("diagnostics-player")),
+        });
+        let offer = gateway
+            .issue_diagnostics_server_time(participant, TimestampMillis::from_unix_millis(10))
+            .expect("offer");
+        let capabilities = Capabilities {
+            offer_id: offer.offer_id,
+            features: citadel_wire::diagnostics::CAPABILITY_RECORDING,
+        };
+        gateway.handle_inbound(
+            participant,
+            &Envelope::new(
+                KIND_DIAG_CAPABILITIES,
+                capabilities.encode().expect("capabilities"),
+            ),
+        );
+        gateway.handle_inbound(participant, &Envelope::new(KIND_DIAG_START, vec![1]));
+        assert_eq!(
+            *probe.dispatches.lock().expect("dispatch lock"),
+            0,
+            "reserved diagnostics controls cannot reach a script handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_ingest_flush_uses_one_redacted_grant_per_recording_session() {
+        use std::collections::BTreeMap;
+
+        use crate::config::LagDiagnosticsConfig;
+        use crate::lag_diagnostics::CaptureParticipant;
+        use base64::Engine as _;
+
+        let root = std::env::temp_dir().join(format!("citadel-gateway-lag-{}", Uuid::new_v4()));
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "current".to_string(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([6_u8; 32]),
+        );
+        let ingest = LagDiagnosticsService::new(
+            LagDiagnosticsConfig {
+                enabled: true,
+                raw_root: Some(root.display().to_string()),
+                active_key_id: Some("current".to_string()),
+                upload_hmac_keys: keys,
+                allowed_origins: Vec::new(),
+                max_compressed_bytes: 1024 * 1024,
+                max_decompressed_bytes: 1024 * 1024,
+                max_decompression_ratio: 32,
+                max_concurrent_uploads: 2,
+                max_raw_bytes: 4 * 1024 * 1024,
+                retention_hours: 1,
+                shared_raw_store: false,
+            },
+            "node-a".to_string(),
+        )
+        .expect("ingest");
+        let gateway = Gateway::new();
+        let (participant, mut receiver) = register(&gateway, TransportKind::WebSocket);
+        let offer = gateway
+            .issue_diagnostics_server_time(participant, TimestampMillis::from_unix_millis(10))
+            .expect("offer");
+        assert!(gateway.diagnostics.accept_capabilities(
+            participant,
+            Capabilities {
+                offer_id: offer.offer_id,
+                features: citadel_wire::diagnostics::CAPABILITY_RECORDING,
+            },
+        ));
+        let capture_id = CaptureId::new([4; 16]).expect("capture");
+        let start = StartCapture {
+            capture_id,
+            generation: 1,
+            deadline_server_utc_ms: 1_000,
+            max_record_bytes: 1_024,
+            filters: vec![citadel_wire::diagnostics::PacketFilter {
+                kind: KIND_POSITION,
+                direction: citadel_wire::diagnostics::PacketDirection::Inbound,
+                entity_id: None,
+            }],
+        };
+        gateway
+            .start_lag_capture_with_ingest_at(&ingest, start, TimestampMillis::from_unix_millis(10))
+            .expect("start");
+        assert_eq!(
+            receiver.recv().await.expect("start queued").envelope.kind,
+            KIND_DIAG_START
+        );
+        gateway
+            .diagnostics
+            .apply_status(
+                participant,
+                CaptureStatus {
+                    capture_id,
+                    generation: 1,
+                    code: citadel_wire::diagnostics::CaptureStatusCode::Recording,
+                    attempt_id: 0,
+                    recorded_packets: 0,
+                    dropped_packets: 0,
+                    recorded_bytes: 0,
+                },
+            )
+            .expect("recording");
+        let result = gateway
+            .flush_lag_capture_with_ingest_at(
+                &ingest,
+                CaptureFlushPlan {
+                    capture_id,
+                    generation: 1,
+                    attempt_id: 1,
+                    upload_deadline_server_utc_ms: 500,
+                    max_compressed_bytes: 1_024,
+                    required_uploads: 1,
+                    analyze: false,
+                    participants: vec![CaptureParticipant {
+                        participant_id: participant.get(),
+                        session_id: "session-1".to_string(),
+                        tenant_id: "tenant-a".to_string(),
+                        match_id: "match-a".to_string(),
+                    }],
+                },
+                TimestampMillis::from_unix_millis(20),
+            )
+            .expect("secure flush");
+        assert_eq!(result.grants.len(), 1);
+        let queued = receiver.recv().await.expect("flush queued").envelope;
+        assert_eq!(queued.kind, KIND_DIAG_FLUSH);
+        let decoded = FlushCapture::decode(&queued.body).expect("flush body");
+        assert_eq!(
+            decoded.upload_path,
+            citadel_wire::diagnostics::DIAGNOSTICS_UPLOAD_PATH
+        );
+        assert_ne!(decoded.upload_token, "session-1");
+        assert!(format!("{:?}", decoded).contains("[redacted]"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn register(gw: &Gateway, kind: TransportKind) -> (ParticipantId, TestOutboundReceiver) {

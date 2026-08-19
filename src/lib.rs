@@ -19,6 +19,8 @@ pub mod error_reporting;
 pub mod host_telemetry;
 pub mod http;
 pub mod identity;
+pub mod lag_analysis;
+pub mod lag_diagnostics;
 pub mod leaderboard_scheduler;
 pub mod lifecycle;
 pub mod maps;

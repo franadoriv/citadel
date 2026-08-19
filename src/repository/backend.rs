@@ -228,6 +228,16 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// [`UnitOfWork`].
     fn purchases_repository(&self) -> Arc<dyn PurchasesRepository>;
 
+    /// Optional durable, report-only lag-diagnostics repository. Raw capture
+    /// bytes and their filesystem locators never cross this backend boundary.
+    /// SQLite, PostgreSQL, and CockroachDB expose this capability; the
+    /// in-memory and MongoDB backends deliberately return `None`.
+    fn lag_report_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::repository::DurableLagReportRepository>> {
+        None
+    }
+
     /// Optional read-only administrative database explorer.
     ///
     /// This is deliberately a capability accessor, not a domain repository:

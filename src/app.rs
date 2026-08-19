@@ -17,8 +17,14 @@ use crate::error::{AppError, AppResult};
 use crate::error_journal::ErrorJournal;
 use crate::error_reporting;
 use crate::host_telemetry::{HostTelemetryService, HostTelemetrySnapshot};
+use crate::lag_analysis::{
+    AnalysisIdentity, AnalysisWorkResult, InMemoryLagReportRepository, LagAnalysisWorker,
+    LagReport, LagReportCaptureOverview, LagReportRepository,
+};
 use crate::observability::NodeMetrics;
-use crate::repository::{Backend, BackendKind, InMemoryBackend, select_backend};
+use crate::repository::{
+    Backend, BackendKind, DurableLagReportRepository, InMemoryBackend, select_backend,
+};
 use crate::services::{
     ApiKeyService, AuditLog, AuthenticationRateLimitPolicy, AuthenticationService,
     AuthenticationServiceImpl, ChatAccessCoordinator, ChatRateLimitPolicy, ChatService,
@@ -26,7 +32,7 @@ use crate::services::{
     InMemorySessionService, LeaderboardService, NotificationService, PlayerNotificationService,
     PurchaseService, SharedSessionService, WalletService,
 };
-use crate::time::{Clock, SystemClock};
+use crate::time::{Clock, SystemClock, TimestampMillis};
 
 /// Crate version, surfaced for `--version` and health responses.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -77,6 +83,13 @@ pub struct App {
     wallet: Arc<WalletService>,
     friends: Arc<FriendsService>,
     deferred_storage: Option<Arc<DeferredStorageWriter>>,
+    lag_diagnostics: Arc<crate::lag_diagnostics::LagDiagnosticsService>,
+    /// Fast local cache for analysis deduplication and the in-memory backend.
+    lag_reports: Arc<InMemoryLagReportRepository>,
+    /// Selected database-backed report store. It contains only bounded derived
+    /// reports; raw CLAG and filesystem locators stay in `lag_diagnostics`.
+    durable_lag_reports: Option<Arc<dyn DurableLagReportRepository>>,
+    lag_analysis_worker: Arc<LagAnalysisWorker>,
 }
 
 impl std::fmt::Debug for App {
@@ -167,6 +180,27 @@ impl App {
         let player_notifications = Arc::new(PlayerNotificationService::new(Arc::clone(&backend)));
         let wallet = Arc::new(WalletService::new(backend.wallet_repository()));
         let purchases = Arc::new(PurchaseService::new(backend.purchases_repository()));
+        let lag_diagnostics = Arc::new(
+            crate::lag_diagnostics::LagDiagnosticsService::new(
+                config.lag_diagnostics.clone(),
+                config.server.node_id.clone(),
+            )
+            .expect("validated lag-diagnostics configuration"),
+        );
+        let lag_reports = Arc::new(InMemoryLagReportRepository::default());
+        let durable_lag_reports = backend.lag_report_repository();
+        let lag_analysis_worker = Arc::new(LagAnalysisWorker::new(
+            lag_reports.clone(),
+            usize::from(config.lag_diagnostics.max_concurrent_uploads),
+        ));
+        // Raw capture state is deliberately outside the database. Reconcile
+        // interrupted leases before exposing the permanent ingest route.
+        // Retention is asynchronous because every exact report projection must
+        // be marked unavailable durably before the corresponding bytes vanish.
+        let lag_diagnostics_now = SystemClock.now();
+        lag_diagnostics
+            .recover(lag_diagnostics_now)
+            .expect("private lag-diagnostics recovery");
         Self {
             config,
             started_at: Instant::now(),
@@ -197,6 +231,10 @@ impl App {
             wallet,
             friends,
             deferred_storage,
+            lag_diagnostics,
+            lag_reports,
+            durable_lag_reports,
+            lag_analysis_worker,
         }
     }
 
@@ -250,7 +288,12 @@ impl App {
             node_id = %config.server.node_id,
             "selected persistence backend"
         );
-        Ok(Self::with_backend(config, backend))
+        let app = Self::with_backend(config, backend);
+        // Reconcile retention before any listener is exposed. The public upload
+        // route repeats this lightweight maintenance pass so deployments that
+        // stay up longer than the retention window keep the same invariant.
+        app.reconcile_lag_raw_retention(SystemClock.now()).await?;
+        Ok(app)
     }
 
     /// Borrow the resolved configuration.
@@ -329,6 +372,162 @@ impl App {
     #[must_use]
     pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit
+    }
+
+    /// In-process report store used for local deduplication and by the
+    /// explicitly non-durable in-memory backend.
+    #[must_use]
+    pub fn lag_reports(&self) -> &Arc<InMemoryLagReportRepository> {
+        &self.lag_reports
+    }
+
+    /// Read a bounded keyset page from the selected durable report store when
+    /// one is configured, otherwise from the in-memory reference store.
+    pub async fn list_lag_reports(
+        &self,
+        after_report_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<LagReport>> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository.list(after_report_id, limit).await
+        } else if self.backend.kind() == BackendKind::InMemory {
+            Ok(self.lag_reports.list(after_report_id, limit))
+        } else {
+            // MongoDB deliberately has no report-only adapter yet. Do not
+            // present its process-local worker cache as a durable history.
+            Ok(Vec::new())
+        }
+    }
+
+    /// Read one redacted-report source row by its opaque report id.
+    pub async fn lag_report_by_id(&self, report_id: &str) -> AppResult<Option<LagReport>> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository.get_by_report_id(report_id).await
+        } else if self.backend.kind() == BackendKind::InMemory {
+            Ok(self.lag_reports.find_by_report_id(report_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List capture-level report aggregates using the durable store when
+    /// available. Raw-retention metadata is merged separately by the Console.
+    pub async fn list_lag_capture_overviews(
+        &self,
+        after_capture_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<LagReportCaptureOverview>> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository
+                .list_capture_overviews(after_capture_id, limit)
+                .await
+        } else if self.backend.kind() == BackendKind::InMemory {
+            Ok(self
+                .lag_reports
+                .list_capture_overviews(after_capture_id, limit))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Persist a completed or pre-existing derived report before returning it
+    /// to a caller. The cache is updated only with the durable row, so a
+    /// database failure cannot be presented as a durable analysis success.
+    pub async fn persist_lag_analysis(&self, result: AnalysisWorkResult) -> AnalysisWorkResult {
+        let Some(repository) = &self.durable_lag_reports else {
+            return if self.backend.kind() == BackendKind::InMemory {
+                result
+            } else {
+                AnalysisWorkResult::Failed
+            };
+        };
+        let (completed, mut report) = match result {
+            AnalysisWorkResult::Completed(report) => (true, report),
+            AnalysisWorkResult::Existing(report) => (false, report),
+            other => return other,
+        };
+        // The bounded worker cache is intentionally process-local. Consult the
+        // durable source before a new insert so changing analysis options after
+        // a restart still links the immutable successor to its predecessor.
+        if completed && report.supersedes_report_id.is_none() {
+            report.supersedes_report_id = match repository
+                .latest_for_artifact(
+                    &report.capture_id,
+                    report.generation,
+                    &report.artifact_digest_sha256,
+                )
+                .await
+            {
+                Ok(previous) => previous.map(|previous| previous.report_id),
+                Err(_) => return AnalysisWorkResult::Failed,
+            };
+        }
+        let identity = analysis_identity(&report);
+        let stored = match repository.insert_immutable(&identity, &report).await {
+            Ok(stored) => stored,
+            Err(_) => return AnalysisWorkResult::Failed,
+        };
+        self.lag_reports.insert_immutable(identity, stored.clone());
+        if completed {
+            AnalysisWorkResult::Completed(stored)
+        } else {
+            AnalysisWorkResult::Existing(stored)
+        }
+    }
+
+    /// Project current raw-retention availability without changing immutable
+    /// report metrics or status.
+    pub async fn mark_lag_raw_unavailable(
+        &self,
+        capture_id: &str,
+        generation: u64,
+        artifact_digest_sha256: &str,
+    ) -> AppResult<()> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository
+                .mark_raw_unavailable(capture_id, generation, artifact_digest_sha256)
+                .await?;
+        }
+        self.lag_reports
+            .mark_raw_unavailable(capture_id, generation, artifact_digest_sha256);
+        Ok(())
+    }
+
+    /// Reconcile expired private raw artifacts without ever leaving a report
+    /// that advertises an artifact after its bytes have been removed. Each
+    /// `(capture, generation, digest)` projection is durably set to unavailable
+    /// before its private file/manifest deletion is attempted; a deletion race
+    /// or storage failure therefore remains conservatively unavailable.
+    pub async fn reconcile_lag_raw_retention(&self, now: TimestampMillis) -> AppResult<usize> {
+        let service = Arc::clone(&self.lag_diagnostics);
+        let candidates =
+            tokio::task::spawn_blocking(move || service.expired_retention_candidates(now))
+                .await
+                .map_err(|_| AppError::internal("lag raw retention scan failed"))?
+                .map_err(|_| AppError::internal("lag raw retention scan failed"))?;
+        let mut removed = 0;
+        for candidate in candidates {
+            self.mark_lag_raw_unavailable(
+                &candidate.capture_id,
+                candidate.generation,
+                &candidate.digest_sha256,
+            )
+            .await?;
+            let service = Arc::clone(&self.lag_diagnostics);
+            let removed_candidate =
+                tokio::task::spawn_blocking(move || service.remove_retention_candidate(&candidate))
+                    .await
+                    .map_err(|_| AppError::internal("lag raw retention removal failed"))?
+                    .map_err(|_| AppError::internal("lag raw retention removal failed"))?;
+            removed += usize::from(removed_candidate);
+        }
+        Ok(removed)
+    }
+
+    /// Bounded lag analysis worker associated with this application.
+    #[must_use]
+    pub fn lag_analysis_worker(&self) -> &Arc<LagAnalysisWorker> {
+        &self.lag_analysis_worker
     }
 
     /// The local, redacted process incident journal shown in the console.
@@ -487,6 +686,13 @@ impl App {
         self.realtime.get().cloned()
     }
 
+    /// Server-owned, filesystem-backed lag-diagnostics capture service. Raw
+    /// artifacts and grants never pass through the selected database backend.
+    #[must_use]
+    pub fn lag_diagnostics(&self) -> &Arc<crate::lag_diagnostics::LagDiagnosticsService> {
+        &self.lag_diagnostics
+    }
+
     /// Compose durable session revocation with exact local live-session
     /// fencing. The gateway is optional only for HTTP-only nodes, where no
     /// connection can be live; callers always use this coordinator rather than
@@ -549,6 +755,16 @@ impl App {
     #[must_use]
     pub fn health(&self) -> Health {
         Health::Healthy
+    }
+}
+
+fn analysis_identity(report: &LagReport) -> AnalysisIdentity {
+    AnalysisIdentity {
+        capture_id: report.capture_id.clone(),
+        generation: report.generation,
+        artifact_digest_sha256: report.artifact_digest_sha256.clone(),
+        analyzer_version: report.analyzer_version,
+        options_hash: report.options_hash.clone(),
     }
 }
 
