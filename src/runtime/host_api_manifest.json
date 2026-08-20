@@ -61,6 +61,66 @@
     "since": "pre-1.0"
   },
   {
+    "name": "on_match_created",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_started",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_ended",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_join",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_leave",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_tick",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "on_tick",
     "category": "tick_hook",
     "params": [

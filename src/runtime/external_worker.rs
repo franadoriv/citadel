@@ -15,10 +15,13 @@
 //!
 //! Dispatch is asynchronous by design: the worker schedules matches fairly on
 //! its own cadence, so an invocation returns no commands inline; results
-//! arrive as fenced `MatchCommands` frames and are applied room-scoped. The
-//! non-match surface (global messages, RPC, lifecycle hooks) is not routed to
-//! the worker yet and fails visibly instead of silently: RPC calls return an
-//! error outcome and other hooks produce no commands.
+//! arrive as fenced `MatchCommands` frames and are applied room-scoped. Native
+//! authoritative-match lifecycle frames carrying the server-owned context are
+//! not implemented by this protocol yet. Therefore this adapter explicitly
+//! declares that it cannot host that surface; the gateway rejects admission
+//! before creating a native lifecycle match rather than silently dropping
+//! lifecycle hooks. The shipped native lifecycle surface is embedded Lua,
+//! Python, and JavaScript.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,7 +39,10 @@ use crate::runtime::worker_data_protocol::{
     RxCounters, decode_commands,
 };
 
-use super::{BridgeCommandSink, NormalizedEventBatch, Runtime, ScriptCommandBatch};
+use super::{
+    BridgeCommandSink, NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext,
+    NativeMatchLifecycleHook, NormalizedEventBatch, Runtime, ScriptCommandBatch,
+};
 
 /// Marker `kind` on a [`DataFrame::MatchEvent`] whose `body` is an encoded
 /// [`NormalizedEventBatch`] rather than a raw wire envelope. `u16::MAX` is never
@@ -498,33 +504,6 @@ impl ExternalWorkerRuntime {
         }
     }
 
-    /// Open `room_id` on the active generation without an event (the
-    /// room-join admission path), so join-driven matches begin ticking before
-    /// their first routed message.
-    fn ensure_match_open(&self, room_id: u64) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(generation) = state.active.as_mut() else {
-            return;
-        };
-        if generation.tx_seqs.contains_key(&room_id) {
-            return;
-        }
-        generation
-            .rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .open_match(room_id);
-        let header = next_header(generation, room_id);
-        let frame = DataFrame::MatchOpen {
-            protocol_version: DATA_PROTOCOL_VERSION,
-            header,
-            script_identity: Some(self.identity.clone()),
-        };
-        if generation.sender.send(frame).is_err() {
-            self.counters.dropped_sends.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// Tell the worker a match ended gateway-side so it frees the context.
     pub fn notify_match_closed(&self, room_id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -610,6 +589,28 @@ impl Runtime for ExternalWorkerRuntime {
         Vec::new()
     }
 
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        _budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        // This remains loud for a direct trait invocation that bypasses the
+        // gateway admission gate. A protocol frame carrying the full trusted
+        // context has not shipped, so forwarding a partial event is unsafe.
+        tracing::error!(
+            hook = hook.name(),
+            match_id = context.match_id,
+            reason = NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+            "external worker rejected native match lifecycle dispatch"
+        );
+        Vec::new()
+    }
+
+    fn supports_native_match_lifecycle(&self) -> bool {
+        false
+    }
+
     fn tick(&self, _dt: Duration, _budget: Duration) -> Vec<OutboundCommand> {
         // The worker ticks its matches on its own scheduler cadence.
         Vec::new()
@@ -648,10 +649,12 @@ impl Runtime for ExternalWorkerRuntime {
     }
 
     fn call_room_join(&self, _sender: u64, _user_id: Option<&str>, room_id: u64) -> bool {
-        // Admit, and open the match context on join so join-driven matches
-        // begin ticking before their first routed message.
-        self.ensure_match_open(room_id);
-        true
+        tracing::warn!(
+            room_id,
+            reason = NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+            "external worker rejected room admission because native lifecycle is unsupported"
+        );
+        false
     }
 
     fn has_tick_handler(&self) -> bool {
@@ -833,18 +836,24 @@ mod tests {
     }
 
     #[test]
-    fn room_join_admission_opens_the_match() {
+    fn room_admission_fails_closed_without_native_lifecycle_protocol_frames() {
         let (runtime, _dir) = runtime_with_script();
         let sender = CapturingSender::new();
         let epoch = runtime.allocate_epoch();
         runtime.install_generation(epoch, sender.clone());
-        assert!(runtime.call_room_join(7, None, 4), "join is admitted");
-        let frames = sender.frames();
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(frames[0], DataFrame::MatchOpen { .. }));
-        // The subsequent event does not re-open.
-        runtime.dispatch_in_room(7, None, 4, 9, b"x");
-        assert_eq!(sender.frames().len(), 2);
+
+        assert!(
+            !runtime.supports_native_match_lifecycle(),
+            "the worker must advertise that it cannot carry lifecycle context"
+        );
+        assert!(
+            !runtime.call_room_join(7, None, 4),
+            "admission must fail before opening a match without lifecycle frames"
+        );
+        assert!(
+            sender.frames().is_empty(),
+            "a refused admission must not create a worker match context"
+        );
     }
 
     #[test]

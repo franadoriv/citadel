@@ -38,6 +38,35 @@ When `require_script = false` (the default unzip-and-run mode) there is **no
 bridge**: the built-in relay applies owner state, integrates input, and fans out
 spawns exactly as before, byte for byte. `on_input` is simply never called.
 
+## Native authoritative-match lifecycle
+
+A room bound to an **embedded** authoritative runtime exposes a server-owned
+match lifecycle in Lua, JavaScript, and Python. These embedded adapters are the
+shipped lifecycle surface; `runtime.adapter = "external-worker"` currently
+fails room and matchmaker admission closed because its data-plane protocol does
+not yet carry a complete lifecycle frame and server-owned context. Register only
+the callbacks your game needs:
+
+```lua
+citadel.on_match_created(function(ctx) end)
+citadel.on_match_started(function(ctx) end)
+citadel.on_match_ended(function(ctx) end)
+citadel.on_match_join(function(ctx) end)
+citadel.on_match_leave(function(ctx) end)
+citadel.on_match_tick(function(ctx) end)
+```
+
+Every callback receives context assembled by Citadel: `match_id`, lifecycle
+generation, clock epoch, authoritative tick, current scoped participants, and
+validated room metadata. End callbacks additionally carry a non-sensitive
+termination reason. Scripts cannot select or replace this scope. In JavaScript,
+identifier fields are `BigInt`; `match_id_number` is supplied only as a lossy
+convenience for older integrations.
+
+Global `on_join`, `on_leave`, and `on_tick` remain compatible for existing
+applications. Match lifecycle callbacks are additive and their emitted commands
+are applied only to the current authoritative room.
+
 ## Normalized events
 
 `citadel.on_input(handler)` registers a per-event handler. The bridge calls it

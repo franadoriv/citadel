@@ -548,7 +548,9 @@ async fn matches_section_lists_live_rooms_from_the_gateway() {
     gateway
         .join_room(ParticipantId::from_raw(2), lobby)
         .expect("second member");
-    gateway.create_room(RoomLabel::with_map("DesertMap"));
+    gateway
+        .create_room(RoomLabel::with_map("DesertMap"))
+        .expect("relay-compatible gateway creates room");
     // (The id-only room has no members, so it exists but stays listable.)
 
     let listed = get(addr, "/console/v1/matches", Some(&token)).await;

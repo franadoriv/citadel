@@ -66,14 +66,18 @@ use crate::realtime::registry::{
     CloseDisposition, LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen,
     SessionHandle, SessionRegistry,
 };
-use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
+use crate::realtime::rooms::{
+    JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry, RoomSnapshot,
+};
 use crate::realtime::transform::TransformHub;
 use crate::runtime::{
     BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepField, BridgeRepValue,
     BridgeTransform, Capability, Correction, Decision, EventDraft, FireIntent, GameScriptReadiness,
-    LifecycleHook, NormalizedEventBatch, NormalizedPayload, OutboundCommand, PendingBatchLedger,
-    RealtimeAfterOutcome, RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE,
-    ScriptBinding, ScriptCommand, ScriptCommandBatch, ValidatedBatch, ValidatedOutcome,
+    LifecycleHook, NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext,
+    NativeMatchLifecycleHook, NativeMatchLifecycleUnavailable, NormalizedEventBatch,
+    NormalizedPayload, OutboundCommand, PendingBatchLedger, RealtimeAfterOutcome,
+    RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
+    ScriptCommand, ScriptCommandBatch, ValidatedBatch, ValidatedOutcome,
 };
 use crate::services::party_directory::{
     PartyOwnerResolution, PartyQueueFreeze, StoragePartyDirectory,
@@ -2551,8 +2555,15 @@ impl Gateway {
     /// attached and not `Ready`; a created room is bound to the gating
     /// snapshot's `(revision, generation)`.
     pub(crate) fn live_matchmaker_create_room(&self, participants: usize) -> Result<RoomId, ()> {
+        if self.require_native_match_lifecycle().is_err() {
+            tracing::error!(
+                reason = NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+                "refused live matchmaker room creation before native lifecycle match existed"
+            );
+            return Err(());
+        }
         let binding = self.script_gate(ScriptGateSurface::LiveForm)?;
-        Ok(self.rooms.create_bound(
+        let room_id = self.rooms.create_bound(
             RoomLabel {
                 map: "default".to_owned(),
                 mode: "matchmaker".to_owned(),
@@ -2560,7 +2571,9 @@ impl Gateway {
                 open: false,
             },
             binding,
-        ))
+        );
+        self.dispatch_match_created(room_id);
+        Ok(room_id)
     }
 
     /// Persisted live handoffs are notified only through the recipient's local
@@ -2593,6 +2606,15 @@ impl Gateway {
         request_id: u64,
         room_id: RoomId,
     ) -> Result<(), ()> {
+        if self.require_native_match_lifecycle().is_err() {
+            let _ = self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE.as_bytes(),
+            );
+            return Err(());
+        }
         let Ok(binding) = self.script_gate(ScriptGateSurface::LiveAcceptLocal) else {
             let _ = self.reply_rpc(
                 sender,
@@ -2602,15 +2624,19 @@ impl Gateway {
             );
             return Err(());
         };
-        let admission = {
+        let (admission, previous) = {
             let _scope = self.lock_room_scope();
+            let previous = self
+                .rooms
+                .room_of(sender)
+                .and_then(|id| self.room_snapshot_for_lifecycle(id));
             let admission = self
                 .rooms
                 .admit_match_bound(sender, room_id, binding.as_ref());
             if admission.is_ok() {
                 self.bind_rep_connection_to_room_under_scope(sender, room_id);
             }
-            admission
+            (admission, previous)
         };
         let label = match admission {
             Ok(label) => label,
@@ -2625,6 +2651,7 @@ impl Gateway {
             }
             Err(_) => return Err(()),
         };
+        self.dispatch_local_match_admission(sender, previous, room_id, false);
         let body = serde_json::json!({ "accepted": true, "match_id": room_id }).to_string();
         let _ = self.reply_rpc(sender, request_id, protocol::RPC_STATUS_OK, body.as_bytes());
         let _ = self.reply_joined_with_rep_bootstrap(sender, room_id, label);
@@ -2642,6 +2669,15 @@ impl Gateway {
         request_id: u64,
         room_id: RoomId,
     ) -> Result<(), ()> {
+        if self.require_native_match_lifecycle().is_err() {
+            let _ = self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE.as_bytes(),
+            );
+            return Err(());
+        }
         let binding = match self.script_gate(ScriptGateSurface::LiveAcceptRemote) {
             Ok(binding) => binding,
             Err(()) => {
@@ -2691,22 +2727,29 @@ impl Gateway {
         user_id: String,
         room_id: RoomId,
     ) -> Result<(), ()> {
+        self.require_native_match_lifecycle().map_err(|_| ())?;
         let binding = self.script_gate(ScriptGateSurface::LiveAdmitRemote)?;
         if self.remote_match_requires_state_relay(room_id) {
             return Err(());
         }
-        let admission = {
-            let _scope = self.lock_room_scope();
-            self.rooms.admit_remote_match_bound(
-                RemoteRoomMember {
-                    node_id: requester_node,
-                    user_id,
-                },
-                room_id,
-                binding.as_ref(),
-            )
+        let member = RemoteRoomMember {
+            node_id: requester_node,
+            user_id,
         };
-        admission.map(|_| ()).map_err(|_| ())
+        let (admission, previous) = {
+            let _scope = self.lock_room_scope();
+            let previous = self
+                .rooms
+                .remote_room_of(&member)
+                .and_then(|id| self.room_snapshot_for_lifecycle(id));
+            let admission =
+                self.rooms
+                    .admit_remote_match_bound(member.clone(), room_id, binding.as_ref());
+            (admission, previous)
+        };
+        admission.map_err(|_| ())?;
+        self.dispatch_remote_match_admission(&member, previous, room_id);
+        Ok(())
     }
 
     /// Shard-owner-side validation after a party ticket crossed the
@@ -4247,6 +4290,188 @@ impl Gateway {
         }
     }
 
+    /// Dispatch one server-owned native match lifecycle callback. The room
+    /// snapshot is copied before entering script code, so a handler cannot select
+    /// or mutate its own match identity, membership, clock, or close reason.
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        room: RoomSnapshot,
+        termination_reason: Option<&str>,
+        budget: std::time::Duration,
+    ) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let (clock_epoch, tick) = self
+            .transform
+            .as_ref()
+            .and_then(|hub| hub.gameplay_clock())
+            .map(|clock| (clock.epoch, clock.tick))
+            .unwrap_or((0, 0));
+        let context = NativeMatchContext {
+            match_id: room.id,
+            lifecycle_generation: room
+                .script_binding
+                .as_ref()
+                .map_or(0, |binding| binding.generation),
+            clock_epoch,
+            tick,
+            participants: room.members.iter().map(|member| member.get()).collect(),
+            map: room.label.map,
+            mode: room.label.mode,
+            max_players: room.label.max_players,
+            open: termination_reason.is_none() && room.label.open,
+            termination_reason: termination_reason.map(str::to_owned),
+        };
+        let commands = runtime.dispatch_match_lifecycle(hook, context, budget);
+        self.apply_commands_scoped(None, Some(room.id), commands);
+    }
+
+    /// Require the selected adapter to carry every server-owned native lifecycle
+    /// callback before any room creation or admission mutates state. A missing
+    /// runtime preserves relay-compatible rooms; any attached adapter must
+    /// explicitly support the lifecycle surface.
+    fn require_native_match_lifecycle(&self) -> Result<(), NativeMatchLifecycleUnavailable> {
+        self.runtime.as_ref().map_or(Ok(()), |runtime| {
+            runtime
+                .supports_native_match_lifecycle()
+                .then_some(())
+                .ok_or(NativeMatchLifecycleUnavailable)
+        })
+    }
+
+    fn native_match_budget(&self) -> std::time::Duration {
+        self.runtime
+            .as_ref()
+            .map_or_else(|| std::time::Duration::ZERO, |runtime| runtime.budget())
+    }
+
+    fn room_snapshot_for_lifecycle(&self, room_id: RoomId) -> Option<RoomSnapshot> {
+        self.rooms
+            .snapshot()
+            .into_iter()
+            .find(|room| room.id == room_id)
+    }
+
+    fn dispatch_match_created(&self, room_id: RoomId) {
+        if let Some(room) = self.room_snapshot_for_lifecycle(room_id) {
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Created,
+                room,
+                None,
+                self.native_match_budget(),
+            );
+        }
+    }
+
+    /// Dispatch the exact native transitions for one successful local admission.
+    /// The room registry owns the membership mutation; this observes its before
+    /// and after snapshots so protocol and trusted paths share idempotence and
+    /// move semantics without exposing a second mutation API.
+    fn dispatch_local_match_admission(
+        &self,
+        participant: ParticipantId,
+        previous: Option<RoomSnapshot>,
+        room_id: RoomId,
+        created: bool,
+    ) {
+        if previous.as_ref().is_some_and(|room| room.id == room_id) {
+            return;
+        }
+        let Some(current) = self.room_snapshot_for_lifecycle(room_id) else {
+            return;
+        };
+        let budget = self.native_match_budget();
+        if let Some(previous) = previous {
+            let ended = self.room_snapshot_for_lifecycle(previous.id).is_none();
+            let mut leaving = self
+                .room_snapshot_for_lifecycle(previous.id)
+                .unwrap_or(previous);
+            leaving.members.retain(|member| *member != participant);
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Leave,
+                leaving.clone(),
+                None,
+                budget,
+            );
+            if ended {
+                self.dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Ended,
+                    leaving,
+                    Some("final_departure"),
+                    budget,
+                );
+            }
+        }
+        if created {
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Created,
+                current.clone(),
+                None,
+                budget,
+            );
+        }
+        if current.members.len() + current.remote_member_count == 1 {
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Started,
+                current.clone(),
+                None,
+                budget,
+            );
+        }
+        self.dispatch_match_lifecycle(NativeMatchLifecycleHook::Join, current, None, budget);
+    }
+
+    /// The owner node observes trusted remote admission just as it observes a
+    /// local admission. Remote member identities remain control-plane data, so
+    /// the server-owned script context exposes only local participant ids.
+    fn dispatch_remote_match_admission(
+        &self,
+        member: &RemoteRoomMember,
+        previous: Option<RoomSnapshot>,
+        room_id: RoomId,
+    ) {
+        if previous.as_ref().is_some_and(|room| room.id == room_id) {
+            return;
+        }
+        let Some(current) = self.room_snapshot_for_lifecycle(room_id) else {
+            return;
+        };
+        let budget = self.native_match_budget();
+        if let Some(previous) = previous {
+            let ended = self.room_snapshot_for_lifecycle(previous.id).is_none();
+            let mut leaving = self
+                .room_snapshot_for_lifecycle(previous.id)
+                .unwrap_or(previous);
+            leaving.remote_member_count = leaving.remote_member_count.saturating_sub(1);
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Leave,
+                leaving.clone(),
+                None,
+                budget,
+            );
+            if ended {
+                self.dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Ended,
+                    leaving,
+                    Some("final_departure"),
+                    budget,
+                );
+            }
+        }
+        if current.members.len() + current.remote_member_count == 1 {
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Started,
+                current.clone(),
+                None,
+                budget,
+            );
+        }
+        self.dispatch_match_lifecycle(NativeMatchLifecycleHook::Join, current, None, budget);
+        let _ = member;
+    }
+
     /// Run one server game-loop tick and deliver its commands to all sessions.
     ///
     /// Invoked by the periodic tick task. `dt` is the nominal step and `budget`
@@ -4272,8 +4497,10 @@ impl Gateway {
             0
         };
         for room in rooms {
-            let commands = runtime.tick_in_room(room.id, dt, budget);
-            delivered += self.apply_commands_scoped(None, Some(room.id), commands);
+            let room_id = room.id;
+            self.dispatch_match_lifecycle(NativeMatchLifecycleHook::Tick, room, None, budget);
+            let commands = runtime.tick_in_room(room_id, dt, budget);
+            delivered += self.apply_commands_scoped(None, Some(room_id), commands);
         }
         delivered
     }
@@ -5396,6 +5623,19 @@ impl Gateway {
         let now = SystemClock.now();
         match method {
             "matchmaker.add" => {
+                if self.require_native_match_lifecycle().is_err() {
+                    tracing::error!(
+                        participant = sender.get(),
+                        reason = NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+                        "refused matchmaker admission before native lifecycle match creation"
+                    );
+                    return self.reply_rpc(
+                        sender,
+                        request_id,
+                        protocol::RPC_STATUS_ERROR,
+                        NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE.as_bytes(),
+                    );
+                }
                 // Readiness gate: a ticket that can only ever form a match a
                 // ready script must exist for is refused up front rather than
                 // parked in a queue that cannot activate.
@@ -5754,6 +5994,9 @@ impl Gateway {
     /// member receives a short-lived, owner-bound `KIND_MATCHMAKER_MATCHED`
     /// handoff; only `matchmaker.accept` performs trusted admission.
     fn activate_formed_matches(&self, now: crate::time::TimestampMillis) -> usize {
+        if self.require_native_match_lifecycle().is_err() {
+            return 0;
+        }
         self.prune_expired_handoffs(now);
         // Readiness gate: while not Ready, queued tickets are held unevaluated
         // (never consumed) and no match room is born on this tick.
@@ -5790,6 +6033,7 @@ impl Gateway {
                 },
                 binding.clone(),
             );
+            self.dispatch_match_created(room_id);
             let mut deliveries = Vec::new();
             let mut complete = true;
             for (ticket, members) in formed.tickets.iter().zip(&formed.ticket_members) {
@@ -5840,7 +6084,7 @@ impl Gateway {
                 }
             }
             if !complete || deliveries.len() != formed.participants.len() {
-                let _ = self.rooms.discard_empty(room_id);
+                let _ = self.discard_empty_room(room_id);
                 continue;
             }
             for (_, ticket, handoff) in &deliveries {
@@ -5946,7 +6190,7 @@ impl Gateway {
                 })
                 .unwrap_or(true);
             if !still_pending {
-                let _ = self.rooms.discard_empty(room_id);
+                let _ = self.discard_empty_room(room_id);
             }
         }
     }
@@ -5960,6 +6204,14 @@ impl Gateway {
         token: &str,
         now: crate::time::TimestampMillis,
     ) -> usize {
+        if self.require_native_match_lifecycle().is_err() {
+            return self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE.as_bytes(),
+            );
+        }
         self.prune_expired_handoffs(now);
         // Readiness gate: trusted admission is refused (stable client-safe
         // message) while not Ready and for rooms bound to a superseded load.
@@ -5990,18 +6242,23 @@ impl Gateway {
                 b"invalid match join token",
             );
         }
-        let admission = {
+        let (admission, previous) = {
             let _scope = self.lock_room_scope();
+            let previous = self
+                .rooms
+                .room_of(sender)
+                .and_then(|id| self.room_snapshot_for_lifecycle(id));
             let admission = self
                 .rooms
                 .admit_match_bound(sender, handoff.room_id, binding.as_ref());
             if admission.is_ok() {
                 self.bind_rep_connection_to_room_under_scope(sender, handoff.room_id);
             }
-            admission
+            (admission, previous)
         };
         match admission {
             Ok(label) => {
+                self.dispatch_local_match_admission(sender, previous, handoff.room_id, false);
                 if let Ok(mut handoffs) = self.handoffs.lock() {
                     let remove_ticket = if let Some(pending) = handoffs.pending.get_mut(ticket) {
                         pending.retain(|candidate| {
@@ -6044,6 +6301,8 @@ impl Gateway {
                 request.requester_node,
             ));
         };
+        self.require_native_match_lifecycle()
+            .map_err(|_| MatchmakerRouterError::Rejected(cluster.node_id.clone()))?;
         let binding = self
             .script_gate(ScriptGateSurface::ClusterAdmitRemote)
             .map_err(|()| MatchmakerRouterError::Rejected(cluster.node_id.clone()))?;
@@ -6066,19 +6325,26 @@ impl Gateway {
             .authority
             .claim_admission(&request.ticket_id, &request.user_id, &cluster.lease, now)
             .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
-        let admission = {
+        let member = RemoteRoomMember {
+            node_id: request.requester_node,
+            user_id: request.user_id,
+        };
+        let (admission, previous) = {
             let _scope = self.lock_room_scope();
-            self.rooms.admit_remote_match_bound(
-                RemoteRoomMember {
-                    node_id: request.requester_node,
-                    user_id: request.user_id,
-                },
+            let previous = self
+                .rooms
+                .remote_room_of(&member)
+                .and_then(|id| self.room_snapshot_for_lifecycle(id));
+            let admission = self.rooms.admit_remote_match_bound(
+                member.clone(),
                 handoff.room_id,
                 binding.as_ref(),
-            )
+            );
+            (admission, previous)
         };
         admission
             .map_err(|_| MatchmakerRouterError::UnknownDestination(cluster.node_id.clone()))?;
+        self.dispatch_remote_match_admission(&member, previous, handoff.room_id);
         Ok(handoff.room_id)
     }
 
@@ -6604,9 +6870,16 @@ impl Gateway {
 
     /// Create an empty trusted room. Membership admission remains a separate
     /// gateway operation so it can atomically install its replication binding.
-    pub fn create_room(&self, label: RoomLabel) -> RoomId {
-        let _scope = self.lock_room_scope();
-        self.rooms.create(label)
+    /// Returns a typed refusal without mutating room state when the selected
+    /// runtime cannot carry the complete native lifecycle.
+    pub fn create_room(&self, label: RoomLabel) -> Result<RoomId, NativeMatchLifecycleUnavailable> {
+        self.require_native_match_lifecycle()?;
+        let room_id = {
+            let _scope = self.lock_room_scope();
+            self.rooms.create(label)
+        };
+        self.dispatch_match_created(room_id);
+        Ok(room_id)
     }
 
     /// Atomically admit a trusted local participant and bind its replication
@@ -6617,9 +6890,19 @@ impl Gateway {
         participant: ParticipantId,
         room_id: RoomId,
     ) -> Result<RoomLabel, JoinError> {
-        let _scope = self.lock_room_scope();
-        let label = self.rooms.join(participant, room_id)?;
-        self.bind_rep_connection_to_room_under_scope(participant, room_id);
+        self.require_native_match_lifecycle()
+            .map_err(JoinError::from)?;
+        let (label, previous) = {
+            let _scope = self.lock_room_scope();
+            let previous = self
+                .rooms
+                .room_of(participant)
+                .and_then(|id| self.room_snapshot_for_lifecycle(id));
+            let label = self.rooms.join(participant, room_id)?;
+            self.bind_rep_connection_to_room_under_scope(participant, room_id);
+            (label, previous)
+        };
+        self.dispatch_local_match_admission(participant, previous, room_id, false);
         Ok(label)
     }
 
@@ -6643,19 +6926,53 @@ impl Gateway {
         binding: Option<ScriptBinding>,
         make_label: impl FnOnce() -> RoomLabel,
     ) -> Result<(RoomId, RoomLabel), JoinError> {
-        let _scope = self.lock_room_scope();
-        let (room_id, label) =
-            self.rooms
-                .join_or_create_bound(participant, name, binding, make_label)?;
-        self.bind_rep_connection_to_room_under_scope(participant, room_id);
+        self.require_native_match_lifecycle()
+            .map_err(JoinError::from)?;
+        let (room_id, label, created, previous) = {
+            let _scope = self.lock_room_scope();
+            let existing_rooms: HashSet<RoomId> = self
+                .rooms
+                .snapshot()
+                .into_iter()
+                .map(|room| room.id)
+                .collect();
+            let previous = self
+                .rooms
+                .room_of(participant)
+                .and_then(|id| self.room_snapshot_for_lifecycle(id));
+            let (room_id, label) =
+                self.rooms
+                    .join_or_create_bound(participant, name, binding, make_label)?;
+            self.bind_rep_connection_to_room_under_scope(participant, room_id);
+            (room_id, label, !existing_rooms.contains(&room_id), previous)
+        };
+        self.dispatch_local_match_admission(participant, previous, room_id, created);
         Ok((room_id, label))
     }
 
     /// Drop a room that never admitted a member. Matchmaker failure cleanup is
     /// serialized with admissions so an expired handoff cannot race a bind.
     pub(crate) fn discard_empty_room(&self, room_id: RoomId) -> bool {
-        let _scope = self.lock_room_scope();
-        self.rooms.discard_empty(room_id)
+        let (discarded, room) = {
+            let _scope = self.lock_room_scope();
+            let room = self.room_snapshot_for_lifecycle(room_id);
+            let discarded = self.rooms.discard_empty(room_id);
+            (discarded, room)
+        };
+        if discarded {
+            if let Some(room) = room {
+                self.dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Ended,
+                    room,
+                    Some("formation_abandoned"),
+                    self.native_match_budget(),
+                );
+            }
+            if let Some(runtime) = &self.runtime {
+                runtime.on_match_closed(room_id);
+            }
+        }
+        discarded
     }
 
     /// Unit tests use the concrete registry to construct deliberate stale
@@ -6701,9 +7018,21 @@ impl Gateway {
     /// Send the stable, client-safe policy rejection for a refused room frame
     /// (`KIND_ROOM_REJECT`). Returns frames delivered.
     fn reply_room_reject(&self, sender: ParticipantId, request_kind: u16) -> usize {
+        self.reply_room_reject_with_reason(sender, request_kind, SCRIPT_UNAVAILABLE_MESSAGE)
+    }
+
+    /// Send a client-safe refusal for a room operation before it can create or
+    /// admit a match. The reason is a stable operator-facing policy message,
+    /// never a runtime error or script detail.
+    fn reply_room_reject_with_reason(
+        &self,
+        sender: ParticipantId,
+        request_kind: u16,
+        reason: &str,
+    ) -> usize {
         let body = citadel_wire::room::RoomReject {
             request_kind,
-            reason: SCRIPT_UNAVAILABLE_MESSAGE.to_owned(),
+            reason: reason.to_owned(),
         }
         .encode();
         usize::from(self.send_reliable(sender, citadel_wire::protocol::KIND_ROOM_REJECT, body))
@@ -6718,8 +7047,13 @@ impl Gateway {
     /// the member's behalf, so nothing can resume the dead match. Returns the
     /// number of notifications delivered (0 when no such room exists).
     pub fn close_match(&self, room_id: RoomId) -> usize {
-        let members = {
+        let (members, room) = {
             let _scope = self.lock_room_scope();
+            let room = self
+                .rooms
+                .snapshot()
+                .into_iter()
+                .find(|snapshot| snapshot.id == room_id);
             let Some(members) = self.rooms.close(room_id) else {
                 return 0;
             };
@@ -6730,8 +7064,36 @@ impl Gateway {
             // still find a live ledger. Remove both identities in the same
             // transaction as the membership/binding transition.
             self.drop_bridge_match(room_id);
-            members
+            (members, room)
         };
+        if let Some(room) = room {
+            let budget = self.native_match_budget();
+            let mut leaving = room.clone();
+            for member in &members {
+                leaving.members.retain(|candidate| candidate != member);
+                self.dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Leave,
+                    leaving.clone(),
+                    None,
+                    budget,
+                );
+            }
+            for _ in 0..leaving.remote_member_count {
+                leaving.remote_member_count -= 1;
+                self.dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Leave,
+                    leaving.clone(),
+                    None,
+                    budget,
+                );
+            }
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Ended,
+                leaving,
+                Some("server_closed"),
+                budget,
+            );
+        }
         // Let a process-hosting runtime adapter release the match's execution
         // context (a no-op for embedded adapters, and for a worker-initiated
         // close whose context is already gone).
@@ -6797,6 +7159,18 @@ impl Gateway {
         use citadel_wire::room::{RoomCreate, RoomJoin, RoomLeave, RoomMapReady};
         match env.kind {
             KIND_ROOM_CREATE => {
+                if self.require_native_match_lifecycle().is_err() {
+                    tracing::error!(
+                        participant = sender.get(),
+                        reason = NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+                        "refused room creation before native lifecycle match existed"
+                    );
+                    return self.reply_room_reject_with_reason(
+                        sender,
+                        KIND_ROOM_CREATE,
+                        NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+                    );
+                }
                 let Ok(create) = RoomCreate::decode(&env.body) else {
                     tracing::debug!(%sender, "gateway dropped a malformed ROOM_CREATE");
                     return 0;
@@ -6819,15 +7193,25 @@ impl Gateway {
                     }
                 };
                 let params = create.params.clone();
-                let admission = {
+                let (admission, previous, existing_rooms) = {
                     let _scope = self.lock_room_scope();
+                    let previous = self
+                        .rooms
+                        .room_of(sender)
+                        .and_then(|id| self.room_snapshot_for_lifecycle(id));
+                    let existing_rooms: HashSet<RoomId> = self
+                        .rooms
+                        .snapshot()
+                        .into_iter()
+                        .map(|room| room.id)
+                        .collect();
                     let admission = self.rooms.join_or_create_bound(sender, &name, binding, || {
                         self.room_label_for_create(sender, &params)
                     });
                     if let Ok((room_id, _)) = &admission {
                         self.bind_rep_connection_to_room_under_scope(sender, *room_id);
                     }
-                    admission
+                    (admission, previous, existing_rooms)
                 };
                 match admission {
                     Ok((room_id, label)) => {
@@ -6837,6 +7221,12 @@ impl Gateway {
                             name = %name,
                             map = %label.map,
                             "room: join-or-create"
+                        );
+                        self.dispatch_local_match_admission(
+                            sender,
+                            previous,
+                            room_id,
+                            !existing_rooms.contains(&room_id),
                         );
                         self.reply_joined(sender, room_id, label)
                     }
@@ -6856,6 +7246,13 @@ impl Gateway {
                 }
             }
             KIND_ROOM_JOIN => {
+                if self.require_native_match_lifecycle().is_err() {
+                    return self.reply_room_reject_with_reason(
+                        sender,
+                        KIND_ROOM_JOIN,
+                        NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+                    );
+                }
                 let Ok(join) = RoomJoin::decode(&env.body) else {
                     return 0;
                 };
@@ -6911,16 +7308,30 @@ impl Gateway {
         room_id: RoomId,
         binding: Option<ScriptBinding>,
     ) -> usize {
-        let admission = {
+        if self.require_native_match_lifecycle().is_err() {
+            return self.reply_room_reject_with_reason(
+                sender,
+                KIND_ROOM_JOIN,
+                NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+            );
+        }
+        let (admission, previous) = {
             let _scope = self.lock_room_scope();
+            let previous = self
+                .rooms
+                .room_of(sender)
+                .and_then(|id| self.room_snapshot_for_lifecycle(id));
             let admission = self.rooms.join_bound(sender, room_id, binding.as_ref());
             if admission.is_ok() {
                 self.bind_rep_connection_to_room_under_scope(sender, room_id);
             }
-            admission
+            (admission, previous)
         };
         match admission {
-            Ok(label) => self.reply_joined(sender, room_id, label),
+            Ok(label) => {
+                self.dispatch_local_match_admission(sender, previous, room_id, false);
+                self.reply_joined(sender, room_id, label)
+            }
             Err(JoinError::StaleScript) => self.reply_room_reject(sender, KIND_ROOM_JOIN),
             Err(reason) => {
                 tracing::debug!(
@@ -6960,15 +7371,46 @@ impl Gateway {
     /// Remove `sender` from its room and notify the members that remain. Returns the
     /// number of `ROOM_LEAVE` notifications delivered.
     fn leave_room(&self, sender: ParticipantId) -> usize {
-        let leave = {
+        let (leave, before) = {
             let _scope = self.lock_room_scope();
+            let before = self.rooms.room_of(sender).and_then(|room_id| {
+                self.rooms
+                    .snapshot()
+                    .into_iter()
+                    .find(|room| room.id == room_id)
+            });
             let leave = self.rooms.leave(sender);
             self.unbind_rep_connection_under_scope(sender);
-            leave
+            (leave, before)
         };
         let Some((room_id, remaining)) = leave else {
             return 0;
         };
+        let ended = self.room_snapshot_for_lifecycle(room_id).is_none();
+        if let Some(mut room) = self
+            .rooms
+            .snapshot()
+            .into_iter()
+            .find(|room| room.id == room_id)
+            .or(before)
+        {
+            room.members.retain(|member| *member != sender);
+            let budget = self.native_match_budget();
+            self.dispatch_match_lifecycle(
+                NativeMatchLifecycleHook::Leave,
+                room.clone(),
+                None,
+                budget,
+            );
+            if ended {
+                self.dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Ended,
+                    room,
+                    Some("final_departure"),
+                    budget,
+                );
+            }
+        }
         // A leave that empties the room prunes it from the registry. Let a
         // process-hosting runtime adapter release the match's execution
         // context, exactly like [`Self::close_match`] does (embedded adapters
@@ -9834,6 +10276,10 @@ mod transform_tests {
             Vec::new()
         }
 
+        fn supports_native_match_lifecycle(&self) -> bool {
+            true
+        }
+
         fn on_match_closed(&self, room_id: u64) {
             self.closed.lock().expect("closed lock").push(room_id);
         }
@@ -10883,7 +11329,9 @@ mod transform_tests {
         let (gw, hub) = authoritative_gateway_slots("-- deferred validator", 1);
         let (participant, object_id, ownership_epoch) = authoritative_slot_member(&gw).await;
         let room_a = gw.rooms().room_of(participant).expect("member starts in A");
-        let room_b = gw.create_room(RoomLabel::with_map("B"));
+        let room_b = gw
+            .create_room(RoomLabel::with_map("B"))
+            .expect("test runtime supports lifecycle");
         gw.join_room(participant, room_b)
             .expect("trusted move to B");
 
@@ -11004,7 +11452,9 @@ mod transform_tests {
         let (gw, hub) = authoritative_gateway("-- deferred validator");
         let (participant, _receiver) = authoritative_room_member(&gw).await;
         let room_a = gw.rooms().room_of(participant).expect("member starts in A");
-        let room_b = gw.create_room(RoomLabel::with_map("B"));
+        let room_b = gw
+            .create_room(RoomLabel::with_map("B"))
+            .expect("test runtime supports lifecycle");
         gw.join_room(participant, room_b)
             .expect("trusted move to B");
 
@@ -11184,7 +11634,9 @@ mod transform_tests {
             .recv()
             .await
             .expect("other-room schema bootstrap");
-        let room_two = gw.create_room(RoomLabel::with_map("other"));
+        let room_two = gw
+            .create_room(RoomLabel::with_map("other"))
+            .expect("test runtime supports lifecycle");
         gw.join_room(other_room, room_two)
             .expect("other-room peer joins a different room");
 
@@ -15001,10 +15453,12 @@ mod domain_rpc_tests {
 mod script_gate_tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::time::Duration;
+
     use super::*;
     use crate::matchmaker_cluster::{MatchmakerHandoffRouter, QueueShardId};
     use crate::realtime::registry::{ParticipantIdentity, SessionHandle};
-    use crate::runtime::GameScriptReadiness;
+    use crate::runtime::{GameScriptReadiness, RoomSpec};
     use crate::session::SessionId;
     use crate::storage::UserId;
     use crate::transport::TransportKind;
@@ -15077,6 +15531,58 @@ mod script_gate_tests {
         Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode())
     }
 
+    struct UnsupportedNativeLifecycleRuntime;
+
+    impl Runtime for UnsupportedNativeLifecycleRuntime {
+        fn dispatch(&self, _: u64, _: Option<&str>, _: u16, _: &[u8]) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn dispatch_lifecycle(
+            &self,
+            _: LifecycleHook,
+            _: u64,
+            _: Option<&str>,
+        ) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn tick(&self, _: Duration, _: Duration) -> Vec<OutboundCommand> {
+            Vec::new()
+        }
+
+        fn call_rpc(&self, _: u64, _: Option<&str>, _: &str, _: &[u8]) -> RpcOutcome {
+            RpcOutcome::Err("unused".to_owned())
+        }
+
+        fn call_room_create(&self, _: u64, _: Option<&str>, _: &[u8]) -> Option<RoomSpec> {
+            None
+        }
+
+        fn call_room_join(&self, _: u64, _: Option<&str>, _: u64) -> bool {
+            false
+        }
+
+        fn has_tick_handler(&self) -> bool {
+            false
+        }
+
+        fn budget(&self) -> Duration {
+            Duration::from_millis(1)
+        }
+
+        fn introspect(&self) -> crate::runtime::RuntimeIntrospection {
+            crate::runtime::RuntimeIntrospection {
+                source: "unsupported-native-lifecycle".to_owned(),
+                reloadable: false,
+                deadline_ms: 1,
+                rpcs: Vec::new(),
+                message_kinds: Vec::new(),
+                hooks: Vec::new(),
+            }
+        }
+    }
+
     /// Assert the next frame is the stable, client-safe policy rejection.
     async fn expect_room_reject(rx: &mut mpsc::Receiver<Outbound>, request_kind: u16) {
         let out = rx.recv().await.expect("reject reply delivered");
@@ -15084,6 +15590,48 @@ mod script_gate_tests {
         let reject = RoomReject::decode(&out.envelope.body).expect("decodes");
         assert_eq!(reject.request_kind, request_kind);
         assert_eq!(reject.reason, SCRIPT_UNAVAILABLE_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn unsupported_native_lifecycle_refuses_local_and_remote_handoffs_before_mutation() {
+        let gw = Gateway::with_metrics_and_runtime(
+            Arc::new(NodeMetrics::new()),
+            Some(Arc::new(UnsupportedNativeLifecycleRuntime)),
+        );
+        let (alice, mut replies) = register(&gw, Some("alice"));
+
+        assert_eq!(
+            gw.live_matchmaker_finish_local_accept(alice, 1, 1),
+            Err(()),
+            "local matchmaker admission must not mutate an unsupported match"
+        );
+        let (status, body) = recv_rpc(&mut replies).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE
+        );
+
+        assert_eq!(
+            gw.live_matchmaker_finish_remote_accept(alice, 2, 2),
+            Err(()),
+            "remote handoff completion must not bind an unsupported match"
+        );
+        let (status, body) = recv_rpc(&mut replies).await;
+        assert_eq!(status, protocol::RPC_STATUS_ERROR);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE
+        );
+        assert!(gw.rooms().snapshot().is_empty());
+        assert!(
+            gw.rep_rooms
+                .lock()
+                .expect("replication bindings lock")
+                .connections
+                .is_empty(),
+            "neither refusal may leave a room or remote replication binding"
+        );
     }
 
     // ---- Surface 1: KIND_ROOM_CREATE ------------------------------------

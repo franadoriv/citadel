@@ -1069,11 +1069,12 @@ pub struct RuntimeConfig {
     /// Explicit runtime language. `None` means autodetect from `scripts_dir`.
     pub language: Option<RuntimeLanguage>,
     /// Runtime hosting adapter. `embedded` executes game scripts in-process.
-    /// `external-worker` (unix and windows) executes them in a supervised
-    /// worker process instead: matches run in per-match engine contexts over
-    /// the authenticated data plane, while the match-independent surface
-    /// (global messages, RPC, lifecycle hooks) is not routed to the worker
-    /// yet. `wasm` is not implemented.
+    /// `external-worker` (unix and windows) executes its existing per-match
+    /// data-plane dispatch in a supervised worker process. It does **not** yet
+    /// carry native authoritative-match lifecycle frames with their complete
+    /// server-owned context, so Citadel rejects room and matchmaker admission
+    /// before a lifecycle match is created. Native lifecycle callbacks ship only
+    /// for embedded Lua, Python, and JavaScript. `wasm` is not implemented.
     pub adapter: RuntimeAdapter,
     /// Runtime trust tier. Only `trusted` is implemented today.
     pub tier: RuntimeTier,

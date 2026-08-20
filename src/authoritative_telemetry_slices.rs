@@ -32,6 +32,36 @@ pub(crate) fn set_active_runtime_scope(room_id: Option<u64>) {
     ACTIVE_RUNTIME_SCOPE.with(|scope| scope.set(room_id));
 }
 
+/// Restore the prior runtime scope when a nested synchronous invocation ends.
+///
+/// Runtime entry points must use this guard rather than assigning the thread-local
+/// directly whenever a callback receives an authoritative match context. It makes
+/// the callback's context the sole telemetry correlation even if an earlier
+/// invocation left a scope installed, and it restores that earlier scope on every
+/// exit path, including panic unwinding.
+pub(crate) struct RuntimeScopeGuard {
+    previous: Option<u64>,
+}
+
+impl RuntimeScopeGuard {
+    /// Install `room_id` for the duration of this guard's lexical scope.
+    #[must_use]
+    pub(crate) fn enter(room_id: Option<u64>) -> Self {
+        let previous = ACTIVE_RUNTIME_SCOPE.with(|scope| {
+            let previous = scope.get();
+            scope.set(room_id);
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for RuntimeScopeGuard {
+    fn drop(&mut self) {
+        ACTIVE_RUNTIME_SCOPE.with(|scope| scope.set(self.previous));
+    }
+}
+
 /// Return the context derived from the active runtime invocation, if any.
 pub(crate) fn active_runtime_context() -> Option<TelemetrySliceContext> {
     ACTIVE_RUNTIME_SCOPE.with(|scope| scope.get().map(TelemetrySliceContext::match_context))
