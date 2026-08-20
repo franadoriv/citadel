@@ -19,6 +19,9 @@ use rquickjs::{
     Runtime as QuickJsRuntime, TypedArray, Value,
 };
 
+use crate::authoritative_telemetry_slices::{
+    TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
@@ -40,6 +43,7 @@ use crate::runtime::{
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
     script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
+use crate::time::{Clock, SystemClock};
 use citadel_physics::{PhysicsConfig, Shape};
 
 /// Default JavaScript script entrypoint under `runtime.scripts_dir`.
@@ -127,6 +131,9 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "cache.set",
     "cache.delete",
     "cache.cas",
+    "telemetry.begin",
+    "telemetry.mark",
+    "telemetry.finish",
 ];
 
 const JS_HOST_PRELUDE: &str = r#"
@@ -364,6 +371,11 @@ const JS_HOST_PRELUDE: &str = r#"
       bodyCommand("send", [toSessionString(session), Number(kind), body, Boolean(unreliable)], 2);
     },
     log,
+    telemetry: {
+      begin() { const error = globalThis.__citadel_telemetry_begin(); if (error) throw new Error(error); },
+      mark(marker) { const error = globalThis.__citadel_telemetry_mark(String(marker)); if (error) throw new Error(error); },
+      finish() { const error = globalThis.__citadel_telemetry_finish(); if (error) throw new Error(error); },
+    },
     http: {
       fetch(url, opts) {
         if (globalThis.__citadel_realtime_interceptor) {
@@ -1005,6 +1017,7 @@ pub struct JsRuntime {
     maps: Option<Arc<MapCatalog>>,
     /// Transform hub retained across hot reload for `citadel.physics_state`.
     transform_hub: Option<Arc<TransformHub>>,
+    telemetry_slices: Option<Arc<TelemetrySliceService>>,
     /// Where this runtime's authoritative-bridge answers land (the gateway),
     /// held weakly to avoid an `Arc` cycle. Lives on the runtime so it survives
     /// a hot-reload's whole-context swap.
@@ -1115,6 +1128,7 @@ impl JsRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             bridge_sink: Mutex::new(None),
         }))
     }
@@ -1157,6 +1171,7 @@ impl JsRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1200,6 +1215,7 @@ impl JsRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1217,6 +1233,15 @@ impl JsRuntime {
                 Arc::clone(&guard.interceptor_mode),
             );
         }
+        self
+    }
+
+    /// Attach private context-derived telemetry slices to trusted script calls.
+    #[must_use]
+    pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
+        self.telemetry_slices = Some(slices);
+        let guard = lock_mutex(&self.vm);
+        apply_telemetry_slices(&guard.context, &self.telemetry_slices);
         self
     }
 
@@ -1338,6 +1363,7 @@ impl JsRuntime {
         );
         apply_map_catalog(&fresh.context, &self.maps);
         apply_transform_hub(&fresh.context, &self.transform_hub);
+        apply_telemetry_slices(&fresh.context, &self.telemetry_slices);
         {
             let mut guard = lock_mutex(&self.vm);
             *guard = fresh;
@@ -1573,6 +1599,7 @@ impl JsRuntime {
 
     /// Dispatch the periodic tick handler with `dt` in seconds.
     pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        set_active_runtime_scope(None);
         let dt_secs = dt.as_secs_f64();
         self.run_commands("on_tick", budget, |ctx| {
             let globals = ctx.globals();
@@ -3020,6 +3047,7 @@ fn make_ctx<'js>(
     method: Option<&str>,
     room_id: Option<u64>,
 ) -> JsHostResult<Object<'js>> {
+    set_active_runtime_scope(room_id);
     let obj = caught(ctx, Object::new(ctx.clone()))?;
     let sender_bigint = caught(ctx, BigInt::from_u64(ctx.clone(), sender))?;
     caught(ctx, obj.set("sender", sender_bigint))?;
@@ -3806,6 +3834,63 @@ fn apply_map_catalog(context: &Context, maps: &Option<Arc<MapCatalog>>) {
         )?;
         caught(&ctx, ctx.globals().set("__citadel_find_path", find_path))?;
         Ok(())
+    });
+}
+
+fn apply_telemetry_slices(context: &Context, slices: &Option<Arc<TelemetrySliceService>>) {
+    let Some(slices) = slices else {
+        return;
+    };
+    let slices = Arc::clone(slices);
+    let _ = context.with(|ctx| -> JsHostResult<()> {
+        let begin_slices = Arc::clone(&slices);
+        let begin = caught(
+            &ctx,
+            Function::new(ctx.clone(), move || -> String {
+                let Some(context) = active_runtime_context() else {
+                    return "telemetry slices require a match-scoped context".to_owned();
+                };
+                begin_slices
+                    .begin(context, SystemClock.now().unix_millis())
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
+            }),
+        )?;
+        let mark_slices = Arc::clone(&slices);
+        let mark = caught(
+            &ctx,
+            Function::new(ctx.clone(), move |marker: String| -> String {
+                let Some(context) = active_runtime_context() else {
+                    return "telemetry slices require a match-scoped context".to_owned();
+                };
+                mark_slices
+                    .mark(context, &marker, SystemClock.now().unix_millis())
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
+            }),
+        )?;
+        let finish_slices = Arc::clone(&slices);
+        let finish = caught(
+            &ctx,
+            Function::new(ctx.clone(), move || -> String {
+                let Some(context) = active_runtime_context() else {
+                    return "telemetry slices require a match-scoped context".to_owned();
+                };
+                finish_slices
+                    .finish(context, SystemClock.now().unix_millis())
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
+            }),
+        )?;
+        caught(&ctx, ctx.globals().set("__citadel_telemetry_begin", begin))?;
+        caught(&ctx, ctx.globals().set("__citadel_telemetry_mark", mark))?;
+        caught(
+            &ctx,
+            ctx.globals().set("__citadel_telemetry_finish", finish),
+        )
     });
 }
 

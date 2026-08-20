@@ -625,6 +625,30 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         since: "TASK-0418",
     },
     HostApiFn {
+        name: "telemetry.begin",
+        category: HostApiCategory::Log,
+        params: &[],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
+        name: "telemetry.mark",
+        category: HostApiCategory::Log,
+        params: &["marker:string"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
+        name: "telemetry.finish",
+        category: HostApiCategory::Log,
+        params: &[],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
         name: "cache.cas",
         category: HostApiCategory::Storage,
         params: &[

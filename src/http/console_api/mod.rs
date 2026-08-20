@@ -27,6 +27,7 @@
 pub mod accounts;
 pub mod api_keys;
 pub mod audit;
+pub mod authoritative_telemetry_slices;
 pub mod chat;
 pub mod config;
 pub mod database;
@@ -61,6 +62,9 @@ use super::error::{ApiError, ErrorBody};
 
 pub use accounts::ACCOUNTS_PATH;
 pub use audit::AUDIT_PATH;
+pub use authoritative_telemetry_slices::{
+    AUTHORITATIVE_TELEMETRY_SLICE_DETAIL_PATH, AUTHORITATIVE_TELEMETRY_SLICES_PATH,
+};
 pub use chat::CHAT_PATH;
 pub use config::CONFIG_PATH;
 pub use database::DATABASE_PATH;
@@ -91,6 +95,7 @@ pub const ME_PATH: &str = "/console/v1/me";
 pub const SECTION_PATHS: &[&str] = &[
     "/console/v1/config",
     "/console/v1/audit",
+    authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICES_PATH,
     "/console/v1/errors",
     "/console/v1/storage",
     "/console/v1/database",
@@ -114,6 +119,7 @@ pub const SECTION_PATHS: &[&str] = &[
 /// router build (duplicate route), which is the desired failure mode.
 pub const IMPLEMENTED_SECTION_PATHS: &[&str] = &[
     audit::AUDIT_PATH,
+    authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICES_PATH,
     errors::ERRORS_PATH,
     config::CONFIG_PATH,
     storage::STORAGE_PATH,
@@ -339,6 +345,14 @@ pub(super) fn routes() -> Router<App> {
             post(api_keys::revoke_handler),
         )
         .route(audit::AUDIT_PATH, get(audit::list_handler))
+        .route(
+            authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICES_PATH,
+            get(authoritative_telemetry_slices::list_handler),
+        )
+        .route(
+            authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICE_DETAIL_PATH,
+            get(authoritative_telemetry_slices::detail_handler),
+        )
         .route(
             lag_diagnostics::LAG_REPORTS_PATH,
             get(lag_diagnostics::list_reports_handler),
@@ -655,7 +669,7 @@ mod tests {
         assert_eq!(unique.len(), SECTION_PATHS.len());
         // One route per placeholder sidebar section (purchases splits into
         // purchases + subscriptions, and Status stays on the public /status).
-        assert_eq!(SECTION_PATHS.len(), 15);
+        assert_eq!(SECTION_PATHS.len(), 16);
     }
 
     #[test]

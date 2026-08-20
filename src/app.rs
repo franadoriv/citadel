@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder;
+use crate::authoritative_telemetry_slices::{TelemetrySlicePolicy, TelemetrySliceService};
 use crate::config::{Config, RuntimeConfig};
 use crate::deferred_storage::DeferredStorageWriter;
 use crate::error::{AppError, AppResult};
@@ -59,6 +60,7 @@ pub struct App {
     started_at: Instant,
     metrics: Arc<NodeMetrics>,
     authoritative_decision_recorder: Option<Arc<AuthoritativeDecisionRecorder>>,
+    telemetry_slices: Option<Arc<TelemetrySliceService>>,
     host_telemetry: Arc<HostTelemetryService>,
     backend: Arc<dyn Backend>,
     auth: Arc<dyn AuthenticationService>,
@@ -144,6 +146,16 @@ impl App {
                     config.telemetry.authoritative_decisions.capacity,
                 ))
             });
+        let telemetry_slices = authoritative_decision_recorder.as_ref().map(|recorder| {
+            Arc::new(TelemetrySliceService::new(
+                Arc::clone(recorder),
+                config
+                    .telemetry
+                    .slices
+                    .policy()
+                    .expect("validated telemetry slice configuration"),
+            ))
+        });
         let sessions: SharedSessionService = Arc::new(InMemorySessionService::with_secure_issuer(
             backend.session_repository(),
         ));
@@ -220,6 +232,7 @@ impl App {
             started_at: Instant::now(),
             metrics,
             authoritative_decision_recorder,
+            telemetry_slices,
             host_telemetry: Arc::new(HostTelemetryService::new()),
             backend,
             auth,
@@ -369,6 +382,12 @@ impl App {
     #[must_use]
     pub fn authoritative_decision_recorder(&self) -> Option<Arc<AuthoritativeDecisionRecorder>> {
         self.authoritative_decision_recorder.clone()
+    }
+
+    /// The optional bounded service that derives closed redacted telemetry reports.
+    #[must_use]
+    pub fn telemetry_slices(&self) -> Option<Arc<TelemetrySliceService>> {
+        self.telemetry_slices.clone()
     }
 
     /// Return host CPU, memory, and filesystem capacity telemetry.

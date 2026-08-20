@@ -678,6 +678,32 @@
     "since": "TASK-0418"
   },
   {
+    "name": "telemetry.begin",
+    "category": "log",
+    "params": [],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "telemetry.mark",
+    "category": "log",
+    "params": [
+      "marker:string"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "telemetry.finish",
+    "category": "log",
+    "params": [],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "cache.cas",
     "category": "storage",
     "params": [

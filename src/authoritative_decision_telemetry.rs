@@ -81,6 +81,9 @@ impl AuthoritativeDecisionReason {
 /// This deliberately contains no payload, reply, command, identity, or value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthoritativeDecisionRecord {
+    /// Process-local monotonic position, used only to derive bounded slice windows.
+    /// It is never emitted through the operator API.
+    pub(crate) sequence: u64,
     /// Opaque numeric correlations only.
     pub correlation: AuthoritativeDecisionCorrelation,
     /// Generic decision classification.
@@ -141,12 +144,14 @@ impl AuthoritativeDecisionRecorder {
             state.records.pop_front();
             state.metrics.evicted_total = state.metrics.evicted_total.saturating_add(1);
         }
+        state.metrics.recorded_total = state.metrics.recorded_total.saturating_add(1);
+        let sequence = state.metrics.recorded_total;
         state.records.push_back(AuthoritativeDecisionRecord {
+            sequence,
             correlation,
             outcome,
             reason,
         });
-        state.metrics.recorded_total = state.metrics.recorded_total.saturating_add(1);
         match outcome {
             AuthoritativeDecisionOutcome::Accepted => {
                 state.metrics.accepted_total = state.metrics.accepted_total.saturating_add(1);

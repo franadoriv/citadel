@@ -17,6 +17,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyTuple};
 
+use crate::authoritative_telemetry_slices::{
+    TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
 use crate::realtime::TransformHub;
@@ -40,6 +43,7 @@ use crate::runtime::{
     set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
+use crate::time::{Clock, SystemClock};
 use citadel_physics::{PhysicsConfig, Shape};
 
 static PYTHON_BUILD_LOCK: Mutex<()> = Mutex::new(());
@@ -135,6 +139,9 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "cache.set",
     "cache.delete",
     "cache.cas",
+    "telemetry.begin",
+    "telemetry.mark",
+    "telemetry.finish",
 ];
 
 /// The Python-side `citadel` module. Keeping this in Python avoids Rust-side
@@ -372,6 +379,23 @@ class _Cache:
             str(namespace), str(key), version, _bytes(value), int(ttl_ms)))
 
 cache = _Cache()
+
+class _Telemetry:
+    def _bridge(self):
+        if "_telemetry_slices_bridge" not in globals():
+            raise RuntimeError("telemetry slices are unavailable")
+        return _telemetry_slices_bridge
+
+    def begin(self):
+        return self._bridge().begin()
+
+    def mark(self, marker):
+        return self._bridge().mark(str(marker))
+
+    def finish(self):
+        return self._bridge().finish()
+
+telemetry = _Telemetry()
 
 def _push(command, body_len=0):
     global _total_bytes, _overflowed
@@ -841,7 +865,42 @@ struct DomainHostBridge {
     interceptor_mode: Arc<AtomicBool>,
 }
 
-/// PyO3 wrapper exposing the read-only loaded-map catalog to Python scripts.
+/// PyO3 wrapper exposing context-derived telemetry slices to Python scripts.
+#[pyclass]
+struct TelemetrySlicesHandle {
+    slices: Arc<TelemetrySliceService>,
+}
+
+#[pymethods]
+impl TelemetrySlicesHandle {
+    fn begin(&self) -> PyResult<()> {
+        let context = active_runtime_context().ok_or_else(|| {
+            PyRuntimeError::new_err("telemetry slices require a match-scoped context")
+        })?;
+        self.slices
+            .begin(context, SystemClock.now().unix_millis())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    fn mark(&self, marker: String) -> PyResult<()> {
+        let context = active_runtime_context().ok_or_else(|| {
+            PyRuntimeError::new_err("telemetry slices require a match-scoped context")
+        })?;
+        self.slices
+            .mark(context, &marker, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    fn finish(&self) -> PyResult<()> {
+        let context = active_runtime_context().ok_or_else(|| {
+            PyRuntimeError::new_err("telemetry slices require a match-scoped context")
+        })?;
+        self.slices
+            .finish(context, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
 #[pyclass]
 struct MapCatalogBridge {
     maps: Arc<MapCatalog>,
@@ -1652,6 +1711,7 @@ pub struct PythonRuntime {
     domain: Option<Arc<dyn DomainHost>>,
     maps: Option<Arc<MapCatalog>>,
     transform_hub: Option<Arc<TransformHub>>,
+    telemetry_slices: Option<Arc<TelemetrySliceService>>,
     /// Where this runtime's authoritative-bridge answers land (the gateway),
     /// held weakly. Lives on the runtime so it survives a hot-reload swap.
     bridge_sink: Mutex<Option<Weak<dyn BridgeCommandSink>>>,
@@ -1764,6 +1824,7 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             bridge_sink: Mutex::new(None),
         }))
     }
@@ -1809,6 +1870,7 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1855,6 +1917,7 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1876,6 +1939,15 @@ impl PythonRuntime {
                 Arc::clone(&guard.interceptor_mode),
             );
         }
+        self
+    }
+
+    /// Attach private context-derived telemetry slices to trusted script calls.
+    #[must_use]
+    pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
+        self.telemetry_slices = Some(slices);
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        apply_telemetry_slices(&guard.citadel, &self.telemetry_slices);
         self
     }
 
@@ -1985,6 +2057,7 @@ impl PythonRuntime {
                 return ReloadOutcome::Rejected;
             }
         };
+        apply_telemetry_slices(&fresh.citadel, &self.telemetry_slices);
         if !vm_has_any_handler(&fresh) {
             tracing::warn!(
                 script = %label,
@@ -2261,6 +2334,7 @@ impl PythonRuntime {
 
     /// Dispatch the periodic tick handler with `dt` in seconds.
     pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        set_active_runtime_scope(None);
         let dt_secs = dt.as_secs_f64();
         self.run_commands("on_tick", budget, |_, module| {
             module
@@ -2692,6 +2766,21 @@ fn apply_map_catalog(citadel: &Py<PyModule>, maps: &Option<Arc<MapCatalog>>) {
 }
 
 /// Apply the synchronous transform-physics read bridge to a freshly-built VM.
+fn apply_telemetry_slices(citadel: &Py<PyModule>, slices: &Option<Arc<TelemetrySliceService>>) {
+    if let Some(slices) = slices {
+        Python::attach(|py| {
+            if let Err(e) = citadel.bind(py).setattr(
+                "_telemetry_slices_bridge",
+                TelemetrySlicesHandle {
+                    slices: Arc::clone(slices),
+                },
+            ) {
+                tracing::warn!(error = %e, "failed to set telemetry slices bridge on python module");
+            }
+        });
+    }
+}
+
 fn apply_transform_hub(citadel: &Py<PyModule>, hub: &Option<Arc<TransformHub>>) {
     if let Some(hub) = hub {
         Python::attach(|py| {
@@ -3118,6 +3207,7 @@ fn make_ctx<'py>(
     method: Option<&str>,
     room_id: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    set_active_runtime_scope(room_id);
     module
         .getattr("_make_ctx")?
         .call1((sender, user_id, kind, method, room_id))

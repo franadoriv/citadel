@@ -865,6 +865,7 @@ pre.code {
       { id: 'purchases', title: 'Purchases & Subscriptions', icon: 'cart' }
     ]},
     { label: 'Operations', items: [
+      { id: 'telemetry-slices', title: 'Telemetry Slices', icon: 'activity' },
       { id: 'lag-diagnostics', title: 'Lag Diagnostics', icon: 'activity' }
     ]},
     { label: 'System', items: [
@@ -2395,6 +2396,44 @@ pre.code {
     };
   }
 
+
+  // ==== Telemetry Slices =======================================================
+  function renderTelemetrySlices() {
+    setPage(pageHead('Telemetry Slices', 'Closed, bounded authoritative-decision reports. No packet payloads or player identity are retained.')
+      + '<div class="toolbar"><div class="grow"></div><button class="btn" data-act="ts-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Closed reports</h2><span class="sub" id="ts-meta"></span></div><div id="ts-table">' + loadingRows(7) + '</div></div>');
+    ACT['ts-refresh'] = loadTelemetrySlices;
+    loadTelemetrySlices();
+  }
+
+  function loadTelemetrySlices() {
+    api('GET', '/console/v1/telemetry/slices?limit=100').then(function (d) {
+      var rows = '';
+      (d.items || []).forEach(function (r) {
+        var totals = fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total);
+        rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(r.closed_at_ms)) + '</td>'
+          + '<td class="mono">' + esc(r.report_id) + '</td>'
+          + '<td>' + esc(r.context_kind) + '</td><td>' + esc(r.close_reason) + '</td>'
+          + '<td>' + esc(fmtNum(r.duration_ms)) + ' ms</td><td>' + esc(totals) + '</td>'
+          + '<td>' + (r.truncated ? '<span class="tag-soft off">truncated</span>' : '<span class="tag-soft on">complete</span>') + '</td>'
+          + '<td><button class="btn small" data-act="ts-detail" data-id="' + esc(r.report_id) + '">View</button></td></tr>';
+      });
+      if (!rows) rows = emptyRowHtml(8, 'No closed telemetry slices are retained.');
+      setHtml('ts-table', tableHtml(['Closed', 'Report', 'Context', 'Close reason', 'Duration', 'Accept / Reject / Correct', 'Completeness', ''], rows));
+      setText('ts-meta', fmtNum((d.items || []).length) + ' retained reports');
+      document.querySelectorAll('[data-act="ts-detail"]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          var id = button.getAttribute('data-id');
+          api('GET', '/console/v1/telemetry/slices/' + encodeURIComponent(id)).then(function (r) {
+            var markers = r.markers && r.markers.length ? r.markers.join(', ') : 'none';
+            openModal('Telemetry slice ' + r.report_id,
+              '<div class="panel-body"><p><b>Context:</b> ' + esc(r.context_kind) + '</p><p><b>Close reason:</b> ' + esc(r.close_reason) + '</p><p><b>Duration:</b> ' + esc(fmtNum(r.duration_ms)) + ' ms</p><p><b>Markers:</b> ' + esc(markers) + '</p><p><b>Accepted / rejected / corrected:</b> ' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</p><p><b>Completeness:</b> ' + esc(r.truncated ? 'truncated by bounded retention' : 'complete within retained window') + '</p></div>');
+          }).catch(fail);
+        });
+      });
+    }).catch(fail);
+  }
+
   // ==== Audit Logs =============================================================
   var aud = { actor: '', action: '', limit: 100 };
 
@@ -2890,6 +2929,7 @@ pre.code {
     matches: renderMatches,
     purchases: renderPurchases,
     'lag-diagnostics': renderLagDiagnostics,
+    'telemetry-slices': renderTelemetrySlices,
     configuration: renderConfiguration,
     'api-keys': renderApiKeys,
     api: renderApi,

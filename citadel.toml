@@ -68,6 +68,14 @@ max_entries = 2000
 enabled = true
 capacity = 1024
 
+[telemetry.slices]
+# Trusted runtime code may begin/mark/finish context-bound slices. Citadel closes
+# slices at the TTL or configured caps and retains only bounded, redacted reports.
+max_active = 32
+max_markers = 32
+ttl_ms = 300000
+max_closed_reports = 128
+
 [database]
 # Persistence backend, selected by URL scheme:
 #   sqlite://<file>            -> embedded single-file SQLite (created on first run)

@@ -422,6 +422,7 @@ async fn dashboard_lag_diagnostics_uses_redacted_keysets_and_admin_raw_modals() 
     assert_eq!(dashboard.status, 200);
     for required in [
         "label: 'Operations'",
+        "id: 'telemetry-slices'",
         "id: 'lag-diagnostics'",
         "title: 'Lag Diagnostics'",
         "'/console/v1/lag/reports?limit=20'",
