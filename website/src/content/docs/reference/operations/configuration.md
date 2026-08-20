@@ -285,8 +285,8 @@ is a trusted server-script boundary; it is not a sandbox for malicious scripts.
 
 Closed reports are available only to authenticated console operators at
 `/console/v1/telemetry/slices`; each read is audited. They contain generic
-decision totals, bounded marker names, close reason, duration, and a truncation
-indicator. They never contain raw payloads, player identity, account data,
+decision totals, marker counts, close reason, duration, and a truncation
+indicator. Marker text is never retained. They never contain raw payloads, player identity, account data,
 replies, commands, or corrected values.
 
 

@@ -145,8 +145,8 @@ pub struct ClosedTelemetrySliceReport {
     pub closed_at_ms: u64,
     /// Bounded duration computed by the server clock.
     pub duration_ms: u64,
-    /// Server-validated marker names only; no marker payload exists.
-    pub markers: Vec<String>,
+    /// Number of validated runtime markers observed; marker text is never retained.
+    pub marker_total: u32,
     /// Whether bounded recorder eviction may have removed decisions from this slice.
     pub truncated: bool,
     /// Aggregate decision counts derived only from decisions recorded after begin.
@@ -183,7 +183,7 @@ struct ActiveSlice {
     started_at_ms: u64,
     start_sequence: u64,
     start_evictions: u64,
-    markers: Vec<String>,
+    marker_total: u32,
 }
 
 #[derive(Debug, Default)]
@@ -241,7 +241,7 @@ impl TelemetrySliceService {
                 started_at_ms: now_ms,
                 start_sequence: metrics.recorded_total,
                 start_evictions: metrics.evicted_total,
-                markers: Vec::new(),
+                marker_total: 0,
             },
         );
         Ok(())
@@ -263,10 +263,10 @@ impl TelemetrySliceService {
             .active
             .get_mut(&context)
             .ok_or(TelemetrySliceError::NotActive)?;
-        if slice.markers.len() >= self.policy.max_markers {
+        if usize::try_from(slice.marker_total).unwrap_or(usize::MAX) >= self.policy.max_markers {
             return Ok(self.close_one(&mut state, context, now_ms, "marker_cap"));
         }
-        slice.markers.push(marker.to_owned());
+        slice.marker_total = slice.marker_total.saturating_add(1);
         Ok(None)
     }
 
@@ -358,7 +358,7 @@ impl TelemetrySliceService {
             close_reason,
             closed_at_ms: now_ms,
             duration_ms: now_ms.saturating_sub(slice.started_at_ms),
-            markers: slice.markers,
+            marker_total: slice.marker_total,
             truncated: self.recorder.metrics().evicted_total > slice.start_evictions,
             accepted_total,
             rejected_total,

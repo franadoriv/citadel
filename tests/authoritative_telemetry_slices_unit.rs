@@ -48,7 +48,7 @@ fn closed_slice_is_redacted_and_derived_from_its_context_decisions() {
     assert_eq!(report.context_kind, "match");
     assert_eq!(report.close_reason, "finished");
     assert_eq!(report.duration_ms, 100);
-    assert_eq!(report.markers, vec!["core.phase"]);
+    assert_eq!(report.marker_total, 1);
     assert!(!report.truncated);
     assert_eq!(report.accepted_total, 1);
     assert_eq!(report.rejected_total, 0);
