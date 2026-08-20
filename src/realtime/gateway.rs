@@ -10413,6 +10413,225 @@ mod transform_tests {
     }
 
     #[tokio::test]
+    async fn simultaneous_authoritative_rooms_never_cross_deliver_b_state() {
+        use citadel_wire::na::{NaPresence, NaSpawn, NaTransform};
+        use citadel_wire::tsync::Snapshot;
+
+        // The B owner receives a correction and emits an event.  The test then
+        // proves that a recipient in A sees neither that event nor B's spawned
+        // entity or corrected transform in its own snapshot.
+        let (gw, hub) = authoritative_gateway(
+            r#"citadel.on_input(function(_)
+                citadel.broadcast(100, "room-local-input", true)
+                return {
+                    decision = "correct",
+                    transform = {
+                        position = { x = 700, y = 0, z = 0 },
+                        rotation = { x = 0, y = 0, z = 0, w = 1 },
+                        velocity = { x = 0, y = 0, z = 0 },
+                    },
+                }
+            end)"#,
+        );
+        let binding = ScriptBinding {
+            revision_id: "sha256:two-room-scope".to_owned(),
+            generation: 1,
+        };
+
+        let (a, mut a_rx) = register(&gw);
+        let (room_a, _) = gw
+            .join_or_create_room_bound(a, "authoritative-A", Some(binding.clone()), || {
+                RoomLabel::with_map("authoritative-A")
+            })
+            .expect("A joins its bound room");
+        gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = a_rx.recv().await.expect("A hello reply");
+        let (a_peer, mut a_peer_rx) = register(&gw);
+        let (peer_room_a, _) = gw
+            .join_or_create_room_bound(a_peer, "authoritative-A", Some(binding.clone()), || {
+                RoomLabel::with_map("authoritative-A")
+            })
+            .expect("second A recipient joins the same bound room");
+        assert_eq!(peer_room_a, room_a, "both A recipients share room A");
+        gw.handle_inbound(a_peer, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = a_peer_rx.recv().await.expect("second A hello reply");
+
+        // Register B's relay-owned object before the room binding, then bind B
+        // to its own authoritative room before any state report is accepted.
+        let (b, mut b_rx) = register(&gw);
+        gw.handle_inbound(
+            b,
+            &Envelope::new(
+                KIND_NA_PRESENCE,
+                NaPresence {
+                    archetype_id: 1,
+                    transform: NaTransform::identity(),
+                }
+                .encode(),
+            ),
+        );
+        let b_object = hub
+            .relay_owned_object(b.get())
+            .expect("B relay-owned object");
+        let _ = b_rx.recv().await.expect("B self spawn");
+        let _ = b_rx.recv().await.expect("B initial spawn batch");
+        let (room_b, _) = gw
+            .join_or_create_room_bound(b, "authoritative-B", Some(binding), || {
+                RoomLabel::with_map("authoritative-B")
+            })
+            .expect("B joins its bound room");
+        assert_ne!(room_a, room_b, "two authoritative rooms are live together");
+        gw.handle_inbound(b, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
+        let _ = b_rx.recv().await.expect("B hello reply");
+
+        // Server entities use the same script-visible id in both rooms. Their
+        // room-scoped runtime ids must nevertheless remain distinct and local.
+        assert_eq!(
+            gw.apply_external_match_commands(
+                room_a,
+                vec![OutboundCommand::SpawnActor {
+                    object_id: 41,
+                    archetype: 1,
+                    position: [10.0, 0.0, 0.0],
+                }],
+            ),
+            2,
+            "both A recipients receive their own authoritative entity"
+        );
+        let a_spawn = a_rx.recv().await.expect("A entity spawn");
+        assert_eq!(a_spawn.envelope.kind, KIND_NA_SPAWN);
+        let a_entity = NaSpawn::decode(&a_spawn.envelope.body)
+            .expect("A entity spawn decodes")
+            .object_id;
+        let a_peer_spawn = a_peer_rx.recv().await.expect("second A entity spawn");
+        assert_eq!(a_peer_spawn.envelope.kind, KIND_NA_SPAWN);
+        assert_eq!(
+            NaSpawn::decode(&a_peer_spawn.envelope.body)
+                .expect("second A entity spawn decodes")
+                .object_id,
+            a_entity,
+            "both A recipients see the same A entity"
+        );
+
+        assert_eq!(
+            gw.apply_external_match_commands(
+                room_b,
+                vec![OutboundCommand::SpawnActor {
+                    object_id: 41,
+                    archetype: 1,
+                    position: [20.0, 0.0, 0.0],
+                }],
+            ),
+            1,
+            "B receives its own authoritative entity"
+        );
+        let b_spawn = b_rx.recv().await.expect("B entity spawn");
+        assert_eq!(b_spawn.envelope.kind, KIND_NA_SPAWN);
+        let b_entity = NaSpawn::decode(&b_spawn.envelope.body)
+            .expect("B entity spawn decodes")
+            .object_id;
+        assert_ne!(
+            a_entity, b_entity,
+            "scoped entities have independent world ids"
+        );
+        assert!(
+            a_rx.try_recv().is_err(),
+            "A never receives B's entity spawn"
+        );
+        assert!(
+            a_peer_rx.try_recv().is_err(),
+            "the second A recipient never receives B's entity spawn"
+        );
+
+        // This is a real authoritative input batch: B's correction writes only
+        // B's object and its script event fans out only to B's current room.
+        gw.handle_inbound(b, &na_state_frame(b_object, 999.0));
+        let b_event = b_rx.recv().await.expect("B room-local script event");
+        assert_eq!(b_event.envelope.kind, 100);
+        assert_eq!(
+            b_event.envelope.body.as_ref(),
+            b"room-local-input".as_slice()
+        );
+        assert!(
+            a_rx.try_recv().is_err(),
+            "A never receives B's authoritative event or correction side effect"
+        );
+        assert!(
+            a_peer_rx.try_recv().is_err(),
+            "the second A recipient never receives B's authoritative event or correction side effect"
+        );
+        assert_eq!(
+            hub.get_transform(b_object)
+                .expect("B object survives correction")
+                .position,
+            [700.0, 0.0, 0.0],
+            "B's script correction reaches only B's authoritative transform"
+        );
+
+        gw.transform_sim_step();
+        assert_eq!(
+            gw.transform_snapshot_step(),
+            3,
+            "each authoritative-room recipient receives exactly one scoped snapshot"
+        );
+        let a_snapshot = a_rx.recv().await.expect("A scoped snapshot");
+        let a_peer_snapshot = a_peer_rx.recv().await.expect("second A scoped snapshot");
+        let b_snapshot = b_rx.recv().await.expect("B scoped snapshot");
+        assert_eq!(a_snapshot.envelope.kind, KIND_TSYNC_SNAPSHOT);
+        assert_eq!(a_peer_snapshot.envelope.kind, KIND_TSYNC_SNAPSHOT);
+        assert_eq!(b_snapshot.envelope.kind, KIND_TSYNC_SNAPSHOT);
+        let a_snapshot =
+            Snapshot::decode(&a_snapshot.envelope.body, hub.codec()).expect("A snapshot decodes");
+        let a_peer_snapshot = Snapshot::decode(&a_peer_snapshot.envelope.body, hub.codec())
+            .expect("second A snapshot decodes");
+        let b_snapshot =
+            Snapshot::decode(&b_snapshot.envelope.body, hub.codec()).expect("B snapshot decodes");
+        let a_ids: Vec<_> = a_snapshot
+            .updates
+            .iter()
+            .map(|update| update.object_id)
+            .collect();
+        let a_peer_ids: Vec<_> = a_peer_snapshot
+            .updates
+            .iter()
+            .map(|update| update.object_id)
+            .collect();
+        let b_ids: Vec<_> = b_snapshot
+            .updates
+            .iter()
+            .map(|update| update.object_id)
+            .collect();
+        assert!(
+            a_ids.contains(&a_entity),
+            "A receives its own entity snapshot"
+        );
+        assert!(
+            a_peer_ids.contains(&a_entity),
+            "the second A recipient receives its own entity snapshot"
+        );
+        assert!(
+            b_ids.contains(&b_entity),
+            "B receives its own entity snapshot"
+        );
+        assert!(
+            b_ids.contains(&b_object),
+            "B receives its corrected transform snapshot"
+        );
+        assert!(
+            !a_ids.contains(&b_entity) && !a_ids.contains(&b_object),
+            "A never receives B entities, transforms, snapshots, or corrections: {a_ids:?}"
+        );
+        assert!(
+            !a_peer_ids.contains(&b_entity) && !a_peer_ids.contains(&b_object),
+            "the second A recipient never receives B state: {a_peer_ids:?}"
+        );
+        assert!(
+            !b_ids.contains(&a_entity),
+            "B never receives A entities or snapshots: {b_ids:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn authoritative_na_state_is_not_applied_without_a_script_answer() {
         // A1/A6/D-policy: a script that never answers (no on_input handler)
         // must not let the owner's report mutate authoritative state. This is

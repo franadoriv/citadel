@@ -299,7 +299,7 @@ Sync->OnRewindResult.AddDynamic(this, &AMyPawn::HandleHit);
 - Kinematic capsule hitreg only (no per-bone animated hitboxes); no server-side
   physics — prediction is kinematic (CMC-style), not full-physics resimulation.
 - WebSocket clients (reliable-only) cannot use the unreliable hot path.
-- A single global interest grid until matches land; per-match scoping is a soft
-  dependency.
+- Interest evaluation shares one hub implementation, but snapshot candidates and
+  delivery are scoped to the recipient's authoritative room.
 - The lag profile (one-way delay / interpolation delay / RTT) is set explicitly;
   wiring it from live QUIC path stats is a follow-up.
