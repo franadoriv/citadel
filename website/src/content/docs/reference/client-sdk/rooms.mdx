@@ -175,10 +175,8 @@ never see each other's avatars even though they run in one world.
 ## Known limitations (Phase A)
 
 - **One room per participant.** Joining a new room leaves the previous one.
-- **Snapshots are not yet room-filtered.** Cross-room transforms are never *rendered*
-  (a client only draws actors it was told to spawn), but they still travel on the
-  snapshot path — wasted bandwidth when rooms overlap in world space. Per-room snapshot
-  relevance is a planned follow-up.
+- **Room-filtered snapshots.** A recipient receives transforms only from objects
+  whose owners remain in the same live room at enqueue time.
 - **Ticket matchmaker labels are currently fixed.** The ticket
   [matchmaker](./matchmaker/) creates and admits a cohort to a server-owned room, but
   its label is currently `map: "default"`, `mode: "matchmaker"`; Lua cannot yet
