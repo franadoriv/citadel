@@ -21,6 +21,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::authoritative_decision_telemetry::DEFAULT_AUTHORITATIVE_DECISION_CAPACITY;
+use crate::authoritative_telemetry_slices::TelemetrySlicePolicy;
 use crate::error::{AppError, AppResult};
 use crate::session::NodeId;
 use crate::storage::{
@@ -95,6 +96,8 @@ pub struct Config {
 pub struct TelemetryConfig {
     /// Validated authoritative-decision telemetry.
     pub authoritative_decisions: AuthoritativeDecisionTelemetryConfig,
+    /// Bounded lifecycle policy for trusted authoritative telemetry slices.
+    pub slices: TelemetrySlicesConfig,
 }
 
 /// Privacy-safe retention for validated authoritative decisions.
@@ -120,6 +123,43 @@ impl Default for AuthoritativeDecisionTelemetryConfig {
     }
 }
 
+/// Bounds for trusted runtime-controlled telemetry slices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetrySlicesConfig {
+    /// Maximum concurrently active context-bound slices.
+    pub max_active: usize,
+    /// Maximum namespaced markers retained for one slice.
+    pub max_markers: usize,
+    /// Server-enforced lifetime after which a slice is closed on the next service maintenance pass.
+    pub ttl_ms: u64,
+    /// Maximum closed, process-local reports retained oldest-first.
+    pub max_closed_reports: usize,
+}
+
+impl Default for TelemetrySlicesConfig {
+    fn default() -> Self {
+        Self {
+            max_active: 32,
+            max_markers: 32,
+            ttl_ms: 300_000,
+            max_closed_reports: 128,
+        }
+    }
+}
+
+impl TelemetrySlicesConfig {
+    pub fn policy(&self) -> AppResult<TelemetrySlicePolicy> {
+        TelemetrySlicePolicy::new(
+            self.max_active,
+            self.max_markers,
+            self.ttl_ms,
+            self.max_closed_reports,
+        )
+        .map_err(|_| AppError::config("telemetry.slices must use nonzero bounded limits"))
+    }
+}
+
 impl TelemetryConfig {
     fn validate(&self) -> AppResult<()> {
         const MAX_AUTHORITATIVE_DECISION_CAPACITY: usize = 100_000;
@@ -131,6 +171,7 @@ impl TelemetryConfig {
                 "telemetry.authoritative_decisions.capacity must be between 1 and {MAX_AUTHORITATIVE_DECISION_CAPACITY} when enabled"
             )));
         }
+        self.slices.policy()?;
         Ok(())
     }
 }

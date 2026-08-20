@@ -256,13 +256,39 @@ authoritative bridge validator at the gateway. It retains a bounded FIFO of
 opaque numeric match/batch/event correlations, generic `accepted`/`rejected`/
 `corrected` outcomes, and an opaque numeric rejection code when supplied. It
 never retains client payloads, replies, script commands, corrected values,
-participant IDs, or account IDs. The first release deliberately provides no
-public HTTP endpoint or console view.
+participant IDs, or account IDs. Trusted runtime-controlled slices can derive
+private bounded reports from this recorder; the reports are visible only through
+the authenticated operator console and never through a public endpoint.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Composes the process-local recorder at application startup. |
 | `capacity` | integer | `1024` | Retained records; must be `1..=100000` when enabled. On overflow, the oldest record is deterministically evicted first. |
+
+
+### `[telemetry.slices]`
+
+Trusted embedded runtime logic can open, mark, and finish a telemetry slice for
+the server-owned room context of its active invocation. The lifecycle APIs take
+no room or match identifier. This allows a game to choose diagnostic windows without
+making Citadel assume that a room is a short-lived match. The API receives the
+Citadel-created runtime context rather than a client-provided match, session,
+account, report, or payload identifier. Like the other runtime host APIs, this
+is a trusted server-script boundary; it is not a sandbox for malicious scripts.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `max_active` | `32` | Maximum active process-local slices; the oldest is closed when the bound is reached. |
+| `max_markers` | `32` | Maximum namespaced marker names retained per slice. |
+| `ttl_ms` | `300000` | Maximum slice duration, `1..=86400000` ms. Expired slices close during normal service maintenance or an operator report read. |
+| `max_closed_reports` | `128` | FIFO retention limit for redacted closed reports. |
+
+Closed reports are available only to authenticated console operators at
+`/console/v1/telemetry/slices`; each read is audited. They contain generic
+decision totals, bounded marker names, close reason, duration, and a truncation
+indicator. They never contain raw payloads, player identity, account data,
+replies, commands, or corrected values.
+
 
 ### `[errors]`
 

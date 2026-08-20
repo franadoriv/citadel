@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use citadel_physics::{PhysicsConfig, Shape};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
+use crate::authoritative_telemetry_slices::{
+    TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+};
 use crate::config::LuaExecutionMode;
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
@@ -37,6 +40,7 @@ use crate::runtime::{
 };
 use crate::services::PlayerNotification;
 use crate::storage::StorageIndexName;
+use crate::time::{Clock, SystemClock};
 
 /// Default per-invocation time budget for a script handler, in milliseconds.
 pub const DEFAULT_DEADLINE_MS: u64 = 100;
@@ -360,6 +364,9 @@ struct MapCatalogHandle(Arc<MapCatalog>);
 /// Authoritative transform hub made available to synchronous physics reads.
 struct TransformHubHandle(Arc<TransformHub>);
 
+/// Private trusted-runtime bridge; scripts receive no recorder or report handles.
+struct TelemetrySlicesHandle(Arc<TelemetrySliceService>);
+
 /// Install (or refresh) the domain-host seam on a VM's app-data.
 ///
 /// Called after each VM build (initial + hot-reload) so `citadel.friends_*` can
@@ -379,6 +386,12 @@ fn apply_map_catalog(lua: &Lua, maps: &Option<Arc<MapCatalog>>) {
 fn apply_transform_hub(lua: &Lua, hub: &Option<Arc<TransformHub>>) {
     if let Some(hub) = hub {
         lua.set_app_data(TransformHubHandle(Arc::clone(hub)));
+    }
+}
+
+fn apply_telemetry_slices(lua: &Lua, slices: &Option<Arc<TelemetrySliceService>>) {
+    if let Some(slices) = slices {
+        lua.set_app_data(TelemetrySlicesHandle(Arc::clone(slices)));
     }
 }
 
@@ -507,6 +520,8 @@ pub struct LuaRuntime {
     maps: Option<Arc<MapCatalog>>,
     /// Authoritative transform hub retained for synchronous physics reads.
     transform_hub: Option<Arc<TransformHub>>,
+    /// Private trusted host bridge for context-derived telemetry slices.
+    telemetry_slices: Option<Arc<TelemetrySliceService>>,
     /// The capability mode used when constructing this VM. Retained so a reload
     /// cannot accidentally change the script's authority.
     execution_mode: LuaExecutionMode,
@@ -656,6 +671,7 @@ impl LuaRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             execution_mode,
             outbound_http_policy,
             http_endpoint_policy,
@@ -707,6 +723,7 @@ impl LuaRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             execution_mode: LuaExecutionMode::Sandboxed,
             outbound_http_policy: OutboundHttpPolicy::default(),
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
@@ -757,6 +774,7 @@ impl LuaRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
             execution_mode: LuaExecutionMode::Sandboxed,
             outbound_http_policy: OutboundHttpPolicy::default(),
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
@@ -779,6 +797,15 @@ impl LuaRuntime {
             let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
             apply_domain_host(&guard.lua, &self.domain);
         }
+        self
+    }
+
+    /// Attach private context-derived telemetry slices to trusted script calls.
+    #[must_use]
+    pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
+        self.telemetry_slices = Some(slices);
+        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+        apply_telemetry_slices(&guard.lua, &self.telemetry_slices);
         self
     }
 
@@ -1036,6 +1063,7 @@ impl LuaRuntime {
         apply_domain_host(&fresh, &self.domain);
         apply_map_catalog(&fresh, &self.maps);
         apply_transform_hub(&fresh, &self.transform_hub);
+        apply_telemetry_slices(&fresh, &self.telemetry_slices);
         // Guard against an accidental empty/handlerless save (e.g. an editor's
         // transient zero-byte write caught mid-save): swapping it in would leave
         // the node with no handlers. Reject and keep the working script.
@@ -1373,6 +1401,7 @@ impl LuaRuntime {
     /// error isolation: a hung or erroring tick yields no commands and never
     /// wedges inbound dispatch. A no-op when no `on_tick` handler is registered.
     pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        set_active_runtime_scope(None);
         let dt_secs = dt.as_secs_f64();
         self.run_locked("on_tick", budget, |lua| {
             if let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_TICK_KEY)? {
@@ -1392,6 +1421,7 @@ impl LuaRuntime {
         dt: Duration,
         budget: Duration,
     ) -> Vec<OutboundCommand> {
+        set_active_runtime_scope(Some(room_id));
         let dt_secs = dt.as_secs_f64();
         self.run_locked("match_tick", budget, |lua| {
             if let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_TICK_KEY)? {
@@ -1905,6 +1935,7 @@ fn build_ctx(
     kind: u16,
     room_id: Option<u64>,
 ) -> mlua::Result<Table> {
+    set_active_runtime_scope(room_id);
     let ctx = lua.create_table()?;
     ctx.set("sender", sender)?;
     ctx.set("kind", kind)?;
@@ -2447,6 +2478,52 @@ fn install_host_api(
     )?;
     events.set("emit", emit)?;
     citadel.set("events", events)?;
+
+    // Scope comes only from the server-owned active runtime invocation. Scripts
+    // cannot provide a match/session/account/report correlation to this API.
+    let telemetry = lua.create_table()?;
+    let begin = lua.create_function(|lua, ()| {
+        let context = active_runtime_context().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices require a match-scoped context".to_string())
+        })?;
+        let handle = lua.app_data_ref::<TelemetrySlicesHandle>().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices are unavailable".to_string())
+        })?;
+        handle
+            .0
+            .begin(context, SystemClock.now().unix_millis())
+            .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
+    })?;
+    telemetry.set("begin", begin)?;
+    let mark = lua.create_function(|lua, marker: String| {
+        let context = active_runtime_context().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices require a match-scoped context".to_string())
+        })?;
+        let handle = lua.app_data_ref::<TelemetrySlicesHandle>().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices are unavailable".to_string())
+        })?;
+        handle
+            .0
+            .mark(context, &marker, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
+    })?;
+    telemetry.set("mark", mark)?;
+    let finish = lua.create_function(|lua, ()| {
+        let context = active_runtime_context().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices require a match-scoped context".to_string())
+        })?;
+        let handle = lua.app_data_ref::<TelemetrySlicesHandle>().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices are unavailable".to_string())
+        })?;
+        handle
+            .0
+            .finish(context, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
+    })?;
+    telemetry.set("finish", finish)?;
+    citadel.set("telemetry", telemetry)?;
 
     let cache = lua.create_table()?;
     let get = lua.create_function(|lua, (namespace, key): (String, String)| {

@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod authoritative_decision_telemetry;
+pub mod authoritative_telemetry_slices;
 pub mod chat_cluster;
 pub mod cli;
 pub mod config;
