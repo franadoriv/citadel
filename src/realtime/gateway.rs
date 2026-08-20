@@ -36,6 +36,7 @@ use crate::chat_cluster::{
     ChatDeliveryDisposition, ChatPresenceDirectory, LocalChatPresenceAnnouncer, RemoteChatDelivery,
 };
 use crate::lag_diagnostics::{CaptureFlushGrant, CaptureFlushPlan, LagDiagnosticsService};
+use crate::lifecycle::CancellationToken;
 use crate::maps::MapCatalog;
 use crate::matchmaker::{Matchmaker, MatchmakerStats, TicketId, TicketRequest, TicketState};
 use crate::matchmaker_cluster::{
@@ -60,11 +61,12 @@ use crate::realtime::chat_presence::{ChatPresenceRegistry, ChatSubscription};
 use crate::realtime::diagnostics::{
     LagCaptureError, LagCaptureFlush, LagCaptureManager, LagCaptureStart, LagCaptureStatus,
 };
+use crate::realtime::identity::ResumeSecret;
 use crate::realtime::netpeer::layout::RepLayout;
 use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot, Validated};
 use crate::realtime::registry::{
     CloseDisposition, LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen,
-    SessionHandle, SessionRegistry,
+    ReplacedTransportCleanup, SessionHandle, SessionRegistry,
 };
 use crate::realtime::rooms::{JoinError, RemoteRoomMember, RoomId, RoomLabel, RoomRegistry};
 use crate::realtime::transform::TransformHub;
@@ -2322,6 +2324,29 @@ struct RepObjectSpawn {
     initial: RepSnapshot,
 }
 
+/// Result owned by a concrete transport after registration. The cancellation
+/// token fires only when a newer connection replaces this exact authenticated
+/// session; WebSocket deliberately retains its existing fenced-loop behavior.
+#[derive(Debug)]
+pub struct TransportRegistration {
+    /// Latest-wins outbound mailbox for the registered transport writer.
+    pub unreliable: LatestOutboundReceiver,
+    /// Signal for QUIC-family transports to close a superseded receive loop.
+    pub superseded: CancellationToken,
+    /// Shared with datagram routing to make same-session cancellation a decode
+    /// and metrics linearization boundary.
+    pub supersession_gate: Arc<Mutex<()>>,
+    /// Serializes concrete application writes with supersession/close.
+    pub transport_write_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Closes write admission while an already-admitted frame flushes.
+    pub superseding: Arc<std::sync::atomic::AtomicBool>,
+    /// Deferred old-generation cleanup, released after its inbound handoff gate
+    /// drains. Concrete transports own the task that invokes Gateway cleanup.
+    pub replaced_cleanup: Option<ReplacedTransportCleanup>,
+    /// Fires after this generation's own inbound supersession gate is released.
+    pub inbound_supersession_drained: CancellationToken,
+}
+
 pub struct Gateway {
     registry: SessionRegistry,
     ids: ParticipantIdGen,
@@ -3994,44 +4019,228 @@ impl Gateway {
         if !self.registry.accepts_work(id) {
             return unreliable;
         }
-        // Every registered participant moves the participant gauge; only an
-        // account-bound participant moves the authenticated-session gauge.
-        self.metrics.participant_opened();
-        if authenticated {
-            self.metrics.session_opened();
-            if let Some(user_id) = authenticated_user.as_deref() {
-                self.sync_party_presence_for_session(user_id, id);
-            }
-        }
-        // Preserve the roomless/non-authoritative match-0 lifecycle byte for
-        // byte. Authoritative gateways deliberately remain schema-only until a
-        // room admission atomically binds both membership and replication.
-        if let Some(rep) = &self.rep {
-            let room_bound = {
-                let _scope = self.lock_room_scope();
-                let assigned_room = self
-                    .rep_rooms
-                    .lock()
-                    .ok()
-                    .and_then(|bindings| bindings.connections.get(&id).copied());
-                if let Some(room_id) = assigned_room {
-                    self.bind_rep_connection_to_room_under_scope(id, room_id);
-                    true
-                } else {
-                    false
-                }
-            };
-            if room_bound {
-                let _ = self.send_rep_bootstrap(id);
-            } else if self.bridge.is_some() && !rep.is_joined(id.get()) {
-                let _ = self.send_rep_schema(id);
-            } else if self.bridge.is_none() {
-                rep.join_match(id.get(), 0, self.registry.user_id_of(id).is_none());
-                let _ = self.send_rep_bootstrap(id);
-            }
-        }
-        self.dispatch_lifecycle(LifecycleHook::Join, id);
+        self.complete_gateway_registration(id, authenticated, authenticated_user.as_deref(), true);
         unreliable
+    }
+
+    /// Run side effects for a registration only while the registry confirms that
+    /// this exact generation still owns the active session mapping. Replacement
+    /// and cleanup share that ownership gate, so an obsolete registration cannot
+    /// emit Join, publish presence, or move gauges after it loses ownership.
+    fn complete_gateway_registration(
+        &self,
+        id: ParticipantId,
+        authenticated: bool,
+        authenticated_user: Option<&str>,
+        initialize_replication: bool,
+    ) -> bool {
+        self.registry.run_gateway_registration(id, || {
+            self.metrics.participant_opened();
+            if authenticated {
+                self.metrics.session_opened();
+                if let Some(user_id) = authenticated_user {
+                    self.sync_party_presence_for_session(user_id, id);
+                }
+            }
+            if initialize_replication {
+                if let Some(rep) = &self.rep {
+                    let room_bound = {
+                        let _scope = self.lock_room_scope();
+                        let assigned_room = self
+                            .rep_rooms
+                            .lock()
+                            .ok()
+                            .and_then(|bindings| bindings.connections.get(&id).copied());
+                        if let Some(room_id) = assigned_room {
+                            self.bind_rep_connection_to_room_under_scope(id, room_id);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if room_bound {
+                        let _ = self.send_rep_bootstrap(id);
+                    } else if self.bridge.is_some() && !rep.is_joined(id.get()) {
+                        let _ = self.send_rep_schema(id);
+                    } else if self.bridge.is_none() {
+                        rep.join_match(id.get(), 0, self.registry.user_id_of(id).is_none());
+                        let _ = self.send_rep_bootstrap(id);
+                    }
+                }
+            }
+            self.dispatch_lifecycle(LifecycleHook::Join, id);
+        })
+    }
+
+    /// Time-checked authenticated registration used by realtime transports.
+    /// Unlike the legacy compatibility entry points, this binds the exact
+    /// `SessionId` to one active participant, fences an incumbent, and rejects
+    /// an identity at its expiry boundary.
+    pub fn register_session_at(
+        &self,
+        handle: SessionHandle,
+        now: TimestampMillis,
+    ) -> TransportRegistration {
+        self.register_session_with_initials_at(handle, Vec::new(), now)
+    }
+
+    /// Time-checked form of [`Self::register_session_with_initials`].
+    pub fn register_session_with_initials_at(
+        &self,
+        handle: SessionHandle,
+        initials: Vec<Outbound>,
+        now: TimestampMillis,
+    ) -> TransportRegistration {
+        self.register_session_with_initials_at_after_publish(handle, initials, now, || {})
+    }
+
+    /// Internal registration seam that keeps the post-publication ownership
+    /// check explicit for deterministic interleaving tests.
+    fn register_session_with_initials_at_after_publish<F>(
+        &self,
+        handle: SessionHandle,
+        initials: Vec<Outbound>,
+        now: TimestampMillis,
+        after_publish: F,
+    ) -> TransportRegistration
+    where
+        F: FnOnce(),
+    {
+        let id = handle.id;
+        let authenticated = handle.is_authenticated();
+        let authenticated_user = handle
+            .identity
+            .as_ref()
+            .map(|identity| identity.user_id.as_str().to_owned());
+        let registration = self.registry.register_session_at(handle, initials, now);
+        let unreliable = registration.unreliable;
+        let superseded = registration.superseded;
+        let supersession_gate = registration.supersession_gate;
+        let transport_write_gate = registration.transport_write_gate;
+        let superseding = registration.superseding;
+        let mut replaced_cleanup = registration.replaced_cleanup;
+        let inbound_supersession_drained = registration.inbound_supersession_drained;
+        if !registration.accepted {
+            return TransportRegistration {
+                unreliable,
+                superseded,
+                supersession_gate,
+                transport_write_gate,
+                superseding,
+                replaced_cleanup,
+                inbound_supersession_drained,
+            };
+        }
+        after_publish();
+        if let Some(replaced) = registration.replaced {
+            // The registry synchronously fences receive admission before it can
+            // defer cancellation behind an outbound flush. Do not release room
+            // state until its inbound handoff gate has drained; the concrete
+            // transport owns the deferred cleanup task. The uncontended fast
+            // path is already drained and preserves direct callers' cleanup.
+            if replaced_cleanup
+                .as_ref()
+                .is_some_and(ReplacedTransportCleanup::is_ready)
+            {
+                self.unregister_session(replaced.participant_id());
+                replaced_cleanup = None;
+            }
+        }
+        self.complete_gateway_registration(id, authenticated, authenticated_user.as_deref(), true);
+        TransportRegistration {
+            unreliable,
+            superseded,
+            supersession_gate,
+            transport_write_gate,
+            superseding,
+            replaced_cleanup,
+            inbound_supersession_drained,
+        }
+    }
+
+    /// Start a bounded reconnect grace window for an exact active participant.
+    /// The caller supplies server-minted opaque material and tears the transport
+    /// down through this method; callers never choose another session id.
+    pub fn begin_reconnect_grace(
+        &self,
+        id: ParticipantId,
+        secret: ResumeSecret,
+        requested_until: TimestampMillis,
+    ) -> bool {
+        self.registry
+            .begin_reconnect_grace(id, secret, requested_until)
+            .then(|| self.unregister_session(id))
+            .is_some()
+    }
+
+    /// Deterministic bounded reconnect-grace transition. The registry caps the
+    /// requested expiry from `now`, so tests and production callers use the same
+    /// resource bound without relying on wall-clock timing.
+    pub fn begin_reconnect_grace_at(
+        &self,
+        id: ParticipantId,
+        secret: ResumeSecret,
+        now: TimestampMillis,
+        requested_until: TimestampMillis,
+    ) -> bool {
+        if !self
+            .registry
+            .begin_reconnect_grace_at(id, secret, now, requested_until)
+        {
+            return false;
+        }
+        self.unregister_session(id);
+        true
+    }
+
+    /// Redeem an exact-session, one-use grace ticket after current
+    /// authentication. This is server-internal lifecycle plumbing: no production
+    /// transport handshake supplies a resume secret or advertises resume to
+    /// version-1 clients. Do not expose it to clients without a versioned,
+    /// cross-SDK handshake contract.
+    pub fn resume_session_at(
+        &self,
+        handle: SessionHandle,
+        secret: ResumeSecret,
+        now: TimestampMillis,
+    ) -> LatestOutboundReceiver {
+        let id = handle.id;
+        let authenticated = handle.is_authenticated();
+        let authenticated_user = handle
+            .identity
+            .as_ref()
+            .map(|identity| identity.user_id.as_str().to_owned());
+        let registration = self.registry.resume_session_at(handle, secret, now);
+        let unreliable = registration.unreliable;
+        if !registration.accepted {
+            return unreliable;
+        }
+        self.complete_gateway_registration(id, authenticated, authenticated_user.as_deref(), false);
+        unreliable
+    }
+
+    /// Sweep grace windows at a supplied instant. Grace transitions do not leave
+    /// a transport behind (it was cleaned during `begin_reconnect_grace`), so
+    /// this returns the exact number of terminal session records reclaimed.
+    pub fn expire_reconnect_grace_at(&self, now: TimestampMillis) -> usize {
+        self.registry.expire_reconnect_grace_at(now).len()
+    }
+
+    /// Reclaim durable session-revocation tombstones after their authoritative
+    /// access expiry. Production maintenance invokes this independently of a
+    /// game runtime or socket activity.
+    pub fn expire_revocation_tombstones_at(&self, now: TimestampMillis) -> usize {
+        self.registry.expire_revocation_tombstones_at(now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconnect_grace_count(&self) -> usize {
+        self.registry.reconnect_grace_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revocation_tombstone_count(&self) -> usize {
+        self.registry.revocation_tombstone_count()
     }
 
     /// Whether a just-registered participant survived the durable-revocation
@@ -4120,6 +4329,13 @@ impl Gateway {
         if !self.registry.claim_cleanup(id) {
             return;
         }
+        // A replacement/close can win after registry publication but before its
+        // Gateway side effects begin. Only a generation that completed those
+        // effects may emit Leave or decrement their paired gauges.
+        if !self.registry.retire_gateway_registration(id) {
+            let _ = self.registry.unregister(id);
+            return;
+        }
         // Freeze the diagnostics participant state before lifecycle hooks or
         // registry removal can make a disconnect look like a missing upload.
         self.diagnostics.disconnect(id);
@@ -4198,11 +4414,13 @@ impl Gateway {
                 }
             }
         }
-        self.metrics.participant_closed();
-        // Decrement the authenticated-session gauge exactly when it was
-        // incremented (an account-bound participant left).
-        if removed.map(|h| h.is_authenticated()).unwrap_or(false) {
-            self.metrics.session_closed();
+        if let Some(removed) = removed {
+            self.metrics.participant_closed();
+            // Decrement the authenticated-session gauge exactly when it was
+            // incremented (an account-bound participant left).
+            if removed.is_authenticated() {
+                self.metrics.session_closed();
+            }
         }
     }
 
@@ -4214,10 +4432,12 @@ impl Gateway {
         session_id: &crate::session::SessionId,
         command_id: &str,
         expected_generation: Option<u64>,
+        expires_at: TimestampMillis,
+        now: TimestampMillis,
     ) -> usize {
         let closed = self
             .registry
-            .close_session(session_id, command_id, expected_generation)
+            .close_session_at(session_id, command_id, expected_generation, expires_at, now)
             .await;
         let mut cleaned = 0;
         for (connection, disposition) in closed {
@@ -4255,6 +4475,7 @@ impl Gateway {
     /// has no originating sender). Returns the number of sessions delivered to.
     /// A no-op returning 0 when no runtime is attached.
     pub fn tick(&self, dt: std::time::Duration, budget: std::time::Duration) -> usize {
+        self.expire_revocation_tombstones_at(SystemClock.now());
         let Some(runtime) = &self.runtime else {
             return 0;
         };
@@ -11364,9 +11585,239 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_activation_fences_an_exact_session_replacement_and_rejects_expiry() {
+        let gateway = Gateway::new();
+        let first = gateway.next_participant_id();
+        let replacement = gateway.next_participant_id();
+        let (first_tx, _first_rx) = mpsc::channel(8);
+        let (replacement_tx, _replacement_rx) = mpsc::channel(8);
+        let identity = test_identity("reconnect-player");
+
+        gateway.register_session_at(
+            SessionHandle {
+                id: first,
+                kind: TransportKind::WebSocket,
+                outbound: first_tx,
+                identity: Some(identity.clone()),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        assert!(gateway.accepts_work(first));
+
+        gateway.register_session_at(
+            SessionHandle {
+                id: replacement,
+                kind: TransportKind::WebSocket,
+                outbound: replacement_tx,
+                identity: Some(identity),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        assert!(
+            !gateway.accepts_work(first),
+            "an activation for the exact same session fences its prior participant"
+        );
+        assert!(gateway.accepts_work(replacement));
+
+        let expired = gateway.next_participant_id();
+        let (expired_tx, _expired_rx) = mpsc::channel(8);
+        gateway.register_session_at(
+            SessionHandle {
+                id: expired,
+                kind: TransportKind::WebSocket,
+                outbound: expired_tx,
+                identity: Some(ParticipantIdentity {
+                    user_id: UserId::new("expired-player").expect("user id"),
+                    session_id: SessionId::new("expired-session").expect("session id"),
+                    expires_at: TimestampMillis::from_unix_millis(10),
+                }),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        assert!(
+            !gateway.accepts_work(expired),
+            "a session cannot activate at its exact expiry boundary"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_defers_old_room_release_until_its_inbound_gate_drains() {
+        let gateway = Arc::new(Gateway::new());
+        let first = gateway.next_participant_id();
+        let replacement = gateway.next_participant_id();
+        let (first_tx, _first_rx) = mpsc::channel(8);
+        let (replacement_tx, _replacement_rx) = mpsc::channel(8);
+        let identity = test_identity("replacement-room-player");
+        let first_registration = gateway.register_session_at(
+            SessionHandle {
+                id: first,
+                kind: TransportKind::WebSocket,
+                outbound: first_tx,
+                identity: Some(identity.clone()),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        let room_id = gateway.rooms.create(RoomLabel {
+            map: "default".to_owned(),
+            mode: "replacement-test".to_owned(),
+            max_players: 2,
+            open: true,
+        });
+        gateway.rooms.join(first, room_id).expect("join old room");
+        let held_receive_gate = first_registration
+            .supersession_gate
+            .lock()
+            .expect("hold old inbound gate");
+
+        let replacement_registration = gateway.register_session_at(
+            SessionHandle {
+                id: replacement,
+                kind: TransportKind::WebSocket,
+                outbound: replacement_tx,
+                identity: Some(identity),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        let cleanup = replacement_registration
+            .replaced_cleanup
+            .expect("replacement returns old cleanup ticket");
+        let cleanup_gateway = Arc::clone(&gateway);
+        let cleanup_task = tokio::spawn(async move {
+            cleanup.wait_for_inbound_drain().await;
+            cleanup_gateway.unregister_session(cleanup.participant_id());
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gateway.rooms.room_of(first),
+            Some(room_id),
+            "the old generation remains in its room while an admitted inbound handoff drains"
+        );
+        drop(held_receive_gate);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cleanup_task)
+            .await
+            .expect("old cleanup follows receive gate drain")
+            .expect("old cleanup task");
+        assert_eq!(
+            gateway.rooms.room_of(first),
+            None,
+            "room release runs only after the old inbound gate drains"
+        );
+    }
+
+    #[test]
+    fn reconnect_grace_resumes_only_the_exact_unexpired_session_once() {
+        let gateway = Gateway::new();
+        let original = gateway.next_participant_id();
+        let resumed = gateway.next_participant_id();
+        let sibling = gateway.next_participant_id();
+        let (original_tx, _original_rx) = mpsc::channel(8);
+        let (resumed_tx, _resumed_rx) = mpsc::channel(8);
+        let (sibling_tx, _sibling_rx) = mpsc::channel(8);
+        let identity = test_identity("resume-player");
+        let secret = ResumeSecret::from_server_bytes(vec![7; 16]).expect("secret");
+
+        gateway.register_session_at(
+            SessionHandle {
+                id: original,
+                kind: TransportKind::WebSocket,
+                outbound: original_tx,
+                identity: Some(identity.clone()),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        assert!(gateway.begin_reconnect_grace(
+            original,
+            secret.clone(),
+            TimestampMillis::from_unix_millis(30),
+        ));
+        assert!(!gateway.accepts_work(original));
+
+        gateway.resume_session_at(
+            SessionHandle {
+                id: resumed,
+                kind: TransportKind::WebSocket,
+                outbound: resumed_tx,
+                identity: Some(identity.clone()),
+            },
+            secret.clone(),
+            TimestampMillis::from_unix_millis(20),
+        );
+        assert!(gateway.accepts_work(resumed));
+
+        gateway.resume_session_at(
+            SessionHandle {
+                id: sibling,
+                kind: TransportKind::WebSocket,
+                outbound: sibling_tx,
+                identity: Some(ParticipantIdentity {
+                    user_id: UserId::new("resume-player").expect("user id"),
+                    session_id: SessionId::new("sibling-session").expect("session id"),
+                    expires_at: TimestampMillis::from_unix_millis(9_999_999_999),
+                }),
+            },
+            secret,
+            TimestampMillis::from_unix_millis(20),
+        );
+        assert!(
+            !gateway.accepts_work(sibling),
+            "a resume secret cannot cross from its exact session to a sibling session"
+        );
+        assert_eq!(
+            gateway.expire_reconnect_grace_at(TimestampMillis::from_unix_millis(30)),
+            0,
+            "a successful resume deterministically removes its grace record"
+        );
+    }
+
+    #[test]
+    fn expired_grace_cleans_exact_session_without_touching_a_sibling() {
+        let gateway = Gateway::new();
+        let first = gateway.next_participant_id();
+        let sibling = gateway.next_participant_id();
+        let (first_tx, _first_rx) = mpsc::channel(8);
+        let (sibling_tx, _sibling_rx) = mpsc::channel(8);
+        let secret = ResumeSecret::from_server_bytes(vec![9; 16]).expect("secret");
+
+        gateway.register_session_at(
+            SessionHandle {
+                id: first,
+                kind: TransportKind::WebSocket,
+                outbound: first_tx,
+                identity: Some(test_identity("grace-player")),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        gateway.register_session_at(
+            SessionHandle {
+                id: sibling,
+                kind: TransportKind::WebSocket,
+                outbound: sibling_tx,
+                identity: Some(test_identity("sibling-player")),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        assert!(gateway.begin_reconnect_grace(
+            first,
+            secret,
+            TimestampMillis::from_unix_millis(30),
+        ));
+        assert_eq!(
+            gateway.expire_reconnect_grace_at(TimestampMillis::from_unix_millis(29)),
+            0
+        );
+        assert_eq!(
+            gateway.expire_reconnect_grace_at(TimestampMillis::from_unix_millis(30)),
+            1
+        );
+        assert!(gateway.accepts_work(sibling));
+    }
+
     #[derive(Default)]
     struct DiagnosticsDispatchProbe {
         dispatches: Mutex<usize>,
+        joins: Mutex<usize>,
     }
 
     impl Runtime for DiagnosticsDispatchProbe {
@@ -11383,10 +11834,13 @@ mod tests {
 
         fn dispatch_lifecycle(
             &self,
-            _hook: LifecycleHook,
+            hook: LifecycleHook,
             _sender: u64,
             _user_id: Option<&str>,
         ) -> Vec<OutboundCommand> {
+            if hook == LifecycleHook::Join {
+                *self.joins.lock().expect("join lock") += 1;
+            }
             Vec::new()
         }
 
@@ -11435,6 +11889,134 @@ mod tests {
                 hooks: Vec::new(),
             }
         }
+    }
+
+    #[test]
+    fn replaced_registration_cannot_emit_join_or_underflow_open_gauges() {
+        let metrics = Arc::new(NodeMetrics::new());
+        let probe = Arc::new(DiagnosticsDispatchProbe::default());
+        let gateway = Arc::new(Gateway::with_metrics_and_runtime(
+            Arc::clone(&metrics),
+            Some(Arc::clone(&probe) as Arc<dyn Runtime>),
+        ));
+        let first = gateway.next_participant_id();
+        let replacement = gateway.next_participant_id();
+        let identity = test_identity("generation-owned-registration");
+        let (first_ready_tx, first_ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(1);
+        let first_gateway = Arc::clone(&gateway);
+        let first_identity = identity.clone();
+        let first_task = std::thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel(8);
+            first_gateway.register_session_with_initials_at_after_publish(
+                SessionHandle {
+                    id: first,
+                    kind: TransportKind::WebSocket,
+                    outbound: tx,
+                    identity: Some(first_identity),
+                },
+                Vec::new(),
+                TimestampMillis::from_unix_millis(10),
+                move || {
+                    first_ready_tx.send(()).expect("first publish");
+                    release_first_rx.recv().expect("release first effects");
+                },
+            );
+        });
+
+        first_ready_rx.recv().expect("first registration publishes");
+        let (replacement_tx, _replacement_rx) = mpsc::channel(8);
+        gateway.register_session_at(
+            SessionHandle {
+                id: replacement,
+                kind: TransportKind::WebSocket,
+                outbound: replacement_tx,
+                identity: Some(identity),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        release_first_tx
+            .send(())
+            .expect("release stale registration");
+        first_task.join().expect("first registration thread");
+
+        assert_eq!(
+            *probe.joins.lock().expect("join lock"),
+            1,
+            "only the generation that still owns registration may dispatch Join"
+        );
+        let active = metrics.snapshot();
+        assert_eq!(active.participants_active, 1);
+        assert_eq!(active.sessions_active, 1);
+
+        gateway.unregister_session(replacement);
+        let inactive = metrics.snapshot();
+        assert_eq!(
+            inactive.participants_active, 0,
+            "cleanup cannot underflow participants"
+        );
+        assert_eq!(
+            inactive.sessions_active, 0,
+            "cleanup cannot underflow sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_registration_cannot_emit_join_or_underflow_open_gauges() {
+        let metrics = Arc::new(NodeMetrics::new());
+        let probe = Arc::new(DiagnosticsDispatchProbe::default());
+        let gateway = Arc::new(Gateway::with_metrics_and_runtime(
+            Arc::clone(&metrics),
+            Some(Arc::clone(&probe) as Arc<dyn Runtime>),
+        ));
+        let participant = gateway.next_participant_id();
+        let identity = test_identity("closed-generation-registration");
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let registering_gateway = Arc::clone(&gateway);
+        let registering_identity = identity.clone();
+        let registration = std::thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel(8);
+            registering_gateway.register_session_with_initials_at_after_publish(
+                SessionHandle {
+                    id: participant,
+                    kind: TransportKind::WebSocket,
+                    outbound: tx,
+                    identity: Some(registering_identity),
+                },
+                Vec::new(),
+                TimestampMillis::from_unix_millis(10),
+                move || {
+                    published_tx.send(()).expect("registration publishes");
+                    release_rx.recv().expect("release registration effects");
+                },
+            );
+        });
+
+        published_rx.recv().expect("registration publishes");
+        assert_eq!(
+            gateway
+                .disconnect_session(
+                    &identity.session_id,
+                    "close-pending-registration",
+                    None,
+                    identity.expires_at,
+                    TimestampMillis::from_unix_millis(10),
+                )
+                .await,
+            1
+        );
+        release_tx.send(()).expect("release closed registration");
+        registration.join().expect("registration thread");
+
+        assert_eq!(
+            *probe.joins.lock().expect("join lock"),
+            0,
+            "a close that wins before side effects must suppress Join"
+        );
+        let gauges = metrics.snapshot();
+        assert_eq!(gauges.participants_active, 0);
+        assert_eq!(gauges.sessions_active, 0);
     }
 
     #[test]
@@ -11680,6 +12262,42 @@ mod tests {
         assert_eq!(snap.connections_accepted_total, 2);
         assert_eq!(snap.participants_active, 1);
         assert_eq!(snap.sessions_active, 0, "the authenticated session ended");
+    }
+
+    #[tokio::test]
+    async fn legacy_authenticated_registration_stays_active_for_lifecycle_gauges_and_presence() {
+        let metrics = Arc::new(NodeMetrics::new());
+        let gw = runtime_gateway(Arc::clone(&metrics), LIFECYCLE_TICK_SCRIPT);
+        let (peer, mut peer_rx) = register_via_session(&gw, TransportKind::WebSocket);
+        let id = gw.next_participant_id();
+        let (tx, _rx) = mpsc::channel(8);
+
+        // This legacy registration API remains public for authenticated callers.
+        // It must still activate normal join handling rather than being treated
+        // as a rejected time-checked registration.
+        gw.register_session(SessionHandle {
+            id,
+            kind: TransportKind::WebSocket,
+            outbound: tx,
+            identity: Some(test_identity("legacy-user")),
+        });
+        assert!(gw.accepts_work(id));
+        assert_eq!(gw.registry().participants_for_user("legacy-user"), vec![id]);
+        let joined = peer_rx.recv().await.expect("legacy join lifecycle event");
+        assert_eq!(joined.envelope.kind, 10);
+        assert_eq!(joined.envelope.body, id.get().to_be_bytes().to_vec());
+        let active = metrics.snapshot();
+        assert_eq!(active.participants_active, 2);
+        assert_eq!(active.sessions_active, 1);
+
+        gw.unregister_session(id);
+        let left = peer_rx.recv().await.expect("legacy leave lifecycle event");
+        assert_eq!(left.envelope.kind, 11);
+        assert_eq!(left.envelope.body, id.get().to_be_bytes().to_vec());
+        let inactive = metrics.snapshot();
+        assert_eq!(inactive.participants_active, 1);
+        assert_eq!(inactive.sessions_active, 0);
+        assert!(gw.accepts_work(peer));
     }
 
     #[tokio::test]

@@ -5133,6 +5133,9 @@ mod tests {
             "cache.set",
             "cache.delete",
             "cache.cas",
+            "telemetry.begin",
+            "telemetry.mark",
+            "telemetry.finish",
         ]
         .into_iter()
         .collect();

@@ -141,6 +141,45 @@ pub async fn quic_guest_handshake(conn: &quinn::Connection) {
     assert_server_time(decode_one(&data));
 }
 
+/// Perform an authenticated handshake over a QUIC client and consume the
+/// accepted result plus its server-time extension.
+pub async fn quic_auth_handshake(conn: &quinn::Connection, token: &str) -> AuthAck {
+    let mut send = conn.open_uni().await.expect("open uni for auth");
+    let auth = Envelope::new(KIND_AUTH, token.as_bytes().to_vec());
+    send.write_all(&auth.encode_framed())
+        .await
+        .expect("write auth");
+    send.finish().expect("finish auth stream");
+
+    let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
+        .await
+        .expect("ack did not time out")
+        .expect("ack stream accepted");
+    let data = recv
+        .read_to_end(ACK_STREAM_BYTES)
+        .await
+        .expect("read ack stream");
+    let ack = decode_one(&data);
+    assert_eq!(ack.kind, KIND_AUTH_RESULT, "handshake is acked");
+    let result = decode_auth_result(&ack.body).expect("auth result decodes");
+    assert!(!result.is_rejected(), "authenticated handshake is accepted");
+
+    let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
+        .await
+        .expect("server time did not arrive")
+        .expect("server-time stream accepted");
+    let data = recv
+        .read_to_end(ACK_STREAM_BYTES)
+        .await
+        .expect("read server-time stream");
+    assert_server_time(decode_one(&data));
+    AuthAck {
+        status: result.status,
+        user_id: result.user_id.to_string(),
+        reason_class: result.reason_class,
+    }
+}
+
 /// Perform the guest handshake over a WebTransport session (same shape as QUIC).
 pub async fn wt_guest_handshake(session: &web_transport_quinn::Session) {
     let mut send = session.open_uni().await.expect("open uni for auth");

@@ -5,7 +5,7 @@
 //! with the resolved `ParticipantIdentity`. Resume secrets are opaque, supplied
 //! by an injected random source, single-use, and never identify a user/session.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::session::SessionId;
@@ -76,7 +76,7 @@ struct State {
     next_generation: u64,
     live: HashMap<SessionId, Live>,
     tickets: HashMap<ResumeSecret, Ticket>,
-    revoked: HashSet<SessionId>,
+    revoked: HashMap<SessionId, TimestampMillis>,
 }
 
 /// Atomic, single-node lifecycle state. `now` and secret generation are supplied
@@ -103,11 +103,46 @@ impl IdentityLifecycle {
         owner_generation: u64,
     ) -> Option<u64> {
         let mut state = self.state.lock().ok()?;
-        if state.revoked.contains(&session) {
+        if state.revoked.contains_key(&session) {
             return None;
         }
         state.next_generation = state.next_generation.checked_add(1)?;
         let generation = state.next_generation;
+        // A normal activation replaces any suspect generation. Its old opaque
+        // ticket must not retain the replaced record until a later sweep.
+        state.tickets.retain(|_, ticket| ticket.session != session);
+        state.live.insert(
+            session,
+            Live {
+                user,
+                participant,
+                generation,
+                owner_generation,
+                suspect_until: None,
+            },
+        );
+        Some(generation)
+    }
+
+    /// Time-checked activation that purges durable revocations at their
+    /// authoritative session expiry before deciding whether this exact session
+    /// remains terminal.
+    pub fn activate_at(
+        &self,
+        user: UserId,
+        session: SessionId,
+        participant: ParticipantId,
+        owner_generation: u64,
+        now: TimestampMillis,
+    ) -> Option<u64> {
+        let mut state = self.state.lock().ok()?;
+        state.revoked.retain(|_, expires_at| *expires_at > now);
+        if state.revoked.contains_key(&session) {
+            return None;
+        }
+        state.next_generation = state.next_generation.checked_add(1)?;
+        let generation = state.next_generation;
+        state.tickets.retain(|_, ticket| ticket.session != session);
         state.live.insert(
             session,
             Live {
@@ -142,7 +177,7 @@ impl IdentityLifecycle {
             .live
             .get(session)
             .is_none_or(|live| live.generation != generation)
-            || state.revoked.contains(session)
+            || state.revoked.contains_key(session)
         {
             return false;
         }
@@ -170,7 +205,7 @@ impl IdentityLifecycle {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if state.revoked.contains(session) {
+        if state.revoked.contains_key(session) {
             return false;
         }
         let Some(live) = state.live.get_mut(session) else {
@@ -183,33 +218,57 @@ impl IdentityLifecycle {
         true
     }
 
+    /// Remove a normally disconnected live session only if this transport still
+    /// owns its generation. A suspect record is explicit reconnect grace and is
+    /// deliberately retained for ticket redemption or grace expiry.
+    pub fn deactivate(&self, session: &SessionId, generation: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !state
+            .live
+            .get(session)
+            .is_some_and(|live| live.generation == generation && live.suspect_until.is_none())
+        {
+            return false;
+        }
+        state.live.remove(session);
+        state.tickets.retain(|_, ticket| &ticket.session != session);
+        true
+    }
+
     /// Resume is reauthentication-backed: callers must pass `reauthenticated`
-    /// only after current access-token/session validation. Consumption and the
-    /// generation CAS happen under one lock, so a replay or revoke race fails
-    /// closed. A fresh transport participant replaces the suspect connection.
+    /// only after current access-token/session *and user* validation.
+    /// Consumption and the generation CAS happen under one lock, so a replay or
+    /// revoke race fails closed. A fresh transport participant replaces the
+    /// suspect connection.
     pub fn resume(
         &self,
         secret: ResumeSecret,
+        reauthenticated_user: Option<&UserId>,
         reauthenticated_session: Option<&SessionId>,
         participant: ParticipantId,
         owner_generation: u64,
         now: TimestampMillis,
     ) -> ResumeResult {
         // A bare `true` is insufficient: a valid credential for a different
-        // device session must not redeem this session's resume ticket.
-        let Some(reauthenticated_session) = reauthenticated_session else {
+        // account or device session must not redeem this session's ticket.
+        let (Some(reauthenticated_user), Some(reauthenticated_session)) =
+            (reauthenticated_user, reauthenticated_session)
+        else {
             return ResumeResult::ReauthRequired;
         };
         let Ok(mut state) = self.state.lock() else {
             return ResumeResult::Rejected;
         };
+        state.revoked.retain(|_, expires_at| *expires_at > now);
         let Some(ticket) = state.tickets.remove(&secret) else {
             return ResumeResult::Rejected;
         };
         if ticket.expires_at <= now
             || ticket.owner_generation != owner_generation
             || ticket.session != *reauthenticated_session
-            || state.revoked.contains(&ticket.session)
+            || state.revoked.contains_key(&ticket.session)
         {
             return ResumeResult::Rejected;
         }
@@ -220,7 +279,10 @@ impl IdentityLifecycle {
         else {
             return ResumeResult::Rejected;
         };
-        if live_generation != ticket.generation || live_owner_generation != owner_generation {
+        if live_generation != ticket.generation
+            || live_owner_generation != owner_generation
+            || &user != reauthenticated_user
+        {
             return ResumeResult::Rejected;
         }
         state.next_generation = match state.next_generation.checked_add(1) {
@@ -241,14 +303,32 @@ impl IdentityLifecycle {
         ResumeResult::Accepted { generation }
     }
 
-    /// Revocation wins all future activations/resumes and terminally removes the
-    /// exact session only; same-user sibling devices are intentionally untouched.
-    pub fn revoke(&self, session: &SessionId) {
+    /// Revocation wins all future activations/resumes until the authoritative
+    /// access-session expiry, then its tombstone is purged. Same-user sibling
+    /// devices remain intentionally untouched.
+    pub fn revoke(&self, session: &SessionId, expires_at: TimestampMillis, now: TimestampMillis) {
         if let Ok(mut state) = self.state.lock() {
-            state.revoked.insert(session.clone());
+            state
+                .revoked
+                .retain(|_, tombstone_expires_at| *tombstone_expires_at > now);
+            if expires_at > now {
+                state.revoked.insert(session.clone(), expires_at);
+            }
             state.live.remove(session);
             state.tickets.retain(|_, ticket| &ticket.session != session);
         }
+    }
+
+    /// Purge durable revocations at a caller-supplied instant and return the
+    /// number reclaimed. The registry invokes this from its regular expiry sweep
+    /// so terminal session ids cannot accumulate while idle.
+    pub fn expire_revocations_at(&self, now: TimestampMillis) -> usize {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
+        let before = state.revoked.len();
+        state.revoked.retain(|_, expires_at| *expires_at > now);
+        before.saturating_sub(state.revoked.len())
     }
 
     /// Deterministic grace sweep. Returns session ids that became terminal; only
@@ -285,6 +365,20 @@ impl IdentityLifecycle {
             },
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn grace_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .live
+                    .values()
+                    .filter(|live| live.suspect_until.is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -312,11 +406,25 @@ mod tests {
             .expect("test fixture");
         assert!(lifecycle.issue_resume(&s, g, secret(1), at(20)));
         assert_eq!(
-            lifecycle.resume(secret(1), Some(&s), ParticipantId::from_raw(2), 7, at(10)),
+            lifecycle.resume(
+                secret(1),
+                Some(&user("u")),
+                Some(&s),
+                ParticipantId::from_raw(2),
+                7,
+                at(10)
+            ),
             ResumeResult::Accepted { generation: g + 1 }
         );
         assert_eq!(
-            lifecycle.resume(secret(1), Some(&s), ParticipantId::from_raw(3), 7, at(10)),
+            lifecycle.resume(
+                secret(1),
+                Some(&user("u")),
+                Some(&s),
+                ParticipantId::from_raw(3),
+                7,
+                at(10)
+            ),
             ResumeResult::Rejected
         );
         assert_eq!(
@@ -335,22 +443,44 @@ mod tests {
             .expect("test fixture");
         assert!(lifecycle.issue_resume(&s, g, secret(1), at(10)));
         assert_eq!(
-            lifecycle.resume(secret(1), Some(&s), ParticipantId::from_raw(2), 7, at(10)),
+            lifecycle.resume(
+                secret(1),
+                Some(&user("u")),
+                Some(&s),
+                ParticipantId::from_raw(2),
+                7,
+                at(10)
+            ),
             ResumeResult::Rejected
         );
         assert!(lifecycle.issue_resume(&s, g, secret(2), at(20)));
         assert_eq!(
-            lifecycle.resume(secret(2), None, ParticipantId::from_raw(2), 7, at(11)),
+            lifecycle.resume(
+                secret(2),
+                None,
+                Some(&s),
+                ParticipantId::from_raw(2),
+                7,
+                at(11)
+            ),
             ResumeResult::ReauthRequired
         );
         assert_eq!(
-            lifecycle.resume(secret(2), Some(&s), ParticipantId::from_raw(2), 8, at(11)),
+            lifecycle.resume(
+                secret(2),
+                Some(&user("u")),
+                Some(&s),
+                ParticipantId::from_raw(2),
+                8,
+                at(11)
+            ),
             ResumeResult::Rejected
         );
         assert!(lifecycle.issue_resume(&s, g, secret(3), at(20)));
         assert_eq!(
             lifecycle.resume(
                 secret(3),
+                Some(&user("u")),
                 Some(&other),
                 ParticipantId::from_raw(2),
                 7,
@@ -359,7 +489,7 @@ mod tests {
             ResumeResult::Rejected,
             "a currently valid credential for a sibling session cannot resume this session"
         );
-        lifecycle.revoke(&s);
+        lifecycle.revoke(&s, at(100), at(10));
         assert!(
             lifecycle
                 .activate(user("u"), s.clone(), ParticipantId::from_raw(2), 7)
@@ -390,7 +520,7 @@ mod tests {
         let b = session("b");
         lifecycle.activate(user("u"), a.clone(), ParticipantId::from_raw(1), 1);
         lifecycle.activate(user("u"), b.clone(), ParticipantId::from_raw(2), 1);
-        lifecycle.revoke(&a);
+        lifecycle.revoke(&a, at(100), at(10));
         assert!(lifecycle.presence(&a).is_none());
         assert!(lifecycle.presence(&b).is_some());
     }
