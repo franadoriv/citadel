@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyTuple};
 
 use crate::authoritative_telemetry_slices::{
-    TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
 };
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
@@ -31,16 +31,16 @@ use crate::runtime::outbound_http::{
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
-    BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEventBatch,
-    OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome,
-    RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
-    RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
-    RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
-    RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
-    append_runtime_event_commands, bridge_event_json, bridge_input_outcome_from_json,
-    disabled_runtime_event_bus_handle, disabled_runtime_shared_cache_handle, runtime_event_bus,
-    runtime_shared_cache, script_command_from_outbound, set_runtime_event_bus,
-    set_runtime_shared_cache,
+    BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NativeMatchContext,
+    NativeMatchLifecycleHook, NormalizedEventBatch, OutboundCommand, PhysicsOptions,
+    RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
+    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
+    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
+    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
+    RuntimeSharedCacheHandle, ScriptCommandBatch, append_runtime_event_commands, bridge_event_json,
+    bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
+    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
+    script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use crate::time::{Clock, SystemClock};
@@ -81,6 +81,12 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "on_message",
     "on_join",
     "on_leave",
+    "on_match_created",
+    "on_match_started",
+    "on_match_ended",
+    "on_match_join",
+    "on_match_leave",
+    "on_match_tick",
     "on_tick",
     "on_leaderboard_reset",
     "on_rpc",
@@ -161,6 +167,12 @@ _MAX_EVENT_SUBSCRIBERS = 64
 _storage_index_filters = {}
 _on_join = None
 _on_leave = None
+_on_match_created = None
+_on_match_started = None
+_on_match_ended = None
+_on_match_join = None
+_on_match_leave = None
+_on_match_tick = None
 _on_tick = None
 _on_leaderboard_reset = None
 _on_room_create = None
@@ -258,6 +270,24 @@ def on_join(handler=None):
 
 def on_leave(handler=None):
     return _single("_on_leave", handler)
+
+def on_match_created(handler=None):
+    return _single("_on_match_created", handler)
+
+def on_match_started(handler=None):
+    return _single("_on_match_started", handler)
+
+def on_match_ended(handler=None):
+    return _single("_on_match_ended", handler)
+
+def on_match_join(handler=None):
+    return _single("_on_match_join", handler)
+
+def on_match_leave(handler=None):
+    return _single("_on_match_leave", handler)
+
+def on_match_tick(handler=None):
+    return _single("_on_match_tick", handler)
 
 def on_tick(handler=None):
     return _single("_on_tick", handler)
@@ -577,6 +607,13 @@ def _dispatch_lifecycle(hook, ctx):
     handler(ctx)
     return True
 
+def _dispatch_match_lifecycle(hook, context):
+    handler = globals().get("_" + str(hook))
+    if handler is None:
+        return False
+    handler(dict(context))
+    return True
+
 def _dispatch_tick(dt):
     if _on_tick is None:
         return False
@@ -658,6 +695,12 @@ def _has_any_handler():
         or bool(_rpc_handlers)
         or _on_join is not None
         or _on_leave is not None
+        or _on_match_created is not None
+        or _on_match_started is not None
+        or _on_match_ended is not None
+        or _on_match_join is not None
+        or _on_match_leave is not None
+        or _on_match_tick is not None
         or _on_tick is not None
         or _on_leaderboard_reset is not None
         or _on_room_create is not None
@@ -675,6 +718,18 @@ def _introspect():
         hooks.append("on_join")
     if _on_leave is not None:
         hooks.append("on_leave")
+    if _on_match_created is not None:
+        hooks.append("on_match_created")
+    if _on_match_started is not None:
+        hooks.append("on_match_started")
+    if _on_match_ended is not None:
+        hooks.append("on_match_ended")
+    if _on_match_join is not None:
+        hooks.append("on_match_join")
+    if _on_match_leave is not None:
+        hooks.append("on_match_leave")
+    if _on_match_tick is not None:
+        hooks.append("on_match_tick")
     if _on_tick is not None:
         hooks.append("on_tick")
     if _on_leaderboard_reset is not None:
@@ -2334,6 +2389,25 @@ impl PythonRuntime {
         })
     }
 
+    /// Dispatch a server-owned authoritative-match lifecycle callback.
+    pub fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        // Match lifecycle telemetry must use this server-owned context, never a
+        // previous invocation's thread-local scope.
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(context.match_id));
+        self.run_commands(hook.name(), budget, |py, module| {
+            let callback_context = native_match_context_dict(py, &context)?;
+            module
+                .getattr("_dispatch_match_lifecycle")?
+                .call1((hook.name(), callback_context))?
+                .extract::<bool>()
+        })
+    }
+
     /// Dispatch the periodic tick handler with `dt` in seconds.
     pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
         set_active_runtime_scope(None);
@@ -2798,6 +2872,21 @@ fn apply_transform_hub(citadel: &Py<PyModule>, hub: &Option<Arc<TransformHub>>) 
     }
 }
 
+fn native_match_context_dict(py: Python<'_>, context: &NativeMatchContext) -> PyResult<Py<PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("match_id", context.match_id)?;
+    result.set_item("lifecycle_generation", context.lifecycle_generation)?;
+    result.set_item("clock_epoch", context.clock_epoch)?;
+    result.set_item("tick", context.tick)?;
+    result.set_item("participants", &context.participants)?;
+    result.set_item("map", &context.map)?;
+    result.set_item("mode", &context.mode)?;
+    result.set_item("max_players", context.max_players)?;
+    result.set_item("open", context.open)?;
+    result.set_item("termination_reason", &context.termination_reason)?;
+    Ok(result.unbind())
+}
+
 impl Runtime for PythonRuntime {
     fn before_realtime(
         &self,
@@ -2858,6 +2947,19 @@ impl Runtime for PythonRuntime {
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand> {
         PythonRuntime::dispatch_lifecycle(self, hook, sender, user_id)
+    }
+
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        PythonRuntime::dispatch_match_lifecycle(self, hook, context, budget)
+    }
+
+    fn supports_native_match_lifecycle(&self) -> bool {
+        true
     }
 
     fn on_leaderboard_reset(
@@ -3653,6 +3755,60 @@ mod tests {
 
     fn runtime(src: &str) -> PythonRuntime {
         PythonRuntime::from_source(src, "test.py", 100).expect("python runtime loads")
+    }
+
+    #[test]
+    fn native_match_lifecycle_telemetry_uses_its_context_and_restores_prior_scope() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"
+import citadel
+
+@citadel.on_match_tick
+def lifecycle(context):
+    citadel.telemetry.begin()
+    citadel.telemetry.mark("match.lifecycle")
+    citadel.telemetry.finish()
+"#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+
+        set_active_runtime_scope(Some(41));
+        assert!(
+            runtime
+                .dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Tick,
+                    NativeMatchContext {
+                        match_id: 42,
+                        lifecycle_generation: 1,
+                        clock_epoch: 0,
+                        tick: 7,
+                        participants: Vec::new(),
+                        map: "arena".to_owned(),
+                        mode: "duel".to_owned(),
+                        max_players: 2,
+                        open: true,
+                        termination_reason: None,
+                    },
+                    Duration::from_millis(100),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        set_active_runtime_scope(None);
+
+        let reports = slices.list_closed(1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].context_kind, "match");
+        assert_eq!(reports[0].marker_total, 1);
     }
 
     // ---- authoritative bridge: citadel.on_input parity ----

@@ -10,8 +10,8 @@ use authoritative_decision_telemetry::{
     AuthoritativeDecisionRecorder,
 };
 use authoritative_telemetry_slices::{
-    TelemetrySliceContext, TelemetrySlicePolicy, TelemetrySliceService, active_runtime_context,
-    set_active_runtime_scope,
+    RuntimeScopeGuard, TelemetrySliceContext, TelemetrySlicePolicy, TelemetrySliceService,
+    active_runtime_context, set_active_runtime_scope,
 };
 use std::sync::Arc;
 
@@ -149,4 +149,33 @@ fn active_runtime_scope_is_server_set_and_can_be_cleared() {
     );
     set_active_runtime_scope(None);
     assert!(active_runtime_context().is_none());
+}
+
+#[test]
+fn runtime_scope_guard_overrides_and_restores_a_prior_scope() {
+    set_active_runtime_scope(Some(41));
+    {
+        let _guard = RuntimeScopeGuard::enter(Some(42));
+        assert_eq!(
+            active_runtime_context(),
+            Some(TelemetrySliceContext::match_context(42)),
+            "a native lifecycle callback must not inherit the prior match"
+        );
+    }
+    assert_eq!(
+        active_runtime_context(),
+        Some(TelemetrySliceContext::match_context(41)),
+        "the previous scope is restored after the callback"
+    );
+    let panic = std::panic::catch_unwind(|| {
+        let _guard = RuntimeScopeGuard::enter(Some(43));
+        panic!("simulated lifecycle failure");
+    });
+    assert!(panic.is_err());
+    assert_eq!(
+        active_runtime_context(),
+        Some(TelemetrySliceContext::match_context(41)),
+        "unwinding a lifecycle callback must restore the previous scope"
+    );
+    set_active_runtime_scope(None);
 }

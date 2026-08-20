@@ -20,7 +20,7 @@ use rquickjs::{
 };
 
 use crate::authoritative_telemetry_slices::{
-    TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
 };
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
@@ -33,13 +33,14 @@ use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION,
-    NormalizedEventBatch, OutboundCommand, PhysicsOptions, RealtimeAfterOutcome,
-    RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime, RuntimeEvent,
-    RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
-    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
-    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
-    RuntimeSharedCacheHandle, ScriptCommandBatch, StorageWriteInput, append_runtime_event_commands,
-    bridge_event_json, bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
+    NativeMatchContext, NativeMatchLifecycleHook, NormalizedEventBatch, OutboundCommand,
+    PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec,
+    RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
+    RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
+    RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
+    StorageWriteInput, append_runtime_event_commands, bridge_event_json,
+    bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
     script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
@@ -73,6 +74,12 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "on_message",
     "on_join",
     "on_leave",
+    "on_match_created",
+    "on_match_started",
+    "on_match_ended",
+    "on_match_join",
+    "on_match_leave",
+    "on_match_tick",
     "on_tick",
     "on_leaderboard_reset",
     "on_rpc",
@@ -148,6 +155,12 @@ const JS_HOST_PRELUDE: &str = r#"
   const storageIndexFilters = new Map();
   let onJoin = null;
   let onLeave = null;
+  let onMatchCreated = null;
+  let onMatchStarted = null;
+  let onMatchEnded = null;
+  let onMatchJoin = null;
+  let onMatchLeave = null;
+  let onMatchTick = null;
   let onTick = null;
   let onLeaderboardReset = null;
   let onRoomCreate = null;
@@ -339,6 +352,24 @@ const JS_HOST_PRELUDE: &str = r#"
     },
     on_leave(handler) {
       return singleRegistration((fn) => { onLeave = fn; }, handler);
+    },
+    on_match_created(handler) {
+      return singleRegistration((fn) => { onMatchCreated = fn; }, handler);
+    },
+    on_match_started(handler) {
+      return singleRegistration((fn) => { onMatchStarted = fn; }, handler);
+    },
+    on_match_ended(handler) {
+      return singleRegistration((fn) => { onMatchEnded = fn; }, handler);
+    },
+    on_match_join(handler) {
+      return singleRegistration((fn) => { onMatchJoin = fn; }, handler);
+    },
+    on_match_leave(handler) {
+      return singleRegistration((fn) => { onMatchLeave = fn; }, handler);
+    },
+    on_match_tick(handler) {
+      return singleRegistration((fn) => { onMatchTick = fn; }, handler);
     },
     on_tick(handler) {
       return singleRegistration((fn) => { onTick = fn; }, handler);
@@ -810,6 +841,21 @@ const JS_HOST_PRELUDE: &str = r#"
     return true;
   };
 
+  globalThis.__citadel_dispatch_match_lifecycle = function (hook, context) {
+    const handlers = {
+      on_match_created: onMatchCreated,
+      on_match_started: onMatchStarted,
+      on_match_ended: onMatchEnded,
+      on_match_join: onMatchJoin,
+      on_match_leave: onMatchLeave,
+      on_match_tick: onMatchTick,
+    };
+    const handler = handlers[String(hook)];
+    if (!handler) return false;
+    handler(Object.assign({}, context, { participants: Array.from(context.participants || []) }));
+    return true;
+  };
+
   globalThis.__citadel_dispatch_tick = function (dt) {
     if (!onTick) {
       return false;
@@ -881,6 +927,12 @@ const JS_HOST_PRELUDE: &str = r#"
       || rpcHandlers.size > 0
       || onJoin !== null
       || onLeave !== null
+      || onMatchCreated !== null
+      || onMatchStarted !== null
+      || onMatchEnded !== null
+      || onMatchJoin !== null
+      || onMatchLeave !== null
+      || onMatchTick !== null
       || onTick !== null
       || onLeaderboardReset !== null
       || onRoomCreate !== null
@@ -895,6 +947,12 @@ const JS_HOST_PRELUDE: &str = r#"
     const hooks = [];
     if (onJoin) hooks.push("on_join");
     if (onLeave) hooks.push("on_leave");
+    if (onMatchCreated) hooks.push("on_match_created");
+    if (onMatchStarted) hooks.push("on_match_started");
+    if (onMatchEnded) hooks.push("on_match_ended");
+    if (onMatchJoin) hooks.push("on_match_join");
+    if (onMatchLeave) hooks.push("on_match_leave");
+    if (onMatchTick) hooks.push("on_match_tick");
     if (onTick) hooks.push("on_tick");
     if (onLeaderboardReset) hooks.push("on_leaderboard_reset");
     if (onRoomCreate) hooks.push("on_room_create");
@@ -1599,6 +1657,24 @@ impl JsRuntime {
         })
     }
 
+    /// Dispatch a server-owned authoritative-match lifecycle callback.
+    pub fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        // Match lifecycle telemetry must use this server-owned context, never a
+        // previous invocation's thread-local scope.
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(context.match_id));
+        self.run_commands(hook.name(), budget, |ctx| {
+            let globals = ctx.globals();
+            let func: Function = caught(&ctx, globals.get("__citadel_dispatch_match_lifecycle"))?;
+            let callback_context = native_match_context_object(&ctx, &context)?;
+            caught(&ctx, func.call((hook.name(), callback_context)))
+        })
+    }
+
     /// Dispatch the periodic tick handler with `dt` in seconds.
     pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
         set_active_runtime_scope(None);
@@ -2154,6 +2230,19 @@ impl Runtime for JsRuntime {
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand> {
         JsRuntime::dispatch_lifecycle(self, hook, sender, user_id)
+    }
+
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        JsRuntime::dispatch_match_lifecycle(self, hook, context, budget)
+    }
+
+    fn supports_native_match_lifecycle(&self) -> bool {
+        true
     }
 
     fn on_leaderboard_reset(
@@ -3081,6 +3170,50 @@ fn make_ctx<'js>(
         }
     }
     Ok(obj)
+}
+
+fn native_match_context_object<'js>(
+    ctx: &Ctx<'js>,
+    context: &NativeMatchContext,
+) -> JsHostResult<Object<'js>> {
+    let object = caught(ctx, Object::new(ctx.clone()))?;
+    let match_id = caught(ctx, BigInt::from_u64(ctx.clone(), context.match_id))?;
+    caught(ctx, object.set("match_id", match_id))?;
+    caught(
+        ctx,
+        object.set("match_id_text", context.match_id.to_string()),
+    )?;
+    caught(ctx, object.set("match_id_number", context.match_id as f64))?;
+    let generation = caught(
+        ctx,
+        BigInt::from_u64(ctx.clone(), context.lifecycle_generation),
+    )?;
+    caught(ctx, object.set("lifecycle_generation", generation))?;
+    let clock_epoch = caught(ctx, BigInt::from_u64(ctx.clone(), context.clock_epoch))?;
+    caught(ctx, object.set("clock_epoch", clock_epoch))?;
+    let tick = caught(ctx, BigInt::from_u64(ctx.clone(), context.tick))?;
+    caught(ctx, object.set("tick", tick))?;
+    let participants = caught(ctx, Array::new(ctx.clone()))?;
+    for (index, participant) in context.participants.iter().copied().enumerate() {
+        let participant = caught(ctx, BigInt::from_u64(ctx.clone(), participant))?;
+        caught(ctx, participants.set(index, participant))?;
+    }
+    caught(ctx, object.set("participants", participants))?;
+    caught(ctx, object.set("map", context.map.as_str()))?;
+    caught(ctx, object.set("mode", context.mode.as_str()))?;
+    caught(
+        ctx,
+        object.set("max_players", u32::from(context.max_players)),
+    )?;
+    caught(ctx, object.set("open", context.open))?;
+    match context.termination_reason.as_deref() {
+        Some(reason) => caught(ctx, object.set("termination_reason", reason))?,
+        None => caught(
+            ctx,
+            object.set("termination_reason", Value::new_null(ctx.clone())),
+        )?,
+    }
+    Ok(object)
 }
 
 fn clear_commands(ctx: &Ctx<'_>) {
@@ -4074,6 +4207,58 @@ mod tests {
 
     fn runtime(src: &str) -> JsRuntime {
         JsRuntime::from_source(src, "test.js", 100).expect("javascript runtime loads")
+    }
+
+    #[test]
+    fn native_match_lifecycle_telemetry_uses_its_context_and_restores_prior_scope() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"
+citadel.on_match_tick(() => {
+  citadel.telemetry.begin();
+  citadel.telemetry.mark("match.lifecycle");
+  citadel.telemetry.finish();
+});
+"#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+
+        set_active_runtime_scope(Some(41));
+        assert!(
+            runtime
+                .dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Tick,
+                    NativeMatchContext {
+                        match_id: 42,
+                        lifecycle_generation: 1,
+                        clock_epoch: 0,
+                        tick: 7,
+                        participants: Vec::new(),
+                        map: "arena".to_owned(),
+                        mode: "duel".to_owned(),
+                        max_players: 2,
+                        open: true,
+                        termination_reason: None,
+                    },
+                    Duration::from_millis(100),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        set_active_runtime_scope(None);
+
+        let reports = slices.list_closed(1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].context_kind, "match");
+        assert_eq!(reports[0].marker_total, 1);
     }
 
     // ---- authoritative bridge: citadel.on_input parity ----

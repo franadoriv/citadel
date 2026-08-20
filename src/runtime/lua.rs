@@ -14,7 +14,7 @@ use citadel_physics::{PhysicsConfig, Shape};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
 use crate::authoritative_telemetry_slices::{
-    TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
 };
 use crate::config::LuaExecutionMode;
 use crate::error::{AppError, AppResult, ErrorCategory};
@@ -29,11 +29,12 @@ use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, BridgeTransform, Correction, Decision, InputOutcome,
-    MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEvent, NormalizedEventBatch, NormalizedPayload,
-    RealtimeAfterOutcome, RealtimeInterception, Runtime, RuntimeEvent, RuntimeEventBus,
-    RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint,
-    RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest,
-    RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
+    MAX_RUNTIME_EVENTS_PER_INVOCATION, NativeMatchContext, NativeMatchLifecycleHook,
+    NormalizedEvent, NormalizedEventBatch, NormalizedPayload, RealtimeAfterOutcome,
+    RealtimeInterception, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
+    RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
+    RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
     append_runtime_event_commands, disabled_runtime_event_bus_handle,
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
     script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
@@ -139,6 +140,14 @@ const ON_JOIN_KEY: &str = "citadel.on_join";
 
 /// Registry key holding the `on_leave` lifecycle handler (a single function).
 const ON_LEAVE_KEY: &str = "citadel.on_leave";
+
+/// Registry keys for the server-owned authoritative-match lifecycle callbacks.
+const ON_MATCH_CREATED_KEY: &str = "citadel.on_match_created";
+const ON_MATCH_STARTED_KEY: &str = "citadel.on_match_started";
+const ON_MATCH_ENDED_KEY: &str = "citadel.on_match_ended";
+const ON_MATCH_JOIN_KEY: &str = "citadel.on_match_join";
+const ON_MATCH_LEAVE_KEY: &str = "citadel.on_match_leave";
+const ON_MATCH_TICK_KEY: &str = "citadel.on_match_tick";
 
 /// Registry key holding the `on_tick` game-loop handler (a single function).
 const ON_TICK_KEY: &str = "citadel.on_tick";
@@ -888,6 +897,12 @@ impl LuaRuntime {
         let hooks = [
             ("on_join", ON_JOIN_KEY),
             ("on_leave", ON_LEAVE_KEY),
+            ("on_match_created", ON_MATCH_CREATED_KEY),
+            ("on_match_started", ON_MATCH_STARTED_KEY),
+            ("on_match_ended", ON_MATCH_ENDED_KEY),
+            ("on_match_join", ON_MATCH_JOIN_KEY),
+            ("on_match_leave", ON_MATCH_LEAVE_KEY),
+            ("on_match_tick", ON_MATCH_TICK_KEY),
             ("on_tick", ON_TICK_KEY),
             ("on_leaderboard_reset", ON_LEADERBOARD_RESET_KEY),
             ("on_room_create", ON_ROOM_CREATE_KEY),
@@ -1396,6 +1411,30 @@ impl LuaRuntime {
         })
     }
 
+    /// Run a server-owned authoritative-match lifecycle callback. Scripts receive
+    /// only a copied context table built by the gateway; its match identity and
+    /// membership cannot be selected by game code.
+    pub fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        // Native lifecycle callbacks own their telemetry correlation. Restore any
+        // surrounding scope (including one left by a different runtime surface)
+        // once the callback returns or panics.
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(context.match_id));
+        self.run_locked(hook.name(), budget, |lua| {
+            let Some(handler) =
+                lua.named_registry_value::<Option<Function>>(native_match_registry_key(hook))?
+            else {
+                return Ok(false);
+            };
+            handler.call::<()>(build_native_match_ctx(lua, &context)?)?;
+            Ok(true)
+        })
+    }
+
     /// Run the `on_tick` game-loop handler with elapsed `dt` and return commands.
     ///
     /// `dt` is passed to the script in seconds. Runs under the same serialized
@@ -1803,6 +1842,19 @@ impl Runtime for LuaRuntime {
         LuaRuntime::dispatch_lifecycle(self, hook, sender, user_id)
     }
 
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        LuaRuntime::dispatch_match_lifecycle(self, hook, context, budget)
+    }
+
+    fn supports_native_match_lifecycle(&self) -> bool {
+        true
+    }
+
     fn on_leaderboard_reset(
         &self,
         epoch: &crate::leaderboard_scheduler::ResetEpoch,
@@ -2146,6 +2198,38 @@ fn parse_transform(t: &Table) -> mlua::Result<BridgeTransform> {
         rotation,
         velocity,
     })
+}
+
+fn native_match_registry_key(hook: NativeMatchLifecycleHook) -> &'static str {
+    match hook {
+        NativeMatchLifecycleHook::Created => ON_MATCH_CREATED_KEY,
+        NativeMatchLifecycleHook::Started => ON_MATCH_STARTED_KEY,
+        NativeMatchLifecycleHook::Ended => ON_MATCH_ENDED_KEY,
+        NativeMatchLifecycleHook::Join => ON_MATCH_JOIN_KEY,
+        NativeMatchLifecycleHook::Leave => ON_MATCH_LEAVE_KEY,
+        NativeMatchLifecycleHook::Tick => ON_MATCH_TICK_KEY,
+    }
+}
+
+fn build_native_match_ctx(lua: &Lua, context: &NativeMatchContext) -> mlua::Result<Table> {
+    let ctx = lua.create_table()?;
+    ctx.set("match_id", context.match_id)?;
+    ctx.set("lifecycle_generation", context.lifecycle_generation)?;
+    ctx.set("clock_epoch", context.clock_epoch)?;
+    ctx.set("tick", context.tick)?;
+    ctx.set(
+        "participants",
+        lua.create_sequence_from(context.participants.iter().copied())?,
+    )?;
+    ctx.set("map", context.map.as_str())?;
+    ctx.set("mode", context.mode.as_str())?;
+    ctx.set("max_players", context.max_players)?;
+    ctx.set("open", context.open)?;
+    match context.termination_reason.as_deref() {
+        Some(reason) => ctx.set("termination_reason", reason)?,
+        None => ctx.set("termination_reason", mlua::Value::Nil)?,
+    }
+    Ok(ctx)
 }
 
 /// Build the `ctx` table handed to a lifecycle handler: `sender` plus `user_id`.
@@ -2610,6 +2694,12 @@ fn install_host_api(
     for (name, key) in [
         ("on_join", ON_JOIN_KEY),
         ("on_leave", ON_LEAVE_KEY),
+        ("on_match_created", ON_MATCH_CREATED_KEY),
+        ("on_match_started", ON_MATCH_STARTED_KEY),
+        ("on_match_ended", ON_MATCH_ENDED_KEY),
+        ("on_match_join", ON_MATCH_JOIN_KEY),
+        ("on_match_leave", ON_MATCH_LEAVE_KEY),
+        ("on_match_tick", ON_MATCH_TICK_KEY),
         ("on_tick", ON_TICK_KEY),
         ("on_room_create", ON_ROOM_CREATE_KEY),
         ("on_room_join", ON_ROOM_JOIN_KEY),
@@ -4096,7 +4186,19 @@ fn has_any_handler(lua: &Lua) -> bool {
     if has_event_subscriber {
         return true;
     }
-    [ON_JOIN_KEY, ON_LEAVE_KEY, ON_TICK_KEY].iter().any(|key| {
+    [
+        ON_JOIN_KEY,
+        ON_LEAVE_KEY,
+        ON_MATCH_CREATED_KEY,
+        ON_MATCH_STARTED_KEY,
+        ON_MATCH_ENDED_KEY,
+        ON_MATCH_JOIN_KEY,
+        ON_MATCH_LEAVE_KEY,
+        ON_MATCH_TICK_KEY,
+        ON_TICK_KEY,
+    ]
+    .iter()
+    .any(|key| {
         lua.named_registry_value::<Option<Function>>(key)
             .map(|h| h.is_some())
             .unwrap_or(false)
@@ -4168,6 +4270,58 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].context_kind, "match");
         assert_eq!(reports[0].close_reason, "finished");
+        assert_eq!(reports[0].marker_total, 1);
+    }
+
+    #[test]
+    fn native_match_lifecycle_telemetry_uses_its_context_and_restores_prior_scope() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"
+                citadel.on_match_tick(function()
+                    citadel.telemetry.begin()
+                    citadel.telemetry.mark("match.lifecycle")
+                    citadel.telemetry.finish()
+                end)
+            "#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+
+        set_active_runtime_scope(Some(41));
+        assert!(
+            runtime
+                .dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Tick,
+                    NativeMatchContext {
+                        match_id: 42,
+                        lifecycle_generation: 1,
+                        clock_epoch: 0,
+                        tick: 7,
+                        participants: Vec::new(),
+                        map: "arena".to_owned(),
+                        mode: "duel".to_owned(),
+                        max_players: 2,
+                        open: true,
+                        termination_reason: None,
+                    },
+                    Duration::from_millis(100),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        set_active_runtime_scope(None);
+
+        let reports = slices.list_closed(1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].context_kind, "match");
         assert_eq!(reports[0].marker_total, 1);
     }
 
@@ -5075,6 +5229,12 @@ mod tests {
             "on_message",
             "on_join",
             "on_leave",
+            "on_match_created",
+            "on_match_started",
+            "on_match_ended",
+            "on_match_join",
+            "on_match_leave",
+            "on_match_tick",
             "on_tick",
             "on_leaderboard_reset",
             "on_rpc",
@@ -5133,6 +5293,9 @@ mod tests {
             "cache.set",
             "cache.delete",
             "cache.cas",
+            "telemetry.begin",
+            "telemetry.mark",
+            "telemetry.finish",
         ]
         .into_iter()
         .collect();

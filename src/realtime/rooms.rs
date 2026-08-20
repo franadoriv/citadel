@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::realtime::registry::ParticipantId;
-use crate::runtime::ScriptBinding;
+use crate::runtime::{NativeMatchLifecycleUnavailable, ScriptBinding};
 use crate::session::NodeId;
 
 /// Server-assigned room identifier (monotonic, starts at 1; `0` is never a room).
@@ -87,6 +87,15 @@ pub enum JoinError {
     /// loaded one (or carries no binding on a gated node). Admission into a
     /// superseded match fails closed.
     StaleScript,
+    /// The selected runtime cannot execute the complete native authoritative
+    /// match lifecycle, so gateway admission was refused before mutation.
+    NativeMatchLifecycleUnavailable,
+}
+
+impl From<NativeMatchLifecycleUnavailable> for JoinError {
+    fn from(_: NativeMatchLifecycleUnavailable) -> Self {
+        Self::NativeMatchLifecycleUnavailable
+    }
 }
 
 #[derive(Debug)]
@@ -349,6 +358,12 @@ impl RoomRegistry {
     #[must_use]
     pub fn room_of(&self, participant: ParticipantId) -> Option<RoomId> {
         self.lock().membership.get(&participant).copied()
+    }
+
+    /// The room a trusted remote member is currently admitted to, if any.
+    #[must_use]
+    pub(crate) fn remote_room_of(&self, member: &RemoteRoomMember) -> Option<RoomId> {
+        self.lock().remote_membership.get(member).copied()
     }
 
     /// Run `f` only while `participant` still belongs to `expected_room`.

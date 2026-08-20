@@ -421,6 +421,66 @@ pub struct RealtimeAfterOutcome {
     pub delivered: usize,
 }
 
+/// A server-owned snapshot installed for a native authoritative-match callback.
+///
+/// Scripts only receive a copy of this value; a match id, membership list, clock,
+/// generation, and close reason are selected by the gateway and cannot be supplied
+/// or replaced by game code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMatchContext {
+    pub match_id: u64,
+    pub lifecycle_generation: u64,
+    pub clock_epoch: u64,
+    pub tick: u64,
+    pub participants: Vec<u64>,
+    pub map: String,
+    pub mode: String,
+    pub max_players: u16,
+    pub open: bool,
+    pub termination_reason: Option<String>,
+}
+
+/// A native authoritative-match lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeMatchLifecycleHook {
+    Created,
+    Started,
+    Ended,
+    Join,
+    Leave,
+    Tick,
+}
+
+impl NativeMatchLifecycleHook {
+    /// Stable host registration name for this lifecycle transition.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Created => "on_match_created",
+            Self::Started => "on_match_started",
+            Self::Ended => "on_match_ended",
+            Self::Join => "on_match_join",
+            Self::Leave => "on_match_leave",
+            Self::Tick => "on_match_tick",
+        }
+    }
+}
+
+/// Client-safe refusal used when the selected runtime cannot run the shipped
+/// native authoritative-match lifecycle surface.
+pub const NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE: &str =
+    "native match lifecycle is unavailable for the selected runtime";
+
+/// Typed refusal returned before a room can be created or a member admitted
+/// when the selected runtime cannot execute the complete native lifecycle.
+///
+/// This is intentionally separate from script readiness: an otherwise-ready
+/// external worker still cannot host a match until its protocol carries every
+/// server-owned lifecycle context frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE}")]
+pub struct NativeMatchLifecycleUnavailable;
+
 /// A language runtime that turns inbound game events into outbound commands.
 ///
 /// Implemented today by [`LuaRuntime`]. Future adapters (Python, JS/TS, native
@@ -517,6 +577,31 @@ pub trait Runtime: Send + Sync + 'static {
         sender: u64,
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand>;
+
+    /// Run one native authoritative-match lifecycle callback.
+    ///
+    /// The gateway builds `context` from its own room registry and clock; runtimes
+    /// must never accept a script-selected match id. The default is intentionally
+    /// inert so existing global lifecycle implementations remain compatible.
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        let _ = (hook, context, budget);
+        Vec::new()
+    }
+
+    /// Whether this runtime can execute every native authoritative-match
+    /// lifecycle callback with its complete server-owned context. Embedded Lua,
+    /// Python, and JavaScript support this shipped surface. An adapter that
+    /// cannot transport it must return `false`; the gateway then refuses
+    /// admission before creating a native lifecycle match. The default is
+    /// fail-closed so an adapter cannot silently opt into callbacks it drops.
+    fn supports_native_match_lifecycle(&self) -> bool {
+        false
+    }
 
     /// Invoke the registered leaderboard-reset hook for one durable epoch.
     ///
