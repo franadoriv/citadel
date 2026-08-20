@@ -2425,9 +2425,8 @@ pre.code {
         button.addEventListener('click', function () {
           var id = button.getAttribute('data-id');
           api('GET', '/console/v1/telemetry/slices/' + encodeURIComponent(id)).then(function (r) {
-            var markers = r.markers && r.markers.length ? r.markers.join(', ') : 'none';
             openModal('Telemetry slice ' + r.report_id,
-              '<div class="panel-body"><p><b>Context:</b> ' + esc(r.context_kind) + '</p><p><b>Close reason:</b> ' + esc(r.close_reason) + '</p><p><b>Duration:</b> ' + esc(fmtNum(r.duration_ms)) + ' ms</p><p><b>Markers:</b> ' + esc(markers) + '</p><p><b>Accepted / rejected / corrected:</b> ' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</p><p><b>Completeness:</b> ' + esc(r.truncated ? 'truncated by bounded retention' : 'complete within retained window') + '</p></div>');
+              '<div class="panel-body"><p><b>Context:</b> ' + esc(r.context_kind) + '</p><p><b>Close reason:</b> ' + esc(r.close_reason) + '</p><p><b>Duration:</b> ' + esc(fmtNum(r.duration_ms)) + ' ms</p><p><b>Markers:</b> ' + esc(fmtNum(r.marker_total || 0)) + '</p><p><b>Accepted / rejected / corrected:</b> ' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</p><p><b>Completeness:</b> ' + esc(r.truncated ? 'truncated by bounded retention' : 'complete within retained window') + '</p></div>');
           }).catch(fail);
         });
       });
