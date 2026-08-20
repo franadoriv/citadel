@@ -804,8 +804,10 @@ impl LuaRuntime {
     #[must_use]
     pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
         self.telemetry_slices = Some(slices);
-        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
-        apply_telemetry_slices(&guard.lua, &self.telemetry_slices);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_telemetry_slices(&guard.lua, &self.telemetry_slices);
+        }
         self
     }
 
@@ -4136,6 +4138,37 @@ mod tests {
 
     fn runtime(src: &str) -> LuaRuntime {
         LuaRuntime::from_source(src, "test", DEFAULT_DEADLINE_MS).expect("runtime loads")
+    }
+
+    #[test]
+    fn telemetry_slice_builder_enables_match_scoped_lua_reports() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"
+                citadel.on_message(1, function()
+                    citadel.telemetry.begin()
+                    citadel.telemetry.mark("match.round")
+                    citadel.telemetry.finish()
+                end)
+            "#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+
+        assert!(
+            runtime
+                .dispatch_in_room(7, Some("user-7"), 42, 1, b"")
+                .is_empty()
+        );
+        let reports = slices.list_closed(1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].context_kind, "match");
+        assert_eq!(reports[0].close_reason, "finished");
+        assert_eq!(reports[0].marker_total, 1);
     }
 
     // ---- authoritative bridge: citadel.on_input ----

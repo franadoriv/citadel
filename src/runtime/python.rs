@@ -1946,8 +1946,10 @@ impl PythonRuntime {
     #[must_use]
     pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
         self.telemetry_slices = Some(slices);
-        let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
-        apply_telemetry_slices(&guard.citadel, &self.telemetry_slices);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_telemetry_slices(&guard.citadel, &self.telemetry_slices);
+        }
         self
     }
 

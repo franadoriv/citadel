@@ -1240,8 +1240,10 @@ impl JsRuntime {
     #[must_use]
     pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
         self.telemetry_slices = Some(slices);
-        let guard = lock_mutex(&self.vm);
-        apply_telemetry_slices(&guard.context, &self.telemetry_slices);
+        {
+            let guard = lock_mutex(&self.vm);
+            apply_telemetry_slices(&guard.context, &self.telemetry_slices);
+        }
         self
     }
 

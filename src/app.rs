@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder;
-use crate::authoritative_telemetry_slices::{TelemetrySlicePolicy, TelemetrySliceService};
+use crate::authoritative_telemetry_slices::TelemetrySliceService;
 use crate::config::{Config, RuntimeConfig};
 use crate::deferred_storage::DeferredStorageWriter;
 use crate::error::{AppError, AppResult};
