@@ -34,11 +34,11 @@
     "name": "on_input",
     "category": "realtime_hook",
     "params": [
-      "handler:fn(event)->outcome"
+      "handler:fn(event:normalized_v2)->outcome"
     ],
     "returns": "void",
     "status": "shipped",
-    "since": "unreleased"
+    "since": "IMPL-20260820-AUTH-MATCH-SCOPED-DELIVERY"
   },
   {
     "name": "on_join",

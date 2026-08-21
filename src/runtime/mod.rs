@@ -81,8 +81,9 @@ use crate::leaderboard_scheduler::{ResetEpoch, SchedulerFencingToken};
 pub use bridge_protocol::{
     BridgeCommandSink, BridgePhysicsOptions, BridgeRepField, BridgeRepValue, BridgeShape,
     BridgeTransform, Correction, Decision, FireIntent, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome,
-    MAX_BRIDGE_PAYLOAD_BYTES, NormalizedEvent, NormalizedEventBatch, NormalizedPayload, PersistOp,
-    RewindHit, RewindQuery, RewindResult, ScriptCommand, ScriptCommandBatch,
+    MAX_BRIDGE_PAYLOAD_BYTES, MAX_MATCH_MESSAGE_BODY_BYTES, NormalizedEvent, NormalizedEventBatch,
+    NormalizedPayload, PersistOp, RewindHit, RewindQuery, RewindResult, ScriptCommand,
+    ScriptCommandBatch,
 };
 pub use bridge_validator::{
     BatchRejection, BridgeMatchContext, BridgeQuotas, Capability, EventDraft, MAX_RESERVED_KIND,
@@ -257,10 +258,17 @@ pub(crate) fn bridge_event_json(batch: &NormalizedEventBatch, event: &Normalized
             map.insert("archetype_id".into(), json!(*archetype_id));
             map.insert("transform".into(), bridge_transform_json(transform));
         }
-        NormalizedPayload::MatchMessage { kind, body } => {
+        NormalizedPayload::MatchMessage {
+            kind,
+            body,
+            reliable,
+            sequence,
+        } => {
             map.insert("kind".into(), json!("message"));
             map.insert("message_kind".into(), json!(*kind));
             map.insert("body".into(), json!(body));
+            map.insert("reliable".into(), json!(*reliable));
+            map.insert("sequence".into(), json!(sequence));
         }
         NormalizedPayload::ParticipantJoined => {
             map.insert("kind".into(), json!("join"));
@@ -769,5 +777,36 @@ mod bridge_seam_tests {
             sink.0.lock().expect("sink lock").is_empty(),
             "the default bridge surface must never answer"
         );
+    }
+
+    #[cfg(any(feature = "runtime-js", feature = "runtime-python"))]
+    #[test]
+    fn json_bridge_exposes_generic_message_metadata_to_each_json_adapter() {
+        let mut batch = NormalizedEventBatch::new(7, 42, 9, 100, 1);
+        let event = NormalizedEvent {
+            event_id: 3,
+            participant: 99,
+            user_id: Some("account".to_owned()),
+            payload: NormalizedPayload::MatchMessage {
+                kind: 401,
+                body: b"opaque\0body".to_vec(),
+                reliable: false,
+                sequence: Some(12),
+            },
+        };
+        batch.events.push(event.clone());
+
+        let event: serde_json::Value =
+            serde_json::from_str(&bridge_event_json(&batch, &event)).expect("event JSON");
+        assert_eq!(event["kind"], "message");
+        assert_eq!(event["message_kind"], 401);
+        assert_eq!(
+            event["body"],
+            serde_json::json!([111, 112, 97, 113, 117, 101, 0, 98, 111, 100, 121])
+        );
+        assert_eq!(event["reliable"], false);
+        assert_eq!(event["sequence"], 12);
+        assert_eq!(event["match_id"], 42);
+        assert_eq!(event["tick"], 100);
     }
 }

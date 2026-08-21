@@ -103,10 +103,10 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
     HostApiFn {
         name: "on_input",
         category: HostApiCategory::RealtimeHook,
-        params: &["handler:fn(event)->outcome"],
+        params: &["handler:fn(event:normalized_v2)->outcome"],
         returns: "void",
         status: HostApiStatus::Shipped,
-        since: "unreleased",
+        since: "IMPL-20260820-AUTH-MATCH-SCOPED-DELIVERY",
     },
     HostApiFn {
         name: "on_join",

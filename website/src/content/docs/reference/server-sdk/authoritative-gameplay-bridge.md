@@ -28,11 +28,12 @@ loaded script. For those matches:
 - Transform input, `KIND_NA_STATE`, `KIND_NA_PRESENCE`, and `KIND_REP_DELTA`
   route through `on_input`; the direct apply paths are unreachable.
 - A player-slot grant is refused inside a bound match (the script owns spawns).
-- Custom message kinds and `KIND_POSITION` are **not** relayed inside a bound
-  match. The legacy `on_message` relay path is closed there, so a script cannot
-  reach `move_actor`/`set_transform` or an unscoped cross-room send outside the
-  validator. Delivering custom kinds through the fenced batch (the `message`
-  event) is planned; until then such frames are dropped fail-closed.
+- Custom message kinds are **not** relayed inside a bound match. They are
+  delivered as protocol-v2 `message` events through the same fenced `on_input`
+  batch as protected input. Reserved kinds, including `KIND_POSITION`, stay
+  closed on this path. The legacy `on_message` relay path stays closed there, so
+  a script cannot reach `move_actor`/`set_transform` or an unscoped cross-room
+  send outside the validator.
 
 When `require_script = false` (the default unzip-and-run mode) there is **no
 bridge**: the built-in relay applies owner state, integrates input, and fans out
@@ -79,18 +80,22 @@ once for every normalized event in a delivered batch. Each event carries a stabl
 | `actor_state` | `object_id`, `transform` |
 | `replicated_var` | `object_id`, `class_id`, `result_id`, `field_count` |
 | `spawn_request` | `archetype_id`, `transform` |
+| `message` | `message_kind`, bounded opaque `body`, `reliable`, `sequence?` |
 
 Every event also carries `event_id`, `participant`, `user_id` (absent for
 guests), `match_id`, and `tick`. Vectors are `{x, y, z}` tables in Lua and
 `[x, y, z]` arrays in JavaScript and Python.
 
-:::caution[Planned, not yet delivered]
-Only `transform_input`, `actor_state`, `replicated_var`, and `spawn_request`
-are ever produced today. The `message`, `join`, and `leave` events are defined
-in the protocol and marshaled across all three runtimes, but the gateway does
-not yet emit them, so `on_input` never receives them. Routing custom message
-kinds and participant join/leave through the fenced batch is planned — do not
-build logic on `message`/`join`/`leave` yet.
+:::note[Generic custom messages]
+Bridge protocol version 2 emits `message` for otherwise-unhandled client
+envelopes in a bound authoritative match. `message_kind` is the wire kind and
+`body` is opaque bytes capped at 64 KiB before the runtime is entered.
+`reliable` reports the native ingress path. `sequence` is optional and appears
+only when that path exposes a stable application sequence; do not infer a
+sequence from `event_id`. The server derives match membership and binding, then
+issues the usual generation, clock-epoch, tick, and batch fences before calling
+`on_input`. A non-member, stale binding, cross-match, or oversized message is
+dropped before runtime execution. `join` and `leave` remain planned.
 :::
 
 ## Decisions

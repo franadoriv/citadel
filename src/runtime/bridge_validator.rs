@@ -571,6 +571,20 @@ fn validate_correction(
             event_id: event.event_id,
         });
     }
+    let object_id = match &event.payload {
+        NormalizedPayload::TransformInput { object_id, .. }
+        | NormalizedPayload::ActorStateReport { object_id, .. }
+        | NormalizedPayload::ReplicatedVarWrite { object_id, .. } => Some(*object_id),
+        NormalizedPayload::SpawnRequest { .. }
+        | NormalizedPayload::MatchMessage { .. }
+        | NormalizedPayload::ParticipantJoined
+        | NormalizedPayload::ParticipantLeft => None,
+    };
+    if let Some(object_id) = object_id
+        && !context.object_in_match(object_id)
+    {
+        return Err(BatchRejection::ObjectNotInMatch { object_id });
+    }
     // A replicated correction must stay within the field bounds of the event's
     // own object (script values are exact).
     if let (

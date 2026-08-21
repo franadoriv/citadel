@@ -75,11 +75,12 @@ use crate::realtime::transform::TransformHub;
 use crate::runtime::{
     BridgeCommandSink, BridgeMatchContext, BridgeQuotas, BridgeRepField, BridgeRepValue,
     BridgeTransform, Capability, Correction, Decision, EventDraft, FireIntent, GameScriptReadiness,
-    LifecycleHook, NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext,
-    NativeMatchLifecycleHook, NativeMatchLifecycleUnavailable, NormalizedEventBatch,
-    NormalizedPayload, OutboundCommand, PendingBatchLedger, RealtimeAfterOutcome,
-    RealtimeInterception, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
-    ScriptCommand, ScriptCommandBatch, ValidatedBatch, ValidatedOutcome,
+    LifecycleHook, MAX_MATCH_MESSAGE_BODY_BYTES, MAX_RESERVED_KIND,
+    NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext, NativeMatchLifecycleHook,
+    NativeMatchLifecycleUnavailable, NormalizedEventBatch, NormalizedPayload, OutboundCommand,
+    PendingBatchLedger, RealtimeAfterOutcome, RealtimeInterception, RpcOutcome, Runtime,
+    SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding, ScriptCommand, ScriptCommandBatch, ValidatedBatch,
+    ValidatedOutcome,
 };
 use crate::services::party_directory::{
     PartyOwnerResolution, PartyQueueFreeze, StoragePartyDirectory,
@@ -115,6 +116,44 @@ pub(crate) const REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE: &str =
 const CHAT_TYPING_TTL_MS: u64 = 5_000;
 const PARTY_OWNER_LEASE_MS: u64 = 15_000;
 const PARTY_PRESENCE_LEASE_MS: u64 = 15_000;
+
+/// Native ingress metadata supplied to the authoritative bridge for a generic
+/// custom client message. Sequence is optional because framing transports do not
+/// all expose a stable application sequence; callers must never fabricate one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundMessageMetadata {
+    /// Whether this envelope arrived on a reliable path.
+    pub reliable: bool,
+    /// Native ingress sequence when the transport provides one.
+    pub sequence: Option<u64>,
+}
+
+impl InboundMessageMetadata {
+    /// Metadata for a reliable, ordered ingress path without an exposed
+    /// application sequence.
+    #[must_use]
+    pub const fn reliable() -> Self {
+        Self {
+            reliable: true,
+            sequence: None,
+        }
+    }
+
+    /// Metadata for an unreliable ingress path, which exposes no sequence.
+    #[must_use]
+    pub const fn unreliable() -> Self {
+        Self {
+            reliable: false,
+            sequence: None,
+        }
+    }
+}
+
+impl Default for InboundMessageMetadata {
+    fn default() -> Self {
+        Self::reliable()
+    }
+}
 
 /// Native result for a secure FLUSH. Unlike the legacy base lifecycle result,
 /// this carries a distinct redacted grant for every realtime participant so a
@@ -4735,6 +4774,18 @@ impl Gateway {
     /// each relayed copy counts as one outbound message so the `messages_*`
     /// gauges track real relay traffic.
     pub fn handle_inbound(&self, sender: ParticipantId, env: &Envelope) -> usize {
+        self.handle_inbound_with_metadata(sender, env, InboundMessageMetadata::default())
+    }
+
+    /// Handle an inbound envelope with native transport metadata. The metadata
+    /// is used only for the versioned custom-message bridge event; all legacy
+    /// routes keep their existing envelope-only behavior.
+    pub fn handle_inbound_with_metadata(
+        &self,
+        sender: ParticipantId,
+        env: &Envelope,
+        metadata: InboundMessageMetadata,
+    ) -> usize {
         // The controller is the first application boundary after transport
         // framing. Once close linearizes, no late buffered frame may reach
         // runtime/domain handling or update inbound metrics.
@@ -4768,6 +4819,21 @@ impl Gateway {
         let user_id = self.registry.user_id_of(sender);
         let room_id = self.rooms.room_of(sender);
         let runtime = self.runtime.as_deref();
+        // Generic custom traffic in a bound match must not traverse a global
+        // runtime interceptor before membership/binding validation. The native
+        // bridge is its first script boundary; protected/reserved kinds retain
+        // their dedicated native routes below.
+        if let Some((authoritative_room, binding)) = self.authoritative_match(sender)
+            && env.kind > MAX_RESERVED_KIND
+        {
+            return self.route_bridge_match_message(
+                sender,
+                env,
+                authoritative_room,
+                &binding,
+                metadata,
+            );
+        }
         if let Some(runtime) = runtime
             && runtime.before_realtime(
                 sender.get(),
@@ -4806,22 +4872,22 @@ impl Gateway {
             self.handle_room(sender, env)
         } else if env.kind == KIND_REP_DELTA || env.kind == KIND_REP_ACK {
             self.handle_rep_frame(sender, env)
-        } else if self.authoritative_match(sender).is_some() {
-            // Owner decision 3: no relay/passthrough to mutation or replication
-            // inside an authoritative match. Unreserved kinds (custom kinds and
-            // `KIND_POSITION`) would otherwise route to the legacy
-            // `dispatch`/`apply_commands_scoped` path, where a script
-            // `on_message` can reach `set_transform` and unscoped cross-room
-            // sends — bypassing the bridge validator for a whole traffic class.
-            // Fenced delivery of custom message kinds (the `message` event) is a
-            // planned follow-up; until it lands these frames are dropped
-            // fail-closed rather than applied outside the validator.
-            tracing::debug!(
-                %sender,
-                kind = env.kind,
-                "gateway dropped an unreserved-kind frame on the legacy path inside an authoritative match"
-            );
-            0
+        } else if let Some((room_id, binding)) = self.authoritative_match(sender) {
+            // Custom envelopes inside a bound match never reach legacy
+            // on_message. The server-derived room/binding and the ledger's
+            // clock/tick fences are installed before on_input runs; a stale,
+            // moved, non-member, oversized, or otherwise foreign frame is
+            // dropped before runtime invocation.
+            if env.kind <= MAX_RESERVED_KIND {
+                tracing::debug!(
+                    %sender,
+                    kind = env.kind,
+                    "gateway dropped reserved frame on the custom-message bridge path"
+                );
+                0
+            } else {
+                self.route_bridge_match_message(sender, env, room_id, &binding, metadata)
+            }
         } else if let Some(runtime) = runtime {
             let user_id = self.registry.user_id_of(sender);
             let commands = match room_id {
@@ -6852,6 +6918,14 @@ impl Gateway {
         let Some(reg) = hub.register_presence(sender.get(), archetype_id, transform) else {
             return 0;
         };
+        if self.bridge.is_some()
+            && sender_room.is_some_and(|room_id| self.rooms.binding(room_id).is_some())
+        {
+            // A bridge-admitted presence is a server-owned match fact. Bind its
+            // object before a synchronous script answer can target or correct it.
+            // Direct/legacy presence keeps its existing node-global behavior.
+            hub.set_object_room(reg.object_id, sender_room);
+        }
         tracing::info!(
             participant = sender.get(),
             object_id = reg.object_id,
@@ -8324,16 +8398,11 @@ impl BridgeMatchContext for GatewayBridgeContext<'_> {
     }
 
     fn object_in_match(&self, object_id: u32) -> bool {
-        // v1: the transform world is node-global, so an object "belongs to the
-        // match" if the world knows it at all. Per-room object binding (spec
-        // F29/F33) tightens this in the structural-stage follow-up; until then
-        // scope for messaging is enforced exactly (is_member), and object scope
-        // is this coarse existence check.
         self.gateway
             .transform
             .as_ref()
-            .and_then(|hub| hub.get_transform(object_id))
-            .is_some()
+            .and_then(|hub| hub.object_room(object_id))
+            == Some(self.room_id)
     }
 
     fn rep_value_in_bounds(&self, object_id: u32, field_id: u16, value: &BridgeRepValue) -> bool {
@@ -8379,12 +8448,49 @@ impl Gateway {
         drafts: Vec<EventDraft>,
     ) {
         let scope = self.lock_room_scope();
-        if self.rooms.room_of(sender) != Some(room_id) {
+        if self.rooms.room_of(sender) != Some(room_id)
+            || self.rooms.binding(room_id).as_ref() != Some(binding)
+        {
             return;
         }
         let batch = self.issue_bridge_batch(room_id, binding, drafts);
         drop(scope);
         if let (Some(batch), Some(runtime)) = (batch, &self.runtime) {
+            runtime.deliver_event_batch(batch);
+        }
+    }
+
+    /// Bind bridge-ingress objects and issue their normalized event batch at one
+    /// room-scope linearization point. The server-owned membership and current
+    /// room script binding are rechecked before any `object_rooms` write, so a
+    /// frame captured before a move or reload cannot leave a stale room binding
+    /// behind even though its runtime delivery is asynchronous.
+    fn bind_bridge_objects_and_deliver_for_member(
+        &self,
+        sender: ParticipantId,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+        object_ids: &[u32],
+        drafts: Vec<EventDraft>,
+    ) {
+        let batch = {
+            let _scope = self.lock_room_scope();
+            if self.rooms.room_of(sender) != Some(room_id)
+                || self.rooms.binding(room_id).as_ref() != Some(binding)
+            {
+                return;
+            }
+            let Some(batch) = self.issue_bridge_batch(room_id, binding, drafts) else {
+                return;
+            };
+            if let Some(hub) = &self.transform {
+                for &object_id in object_ids {
+                    hub.set_object_room(object_id, Some(room_id));
+                }
+            }
+            batch
+        };
+        if let Some(runtime) = &self.runtime {
             runtime.deliver_event_batch(batch);
         }
     }
@@ -8421,6 +8527,43 @@ impl Gateway {
             ledger.set_clock_epoch(clock_epoch);
         }
         Some(ledger.issue(drafts, tick))
+    }
+
+    /// Structural stage for a generic custom envelope in an authoritative
+    /// match. The room and script binding came only from server registries;
+    /// membership and the current binding are rechecked under the room gate
+    /// before a bounded opaque payload can reach on_input. Ledger issue then
+    /// supplies the version/generation/clock/tick/batch fences.
+    fn route_bridge_match_message(
+        &self,
+        sender: ParticipantId,
+        env: &Envelope,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+        metadata: InboundMessageMetadata,
+    ) -> usize {
+        if env.body.len() > MAX_MATCH_MESSAGE_BODY_BYTES {
+            tracing::debug!(
+                %sender,
+                kind = env.kind,
+                bytes = env.body.len(),
+                max_bytes = MAX_MATCH_MESSAGE_BODY_BYTES,
+                "bridge dropped oversized custom client message before runtime"
+            );
+            return 0;
+        }
+        let draft = EventDraft {
+            participant: sender.get(),
+            user_id: self.registry.user_id_of(sender),
+            payload: NormalizedPayload::MatchMessage {
+                kind: env.kind,
+                body: env.body.to_vec(),
+                reliable: metadata.reliable,
+                sequence: metadata.sequence,
+            },
+        };
+        self.deliver_bridge_batch_for_member(sender, room_id, binding, vec![draft]);
+        0
     }
 
     /// Structural stage for an authoritative `KIND_REP_DELTA`: run the rep
@@ -8534,7 +8677,13 @@ impl Gateway {
                 transform: transform.into(),
             },
         };
-        self.deliver_bridge_batch_for_member(sender, room_id, binding, vec![draft]);
+        self.bind_bridge_objects_and_deliver_for_member(
+            sender,
+            room_id,
+            binding,
+            &[state.object_id],
+            vec![draft],
+        );
         0
     }
 
@@ -8587,6 +8736,7 @@ impl Gateway {
         };
         let user_id = self.registry.user_id_of(sender);
         let mut drafts = Vec::new();
+        let mut object_ids = Vec::new();
         for frame in frames {
             // Structural: only the owner's own object at the right epoch, with a
             // finite movement intent, becomes an event.
@@ -8596,6 +8746,7 @@ impl Gateway {
             if frame.move_velocity.iter().any(|v| !v.is_finite()) || !frame.dt.is_finite() {
                 continue;
             }
+            object_ids.push(frame.object_id);
             drafts.push(EventDraft {
                 participant: sender.get(),
                 user_id: user_id.clone(),
@@ -8618,7 +8769,13 @@ impl Gateway {
         if drafts.is_empty() {
             return 0;
         }
-        self.deliver_bridge_batch_for_member(sender, room_id, binding, drafts);
+        self.bind_bridge_objects_and_deliver_for_member(
+            sender,
+            room_id,
+            binding,
+            &object_ids,
+            drafts,
+        );
         0
     }
 
@@ -11036,6 +11193,15 @@ mod transform_tests {
     /// bind it into an authoritative room. Returns the participant and its
     /// owned object id.
     fn authoritative_member(gw: &Arc<Gateway>) -> (ParticipantId, u32, TestOutboundReceiver) {
+        authoritative_member_in(gw, "arena")
+    }
+
+    /// Like [`authoritative_member`], but bind to a selected authoritative room
+    /// so tests exercise two concurrent match scopes.
+    fn authoritative_member_in(
+        gw: &Arc<Gateway>,
+        room_name: &str,
+    ) -> (ParticipantId, u32, TestOutboundReceiver) {
         use citadel_wire::na::{NaPresence, NaTransform};
         let (p, rp) = register(gw);
         gw.handle_inbound(
@@ -11059,7 +11225,9 @@ mod transform_tests {
             generation: 1,
         };
         gw.rooms()
-            .join_or_create_bound(p, "arena", Some(binding), || RoomLabel::with_map("arena"))
+            .join_or_create_bound(p, room_name, Some(binding), || {
+                RoomLabel::with_map(room_name)
+            })
             .expect("bound room");
         (p, object_id, rp)
     }
@@ -11077,6 +11245,89 @@ mod transform_tests {
             }
             .encode(),
         )
+    }
+
+    #[test]
+    fn bridge_rejects_foreign_room_objects_for_commands_and_corrections() {
+        let recorder = Arc::new(AuthoritativeDecisionRecorder::new(8));
+        let hub = Arc::new(TransformHub::new(TransformHubConfig::default()).expect("hub"));
+        let gateway = Gateway::new()
+            .with_authoritative_decision_recorder(Arc::clone(&recorder))
+            .with_transform_hub(Arc::clone(&hub))
+            .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new());
+        let room_a = gateway
+            .create_room(RoomLabel::with_map("command-room-a"))
+            .expect("room A");
+        let room_b = gateway
+            .create_room(RoomLabel::with_map("command-room-b"))
+            .expect("room B");
+        let foreign_object = 91;
+        hub.spawn_server_simulated(foreign_object, TransformState::at([3.0, 0.0, 0.0]));
+        hub.set_object_room(foreign_object, Some(room_b));
+
+        let issue = |event_id| {
+            gateway
+                .bridge
+                .as_ref()
+                .expect("bridge")
+                .ledgers
+                .lock()
+                .expect("ledger lock")
+                .entry(room_a)
+                .or_insert_with(|| PendingBatchLedger::new(room_a, 1, 1))
+                .issue(
+                    vec![EventDraft::guest(
+                        event_id,
+                        NormalizedPayload::ActorStateReport {
+                            object_id: foreign_object,
+                            transform: BridgeTransform::identity(),
+                        },
+                    )],
+                    1,
+                )
+        };
+
+        let command_batch = issue(1);
+        let mut command_answer = ScriptCommandBatch::answering(&command_batch);
+        command_answer.input_outcomes = vec![crate::runtime::InputOutcome {
+            event_id: command_batch.events[0].event_id,
+            decision: Decision::Accept,
+            reply: None,
+        }];
+        command_answer.commands = vec![ScriptCommand::ApplyTransform {
+            object_id: foreign_object,
+            transform: BridgeTransform {
+                position: [100.0, 0.0, 0.0],
+                ..BridgeTransform::identity()
+            },
+        }];
+        gateway.deliver_command_batch(command_answer);
+
+        let correction_batch = issue(2);
+        let mut correction_answer = ScriptCommandBatch::answering(&correction_batch);
+        correction_answer.input_outcomes = vec![crate::runtime::InputOutcome {
+            event_id: correction_batch.events[0].event_id,
+            decision: Decision::Correct {
+                correction: Correction::Transform(BridgeTransform {
+                    position: [200.0, 0.0, 0.0],
+                    ..BridgeTransform::identity()
+                }),
+            },
+            reply: None,
+        }];
+        gateway.deliver_command_batch(correction_answer);
+
+        assert!(
+            recorder.records().is_empty(),
+            "foreign room commands and corrections must fail validation atomically"
+        );
+        assert_eq!(
+            hub.get_transform(foreign_object)
+                .expect("foreign object remains live")
+                .position,
+            [3.0, 0.0, 0.0],
+            "a room A answer cannot mutate room B's bound object"
+        );
     }
 
     #[tokio::test]
@@ -11455,6 +11706,104 @@ mod transform_tests {
         );
     }
 
+    #[tokio::test]
+    async fn authoritative_custom_message_reaches_only_its_match_as_a_fenced_input() {
+        // Two concurrent bound matches prove that a generic client message is
+        // normalized through on_input and cannot fan out across the room boundary.
+        let (gw, _hub) = authoritative_gateway(
+            r#"citadel.on_input(function(event)
+                if event.kind == "message" then
+                    assert(event.message_kind == 401)
+                    assert(event.reliable == true)
+                    assert(event.sequence == nil)
+                    citadel.broadcast(402, event.body, false)
+                end
+                return nil
+            end)"#,
+        );
+        let (a, _a_object, mut a_rx) = authoritative_member_in(&gw, "match-a");
+        let (_a_peer, _a_peer_object, mut a_peer_rx) = authoritative_member_in(&gw, "match-a");
+        let (_b, _b_object, mut b_rx) = authoritative_member_in(&gw, "match-b");
+        while a_rx.try_recv().is_ok() {}
+        while a_peer_rx.try_recv().is_ok() {}
+        while b_rx.try_recv().is_ok() {}
+
+        gw.handle_inbound(a, &Envelope::new(401, b"opaque\0body".to_vec()));
+
+        let sender_delivery = a_rx.try_recv().expect("sender receives scoped command");
+        assert_eq!(sender_delivery.envelope.kind, 402);
+        assert_eq!(sender_delivery.envelope.body.as_ref(), b"opaque\0body");
+        assert_eq!(sender_delivery.delivery, Delivery::Reliable);
+        let peer_delivery = a_peer_rx
+            .try_recv()
+            .expect("same-match peer receives command");
+        assert_eq!(peer_delivery.envelope.kind, 402);
+        assert_eq!(peer_delivery.envelope.body.as_ref(), b"opaque\0body");
+        assert!(
+            b_rx.try_recv().is_err(),
+            "a bound match's custom input and returned command cannot cross to another match"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_custom_message_from_non_member_never_reaches_on_input() {
+        // This uses the gateway's structural entry point with an attacker-owned
+        // participant and a server-owned target room. The public inbound route
+        // cannot provide that target room, which is exactly why this assertion
+        // proves a forged cross-match target is rejected before runtime.
+        let (gw, _hub) = authoritative_gateway(
+            r#"citadel.on_input(function(event)
+                if event.kind == "message" then citadel.broadcast(403, event.body, false) end
+                return nil
+            end)"#,
+        );
+        let (member, _object, mut member_rx) = authoritative_member_in(&gw, "match-a");
+        let (outsider, mut outsider_rx) = register(&gw);
+        while member_rx.try_recv().is_ok() {}
+        while outsider_rx.try_recv().is_ok() {}
+        let room_id = gw.rooms().room_of(member).expect("member room");
+        let binding = gw.rooms().binding(room_id).expect("bound room");
+
+        gw.route_bridge_match_message(
+            outsider,
+            &Envelope::new(401, b"forged-target".to_vec()),
+            room_id,
+            &binding,
+            InboundMessageMetadata::reliable(),
+        );
+
+        assert!(
+            member_rx.try_recv().is_err(),
+            "non-member input never invokes the script"
+        );
+        assert!(
+            outsider_rx.try_recv().is_err(),
+            "non-member receives no authoritative output"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_custom_message_over_limit_is_dropped_before_runtime() {
+        let (gw, _hub) = authoritative_gateway(
+            r#"citadel.on_input(function(event)
+                if event.kind == "message" then citadel.broadcast(404, event.body, false) end
+                return nil
+            end)"#,
+        );
+        let (member, _object, mut member_rx) = authoritative_member_in(&gw, "match-a");
+        while member_rx.try_recv().is_ok() {}
+
+        gw.handle_inbound(
+            member,
+            &Envelope::new(401, vec![0; MAX_MATCH_MESSAGE_BODY_BYTES + 1]),
+        );
+
+        assert!(
+            member_rx.try_recv().is_err(),
+            "an oversized opaque body is rejected before on_input can emit commands"
+        );
+    }
+
     // ---- authoritative bridge: KIND_TSYNC_INPUT flows through the validator ----
 
     fn authoritative_gateway_slots(
@@ -11578,6 +11927,93 @@ mod transform_tests {
             hub.get_transform(object_id).expect("object").position,
             start,
             "the old-room input cannot become transform state in B"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_bridge_input_after_a_move_cannot_restore_the_old_room_binding() {
+        let (gw, hub) = authoritative_gateway_slots("-- deferred validator", 1);
+        let (participant, object_id, ownership_epoch) = authoritative_slot_member(&gw).await;
+        let room_a = gw.rooms().room_of(participant).expect("member starts in A");
+        let binding_a = gw.rooms().binding(room_a).expect("A binding");
+        let (room_b, _) = gw
+            .join_or_create_room_bound(participant, "B", Some(binding_a.clone()), || {
+                RoomLabel::with_map("B")
+            })
+            .expect("trusted bound move to B");
+        let binding_b = gw.rooms().binding(room_b).expect("B binding");
+        let frame = citadel_wire::tsync::InputFrame {
+            input_seq: 1,
+            sim_tick: 0,
+            dt: 0.1,
+            object_id,
+            ownership_epoch,
+            move_velocity: [100.0, 0.0, 0.0],
+            payload: Vec::new(),
+            fire: None,
+        };
+
+        gw.route_bridge_input(
+            participant,
+            std::slice::from_ref(&frame),
+            room_b,
+            &binding_b,
+        );
+        assert_eq!(hub.object_room(object_id), Some(room_b));
+        gw.route_bridge_input(participant, &[frame], room_a, &binding_a);
+
+        assert_eq!(
+            hub.object_room(object_id),
+            Some(room_b),
+            "an ingress frame captured before a move cannot restore its old room binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_bridge_na_state_after_a_move_cannot_restore_the_old_room_binding() {
+        let (gw, hub) = authoritative_gateway("-- deferred validator");
+        let (participant, object_id, _receiver) = authoritative_member(&gw);
+        let room_a = gw.rooms().room_of(participant).expect("member starts in A");
+        let binding_a = gw.rooms().binding(room_a).expect("A binding");
+        let (room_b, _) = gw
+            .join_or_create_room_bound(participant, "B", Some(binding_a.clone()), || {
+                RoomLabel::with_map("B")
+            })
+            .expect("trusted bound move to B");
+        let binding_b = gw.rooms().binding(room_b).expect("B binding");
+        let state = na_state_frame(object_id, 5.0);
+
+        gw.route_bridge_na_state(participant, &state, room_b, &binding_b);
+        assert_eq!(hub.object_room(object_id), Some(room_b));
+        gw.route_bridge_na_state(participant, &state, room_a, &binding_a);
+
+        assert_eq!(
+            hub.object_room(object_id),
+            Some(room_b),
+            "an ingress report captured before a move cannot restore its old room binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_bridge_na_state_binding_after_a_reload_cannot_bind_an_object() {
+        let (gw, hub) = authoritative_gateway("-- deferred validator");
+        let (participant, object_id, _receiver) = authoritative_member(&gw);
+        let room_id = gw.rooms().room_of(participant).expect("member room");
+        let mut stale_binding = gw.rooms().binding(room_id).expect("room binding");
+        stale_binding.generation += 1;
+        hub.set_object_room(object_id, None);
+
+        gw.route_bridge_na_state(
+            participant,
+            &na_state_frame(object_id, 5.0),
+            room_id,
+            &stale_binding,
+        );
+
+        assert_eq!(
+            hub.object_room(object_id),
+            None,
+            "a report fenced to a superseded script binding cannot write object_rooms"
         );
     }
 

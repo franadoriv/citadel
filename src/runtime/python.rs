@@ -2228,6 +2228,7 @@ impl PythonRuntime {
     /// `on_input` handler is registered or the invocation errors, times out, or
     /// panics.
     pub fn evaluate_event_batch(&self, batch: &NormalizedEventBatch) -> Option<ScriptCommandBatch> {
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(batch.match_id));
         let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Python::attach(
@@ -3844,6 +3845,53 @@ def lifecycle(context):
         let mut batch = NormalizedEventBatch::new(5, 42, 9, 100, 1);
         batch.events = events;
         batch
+    }
+
+    #[test]
+    fn on_input_telemetry_uses_batch_match_and_restores_prior_scope_after_error() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            "import citadel\ndef h(e):\n    citadel.telemetry.begin()\n    citadel.telemetry.mark(\"match.input\")\n    citadel.telemetry.finish()\n    raise RuntimeError(\"boom\")\ncitadel.on_input(h)\n",
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+        slices
+            .begin(
+                crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41),
+                SystemClock.now().unix_millis(),
+            )
+            .expect("prior match slice begins");
+        let _prior_scope = RuntimeScopeGuard::enter(Some(41));
+
+        assert!(
+            runtime
+                .evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        assert!(
+            slices
+                .finish(
+                    crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41),
+                    SystemClock.now().unix_millis(),
+                )
+                .is_ok(),
+            "the batch must not close the pre-existing match's telemetry slice"
+        );
+        assert!(
+            slices
+                .list_closed(2)
+                .iter()
+                .any(|report| report.marker_total == 1),
+            "the failing batch still closes its own telemetry slice"
+        );
     }
 
     #[test]
