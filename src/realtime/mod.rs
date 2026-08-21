@@ -29,8 +29,8 @@ pub use diagnostics::{
     LagCaptureParticipantStatus, LagCaptureStart, LagCaptureStatus,
 };
 pub use gateway::{
-    DomainRpcServices, Gateway, Handshake, KIND_AUTH, KIND_AUTH_RESULT, KIND_PEER_POSITION,
-    KIND_POSITION, shared,
+    DomainRpcServices, Gateway, Handshake, InboundMessageMetadata, KIND_AUTH, KIND_AUTH_RESULT,
+    KIND_PEER_POSITION, KIND_POSITION, shared,
 };
 pub use identity::{IdentityLifecycle, Presence, PresenceState, ResumeResult, ResumeSecret};
 pub use registry::{

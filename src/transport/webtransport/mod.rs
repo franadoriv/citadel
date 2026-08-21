@@ -428,7 +428,11 @@ fn route_datagram(
     match decode_datagram(bytes) {
         Ok(env) => {
             metrics.envelope_received();
-            gateway.handle_inbound(session_id, &env);
+            gateway.handle_inbound_with_metadata(
+                session_id,
+                &env,
+                crate::realtime::InboundMessageMetadata::unreliable(),
+            );
         }
         Err(error) => {
             metrics.decode_error();
@@ -480,7 +484,11 @@ where
     }
     before_handoff();
     metrics.envelope_received();
-    gateway.handle_inbound(session_id, env);
+    gateway.handle_inbound_with_metadata(
+        session_id,
+        env,
+        crate::realtime::InboundMessageMetadata::reliable(),
+    );
     true
 }
 
@@ -590,7 +598,11 @@ where
         return Ok(false);
     };
     metrics.envelope_received();
-    gateway.handle_inbound(session_id, &env);
+    gateway.handle_inbound_with_metadata(
+        session_id,
+        &env,
+        crate::realtime::InboundMessageMetadata::reliable(),
+    );
     Ok(true)
 }
 

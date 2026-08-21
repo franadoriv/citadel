@@ -570,7 +570,11 @@ fn route_envelope(
         return false;
     }
     metrics.envelope_received();
-    gateway.handle_inbound(session_id, env);
+    gateway.handle_inbound_with_metadata(
+        session_id,
+        env,
+        crate::realtime::InboundMessageMetadata::reliable(),
+    );
     true
 }
 
@@ -601,7 +605,11 @@ fn route_framed_envelope(
         return Ok(false);
     };
     metrics.envelope_received();
-    gateway.handle_inbound(session_id, &env);
+    gateway.handle_inbound_with_metadata(
+        session_id,
+        &env,
+        crate::realtime::InboundMessageMetadata::reliable(),
+    );
     Ok(true)
 }
 

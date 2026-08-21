@@ -12,8 +12,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::bridge_protocol::NormalizedEventBatch;
 use super::engine_host::MatchSchedulerPolicy;
 use super::engine_host::{EngineHost, HostOpenError, HostOutput, MatchEngine, MatchInvocation};
+use super::external_worker::BRIDGE_EVENT_MARKER_KIND;
 use super::worker_data_protocol::{
     DATA_PROTOCOL_VERSION, DataFrame, DataPlaneRx, EngineReport, FrameHeader, MatchCloseReason,
     RxCounters, WORKER_SCOPE_MATCH_ID, encode_commands,
@@ -91,6 +93,17 @@ impl EngineLoop {
                 tracing::warn!("worker dropped a worker-scoped frame received from the gateway");
                 return Vec::new();
             }
+        }
+        // A bridge-marked event body is a versioned data-plane batch, never a
+        // legacy opaque invocation. Decode it before it can consume a sequence
+        // or reach the worker engine; an incompatible bridge revision must not
+        // be reinterpreted as a legacy message.
+        if let DataFrame::MatchEvent { kind, body, .. } = &frame
+            && *kind == BRIDGE_EVENT_MARKER_KIND
+            && let Err(error) = NormalizedEventBatch::decode(body)
+        {
+            tracing::warn!(?error, "worker dropped an incompatible bridge event batch");
+            return Vec::new();
         }
         let header = frame.header();
         if matches!(frame, DataFrame::MatchOpen { .. }) {
@@ -577,6 +590,34 @@ mod tests {
         assert_eq!(counters.unknown_match, 1);
         assert_eq!(counters.replayed_seq, 1);
         // Exactly one accepted event reached the match.
+        let frames = engine_loop.run_round(Duration::from_millis(16));
+        assert_eq!(sent_bodies(&frames, 1), vec![b"1".to_vec()]);
+    }
+
+    #[test]
+    fn incompatible_bridge_event_does_not_consume_a_legacy_event_sequence() {
+        let mut engine_loop = echo_loop(5);
+        engine_loop.handle_frame(open(1, 5, 1));
+        let mut incompatible = crate::runtime::NormalizedEventBatch::new(1, 1, 0, 0, 1);
+        incompatible.protocol_version = crate::runtime::GS_BRIDGE_PROTOCOL_VERSION - 1;
+        engine_loop.handle_frame(DataFrame::MatchEvent {
+            protocol_version: DATA_PROTOCOL_VERSION,
+            header: FrameHeader {
+                match_id: 1,
+                epoch: 5,
+                seq: 2,
+            },
+            sender: 0,
+            user_id: None,
+            kind: super::super::external_worker::BRIDGE_EVENT_MARKER_KIND,
+            body: incompatible
+                .encode()
+                .expect("encode incompatible bridge batch"),
+        });
+
+        // The incompatible bridge frame was dropped before receive-sequence
+        // accounting, so an ordinary event at the same sequence still arrives.
+        engine_loop.handle_frame(event(1, 5, 2));
         let frames = engine_loop.run_round(Duration::from_millis(16));
         assert_eq!(sent_bodies(&frames, 1), vec![b"1".to_vec()]);
     }
