@@ -23,7 +23,7 @@
 pub mod tls;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -309,7 +309,7 @@ async fn handle_connection(
             tracing::error!(conn = %id, %session_id, error = %error, "failed to issue diagnostics server-time offer")
         }
     }
-    let unreliable = gateway.register_session_with_initials(
+    let registration = gateway.register_session_with_initials_at(
         SessionHandle {
             id: session_id,
             kind: TransportKind::Quic,
@@ -317,7 +317,22 @@ async fn handle_connection(
             identity,
         },
         initials,
+        SystemClock.now(),
     );
+    let unreliable = registration.unreliable;
+    let superseded = registration.superseded;
+    let supersession_gate = registration.supersession_gate;
+    let transport_write_gate = registration.transport_write_gate;
+    let superseding = registration.superseding;
+    let replaced_cleanup = registration.replaced_cleanup;
+    let inbound_supersession_drained = registration.inbound_supersession_drained;
+    if let Some(cleanup) = replaced_cleanup {
+        let cleanup_gateway = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            cleanup.wait_for_inbound_drain().await;
+            cleanup_gateway.unregister_session(cleanup.participant_id());
+        });
+    }
     if !gateway.accepts_work(session_id) {
         gateway.abandon_diagnostics_session(session_id);
         connection.close(0u32.into(), b"session revoked");
@@ -332,45 +347,106 @@ async fn handle_connection(
 
     // Replay the first frame for a legacy client, then any queued frames.
     if handshake.replay_first {
-        metrics.envelope_received();
-        gateway.handle_inbound(session_id, first);
+        if !route_envelope(
+            session_id,
+            first,
+            &metrics,
+            &gateway,
+            &superseded,
+            &superseding,
+            &supersession_gate,
+        ) {
+            connection.close(0u32.into(), b"session replaced");
+            if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+                inbound_supersession_drained.cancelled().await;
+            }
+            gateway.unregister_session(session_id);
+            metrics.connection_closed();
+            gateway.connection_closed();
+            return Ok(());
+        }
     }
     for env in queued {
-        metrics.envelope_received();
-        gateway.handle_inbound(session_id, env);
+        if !route_envelope(
+            session_id,
+            env,
+            &metrics,
+            &gateway,
+            &superseded,
+            &superseding,
+            &supersession_gate,
+        ) {
+            connection.close(0u32.into(), b"session replaced");
+            if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+                inbound_supersession_drained.cancelled().await;
+            }
+            gateway.unregister_session(session_id);
+            metrics.connection_closed();
+            gateway.connection_closed();
+            return Ok(());
+        }
     }
 
     // Outbound write task: drains the gateway-fed channel to the socket.
     let write_conn = connection.clone();
     let write_metrics = metrics.clone();
     let write_cancel = cancel.clone();
+    let write_superseded = superseded.clone();
+    let write_gate = Arc::clone(&transport_write_gate);
+    let write_superseding = Arc::clone(&superseding);
     let writer = tokio::spawn(async move {
-        outbound_writer(write_conn, rx, unreliable, write_metrics, write_cancel).await;
+        outbound_writer(
+            write_conn,
+            rx,
+            unreliable,
+            write_metrics,
+            write_cancel,
+            write_superseded,
+            write_gate,
+            write_superseding,
+        )
+        .await;
     });
 
     // Inbound: datagrams + accepted bi/uni streams routed to the gateway.
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
+            () = superseded.cancelled() => {
+                connection.close(0u32.into(), b"session replaced");
+                break;
+            }
             datagram = connection.read_datagram() => {
                 match datagram {
-                    Ok(bytes) => match decode_datagram(&bytes) {
-                        Ok(env) => {
-                            metrics.envelope_received();
-                            gateway.handle_inbound(session_id, &env);
+                    Ok(bytes) => {
+                        if !route_datagram(
+                            session_id,
+                            &bytes,
+                            &metrics,
+                            &gateway,
+                            &superseded,
+                            &superseding,
+                            &supersession_gate,
+                        ) {
+                            connection.close(0u32.into(), b"session replaced");
+                            break;
                         }
-                        Err(e) => {
-                            metrics.decode_error();
-                            tracing::debug!(conn = %id, error = %e, "bad datagram");
-                        }
-                    },
+                    }
                     Err(_) => break, // connection closed
                 }
             }
             stream = connection.accept_bi() => {
                 match stream {
                     Ok((_send, recv)) => {
-                        spawn_inbound_stream(session_id, recv, metrics.clone(), Arc::clone(&gateway));
+                        spawn_inbound_stream(
+                            session_id,
+                            recv,
+                            metrics.clone(),
+                            Arc::clone(&gateway),
+                            superseded.clone(),
+                            Arc::clone(&superseding),
+                            Arc::clone(&supersession_gate),
+                        );
                     }
                     Err(_) => break,
                 }
@@ -378,7 +454,15 @@ async fn handle_connection(
             stream = connection.accept_uni() => {
                 match stream {
                     Ok(recv) => {
-                        spawn_inbound_stream(session_id, recv, metrics.clone(), Arc::clone(&gateway));
+                        spawn_inbound_stream(
+                            session_id,
+                            recv,
+                            metrics.clone(),
+                            Arc::clone(&gateway),
+                            superseded.clone(),
+                            Arc::clone(&superseding),
+                            Arc::clone(&supersession_gate),
+                        );
                     }
                     Err(_) => break,
                 }
@@ -386,12 +470,97 @@ async fn handle_connection(
         }
     }
 
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        inbound_supersession_drained.cancelled().await;
+    }
     gateway.unregister_session(session_id);
     writer.abort();
     metrics.connection_closed();
     gateway.connection_closed();
     tracing::debug!(conn = %id, %session_id, "QUIC connection closed");
     Ok(())
+}
+
+/// Route a datagram only while this exact transport generation remains current.
+///
+/// A `select!` may choose a concurrently ready datagram after a replacement has
+/// cancelled the connection. Check the fence here, immediately before decode and
+/// metrics mutation, rather than relying on branch selection order.
+fn route_datagram(
+    session_id: crate::realtime::ParticipantId,
+    bytes: &[u8],
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    supersession_gate: &Arc<Mutex<()>>,
+) -> bool {
+    let Ok(_gate) = supersession_gate.lock() else {
+        return false;
+    };
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    match decode_datagram(bytes) {
+        Ok(env) => {
+            metrics.envelope_received();
+            gateway.handle_inbound(session_id, &env);
+        }
+        Err(error) => {
+            metrics.decode_error();
+            tracing::debug!(%session_id, %error, "bad QUIC datagram");
+        }
+    }
+    true
+}
+
+/// Route a post-handshake frame that was decoded before registration only while
+/// this transport generation remains current. Queued/replayed frames share the
+/// same cancellation gate as stream and datagram bytes.
+fn route_envelope(
+    session_id: crate::realtime::ParticipantId,
+    env: &Envelope,
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    supersession_gate: &Arc<Mutex<()>>,
+) -> bool {
+    route_envelope_with_before_handoff(
+        session_id,
+        env,
+        metrics,
+        gateway,
+        superseded,
+        superseding,
+        supersession_gate,
+        || {},
+    )
+}
+
+fn route_envelope_with_before_handoff<F>(
+    session_id: crate::realtime::ParticipantId,
+    env: &Envelope,
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    supersession_gate: &Arc<Mutex<()>>,
+    before_handoff: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    let Ok(_gate) = supersession_gate.lock() else {
+        return false;
+    };
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    before_handoff();
+    metrics.envelope_received();
+    gateway.handle_inbound(session_id, env);
+    true
 }
 
 /// Spawn a task that reads framed envelopes from one inbound stream and routes
@@ -401,9 +570,22 @@ fn spawn_inbound_stream(
     recv: quinn::RecvStream,
     metrics: TransportMetrics,
     gateway: Arc<Gateway>,
+    superseded: CancellationToken,
+    superseding: Arc<std::sync::atomic::AtomicBool>,
+    supersession_gate: Arc<Mutex<()>>,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = read_inbound_stream(session_id, recv, &metrics, &gateway).await {
+        if let Err(e) = read_inbound_stream(
+            session_id,
+            recv,
+            &metrics,
+            &gateway,
+            &superseded,
+            &superseding,
+            &supersession_gate,
+        )
+        .await
+        {
             tracing::debug!(%session_id, error = %e, "QUIC inbound stream ended");
         }
     });
@@ -415,17 +597,85 @@ async fn read_inbound_stream(
     mut recv: quinn::RecvStream,
     metrics: &TransportMetrics,
     gateway: &Gateway,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    supersession_gate: &Arc<Mutex<()>>,
 ) -> AppResult<()> {
-    let data = recv.read_to_end(MAX_STREAM_BYTES).await.map_err(|e| {
+    let data = tokio::select! {
+        () = superseded.cancelled() => return Ok(()),
+        result = recv.read_to_end(MAX_STREAM_BYTES) => result,
+    }
+    .map_err(|e| {
         AppError::new(ErrorCategory::Transport, "failed to read QUIC stream")
             .with_detail(e.to_string())
     })?;
     let mut buf = BytesMut::from(&data[..]);
-    while let Some(env) = decode_framed(&mut buf)? {
-        metrics.envelope_received();
-        gateway.handle_inbound(session_id, &env);
-    }
+    while route_framed_envelope(
+        session_id,
+        &mut buf,
+        metrics,
+        gateway,
+        superseded,
+        superseding,
+        supersession_gate,
+    )? {}
     Ok(())
+}
+
+/// Decode and route one reliable frame only while this transport remains current.
+///
+/// The same per-generation gate used by datagrams is held across the cancellation
+/// check, frame decode, metrics mutation, and gateway handoff. Replacement takes
+/// that gate before cancelling, so it cannot linearize in the gap after an
+/// inbound stream checks cancellation but before it decodes client-controlled
+/// bytes or records them as received.
+fn route_framed_envelope(
+    session_id: crate::realtime::ParticipantId,
+    buf: &mut BytesMut,
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    supersession_gate: &Arc<Mutex<()>>,
+) -> AppResult<bool> {
+    route_framed_envelope_with_before_decode(
+        session_id,
+        buf,
+        metrics,
+        gateway,
+        superseded,
+        superseding,
+        supersession_gate,
+        || {},
+    )
+}
+
+fn route_framed_envelope_with_before_decode<F>(
+    session_id: crate::realtime::ParticipantId,
+    buf: &mut BytesMut,
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    supersession_gate: &Arc<Mutex<()>>,
+    before_decode: F,
+) -> AppResult<bool>
+where
+    F: FnOnce(),
+{
+    let Ok(_gate) = supersession_gate.lock() else {
+        return Ok(false);
+    };
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(false);
+    }
+    before_decode();
+    let Some(env) = decode_framed(buf)? else {
+        return Ok(false);
+    };
+    metrics.envelope_received();
+    gateway.handle_inbound(session_id, &env);
+    Ok(true)
 }
 
 /// Await the first reliable-stream envelope of the connection (the handshake),
@@ -527,45 +777,73 @@ async fn outbound_writer(
     unreliable: LatestOutboundReceiver,
     metrics: TransportMetrics,
     cancel: CancellationToken,
+    superseded: CancellationToken,
+    transport_write_gate: Arc<tokio::sync::Mutex<()>>,
+    superseding: Arc<std::sync::atomic::AtomicBool>,
 ) {
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
+            () = superseded.cancelled() => break,
             next = rx.recv() => {
                 let Some(out) = next else { break };
-                write_outbound(&connection, out, &metrics).await;
+                write_outbound(&connection, out, &metrics, &superseded, &superseding, &transport_write_gate).await;
             }
             out = unreliable.recv() => {
-                write_outbound(&connection, out, &metrics).await;
+                write_outbound(&connection, out, &metrics, &superseded, &superseding, &transport_write_gate).await;
             }
         }
     }
 }
 
-async fn write_outbound(connection: &QuinnConnection, out: Outbound, metrics: &TransportMetrics) {
+async fn write_outbound(
+    connection: &QuinnConnection,
+    out: Outbound,
+    metrics: &TransportMetrics,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    transport_write_gate: &tokio::sync::Mutex<()>,
+) {
     let Some(_delivery) = out.acquire_delivery().await else {
         return;
     };
     match out.delivery {
         Delivery::Unreliable => {
-            if connection
-                .send_datagram(out.envelope.encode_datagram())
-                .is_ok()
+            if crate::transport::write_if_current(
+                superseded,
+                superseding,
+                transport_write_gate,
+                || async { connection.send_datagram(out.envelope.encode_datagram()) },
+            )
+            .await
+            .is_some_and(|result| result.is_ok())
             {
                 metrics.envelope_sent();
             }
         }
-        Delivery::Reliable => match connection.open_uni().await {
-            Ok(mut send) => {
-                let frame = out.envelope.encode_framed();
-                if send.write_all(&frame).await.is_ok() && send.finish().is_ok() {
-                    metrics.envelope_sent();
-                }
+        Delivery::Reliable => {
+            let frame = out.envelope.encode_framed();
+            if crate::transport::write_if_current(
+                superseded,
+                superseding,
+                transport_write_gate,
+                || async {
+                    let Ok(mut send) = connection.open_uni().await else {
+                        return Err(());
+                    };
+                    if send.write_all(&frame).await.is_ok() && send.finish().is_ok() {
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                },
+            )
+            .await
+            .is_some_and(|result| result.is_ok())
+            {
+                metrics.envelope_sent();
             }
-            Err(error) => {
-                tracing::debug!(%error, "failed to open QUIC uni stream");
-            }
-        },
+        }
     }
 }
 
@@ -584,5 +862,271 @@ mod tests {
         let server = QuicServer::bind(loopback(), &cert).expect("bind");
         assert_eq!(server.transport_kind(), TransportKind::Quic);
         assert_ne!(server.local_addr().port(), 0, "ephemeral port assigned");
+    }
+
+    #[tokio::test]
+    async fn outbound_write_waits_before_supersession_is_published() {
+        let superseded = CancellationToken::new();
+        let superseding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let writer_token = superseded.clone();
+        let writer_superseding = Arc::clone(&superseding);
+        let writer_gate = Arc::clone(&gate);
+        let writer = tokio::spawn(async move {
+            crate::transport::write_if_current(
+                &writer_token,
+                &writer_superseding,
+                &writer_gate,
+                || async {
+                    entered_tx.send(()).expect("write entered");
+                    release_rx.await.expect("write released");
+                },
+            )
+            .await
+        });
+        entered_rx.await.expect("application write admitted");
+        superseding.store(true, std::sync::atomic::Ordering::Release);
+        let cancellation_gate = Arc::clone(&gate);
+        let cancellation_token = superseded.clone();
+        let cancellation = tokio::spawn(async move {
+            let _write = cancellation_gate.lock().await;
+            cancellation_token.cancel();
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !superseded.is_cancelled(),
+            "QUIC supersession cannot publish while an admitted application frame writes"
+        );
+        release_tx.send(()).expect("release application write");
+        assert!(writer.await.expect("writer task").is_some());
+        cancellation.await.expect("cancellation task");
+        assert!(superseded.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn superseding_reliable_delivery_does_not_admit_a_quic_stream_open() {
+        let superseded = CancellationToken::new();
+        let superseding = std::sync::atomic::AtomicBool::new(true);
+        let transport_write_gate = tokio::sync::Mutex::new(());
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_opens = Arc::clone(&opens);
+
+        let admitted = crate::transport::write_if_current(
+            &superseded,
+            &superseding,
+            &transport_write_gate,
+            || async move {
+                // This closure is the reliable write admission and includes
+                // `connection.open_uni().await` in `write_outbound`.
+                observed_opens.fetch_add(1, std::sync::atomic::Ordering::Release);
+            },
+        )
+        .await;
+        assert!(admitted.is_none());
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn replacement_gate_prevents_post_check_datagram_interleaving() {
+        let superseded = CancellationToken::new();
+        let supersession_gate = Arc::new(Mutex::new(()));
+        let held = supersession_gate.lock().expect("gate");
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let replacement_gate = Arc::clone(&supersession_gate);
+        let replacement_token = superseded.clone();
+        let replacement = std::thread::spawn(move || {
+            started_tx.send(()).expect("replacement started");
+            let _gate = replacement_gate.lock().expect("gate");
+            replacement_token.cancel();
+        });
+        started_rx
+            .recv()
+            .expect("replacement is waiting on the gate");
+        assert!(
+            !superseded.is_cancelled(),
+            "replacement cannot cancel between a datagram's gate/check and decode/metrics"
+        );
+        drop(held);
+        replacement.join().expect("replacement thread");
+        assert!(superseded.is_cancelled());
+
+        let metrics = TransportMetrics::new();
+        assert!(!route_datagram(
+            crate::realtime::ParticipantId::from_raw(1),
+            &[0],
+            &metrics,
+            &Gateway::new(),
+            &superseded,
+            &std::sync::atomic::AtomicBool::new(false),
+            &supersession_gate,
+        ));
+        assert_eq!(metrics.snapshot(), Default::default());
+    }
+
+    #[test]
+    fn superseded_ready_datagram_is_not_decoded_or_counted() {
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+
+        assert!(
+            !route_datagram(
+                crate::realtime::ParticipantId::from_raw(1),
+                &[0],
+                &metrics,
+                &gateway,
+                &superseded,
+                &std::sync::atomic::AtomicBool::new(false),
+                &Arc::new(Mutex::new(())),
+            ),
+            "a ready datagram selected after replacement must be rejected before decode"
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            Default::default(),
+            "a superseded datagram must not mutate decode or envelope counters"
+        );
+    }
+
+    #[test]
+    fn reliable_stream_gate_makes_replacement_linearizable_before_decode_and_metrics() {
+        let superseded = CancellationToken::new();
+        let supersession_gate = Arc::new(Mutex::new(()));
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+        let framed =
+            Envelope::new(citadel_wire::protocol::KIND_POSITION, b"late".to_vec()).encode_framed();
+        let mut bytes = BytesMut::from(&framed[..]);
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::sync_channel(1);
+        let replacement_gate = Arc::clone(&supersession_gate);
+        let replacement_token = superseded.clone();
+        let replacement = std::thread::spawn(move || {
+            start_rx.recv().expect("start replacement");
+            assert!(matches!(
+                replacement_gate.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            blocked_tx.send(()).expect("replacement is blocked");
+            let _gate = replacement_gate.lock().expect("gate");
+            replacement_token.cancel();
+        });
+
+        assert!(
+            route_framed_envelope_with_before_decode(
+                crate::realtime::ParticipantId::from_raw(1),
+                &mut bytes,
+                &metrics,
+                &gateway,
+                &superseded,
+                &std::sync::atomic::AtomicBool::new(false),
+                &supersession_gate,
+                || {
+                    start_tx.send(()).expect("start replacement");
+                    blocked_rx.recv().expect("replacement checked gate");
+                },
+            )
+            .expect("frame routes before replacement linearizes")
+        );
+        assert_eq!(metrics.snapshot().envelopes_received, 1);
+        replacement.join().expect("replacement thread");
+        assert!(superseded.is_cancelled());
+    }
+
+    #[test]
+    fn superseded_ready_reliable_stream_is_not_decoded_or_counted() {
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+        let framed =
+            Envelope::new(citadel_wire::protocol::KIND_POSITION, b"late".to_vec()).encode_framed();
+        let mut bytes = BytesMut::from(&framed[..]);
+
+        assert!(
+            !route_framed_envelope(
+                crate::realtime::ParticipantId::from_raw(1),
+                &mut bytes,
+                &metrics,
+                &gateway,
+                &superseded,
+                &std::sync::atomic::AtomicBool::new(false),
+                &Arc::new(Mutex::new(())),
+            )
+            .expect("supersession is an orderly stream stop"),
+            "a ready reliable stream selected after replacement must stop before decode"
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            Default::default(),
+            "a superseded reliable stream must not mutate decode or envelope counters"
+        );
+    }
+
+    #[test]
+    fn superseded_queued_replay_is_not_counted_or_routed() {
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+        let queued = Envelope::new(citadel_wire::protocol::KIND_POSITION, b"late".to_vec());
+
+        assert!(
+            !route_envelope(
+                crate::realtime::ParticipantId::from_raw(1),
+                &queued,
+                &metrics,
+                &gateway,
+                &superseded,
+                &std::sync::atomic::AtomicBool::new(false),
+                &Arc::new(Mutex::new(())),
+            ),
+            "a replacement that wins before replay must suppress the queued frame"
+        );
+        assert_eq!(metrics.snapshot(), Default::default());
+    }
+
+    #[test]
+    fn queued_replay_holds_the_supersession_gate_through_gateway_handoff() {
+        let superseded = CancellationToken::new();
+        let superseding = std::sync::atomic::AtomicBool::new(false);
+        let gate = Arc::new(Mutex::new(()));
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+        let queued = Envelope::new(citadel_wire::protocol::KIND_POSITION, b"queued".to_vec());
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::sync_channel(1);
+        let replacement_gate = Arc::clone(&gate);
+        let replacement_token = superseded.clone();
+        let replacement = std::thread::spawn(move || {
+            start_rx.recv().expect("start replacement");
+            assert!(matches!(
+                replacement_gate.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            blocked_tx.send(()).expect("replacement blocked");
+            let _gate = replacement_gate.lock().expect("gate");
+            replacement_token.cancel();
+        });
+
+        assert!(route_envelope_with_before_handoff(
+            crate::realtime::ParticipantId::from_raw(1),
+            &queued,
+            &metrics,
+            &gateway,
+            &superseded,
+            &superseding,
+            &gate,
+            || {
+                start_tx.send(()).expect("start replacement");
+                blocked_rx.recv().expect("replacement checked gate");
+            },
+        ));
+        assert_eq!(metrics.snapshot().envelopes_received, 1);
+        replacement.join().expect("replacement thread");
+        assert!(superseded.is_cancelled());
     }
 }

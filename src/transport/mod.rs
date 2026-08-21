@@ -76,6 +76,30 @@ use crate::services::party_directory::StoragePartyDirectory;
 use crate::session::NodeId;
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 
+/// Run one concrete application/control write only while its transport
+/// generation remains current. The asynchronous gate is deliberately held until
+/// `write` resolves, including socket flush: supersession and durable close take
+/// the same gate before publishing cancellation.
+pub(crate) async fn write_if_current<F, Fut, T>(
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    transport_write_gate: &tokio::sync::Mutex<()>,
+    write: F,
+) -> Option<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let _write = transport_write_gate.lock().await;
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    Some(write().await)
+}
+
 /// Typed, best-effort broadcaster for the local channel-presence announcer.
 /// It deliberately discards a transient peer error: the supervised renewer
 /// republishes the lease and durable history is the recovery path.
@@ -769,6 +793,13 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         chat_delivery_interval,
         64,
         64,
+    ));
+    // Identity lifecycle expiry (reconnect grace and durable revocation
+    // tombstones) is not script state: reclaim it even on a relay-only node
+    // with no runtime tick or inbound socket traffic.
+    supervisor.spawn(crate::realtime::ReconnectGraceExpiryService::new(
+        Arc::clone(&gateway),
+        std::time::Duration::from_secs(1),
     ));
     if !app.config().cluster.enabled {
         supervisor.spawn(crate::realtime::MatchmakerTickService::new(

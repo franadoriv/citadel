@@ -39,9 +39,12 @@ pub const KIND_RPC_RESPONSE: u16 = 4;
 ///
 /// Body convention: the raw bytes of the client's HTTP-issued session access
 /// token (utf-8). An **empty** body is an explicit request to connect as a guest
-/// (anonymous participant). The server validates a presented token via its
-/// session service and binds the connection to the resolved account before any
-/// other message kind is processed; see [`KIND_AUTH_RESULT`].
+/// (anonymous participant). Version-1 deliberately has no reconnect-resume
+/// discriminator, capability, or opaque resume material: server-internal grace
+/// lifecycle support is unavailable to clients until a versioned handshake is
+/// designed and shipped across every client SDK. The server validates a presented
+/// token via its session service and binds the connection to the resolved account
+/// before any other message kind is processed; see [`KIND_AUTH_RESULT`].
 ///
 /// The handshake is uniform across every transport: the client sends this same
 /// envelope first over the reliable path (a WebSocket binary message, or a QUIC/
@@ -632,6 +635,19 @@ mod tests {
         let decoded = decode_auth_result(&encoded).expect("decodes");
         assert!(decoded.is_authenticated());
         assert_eq!(decoded.user_id, "user-abc");
+    }
+
+    #[test]
+    fn auth_result_v1_does_not_advertise_resume() {
+        // Reconnect grace is presently server-internal. The version-1 client
+        // handshake stays exactly status + authenticated user id; accepting or
+        // emitting an opaque ticket here would create unversioned SDK semantics.
+        let encoded = encode_auth_authenticated("u");
+        assert_eq!(encoded, vec![AUTH_STATUS_AUTHENTICATED, b'u']);
+        let decoded = decode_auth_result(&encoded).expect("decodes");
+        assert!(decoded.is_authenticated());
+        assert_eq!(decoded.user_id, "u");
+        assert_eq!(decoded.reason_class, 0);
     }
 
     #[test]

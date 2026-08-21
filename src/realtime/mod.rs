@@ -41,6 +41,6 @@ pub use reload::LuaReloadService;
 pub use rooms::{JoinError, RoomId, RoomLabel, RoomRegistry, RoomSnapshot};
 pub use tick::{
     ChatDeliveryDispatchService, ChatPresenceRenewalService, GameplayClock, GameplayClockSnapshot,
-    LuaTickService, MatchmakerTickService, TransformTickService,
+    LuaTickService, MatchmakerTickService, ReconnectGraceExpiryService, TransformTickService,
 };
 pub use transform::{TransformHub, TransformHubConfig};
