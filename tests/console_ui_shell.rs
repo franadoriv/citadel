@@ -421,7 +421,7 @@ async fn dashboard_lag_diagnostics_uses_redacted_keysets_and_admin_raw_modals() 
     let dashboard = get(addr, http::DASHBOARD_PATH, None).await;
     assert_eq!(dashboard.status, 200);
     for required in [
-        "label: 'Operations'",
+        "label: 'Logs & Diagnostics'",
         "id: 'telemetry-slices'",
         "id: 'lag-diagnostics'",
         "title: 'Lag Diagnostics'",
