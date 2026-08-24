@@ -16,6 +16,10 @@
     "KIND_MATCHMAKER_MATCHED": "KindMatchmakerMatched",
     "KIND_NOTIFICATION": "KindNotification",
     "KIND_CHAT_EVENT": "KindChatEvent",
+    "KIND_INPUT_STREAM_CONTROL": "KindInputStreamControl",
+    "KIND_AUTHORITATIVE_INPUT": "KindAuthoritativeInput",
+    "KIND_CAPABILITY_OFFER": "KindCapabilityOffer",
+    "KIND_CAPABILITY_ACCEPTANCE": "KindCapabilityAcceptance",
     "KIND_TSYNC_HELLO": "KindTsyncHello",
     "KIND_TSYNC_SNAPSHOT": "KindTsyncSnapshot",
     "KIND_TSYNC_INPUT": "KindTsyncInput",
@@ -41,7 +45,14 @@
     "RPC_REQUEST_ID_BYTES": "RpcRequestIdBytes",
     "RPC_METHOD_LEN_BYTES": "RpcMethodLenBytes",
     "SENDER_ID_BYTES": "SenderIdBytes",
-    "POSITION_BYTES": "PositionBytes"
+    "POSITION_BYTES": "PositionBytes",
+    "INPUT_STREAM_CONTROL_VERSION": "InputStreamControlVersion",
+    "INPUT_STREAM_CONTROL_ADVERTISE": "InputStreamControlAdvertise",
+    "INPUT_STREAM_CONTROL_REVOKE": "InputStreamControlRevoke",
+    "INPUT_STREAM_TOKEN_BYTES": "InputStreamTokenBytes",
+    "CAPABILITY_NEGOTIATION_VERSION": "CapabilityNegotiationVersion",
+    "CAPABILITY_AUTHORITATIVE_INPUT": "CapabilityAuthoritativeInput",
+    "CAPABILITY_CHALLENGE_BYTES": "CapabilityChallengeBytes"
   },
   "abi_version": "ExpectedAbiVersion",
   "tier_b_check": null

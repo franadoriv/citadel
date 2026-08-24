@@ -87,7 +87,7 @@ pub use bridge_protocol::{
 };
 pub use bridge_validator::{
     BatchRejection, BridgeMatchContext, BridgeQuotas, Capability, EventDraft, MAX_RESERVED_KIND,
-    PendingBatchLedger, Quota, ValidatedBatch, ValidatedOutcome,
+    PendingBatchLedger, Quota, ReservedKindMode, ValidatedBatch, ValidatedOutcome,
 };
 pub use event_bus::{
     MAX_RUNTIME_EVENTS_PER_INVOCATION, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,

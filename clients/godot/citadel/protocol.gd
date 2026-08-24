@@ -82,6 +82,23 @@ const KIND_NOTIFICATION := 27
 ## reconcile with chat.history when requested.
 const KIND_CHAT_EVENT := 28
 
+## Server->client reliable authoritative input-stream lease control. This is
+## server-only; its opaque token must never be logged or sent by a client.
+const KIND_INPUT_STREAM_CONTROL := 40
+const INPUT_STREAM_CONTROL_VERSION := 1
+const INPUT_STREAM_CONTROL_ADVERTISE := 1
+const INPUT_STREAM_CONTROL_REVOKE := 2
+const INPUT_STREAM_TOKEN_BYTES := 16
+## Client->server stream-bound sequenced custom input; legacy generic input is unchanged.
+const KIND_AUTHORITATIVE_INPUT := 41
+const AUTHORITATIVE_INPUT_VERSION := 1
+const KIND_CAPABILITY_OFFER := 42
+const KIND_CAPABILITY_ACCEPTANCE := 43
+const CAPABILITY_NEGOTIATION_VERSION := 1
+const CAPABILITY_AUTHORITATIVE_INPUT := 1
+const CAPABILITY_CHALLENGE_BYTES := 16
+const MAX_SEQUENCED_INPUT_BODY_BYTES := 64 * 1024
+
 ## Maximum `kind + payload` bytes in one Citadel reliable stream envelope.
 ## This is shared with the server's framed decoder. The WebSocket transport also
 ## keeps at most three trailing bytes while it waits for a complete u32 length.
@@ -258,7 +275,7 @@ static func decode_tsync_v2_snapshot(body: PackedByteArray) -> Dictionary:
 	}
 
 
-## Encode the epoch-bearing v2 input wrapper around the unchanged v1 bundle.
+## Encode the epoch-bearing authoritative input wrapper around the unchanged v1 bundle.
 ## `epoch` and `last_observed_tick` are diagnostics only; the authority never
 ## uses either value to authorize or schedule simulation work.
 static func encode_tsync_v2_input(epoch: int, last_observed_tick: int,
@@ -334,6 +351,101 @@ static func decode_auth_result(body: PackedByteArray) -> Dictionary:
 		return {"status": status, "user_id": "", "reason": body[1] if body.size() > 1 else AUTH_REASON_AUTH_FAILED}
 	# The stable native FFI maps an unknown status to a safe rejected outcome.
 	return {"status": AUTH_STATUS_REJECTED, "user_id": "", "reason": AUTH_REASON_AUTH_FAILED}
+
+
+## Decode a canonical non-bearer V1 capability offer or acceptance. Returns {} on malformed input.
+static func decode_capability_offer(body: PackedByteArray) -> Dictionary:
+	if body.size() != 2 + CAPABILITY_CHALLENGE_BYTES or body[0] != CAPABILITY_NEGOTIATION_VERSION or body[1] != CAPABILITY_AUTHORITATIVE_INPUT:
+		return {}
+	var challenge := body.slice(2)
+	var nonzero := false
+	for value in challenge:
+		nonzero = nonzero or value != 0
+	return {"capability": body[1], "challenge": challenge} if nonzero else {}
+
+## Emit the exact canonical acceptance echo for a decoded offer.
+static func encode_capability_acceptance(offer: PackedByteArray) -> PackedByteArray:
+	return offer.duplicate() if not decode_capability_offer(offer).is_empty() else PackedByteArray()
+
+## Decode server-only KIND_INPUT_STREAM_CONTROL. Returns {} for malformed or
+## noncanonical bodies; advertised opaque tokens are never converted to text.
+static func decode_input_stream_control(body: PackedByteArray) -> Dictionary:
+	if body.size() < 18 or body[0] != INPUT_STREAM_CONTROL_VERSION:
+		return {}
+	var opcode := body[1]
+	var match_id := _read_be_u64(body, 2)
+	var stream_id := _read_be_u64(body, 10)
+	if opcode == INPUT_STREAM_CONTROL_REVOKE:
+		return {"opcode": opcode, "match_id": match_id, "stream_id": stream_id} if body.size() == 18 else {}
+	if opcode != INPUT_STREAM_CONTROL_ADVERTISE or body.size() != 18 + INPUT_STREAM_TOKEN_BYTES:
+		return {}
+	var token := body.slice(18)
+	var nonzero := false
+	for byte in token:
+		nonzero = nonzero or byte != 0
+	return {"opcode": opcode, "match_id": match_id, "stream_id": stream_id, "token": token} if nonzero else {}
+
+## Canonical SequencedInput codec. Godot's `int` is signed, so u64
+## values may be supplied as a nonnegative `int` or exactly eight big-endian
+## bytes. Decoders always return the byte form, preserving the full u64 domain.
+static func encode_sequenced_input(token: PackedByteArray, sequence: Variant, original_custom_kind: int, payload: PackedByteArray = PackedByteArray()) -> PackedByteArray:
+	var sequence_bytes := _u64_wire_bytes(sequence)
+	if token.size() != INPUT_STREAM_TOKEN_BYTES or sequence_bytes.size() != 8 or _u64_is_zero(sequence_bytes) or original_custom_kind < 0 or original_custom_kind > 0xFFFF or payload.size() > MAX_SEQUENCED_INPUT_BODY_BYTES:
+		return PackedByteArray()
+	if _u64_is_zero(token): return PackedByteArray()
+	var result := PackedByteArray(); result.resize(31 + payload.size())
+	result[0] = AUTHORITATIVE_INPUT_VERSION
+	_copy_bytes(result, 1, token); _copy_bytes(result, 17, sequence_bytes)
+	_write_be_u16(result, 25, original_custom_kind); _write_be_u32(result, 27, payload.size()); _copy_bytes(result, 31, payload)
+	return result
+
+static func decode_sequenced_input(body: PackedByteArray) -> Dictionary:
+	if body.size() < 31 or body[0] != AUTHORITATIVE_INPUT_VERSION: return {}
+	var length := _read_be_u32(body, 27); var token := body.slice(1, 17); var sequence := body.slice(17, 25)
+	if _u64_is_zero(token) or _u64_is_zero(sequence) or length > MAX_SEQUENCED_INPUT_BODY_BYTES or body.size() != 31 + length: return {}
+	return {"stream_token": token, "sequence": sequence, "original_custom_kind": _read_be_u16(body, 25), "body": body.slice(31)}
+
+## Canonical stream-bound InputReceipt codec. All u64 correlation values use
+## `_u64_wire_bytes` so u64::MAX round-trips without signed GDScript overflow.
+static func encode_input_receipt(match_id: Variant, stream_id: Variant, token: PackedByteArray, acknowledged_sequence: Variant, decided_sequence: Variant, disposition: int, authoritative_tick: Variant, correction: Variant = null) -> PackedByteArray:
+	var match_bytes := _u64_wire_bytes(match_id); var stream_bytes := _u64_wire_bytes(stream_id)
+	var acknowledged_bytes := _u64_wire_bytes(acknowledged_sequence); var decided_bytes := _u64_wire_bytes(decided_sequence); var tick_bytes := _u64_wire_bytes(authoritative_tick)
+	var correction_present := correction != null
+	if correction_present and not (correction is PackedByteArray): return PackedByteArray()
+	var correction_bytes := PackedByteArray()
+	if correction_present: correction_bytes = correction
+	if match_bytes.size() != 8 or stream_bytes.size() != 8 or acknowledged_bytes.size() != 8 or decided_bytes.size() != 8 or tick_bytes.size() != 8 or token.size() != INPUT_STREAM_TOKEN_BYTES or _u64_is_zero(token) or _u64_is_zero(decided_bytes) or (disposition != 0 and disposition != 1) or correction_bytes.size() > MAX_SEQUENCED_INPUT_BODY_BYTES:
+		return PackedByteArray()
+	var result := PackedByteArray(); result.resize(63 + correction_bytes.size())
+	result[0] = AUTHORITATIVE_INPUT_VERSION
+	_copy_bytes(result, 1, match_bytes); _copy_bytes(result, 9, stream_bytes); _copy_bytes(result, 17, token)
+	_copy_bytes(result, 33, acknowledged_bytes); _copy_bytes(result, 41, decided_bytes); result[49] = disposition
+	_copy_bytes(result, 50, tick_bytes); result[58] = 1 if correction_present else 0; _write_be_u32(result, 59, correction_bytes.size()); _copy_bytes(result, 63, correction_bytes)
+	return result
+
+static func decode_input_receipt(body: PackedByteArray) -> Dictionary:
+	if body.size() < 63 or body[0] != AUTHORITATIVE_INPUT_VERSION: return {}
+	var correction_len := _read_be_u32(body, 59); var correction_present := body[58]
+	if body[49] > 1 or correction_present > 1 or correction_len > MAX_SEQUENCED_INPUT_BODY_BYTES or body.size() != 63 + correction_len or (correction_present == 0 and correction_len != 0): return {}
+	var token := body.slice(17, 33); var decided := body.slice(41, 49)
+	if _u64_is_zero(token) or _u64_is_zero(decided): return {}
+	return {"match_id": body.slice(1, 9), "stream_id": body.slice(9, 17), "stream_token": token, "acknowledged_sequence": body.slice(33, 41), "decided_sequence": decided, "disposition": body[49], "authoritative_tick": body.slice(50, 58), "correction": body.slice(63) if correction_present == 1 else null}
+
+static func _u64_wire_bytes(value: Variant) -> PackedByteArray:
+	if value is PackedByteArray:
+		return value.duplicate() if value.size() == 8 else PackedByteArray()
+	if value is int and value >= 0:
+		var result := PackedByteArray(); result.resize(8); _write_be_u64(result, 0, value); return result
+	return PackedByteArray()
+
+static func _u64_is_zero(value: PackedByteArray) -> bool:
+	if value.is_empty(): return true
+	for byte in value:
+		if byte != 0: return false
+	return true
+
+static func _copy_bytes(destination: PackedByteArray, offset: int, source: PackedByteArray) -> void:
+	for index in source.size(): destination[offset + index] = source[index]
 
 
 static func _read_room_string(body: PackedByteArray, offset: int) -> Dictionary:

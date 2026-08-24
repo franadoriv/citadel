@@ -99,8 +99,34 @@ pub trait MatchCommandSink: Send + Sync + 'static {
     /// Apply one match's command batch (room-scoped broadcast semantics).
     fn apply_match_commands(&self, room_id: u64, commands: Vec<OutboundCommand>) -> usize;
 
+    /// Bind an opened worker-side match to the worker generation that owns it.
+    /// The gateway records this before any worker frame can return.
+    fn register_match_generation(&self, room_id: u64, worker_epoch: u64) {
+        let _ = (room_id, worker_epoch);
+    }
+
+    /// Apply a worker command batch only after the sink validates this exact
+    /// worker generation against its live authoritative room. The legacy method
+    /// remains for non-worker integrations; the external adapter always calls
+    /// this fenced entry point.
+    fn apply_match_commands_fenced(
+        &self,
+        room_id: u64,
+        worker_epoch: u64,
+        commands: Vec<OutboundCommand>,
+    ) -> usize {
+        let _ = worker_epoch;
+        self.apply_match_commands(room_id, commands)
+    }
+
     /// The worker closed the match; members must be informed and requeued.
     fn on_match_closed(&self, room_id: u64, reason: MatchCloseReason);
+
+    /// Fenced worker closure counterpart; see `apply_match_commands_fenced`.
+    fn on_match_closed_fenced(&self, room_id: u64, worker_epoch: u64, reason: MatchCloseReason) {
+        let _ = worker_epoch;
+        self.on_match_closed(room_id, reason);
+    }
 }
 
 /// The frame was dropped: the connection is saturated or gone.
@@ -128,7 +154,7 @@ struct ActiveGeneration {
     sender: Arc<dyn FrameSender>,
     /// Per-match outbound sequence counters; presence means "open".
     tx_seqs: HashMap<u64, u64>,
-    /// Matches whose current worker stream carries bridge-v2 batches. A command
+    /// Matches whose current worker stream carries bridge command batches. A command
     /// frame for one of these matches is never eligible for legacy decoding.
     bridge_matches: HashSet<u64>,
     /// Receive-side validator, shared with the pump thread.
@@ -428,7 +454,7 @@ impl ExternalWorkerRuntime {
                         return;
                     };
                     if let Some(bridge_sink) = self.bridge_sink() {
-                        bridge_sink.deliver_command_batch(answer);
+                        bridge_sink.deliver_command_batch_from_worker(header.epoch, answer);
                     }
                     return;
                 }
@@ -440,7 +466,7 @@ impl ExternalWorkerRuntime {
                     return;
                 };
                 if let Some(sink) = self.sink() {
-                    sink.apply_match_commands(header.match_id, commands);
+                    sink.apply_match_commands_fenced(header.match_id, header.epoch, commands);
                 }
             }
             DataFrame::MatchClosed { header, reason, .. } => {
@@ -466,7 +492,7 @@ impl ExternalWorkerRuntime {
                     "external worker closed a match"
                 );
                 if let Some(sink) = self.sink() {
-                    sink.on_match_closed(header.match_id, reason);
+                    sink.on_match_closed_fenced(header.match_id, header.epoch, reason);
                 }
             }
             DataFrame::EngineReport { report, .. } => {
@@ -505,6 +531,9 @@ impl ExternalWorkerRuntime {
             generation.bridge_matches.insert(room_id);
         }
         if !generation.tx_seqs.contains_key(&room_id) {
+            if let Some(sink) = self.sink() {
+                sink.register_match_generation(room_id, generation.epoch);
+            }
             generation
                 .rx
                 .lock()

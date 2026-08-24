@@ -15,6 +15,8 @@ pub mod chat_presence;
 pub mod diagnostics;
 pub mod gateway;
 pub mod identity;
+pub mod input_reconciliation;
+pub mod input_stream_controller;
 pub mod netpeer;
 pub mod registry;
 pub mod reload;
@@ -33,6 +35,10 @@ pub use gateway::{
     KIND_PEER_POSITION, KIND_POSITION, shared,
 };
 pub use identity::{IdentityLifecycle, Presence, PresenceState, ResumeResult, ResumeSecret};
+pub use input_stream_controller::{
+    InputStreamController, InputStreamControllerConfig, InputStreamControllerError,
+    InputStreamLease, InputStreamToken, TokenSourceError,
+};
 pub use registry::{
     LatestOutboundReceiver, Outbound, ParticipantId, ParticipantIdGen, ParticipantIdentity,
     SessionHandle, SessionRegistry,

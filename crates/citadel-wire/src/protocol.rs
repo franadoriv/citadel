@@ -211,6 +211,26 @@ pub const KIND_DIAG_START: u16 = 37;
 pub const KIND_DIAG_FLUSH: u16 = 38;
 /// Lag-diagnostics client progress/terminal status (`C→S`, reliable).
 pub const KIND_DIAG_STATUS: u16 = 39;
+/// Server-issued authoritative input-stream control (`S→C`, reliable only).
+///
+/// The body is `authoritative_input::InputStreamControl`. Clients never send
+/// this kind: the gateway reserves and drops it on ingress before any runtime,
+/// relay, telemetry, or console path can observe its opaque token.
+pub const KIND_INPUT_STREAM_CONTROL: u16 = 40;
+/// Stream-bound authoritative input (`C→S`) and its fenced receipt (`S→C`,
+/// reliable). Client bodies are `authoritative_input::SequencedInput`; server
+/// bodies are `authoritative_input::InputReceipt`. Gateway derives every other
+/// lifecycle coordinate from server-owned state before bounded queueing or
+/// receipt delivery.
+pub const KIND_AUTHORITATIVE_INPUT: u16 = 41;
+/// Server-issued standalone post-auth capability offer (`S→C`, reliable).
+///
+/// Its body carries only a non-bearer one-use challenge. Older clients may
+/// ignore this unknown kind and therefore never receive stream bearer material.
+pub const KIND_CAPABILITY_OFFER: u16 = 42;
+/// Client acceptance of one exact standalone capability offer (`C→S`, reliable).
+/// The body must be the canonical V1 echo of the server's outstanding challenge.
+pub const KIND_CAPABILITY_ACCEPTANCE: u16 = 43;
 
 // Compile-time guarantees that the reserved ranges are disjoint and sit above the
 // legacy kinds (1..=6). A future edit that overlaps them fails to build rather
@@ -240,6 +260,9 @@ const _: () = assert!(KIND_MATCH_CLOSED > KIND_TSYNC_V2_INPUT);
 const _: () = assert!(KIND_ROOM_REJECT > KIND_MATCH_CLOSED);
 const _: () = assert!(KIND_DIAG_SERVER_TIME == KIND_ROOM_REJECT + 1);
 const _: () = assert!(KIND_DIAG_STATUS == KIND_DIAG_SERVER_TIME + 5);
+const _: () = assert!(KIND_AUTHORITATIVE_INPUT == KIND_INPUT_STREAM_CONTROL + 1);
+const _: () = assert!(KIND_CAPABILITY_OFFER == KIND_AUTHORITATIVE_INPUT + 1);
+const _: () = assert!(KIND_CAPABILITY_ACCEPTANCE == KIND_CAPABILITY_OFFER + 1);
 
 /// [`KIND_AUTH_RESULT`] status: the token validated; the connection is bound to
 /// the `user_id` that follows in the body.

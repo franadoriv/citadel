@@ -137,7 +137,7 @@ impl V2Manifest {
             capabilities: body[1],
         };
         if manifest.version != TSYNC_V2_VERSION
-            || manifest.capabilities != TSYNC_V2_CLOCK_CAPABILITY
+            || manifest.capabilities & TSYNC_V2_CLOCK_CAPABILITY == 0
             || manifest.capabilities & !TSYNC_V2_KNOWN_CAPABILITIES != 0
         {
             return Err(TsyncError::UnsupportedVersion);
@@ -146,7 +146,7 @@ impl V2Manifest {
     }
 }
 
-/// Authoritative gameplay-clock metadata on a v2 snapshot. Epoch zero is
+/// Authoritative gameplay-clock metadata on an epoch-bearing TSYNC snapshot.
 /// reserved, tick is the completed authoritative step count, and rate is the
 /// configured effective simulation rate. It contains no wall-clock or RTT data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,7 +213,7 @@ impl SnapshotV2 {
     }
 }
 
-/// Bounded, untrusted diagnostic hints carried by v2 input. The server may log
+/// Bounded, untrusted diagnostic hints carried by authoritative input. The server may log
 /// these only; they do not select a sim tick, authorize input, schedule work, or
 /// influence rewind/latency policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -225,7 +225,7 @@ const INPUT_V2_PREFIX_BYTES: usize = 17;
 impl InputDiagnosticHint {
     pub fn encode_v2(self, epoch: u64, bundle: &InputBundle) -> Result<Vec<u8>, TsyncError> {
         if epoch == 0 || self.flags != 0 {
-            return Err(TsyncError::OutOfRange("v2 input hint"));
+            return Err(TsyncError::OutOfRange("authoritative input hint"));
         }
         let mut out = Vec::with_capacity(INPUT_V2_PREFIX_BYTES);
         out.extend_from_slice(&epoch.to_be_bytes());
@@ -247,7 +247,7 @@ impl InputDiagnosticHint {
             flags: body[16],
         };
         if epoch == 0 || hint.flags != 0 {
-            return Err(TsyncError::OutOfRange("v2 input hint"));
+            return Err(TsyncError::OutOfRange("authoritative input hint"));
         }
         Ok((
             epoch,
@@ -1333,6 +1333,14 @@ mod tests {
             Err(TsyncError::UnsupportedVersion)
         ));
         assert!(V2Manifest::decode(&[TSYNC_V2_VERSION, TSYNC_V2_CLOCK_CAPABILITY, 0]).is_err());
+    }
+
+    #[test]
+    fn tsync_manifest_rejects_non_clock_capabilities() {
+        assert!(matches!(
+            V2Manifest::decode(&[TSYNC_V2_VERSION, TSYNC_V2_CLOCK_CAPABILITY | 0b1000_0000]),
+            Err(TsyncError::UnsupportedVersion)
+        ));
     }
 
     #[test]

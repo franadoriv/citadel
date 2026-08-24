@@ -20,6 +20,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub mod authoritative_input;
 pub mod baseline;
 pub mod bits;
 pub mod codec;

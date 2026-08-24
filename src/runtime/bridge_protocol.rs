@@ -717,6 +717,15 @@ pub trait BridgeCommandSink: Send + Sync + 'static {
     /// otherwise invalid answer is rejected whole by the validator and
     /// materializes nothing (owner decision 2, batch-atomic).
     fn deliver_command_batch(&self, answer: ScriptCommandBatch);
+
+    /// Hand an external-worker answer to the gateway with the exact epoch from
+    /// its data-plane header. Defaulting to the embedded path keeps existing
+    /// in-process runtimes source-compatible; the gateway overrides this to
+    /// fence worker answers before any pending batch can materialize.
+    fn deliver_command_batch_from_worker(&self, worker_epoch: u64, answer: ScriptCommandBatch) {
+        let _ = worker_epoch;
+        self.deliver_command_batch(answer);
+    }
 }
 
 #[cfg(test)]

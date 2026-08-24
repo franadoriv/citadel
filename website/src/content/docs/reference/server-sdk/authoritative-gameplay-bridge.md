@@ -29,7 +29,7 @@ loaded script. For those matches:
   route through `on_input`; the direct apply paths are unreachable.
 - A player-slot grant is refused inside a bound match (the script owns spawns).
 - Custom message kinds are **not** relayed inside a bound match. They are
-  delivered as protocol-v2 `message` events through the same fenced `on_input`
+  delivered as negotiated `message` events through the same fenced `on_input`
   batch as protected input. Reserved kinds, including `KIND_POSITION`, stay
   closed on this path. The legacy `on_message` relay path stays closed there, so
   a script cannot reach `move_actor`/`set_transform` or an unscoped cross-room

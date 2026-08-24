@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "u64_representation": "big-endian bytes; JS uses bigint; Unity and Unreal use unsigned 64-bit values",
+  "sequenced_input": {
+    "hex": "012122232425262728292a2b2c2d2e2f30ffffffffffffffff03840000000300ff80",
+    "token_hex": "2122232425262728292a2b2c2d2e2f30",
+    "sequence_hex": "ffffffffffffffff",
+    "original_custom_kind": 900,
+    "opaque_body_hex": "00ff80"
+  },
+  "input_receipt": {
+    "hex": "01ffffffffffffffff11121314151617182122232425262728292a2b2c2d2e2f300000000000000000ffffffffffffffff015152535455565758010000000400ff8041",
+    "match_id_hex": "ffffffffffffffff",
+    "stream_id_hex": "1112131415161718",
+    "token_hex": "2122232425262728292a2b2c2d2e2f30",
+    "acknowledged_sequence_hex": "0000000000000000",
+    "decided_sequence_hex": "ffffffffffffffff",
+    "disposition": 1,
+    "authoritative_tick_hex": "5152535455565758",
+    "correction_present": true,
+    "opaque_correction_hex": "00ff8041"
+  },
+  "invalid": {
+    "trailing_byte_hex": "a5",
+    "invalid_disposition_offset": 49,
+    "invalid_correction_present_offset": 58
+  }
+}

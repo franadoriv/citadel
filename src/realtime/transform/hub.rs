@@ -127,13 +127,13 @@ struct HubInner {
     /// Server-owned object -> authoritative room. Absent entries are legacy
     /// node-global objects, retained for relay compatibility.
     object_rooms: HashMap<ObjectId, u64>,
-    /// Aggregate-only v2 input-hint diagnostics. These intentionally carry no
+    /// Aggregate-only authoritative input-hint diagnostics. These intentionally carry no
     /// participant, epoch, tick, or hint values, so telemetry cannot become an
     /// input-derived label/cardinality sink.
     input_hint_metrics: InputHintMetrics,
 }
 
-/// Bounded aggregate diagnostics for untrusted v2 input hints.
+/// Bounded aggregate diagnostics for untrusted authoritative input hints.
 ///
 /// A syntactically valid, epoch-fenced hint is both `accepted` at the wire
 /// boundary and `ignored` by authority: its values never influence simulation,
@@ -915,7 +915,8 @@ impl TransformHub {
         let manifest = tsync::V2Manifest::decode(body).ok()?;
         self.register_client(participant);
         let mut g = self.inner.lock().ok()?;
-        g.clients.get_mut(&participant)?.v2_clock = true;
+        let client = g.clients.get_mut(&participant)?;
+        client.v2_clock = true;
         Some(HubOutbound {
             participant,
             room_scope: None,
@@ -1114,7 +1115,7 @@ impl TransformHub {
         valid.then_some(bundle)
     }
 
-    /// Handle an epoch-fenced v2 input. Hints are decoded only to bound and
+    /// Handle an epoch-fenced authoritative input. Hints are decoded only to bound and
     /// validate the wire; they are deliberately not passed into simulation,
     /// scheduling, authorization, latency, or rewind calculations.
     #[must_use]
@@ -1125,7 +1126,7 @@ impl TransformHub {
         self.handle_input(participant, &bundle.encode())
     }
 
-    /// Return aggregate-only v2 input-hint diagnostics for tests/observability.
+    /// Return aggregate-only authoritative input-hint diagnostics for tests/observability.
     #[must_use]
     pub fn input_hint_metrics(&self) -> InputHintMetrics {
         self.inner

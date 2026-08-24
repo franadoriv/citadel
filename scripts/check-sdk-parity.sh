@@ -35,6 +35,10 @@ fi
 # Tier A — declared-constant parity for every discovered SDK.
 "$py" "$script_dir/check_sdk_parity.py" "$repo_root"
 
+# The authoritative-input V1 byte vectors are one shared source file rather
+# than copied engine literals. Keep every engine test/hook bound to it.
+"$py" "$script_dir/check-authoritative-input-engine-fixtures.py" "$repo_root"
+
 # Tier B — optional per-SDK hooks. Iterate discovered manifests and run any
 # declared "tier_b_check" script; a missing/null hook is skipped.
 shopt -s nullglob

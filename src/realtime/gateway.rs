@@ -62,6 +62,10 @@ use crate::realtime::diagnostics::{
     LagCaptureError, LagCaptureFlush, LagCaptureManager, LagCaptureStart, LagCaptureStatus,
 };
 use crate::realtime::identity::ResumeSecret;
+use crate::realtime::input_stream_controller::{
+    InputStreamController, InputStreamControllerConfig, InputStreamControllerError,
+    InputStreamLease,
+};
 use crate::realtime::netpeer::layout::RepLayout;
 use crate::realtime::netpeer::{RepAuthority, RepReject, RepSnapshot, Validated};
 use crate::realtime::registry::{
@@ -78,9 +82,9 @@ use crate::runtime::{
     LifecycleHook, MAX_MATCH_MESSAGE_BODY_BYTES, MAX_RESERVED_KIND,
     NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext, NativeMatchLifecycleHook,
     NativeMatchLifecycleUnavailable, NormalizedEventBatch, NormalizedPayload, OutboundCommand,
-    PendingBatchLedger, RealtimeAfterOutcome, RealtimeInterception, RpcOutcome, Runtime,
-    SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding, ScriptCommand, ScriptCommandBatch, ValidatedBatch,
-    ValidatedOutcome,
+    PendingBatchLedger, ReadinessSnapshot, RealtimeAfterOutcome, RealtimeInterception,
+    ReservedKindMode, RpcOutcome, Runtime, SCRIPT_UNAVAILABLE_MESSAGE, ScriptBinding,
+    ScriptCommand, ScriptCommandBatch, ScriptReadinessState, ValidatedBatch, ValidatedOutcome,
 };
 use crate::services::party_directory::{
     PartyOwnerResolution, PartyQueueFreeze, StoragePartyDirectory,
@@ -95,6 +99,10 @@ use crate::session::SessionTokenSecret;
 use crate::session::{NodeId, OwnershipGeneration};
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 use crate::transport::{Delivery, Envelope};
+use citadel_wire::authoritative_input::{
+    AuthoritativeInputDisposition, CAPABILITY_AUTHORITATIVE_INPUT, CAPABILITY_CHALLENGE_BYTES,
+    CapabilityAcceptance, CapabilityOffer, InputReceipt, InputStreamControl, SequencedInput,
+};
 use citadel_wire::netpeer::{FieldDelta, RepSchema};
 
 pub use citadel_wire::protocol::{
@@ -116,6 +124,21 @@ pub(crate) const REMOTE_AUTHORITATIVE_ADMISSION_UNAVAILABLE_MESSAGE: &str =
 const CHAT_TYPING_TTL_MS: u64 = 5_000;
 const PARTY_OWNER_LEASE_MS: u64 = 15_000;
 const PARTY_PRESENCE_LEASE_MS: u64 = 15_000;
+/// Custom kinds 40 and 41 remain application-owned unless this exact session
+/// negotiated the authoritative-input capability.
+const MAX_LEGACY_RESERVED_KIND: u16 = KIND_DIAG_STATUS;
+/// Production-wide cap for retained authoritative input stream leases.
+const DEFAULT_INPUT_STREAM_RETAINED_LEASES: usize = 4_096;
+/// Production aggregate backlog. Individual leases are intentionally much
+/// smaller so one participant cannot consume the entire fixed-tick queue.
+const DEFAULT_INPUT_STREAM_QUEUE_CAPACITY: usize = 4_096;
+/// Production cap for the backlog belonging to one exact stream lease.
+const DEFAULT_INPUT_STREAM_PER_LEASE_QUEUE_CAPACITY: usize = 64;
+/// Maximum authoritative-input frames the gateway may move from ingress into
+/// bridge dispatch in one fixed tick. It is deliberately finite: input work
+/// cannot consume an entire simulation budget merely because the backlog is
+/// nonempty.
+const DEFAULT_INPUT_STREAM_DRAIN_PER_FIXED_TICK: usize = 256;
 
 /// Native ingress metadata supplied to the authoritative bridge for a generic
 /// custom client message. Sequence is optional because framing transports do not
@@ -2357,6 +2380,14 @@ struct RepRoomBindings {
     connections: HashMap<ParticipantId, RoomId>,
 }
 
+/// Companion-state rollback image for one local admission. Room membership uses
+/// `RoomAdmissionUndo`, which is intentionally participant scoped and kept
+/// separate so no rollback can restore a whole registry image.
+struct LocalAdmissionRollback {
+    rep_room: Option<RoomId>,
+    leases: Vec<InputStreamLease>,
+}
+
 struct RepObjectSpawn {
     object_id: u32,
     match_id: u64,
@@ -2391,7 +2422,7 @@ pub struct TransportRegistration {
 }
 
 pub struct Gateway {
-    registry: SessionRegistry,
+    registry: Arc<SessionRegistry>,
     ids: ParticipantIdGen,
     metrics: Arc<NodeMetrics>,
     /// Optional bounded recorder for already-validated bridge outcomes.
@@ -2418,11 +2449,24 @@ pub struct Gateway {
     /// room-scoped client enqueue. `RoomRegistry` and `RepRoomBindings` have
     /// independent internal locks, so this is the transaction boundary that
     /// prevents either one from becoming observable without the other.
-    room_scope: Mutex<()>,
+    room_scope: Arc<Mutex<()>>,
     /// Server-owned room membership (, Phase A). Always present: the
     /// gateway routes `KIND_ROOM_*` through it (create/join/leave/map-ready).
     rooms: RoomRegistry,
-    /// Server-owned networked actors (NPCs, ): `(room, script id)` ->
+    /// Server-owned capability leases for the authoritative input control plane.
+    /// Both the controller and delivery index are gateway-private; neither is
+    /// exposed to runtimes, telemetry, or console surfaces.
+    input_streams: Arc<ActiveInputStreamController>,
+    /// Explicit fixed-tick work budget for already-authorized stream input.
+    max_input_stream_drain_per_fixed_tick: usize,
+    input_stream_leases: Arc<Mutex<HashMap<(RoomId, ParticipantId), InputStreamLease>>>,
+    /// Exact post-auth V1 capability state. The nonce is non-bearer and is
+    /// consumed on success; both offer and acceptance are fenced to one live
+    /// registry transport generation.
+    input_capabilities: Mutex<HashMap<ParticipantId, InputCapabilityState>>,
+    /// Exact worker-generation owner for each live external-worker room.
+    /// Populated before an open frame is sent and removed with room closure.
+    worker_match_generations: Mutex<HashMap<RoomId, u64>>,
     /// globally unique transform-world identity and metadata.
     /// Populated by the Lua `spawn_actor` command; used to spawn them for a client
     /// that announces presence (so late joiners see existing NPCs).
@@ -2490,6 +2534,7 @@ impl std::fmt::Debug for Gateway {
             .field("rep_rooms", &self.rep_rooms)
             .field("room_scope", &"locked transaction gate")
             .field("rooms", &self.rooms)
+            .field("input_stream_control", &"[server-owned]")
             .field("npcs", &self.npcs)
             .field("maps", &self.maps)
             .field("domain_attached", &self.domain.is_some())
@@ -2502,6 +2547,103 @@ impl std::fmt::Debug for Gateway {
             .field("bridge", &self.bridge.is_some())
             .field("diagnostics", &self.diagnostics)
             .finish()
+    }
+}
+
+struct ActiveInputStreamController {
+    controller: Mutex<Arc<InputStreamController>>,
+}
+
+/// Private post-auth negotiation state for one exact authenticated transport.
+/// Challenges are non-bearer and never enter debug or telemetry output.
+#[derive(Clone, Copy)]
+enum InputCapabilityState {
+    Offered {
+        generation: u64,
+        offer: CapabilityOffer,
+    },
+    Accepted {
+        generation: u64,
+    },
+}
+
+impl ActiveInputStreamController {
+    fn new(config: InputStreamControllerConfig) -> Self {
+        Self {
+            controller: Mutex::new(Arc::new(InputStreamController::new(config))),
+        }
+    }
+
+    fn replace(&self, config: InputStreamControllerConfig) {
+        let mut controller = self
+            .controller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *controller = Arc::new(InputStreamController::new(config));
+    }
+
+    fn with_active<T>(&self, operation: impl FnOnce(&InputStreamController) -> T) -> T {
+        let controller = Arc::clone(
+            &self
+                .controller
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        operation(&controller)
+    }
+}
+
+fn invalidate_input_stream_control_plane(
+    room_scope: &Mutex<()>,
+    controller: &ActiveInputStreamController,
+    leases: &Mutex<HashMap<(RoomId, ParticipantId), InputStreamLease>>,
+    registry: &SessionRegistry,
+    metrics: &NodeMetrics,
+    readiness: Option<&ReadinessSnapshot>,
+) {
+    let _scope = room_scope
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(mut leases) = leases.lock() else {
+        tracing::error!("input-stream lifecycle invalidation could not lock its delivery index");
+        return;
+    };
+    let retiring: Vec<_> = leases.iter().map(|(key, lease)| (*key, *lease)).collect();
+    for ((room_id, participant), lease) in retiring {
+        let selected = readiness.is_none_or(|snapshot| match snapshot.state {
+            ScriptReadinessState::Ready => lease.binding_generation() < snapshot.generation,
+            _ => lease.binding_generation() <= snapshot.generation,
+        });
+        if !selected {
+            continue;
+        }
+        if leases.get(&(room_id, participant)) != Some(&lease) {
+            continue;
+        }
+        if let Err(error) = controller.with_active(|active| active.revoke(&lease)) {
+            // The index is deliberately retained on controller failure. Dropping
+            // it would make the still-live controller lease unobservable and
+            // permit a future replacement to be silently stranded.
+            tracing::error!(
+                room_id,
+                participant = participant.get(),
+                ?error,
+                "input-stream lifecycle invalidation failed closed"
+            );
+            continue;
+        }
+        leases.remove(&(room_id, participant));
+        let outbound = Outbound::reliable(Envelope::new(
+            citadel_wire::protocol::KIND_INPUT_STREAM_CONTROL,
+            InputStreamControl::Revoke {
+                match_id: lease.match_id(),
+                stream_id: lease.stream_id(),
+            }
+            .encode(),
+        ));
+        if registry.send_to(participant, &outbound) {
+            metrics.record_message_out(outbound.envelope.body.len() as u64);
+        }
     }
 }
 
@@ -2627,15 +2769,18 @@ impl Gateway {
             return Err(());
         }
         let binding = self.script_gate(ScriptGateSurface::LiveForm)?;
-        let room_id = self.rooms.create_bound(
-            RoomLabel {
-                map: "default".to_owned(),
-                mode: "matchmaker".to_owned(),
-                max_players: u16::try_from(participants).unwrap_or(u16::MAX),
-                open: false,
-            },
-            binding,
-        );
+        let room_id = {
+            let _scope = self.lock_room_scope();
+            self.rooms.create_bound(
+                RoomLabel {
+                    map: "default".to_owned(),
+                    mode: "matchmaker".to_owned(),
+                    max_players: u16::try_from(participants).unwrap_or(u16::MAX),
+                    open: false,
+                },
+                binding,
+            )
+        };
         self.dispatch_match_created(room_id);
         Ok(room_id)
     }
@@ -2690,17 +2835,42 @@ impl Gateway {
         };
         let (admission, previous) = {
             let _scope = self.lock_room_scope();
+            let rollback = self
+                .capture_local_admission_rollback_under_scope(sender)
+                .map_err(|_| ())?;
             let previous = self
                 .rooms
                 .room_of(sender)
                 .and_then(|id| self.room_snapshot_for_lifecycle(id));
-            let admission = self
-                .rooms
-                .admit_match_bound(sender, room_id, binding.as_ref());
-            if admission.is_ok() {
-                self.bind_rep_connection_to_room_under_scope(sender, room_id);
+            let admission =
+                self.rooms
+                    .admit_bound_with_undo(sender, room_id, true, binding.as_ref());
+            match admission {
+                Ok((label, room_undo)) => {
+                    self.bind_rep_connection_to_room_under_scope(sender, room_id);
+                    if self
+                        .commit_input_stream_admission_under_scope(
+                            sender,
+                            previous.as_ref(),
+                            room_id,
+                        )
+                        .is_err()
+                    {
+                        let _ = self.rollback_participant_admission_under_scope(
+                            sender, room_undo, rollback,
+                        );
+                        (
+                            Err(JoinError::InputStreamController(
+                                InputStreamControllerError::Unavailable,
+                            )),
+                            previous,
+                        )
+                    } else {
+                        (Ok(label), previous)
+                    }
+                }
+                Err(error) => (Err(error), previous),
             }
-            (admission, previous)
         };
         let label = match admission {
             Ok(label) => label,
@@ -2715,7 +2885,20 @@ impl Gateway {
             }
             Err(_) => return Err(()),
         };
-        self.dispatch_local_match_admission(sender, previous, room_id, false);
+        if let Err(error) = self.dispatch_local_match_admission(sender, previous, room_id, false) {
+            self.rollback_failed_input_stream_admission(sender, room_id);
+            tracing::error!(
+                ?error,
+                "live matchmaker admission rolled back after input-stream failure"
+            );
+            let _ = self.reply_rpc(
+                sender,
+                request_id,
+                protocol::RPC_STATUS_ERROR,
+                SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+            );
+            return Err(());
+        }
         let body = serde_json::json!({ "accepted": true, "match_id": room_id }).to_string();
         let _ = self.reply_rpc(sender, request_id, protocol::RPC_STATUS_OK, body.as_bytes());
         let _ = self.reply_joined_with_rep_bootstrap(sender, room_id, label);
@@ -2858,7 +3041,7 @@ impl Gateway {
         authenticator: Authenticator,
     ) -> Self {
         Self {
-            registry: SessionRegistry::new(),
+            registry: Arc::new(SessionRegistry::new()),
             ids: ParticipantIdGen::new(),
             metrics,
             authoritative_decision_recorder: None,
@@ -2867,8 +3050,19 @@ impl Gateway {
             transform: None,
             rep: None,
             rep_rooms: Mutex::new(RepRoomBindings::default()),
-            room_scope: Mutex::new(()),
+            room_scope: Arc::new(Mutex::new(())),
             rooms: RoomRegistry::new(),
+            input_streams: Arc::new(ActiveInputStreamController::new(
+                InputStreamControllerConfig::new(DEFAULT_INPUT_STREAM_RETAINED_LEASES)
+                    .with_queued_input_capacity(DEFAULT_INPUT_STREAM_QUEUE_CAPACITY)
+                    .with_per_lease_queued_input_capacity(
+                        DEFAULT_INPUT_STREAM_PER_LEASE_QUEUE_CAPACITY,
+                    ),
+            )),
+            max_input_stream_drain_per_fixed_tick: DEFAULT_INPUT_STREAM_DRAIN_PER_FIXED_TICK,
+            input_stream_leases: Arc::new(Mutex::new(HashMap::new())),
+            input_capabilities: Mutex::new(HashMap::new()),
+            worker_match_generations: Mutex::new(HashMap::new()),
             npcs: Mutex::new(HashMap::new()),
             next_scoped_actor_id: Mutex::new(0x8000_0000),
             maps: Arc::new(MapCatalog::empty()),
@@ -2891,7 +3085,39 @@ impl Gateway {
     /// enabled; see the field docs for the fail-closed contract.
     #[must_use]
     pub fn with_script_readiness(mut self, readiness: Arc<GameScriptReadiness>) -> Self {
+        let room_scope = Arc::clone(&self.room_scope);
+        let controller = Arc::clone(&self.input_streams);
+        let leases = Arc::clone(&self.input_stream_leases);
+        let registry = Arc::clone(&self.registry);
+        let metrics = Arc::clone(&self.metrics);
+        readiness.register_invalidation(Arc::new(move |snapshot| {
+            invalidate_input_stream_control_plane(
+                &room_scope,
+                &controller,
+                &leases,
+                &registry,
+                &metrics,
+                Some(&snapshot),
+            );
+        }));
         self.script_readiness = Some(readiness);
+        self
+    }
+
+    /// Override bounded stream-input limits before registering script readiness or
+    /// sharing the gateway.
+    ///
+    /// This is useful for deterministic integration tests and deployments that
+    /// size fixed-tick work explicitly. A zero drain budget fail-closes stream
+    /// input dispatch while retaining a bounded queue.
+    #[must_use]
+    pub fn with_input_stream_config(
+        mut self,
+        config: InputStreamControllerConfig,
+        max_drain_per_fixed_tick: usize,
+    ) -> Self {
+        self.input_streams.replace(config);
+        self.max_input_stream_drain_per_fixed_tick = max_drain_per_fixed_tick;
         self
     }
 
@@ -3545,6 +3771,31 @@ impl Gateway {
         }
     }
 
+    /// Retire every gateway-owned replication index associated with a room
+    /// during its final server-side close. This runs under `room_scope` only
+    /// after all local members have been unbound, so no later scoped delivery
+    /// can resolve a dead room through either direction of the room/match map.
+    fn retire_rep_room_bindings_under_scope(&self, room_id: RoomId) {
+        let Ok(mut bindings) = self.rep_rooms.lock() else {
+            tracing::error!(room_id, "match close could not lock replication room index");
+            return;
+        };
+        bindings
+            .connections
+            .retain(|_, bound_room| *bound_room != room_id);
+        bindings
+            .objects
+            .retain(|_, bound_room| *bound_room != room_id);
+        if let Some(match_id) = bindings.room_matches.remove(&room_id)
+            && bindings.match_rooms.get(&match_id) == Some(&room_id)
+        {
+            bindings.match_rooms.remove(&match_id);
+        }
+        bindings
+            .match_rooms
+            .retain(|_, bound_room| *bound_room != room_id);
+    }
+
     /// Obtain the gateway-wide transaction gate for room membership, trusted
     /// replication bindings, and their client-facing deliveries.
     fn lock_room_scope(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -4015,6 +4266,15 @@ impl Gateway {
         &self.metrics
     }
 
+    /// Number of stream-input frames admitted to the bounded queue. The
+    /// count intentionally exposes neither payloads nor bearer material.
+    #[must_use]
+    pub fn queued_authoritative_input_count(&self) -> usize {
+        self.input_streams
+            .with_active(|controller| controller.queued_input_count())
+            .unwrap_or(0)
+    }
+
     /// Non-sensitive telemetry from the local ticket index. This is separate
     /// from transport counters because it deliberately reports no player or
     /// query data.
@@ -4102,6 +4362,9 @@ impl Gateway {
             return unreliable;
         }
         self.complete_gateway_registration(id, authenticated, authenticated_user.as_deref(), true);
+        if authenticated {
+            self.offer_authoritative_input(id);
+        }
         unreliable
     }
 
@@ -4229,6 +4492,9 @@ impl Gateway {
             }
         }
         self.complete_gateway_registration(id, authenticated, authenticated_user.as_deref(), true);
+        if authenticated {
+            self.offer_authoritative_input(id);
+        }
         TransportRegistration {
             unreliable,
             superseded,
@@ -4298,6 +4564,9 @@ impl Gateway {
             return unreliable;
         }
         self.complete_gateway_registration(id, authenticated, authenticated_user.as_deref(), false);
+        if authenticated {
+            self.offer_authoritative_input(id);
+        }
         unreliable
     }
 
@@ -4408,6 +4677,7 @@ impl Gateway {
     /// registry removal so its emitted commands still reach the remaining peers
     /// (the leaver is excluded), then the session is removed and the gauge drops.
     pub fn unregister_session(&self, id: ParticipantId) {
+        self.clear_authoritative_input_capability(id);
         if !self.registry.claim_cleanup(id) {
             return;
         }
@@ -4562,28 +4832,57 @@ impl Gateway {
         let Some(runtime) = &self.runtime else {
             return;
         };
-        let (clock_epoch, tick) = self
-            .transform
-            .as_ref()
-            .and_then(|hub| hub.gameplay_clock())
-            .map(|clock| (clock.epoch, clock.tick))
-            .unwrap_or((0, 0));
-        let context = NativeMatchContext {
-            match_id: room.id,
-            lifecycle_generation: room
-                .script_binding
+        // Lifecycle callbacks are an authoritative effect, not a delayed audit
+        // log. Hold the same room transaction gate that commits membership while
+        // validating and invoking the runtime so a concurrent move/leave/rejoin
+        // cannot run a callback for a superseded room image. Commands are applied
+        // only after the gate is released; their scoped delivery revalidates again.
+        let commands = {
+            let _scope = self.lock_room_scope();
+            let current = self.room_snapshot_for_lifecycle(room.id);
+            let current_transition = match hook {
+                NativeMatchLifecycleHook::Created
+                | NativeMatchLifecycleHook::Started
+                | NativeMatchLifecycleHook::Join
+                | NativeMatchLifecycleHook::Tick => current.as_ref().is_some_and(|current| {
+                    current.lifecycle_generation == room.lifecycle_generation
+                }),
+                NativeMatchLifecycleHook::Leave => current.as_ref().is_none_or(|current| {
+                    current.lifecycle_generation == room.lifecycle_generation
+                }),
+                // Room ids never recycle. Once closed, no later live room can
+                // satisfy this callback; the generation still fences callbacks
+                // captured before a move/rejoin while the room remains live.
+                NativeMatchLifecycleHook::Ended => current.is_none(),
+            };
+            if !current_transition {
+                tracing::debug!(
+                    room_id = room.id,
+                    ?hook,
+                    "suppressed stale native match lifecycle callback"
+                );
+                return;
+            }
+            let (clock_epoch, tick) = self
+                .transform
                 .as_ref()
-                .map_or(0, |binding| binding.generation),
-            clock_epoch,
-            tick,
-            participants: room.members.iter().map(|member| member.get()).collect(),
-            map: room.label.map,
-            mode: room.label.mode,
-            max_players: room.label.max_players,
-            open: termination_reason.is_none() && room.label.open,
-            termination_reason: termination_reason.map(str::to_owned),
+                .and_then(|hub| hub.gameplay_clock())
+                .map(|clock| (clock.epoch, clock.tick))
+                .unwrap_or((0, 0));
+            let context = NativeMatchContext {
+                match_id: room.id,
+                lifecycle_generation: room.lifecycle_generation,
+                clock_epoch,
+                tick,
+                participants: room.members.iter().map(|member| member.get()).collect(),
+                map: room.label.map,
+                mode: room.label.mode,
+                max_players: room.label.max_players,
+                open: termination_reason.is_none() && room.label.open,
+                termination_reason: termination_reason.map(str::to_owned),
+            };
+            runtime.dispatch_match_lifecycle(hook, context, budget)
         };
-        let commands = runtime.dispatch_match_lifecycle(hook, context, budget);
         self.apply_commands_scoped(None, Some(room.id), commands);
     }
 
@@ -4624,7 +4923,409 @@ impl Gateway {
         }
     }
 
-    /// Dispatch the exact native transitions for one successful local admission.
+    fn input_stream_clock_epoch(&self) -> Option<u64> {
+        self.transform
+            .as_ref()
+            .map_or(Some(0), |hub| hub.gameplay_clock().map(|clock| clock.epoch))
+    }
+
+    fn current_input_stream_lease(
+        &self,
+        room_id: RoomId,
+        participant: ParticipantId,
+    ) -> Option<InputStreamLease> {
+        self.input_stream_leases
+            .lock()
+            .ok()?
+            .get(&(room_id, participant))
+            .copied()
+    }
+
+    /// Whether this exact authenticated transport generation accepted the
+    /// standalone V1 authoritative-input offer. A replaced transport cannot
+    /// inherit this bit because every read compares the registry generation.
+    fn authoritative_input_negotiated(&self, participant: ParticipantId) -> bool {
+        let Some(connection) = self.registry.connection_ref(participant) else {
+            return false;
+        };
+        self.input_capabilities.lock().ok().is_some_and(|states| {
+            matches!(
+                states.get(&participant),
+                Some(InputCapabilityState::Accepted { generation })
+                    if *generation == connection.generation()
+            )
+        })
+    }
+
+    /// Offer the standalone V1 extension only after authenticated registration.
+    /// The offer contains no bearer and is ignored harmlessly by older SDKs.
+    fn offer_authoritative_input(&self, participant: ParticipantId) {
+        if !self.registry.is_authenticated(participant) {
+            return;
+        }
+        let Some(connection) = self.registry.connection_ref(participant) else {
+            return;
+        };
+        let mut challenge = [0; CAPABILITY_CHALLENGE_BYTES];
+        if getrandom::fill(&mut challenge).is_err() {
+            return;
+        }
+        let Ok(offer) = CapabilityOffer::new(CAPABILITY_AUTHORITATIVE_INPUT, challenge) else {
+            return;
+        };
+        let Ok(mut states) = self.input_capabilities.lock() else {
+            return;
+        };
+        states.insert(
+            participant,
+            InputCapabilityState::Offered {
+                generation: connection.generation(),
+                offer,
+            },
+        );
+        let outbound = Outbound::reliable(Envelope::new(
+            citadel_wire::protocol::KIND_CAPABILITY_OFFER,
+            offer.encode(),
+        ));
+        if self.registry.send_to(participant, &outbound) {
+            self.metrics
+                .record_message_out(outbound.envelope.body.len() as u64);
+        } else {
+            states.remove(&participant);
+        }
+    }
+
+    /// Consume a canonical V1 acceptance only when it echoes this exact live
+    /// transport generation's outstanding offer. Forged, replayed, malformed,
+    /// wrong-session, and stale-generation frames fail closed without metrics or
+    /// script delivery.
+    fn accept_authoritative_input(&self, participant: ParticipantId, body: &[u8]) {
+        let Ok(acceptance) = CapabilityAcceptance::decode(body) else {
+            return;
+        };
+        let Some(connection) = self.registry.connection_ref(participant) else {
+            return;
+        };
+        let Ok(mut states) = self.input_capabilities.lock() else {
+            return;
+        };
+        let Some(InputCapabilityState::Offered { generation, offer }) =
+            states.get(&participant).copied()
+        else {
+            return;
+        };
+        if generation != connection.generation() || !acceptance.matches_offer(offer) {
+            return;
+        }
+        states.insert(
+            participant,
+            InputCapabilityState::Accepted {
+                generation: connection.generation(),
+            },
+        );
+        drop(states);
+        let _scope = self.lock_room_scope();
+        if let Some(room_id) = self.rooms.room_of(participant) {
+            let _ = self.advertise_input_stream_after_admission_under_scope(participant, room_id);
+        }
+    }
+
+    fn clear_authoritative_input_capability(&self, participant: ParticipantId) {
+        if let Ok(mut states) = self.input_capabilities.lock() {
+            states.remove(&participant);
+        }
+    }
+
+    /// Infrastructure kinds are mode-aware at the bridge boundary: the two
+    /// legacy custom kinds stay application-owned until this session negotiated
+    /// authoritative input, at which point 40 is server-only and 41 is the
+    /// tokenized ingress envelope.
+    fn reserved_kind_for_session(&self, participant: ParticipantId, kind: u16) -> bool {
+        kind <= MAX_LEGACY_RESERVED_KIND
+            || (self.authoritative_input_negotiated(participant) && kind <= MAX_RESERVED_KIND)
+    }
+
+    /// Capture every mutable authority owned by a local room admission while
+    /// the caller holds `room_scope`. A later failed control delivery restores
+    /// this image before the scope is released, leaving no observable half-move.
+    fn capture_local_admission_rollback_under_scope(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<LocalAdmissionRollback, InputStreamControllerError> {
+        let rep_room = self
+            .rep_rooms
+            .lock()
+            .map_err(|_| InputStreamControllerError::Unavailable)?
+            .connections
+            .get(&participant)
+            .copied();
+        let leases = self
+            .input_stream_leases
+            .lock()
+            .map_err(|_| InputStreamControllerError::Unavailable)?
+            .iter()
+            .filter_map(|((_, owner), lease)| (*owner == participant).then_some(*lease))
+            .collect();
+        Ok(LocalAdmissionRollback { rep_room, leases })
+    }
+
+    /// Restore a failed local admission while `room_scope` remains held. Current
+    /// provisional leases are retired first, then the exact captured leases and
+    /// replication/membership image return together. Any controller failure is
+    /// returned so callers fail closed rather than silently forgetting a lease.
+    fn rollback_local_admission_under_scope(
+        &self,
+        participant: ParticipantId,
+        rollback: LocalAdmissionRollback,
+    ) -> Result<(), InputStreamControllerError> {
+        let current: Vec<_> = self
+            .input_stream_leases
+            .lock()
+            .map_err(|_| InputStreamControllerError::Unavailable)?
+            .iter()
+            .filter_map(|((_, owner), lease)| (*owner == participant).then_some(*lease))
+            .collect();
+        for lease in current {
+            self.input_streams
+                .with_active(|controller| controller.revoke(&lease))?;
+            self.input_stream_leases
+                .lock()
+                .map_err(|_| InputStreamControllerError::Unavailable)?
+                .remove(&(lease.match_id(), participant));
+        }
+        self.unbind_rep_connection_under_scope(participant);
+        if let Some(room_id) = rollback.rep_room {
+            self.bind_rep_connection_to_room_under_scope(participant, room_id);
+        }
+        for lease in rollback.leases {
+            self.restore_input_stream_lease_under_scope(participant, lease)?;
+        }
+        Ok(())
+    }
+
+    /// Roll back a failed admission without restoring global room state. The
+    /// registry undo touches only `participant`; companion replication and lease
+    /// state are restored under the same outer room transaction.
+    fn rollback_participant_admission_under_scope(
+        &self,
+        participant: ParticipantId,
+        room_undo: crate::realtime::rooms::RoomAdmissionUndo,
+        rollback: LocalAdmissionRollback,
+    ) -> Result<(), InputStreamControllerError> {
+        self.rooms.rollback_admission(room_undo);
+        self.rollback_local_admission_under_scope(participant, rollback)
+    }
+
+    /// Retire exactly the lease observed by a server-owned lifecycle transition.
+    /// Controller revocation succeeds before the delivery index changes: on a
+    /// controller failure the exact index entry remains inspectable and cannot
+    /// be replaced or silently stranded.
+    fn revoke_input_stream_lease_under_scope(
+        &self,
+        participant: ParticipantId,
+        lease: InputStreamLease,
+    ) -> Result<(), InputStreamControllerError> {
+        let key = (lease.match_id(), participant);
+        let mut leases = self
+            .input_stream_leases
+            .lock()
+            .map_err(|_| InputStreamControllerError::Unavailable)?;
+        if leases.get(&key) != Some(&lease) {
+            return Ok(());
+        }
+        let control = InputStreamControl::Revoke {
+            match_id: lease.match_id(),
+            stream_id: lease.stream_id(),
+        };
+        let outbound = Outbound::reliable(Envelope::new(
+            citadel_wire::protocol::KIND_INPUT_STREAM_CONTROL,
+            control.encode(),
+        ));
+        // Server authorization retirement is the linearization point. A client
+        // notification is best effort: a saturated/closed outbound queue must
+        // never retain a usable lease or block teardown.
+        self.input_streams
+            .with_active(|controller| controller.revoke(&lease))?;
+        leases.remove(&key);
+        drop(leases);
+        if self.registry.send_to(participant, &outbound) {
+            self.metrics
+                .record_message_out(outbound.envelope.body.len() as u64);
+        }
+        Ok(())
+    }
+
+    fn restore_input_stream_lease_under_scope(
+        &self,
+        participant: ParticipantId,
+        lease: InputStreamLease,
+    ) -> Result<(), InputStreamControllerError> {
+        let key = (lease.match_id(), participant);
+        let mut leases = self
+            .input_stream_leases
+            .lock()
+            .map_err(|_| InputStreamControllerError::Unavailable)?;
+        if let Some(current) = leases.get(&key) {
+            return (current == &lease)
+                .then_some(())
+                .ok_or(InputStreamControllerError::ActiveLease);
+        }
+        self.input_streams
+            .with_active(|controller| controller.restore(lease))?;
+        leases.insert(key, lease);
+        Ok(())
+    }
+
+    fn revoke_input_stream_lease(&self, participant: ParticipantId, lease: InputStreamLease) {
+        let _scope = self.lock_room_scope();
+        if let Err(error) = self.revoke_input_stream_lease_under_scope(participant, lease) {
+            tracing::error!(
+                room_id = lease.match_id(),
+                participant = participant.get(),
+                ?error,
+                "input-stream revoke failed closed; lease index retained"
+            );
+        }
+    }
+
+    fn revoke_current_input_stream_under_scope(
+        &self,
+        room_id: RoomId,
+        participant: ParticipantId,
+    ) -> Result<(), InputStreamControllerError> {
+        let Some(lease) = self.current_input_stream_lease(room_id, participant) else {
+            return Ok(());
+        };
+        self.revoke_input_stream_lease_under_scope(participant, lease)
+    }
+
+    /// Mint and reliably advertise an input stream only after the gateway has
+    /// revalidated the server-owned membership, script binding, and clock while
+    /// the room lifecycle transition is serialized. Nothing is sent for legacy
+    /// or unbound rooms.
+    fn advertise_input_stream_after_admission_under_scope(
+        &self,
+        participant: ParticipantId,
+        room_id: RoomId,
+    ) -> Result<(), InputStreamControllerError> {
+        if !self.authoritative_input_negotiated(participant) {
+            return Ok(());
+        }
+        let Some((current_room, binding)) = self.authoritative_match(participant) else {
+            return Ok(());
+        };
+        if current_room != room_id {
+            return Ok(());
+        }
+        let clock_epoch = self
+            .input_stream_clock_epoch()
+            .ok_or(InputStreamControllerError::Unavailable)?;
+        if let Some(current) = self.current_input_stream_lease(room_id, participant) {
+            return (current.binding_generation() == binding.generation
+                && current.clock_epoch() == clock_epoch)
+                .then_some(())
+                .ok_or(InputStreamControllerError::ActiveLease);
+        }
+        let lease = self.input_streams.with_active(|controller| {
+            controller.mint(room_id, participant, binding.generation, clock_epoch)
+        })?;
+        let key = (room_id, participant);
+        let mut leases = match self.input_stream_leases.lock() {
+            Ok(leases) => leases,
+            Err(_) => {
+                let _ = self
+                    .input_streams
+                    .with_active(|controller| controller.revoke(&lease));
+                return Err(InputStreamControllerError::Unavailable);
+            }
+        };
+        if leases.contains_key(&key) {
+            let _ = self
+                .input_streams
+                .with_active(|controller| controller.revoke(&lease));
+            return Err(InputStreamControllerError::ActiveLease);
+        }
+        leases.insert(key, lease);
+        let control = InputStreamControl::Advertise {
+            match_id: room_id,
+            stream_id: lease.stream_id(),
+            token: lease.token(),
+        };
+        let outbound = Outbound::reliable(Envelope::new(
+            citadel_wire::protocol::KIND_INPUT_STREAM_CONTROL,
+            control.encode(),
+        ));
+        if self.registry.send_to(participant, &outbound) {
+            self.metrics
+                .record_message_out(outbound.envelope.body.len() as u64);
+            return Ok(());
+        }
+        // A required capability was not installed at the client-facing
+        // boundary. Retire it before reporting admission failure; if the
+        // controller itself is unavailable retain the index for recovery.
+        if let Err(error) = self
+            .input_streams
+            .with_active(|controller| controller.revoke(&lease))
+        {
+            return Err(error);
+        }
+        leases.remove(&key);
+        Err(InputStreamControllerError::Unavailable)
+    }
+
+    /// Revoke leases whose exact server-owned binding, membership, or gameplay
+    /// clock no longer matches. This is called from the always-on tick path, so
+    /// hot reload and clock transitions cannot retain a usable old capability.
+    fn refresh_input_stream_leases(&self) {
+        let leases = self
+            .input_stream_leases
+            .lock()
+            .map(|leases| {
+                leases
+                    .iter()
+                    .map(|(key, lease)| (*key, *lease))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let clock_epoch = self.input_stream_clock_epoch();
+        for ((room_id, participant), lease) in leases {
+            let binding_current = self.rooms.binding(room_id).is_some_and(|binding| {
+                binding.generation == lease.binding_generation()
+                    && self
+                        .script_readiness
+                        .as_ref()
+                        .is_none_or(|readiness| readiness.gate().ok().as_ref() == Some(&binding))
+            });
+            if self.rooms.room_of(participant) != Some(room_id)
+                || !binding_current
+                || clock_epoch != Some(lease.clock_epoch())
+                || self.bridge.is_none()
+            {
+                self.revoke_input_stream_lease(participant, lease);
+            }
+        }
+    }
+
+    /// Commit the input-control half of a local admission while the membership,
+    /// replication binding, and rollback image are all still protected by one
+    /// `room_scope` transaction. The caller restores the image on error before
+    /// exposing any lifecycle callback.
+    fn commit_input_stream_admission_under_scope(
+        &self,
+        participant: ParticipantId,
+        previous: Option<&RoomSnapshot>,
+        room_id: RoomId,
+    ) -> Result<(), InputStreamControllerError> {
+        if previous.is_some_and(|room| room.id == room_id) {
+            return Ok(());
+        }
+        if let Some(previous) = previous {
+            self.revoke_current_input_stream_under_scope(previous.id, participant)?;
+        }
+        self.advertise_input_stream_after_admission_under_scope(participant, room_id)
+    }
+
+    /// Dispatch the exact native transitions for one committed local admission.
     /// The room registry owns the membership mutation; this observes its before
     /// and after snapshots so protocol and trusted paths share idempotence and
     /// move semantics without exposing a second mutation API.
@@ -4634,12 +5335,12 @@ impl Gateway {
         previous: Option<RoomSnapshot>,
         room_id: RoomId,
         created: bool,
-    ) {
+    ) -> Result<(), InputStreamControllerError> {
         if previous.as_ref().is_some_and(|room| room.id == room_id) {
-            return;
+            return Ok(());
         }
         let Some(current) = self.room_snapshot_for_lifecycle(room_id) else {
-            return;
+            return Ok(());
         };
         let budget = self.native_match_budget();
         if let Some(previous) = previous {
@@ -4680,6 +5381,7 @@ impl Gateway {
             );
         }
         self.dispatch_match_lifecycle(NativeMatchLifecycleHook::Join, current, None, budget);
+        Ok(())
     }
 
     /// The owner node observes trusted remote admission just as it observes a
@@ -4731,6 +5433,82 @@ impl Gateway {
         let _ = member;
     }
 
+    /// Drain already-authorized stream-input frames only at the fixed server tick.
+    /// Every capability coordinate is revalidated and the bridge batch is issued
+    /// while `room_scope` is held; a reload, clock change, leave, revoke, or
+    /// capability clear therefore cannot interleave between validation and issue.
+    fn drain_authoritative_inputs_on_fixed_tick(&self) {
+        let Ok(inputs) = self.input_streams.with_active(|controller| {
+            controller.drain_for_fixed_tick(self.max_input_stream_drain_per_fixed_tick)
+        }) else {
+            return;
+        };
+        for input in inputs {
+            let batch = {
+                let _scope = self.lock_room_scope();
+                self.issue_authoritative_input_batch_under_scope(input)
+            };
+            if let (Some(batch), Some(runtime)) = (batch, &self.runtime) {
+                runtime.deliver_event_batch(batch);
+            }
+        }
+    }
+
+    /// Issue one stream-input bridge batch only after atomically revalidating
+    /// the exact accepted capability, lease, room member, binding, and clock.
+    /// The caller holds `room_scope` for the full validation-and-ledger issue.
+    fn issue_authoritative_input_batch_under_scope(
+        &self,
+        input: crate::realtime::input_stream_controller::QueuedInput,
+    ) -> Option<NormalizedEventBatch> {
+        let participant = input.lease.participant();
+        let room_id = input.lease.match_id();
+        if !self.authoritative_input_negotiated(participant) {
+            return None;
+        }
+        let (current_room, binding) = self.authoritative_match(participant)?;
+        if current_room != room_id
+            || self.current_input_stream_lease(room_id, participant) != Some(input.lease)
+            || self.input_stream_clock_epoch() != Some(input.lease.clock_epoch())
+            || binding.generation != input.lease.binding_generation()
+            || self
+                .script_readiness
+                .as_ref()
+                .is_some_and(|readiness| readiness.gate().ok().as_ref() != Some(&binding))
+        {
+            return None;
+        }
+        let batch = self.issue_bridge_batch(
+            room_id,
+            &binding,
+            vec![EventDraft {
+                participant: participant.get(),
+                user_id: self.registry.user_id_of(participant),
+                payload: NormalizedPayload::MatchMessage {
+                    kind: input.original_custom_kind,
+                    body: input.body,
+                    reliable: true,
+                    sequence: Some(input.sequence),
+                },
+            }],
+            ReservedKindMode::AuthoritativeInput,
+        )?;
+        let event_id = batch.events.first()?.event_id;
+        self.bridge
+            .as_ref()?
+            .pending_input_receipts
+            .lock()
+            .ok()?
+            .insert(
+                (room_id, event_id),
+                PendingInputReceipt {
+                    lease: input.lease,
+                    batch_id: batch.batch_id,
+                },
+            );
+        Some(batch)
+    }
+
     /// Run one server game-loop tick and deliver its commands to all sessions.
     ///
     /// Invoked by the periodic tick task. `dt` is the nominal step and `budget`
@@ -4740,6 +5518,8 @@ impl Gateway {
     /// A no-op returning 0 when no runtime is attached.
     pub fn tick(&self, dt: std::time::Duration, budget: std::time::Duration) -> usize {
         self.expire_revocation_tombstones_at(SystemClock.now());
+        self.refresh_input_stream_leases();
+        self.drain_authoritative_inputs_on_fixed_tick();
         let Some(runtime) = &self.runtime else {
             return 0;
         };
@@ -4793,6 +5573,32 @@ impl Gateway {
             tracing::debug!(%sender, kind = env.kind, "gateway dropped inbound after connection close");
             return 0;
         }
+        // Standalone V1 acceptance is a server-owned post-auth control. It is
+        // consumed before metrics/runtime; an unknown offer is harmless to old
+        // clients, while forged or replayed acceptance is side-effect free.
+        if env.kind == citadel_wire::protocol::KIND_CAPABILITY_ACCEPTANCE {
+            self.accept_authoritative_input(sender, &env.body);
+            return 0;
+        }
+        // Input-stream control is server-to-client only for a session that
+        // negotiated authoritative input. Reject it before generic inbound
+        // accounting regardless of current room so a client cannot move traffic
+        // metrics, runtime observability, or application state with a forged
+        // control body after leaving or outside a native match. Sessions that did
+        // not negotiate retain kind 40 as a legacy custom kind.
+        if env.kind == citadel_wire::protocol::KIND_INPUT_STREAM_CONTROL
+            && self.authoritative_input_negotiated(sender)
+        {
+            return 0;
+        }
+        // Stream-bound authoritative input is reserved only for a session that
+        // explicitly negotiated the standalone post-auth capability. Every other session retains legacy
+        // custom-kind 41 dispatch, including inside a bound match.
+        if env.kind == citadel_wire::protocol::KIND_AUTHORITATIVE_INPUT
+            && self.authoritative_input_negotiated(sender)
+        {
+            return self.handle_authoritative_input(sender, &env.body);
+        }
         self.metrics.record_message_in(env.body.len() as u64);
         // `KIND_AUTH`/`KIND_AUTH_RESULT` are handshake-only: a connection
         // authenticates exactly once, before registration. A
@@ -4805,7 +5611,6 @@ impl Gateway {
             tracing::debug!(%sender, kind = env.kind, "gateway dropped a reserved post-handshake auth frame");
             return 0;
         }
-
         // Diagnostics controls are a trusted native protocol surface. They are
         // handled before runtime interception/dispatch and never fall through
         // to relay or GameScript handlers, including malformed and stale input.
@@ -4824,7 +5629,7 @@ impl Gateway {
         // bridge is its first script boundary; protected/reserved kinds retain
         // their dedicated native routes below.
         if let Some((authoritative_room, binding)) = self.authoritative_match(sender)
-            && env.kind > MAX_RESERVED_KIND
+            && !self.reserved_kind_for_session(sender, env.kind)
         {
             return self.route_bridge_match_message(
                 sender,
@@ -4878,7 +5683,7 @@ impl Gateway {
             // clock/tick fences are installed before on_input runs; a stale,
             // moved, non-member, oversized, or otherwise foreign frame is
             // dropped before runtime invocation.
-            if env.kind <= MAX_RESERVED_KIND {
+            if self.reserved_kind_for_session(sender, env.kind) {
                 tracing::debug!(
                     %sender,
                     kind = env.kind,
@@ -4919,6 +5724,68 @@ impl Gateway {
             );
         }
         delivered
+    }
+
+    /// Decode, bind, and safely queue one authoritative input envelope.
+    ///
+    /// The body supplies only its opaque stream token and opaque payload. Match,
+    /// participant, binding generation, stream incarnation, and clock are all
+    /// read under `room_scope` from Gateway-owned authority. No script callback,
+    /// receipt, or telemetry is emitted in this first data-plane slice.
+    fn handle_authoritative_input(&self, sender: ParticipantId, body: &[u8]) -> usize {
+        let Ok(input) = SequencedInput::decode(body) else {
+            return 0;
+        };
+        // The nested kind becomes a bridge message kind at fixed-tick drain.
+        // Keep the entire reserved control plane out of that deferred path at
+        // ingress, before it can consume queue capacity or reach a runtime.
+        if input.original_custom_kind <= MAX_RESERVED_KIND {
+            return 0;
+        }
+        let _scope = self.lock_room_scope();
+        // The outer dispatch check is only a fast route selection. Recheck
+        // under the same scope that commits post-auth capability retirement so a frame
+        // that observed the old capability before waiting cannot enqueue after
+        // its lease has been retired.
+        if !self.authoritative_input_negotiated(sender) {
+            return 0;
+        }
+        let Some((room_id, binding)) = self.authoritative_match(sender) else {
+            return 0;
+        };
+        if self
+            .script_readiness
+            .as_ref()
+            .is_some_and(|readiness| readiness.gate().ok().as_ref() != Some(&binding))
+        {
+            return 0;
+        }
+        let Some(clock_epoch) = self.input_stream_clock_epoch() else {
+            return 0;
+        };
+        let Some(lease) = self.current_input_stream_lease(room_id, sender) else {
+            return 0;
+        };
+        if lease.match_id() != room_id
+            || lease.binding_generation() != binding.generation
+            || lease.clock_epoch() != clock_epoch
+            || lease.token() != input.stream_token
+        {
+            return 0;
+        }
+        // `enqueue_if_current` compares the entire private lease image while
+        // holding the controller lock, including room/participant/stream/token/
+        // binding/clock. Revocation shares this room scope and purges accepted
+        // entries, so no old stream can survive its retirement boundary.
+        let _ = self.input_streams.with_active(|controller| {
+            controller.enqueue_if_current(
+                lease,
+                input.sequence,
+                input.original_custom_kind,
+                input.body,
+            )
+        });
+        0
     }
 
     /// Handle all diagnostics kinds before any script/runtime path. The return
@@ -6531,21 +7398,64 @@ impl Gateway {
         }
         let (admission, previous) = {
             let _scope = self.lock_room_scope();
+            let rollback = match self.capture_local_admission_rollback_under_scope(sender) {
+                Ok(rollback) => rollback,
+                Err(error) => {
+                    return self.reply_rpc(
+                        sender,
+                        request_id,
+                        protocol::RPC_STATUS_ERROR,
+                        format!("match admission failed: {error:?}").as_bytes(),
+                    );
+                }
+            };
             let previous = self
                 .rooms
                 .room_of(sender)
                 .and_then(|id| self.room_snapshot_for_lifecycle(id));
-            let admission = self
-                .rooms
-                .admit_match_bound(sender, handoff.room_id, binding.as_ref());
-            if admission.is_ok() {
-                self.bind_rep_connection_to_room_under_scope(sender, handoff.room_id);
-            }
+            let admission =
+                self.rooms
+                    .admit_bound_with_undo(sender, handoff.room_id, true, binding.as_ref());
+            let admission = match admission {
+                Ok((label, room_undo)) => {
+                    self.bind_rep_connection_to_room_under_scope(sender, handoff.room_id);
+                    match self.commit_input_stream_admission_under_scope(
+                        sender,
+                        previous.as_ref(),
+                        handoff.room_id,
+                    ) {
+                        Ok(()) => Ok(label),
+                        Err(error) => {
+                            let rollback_error = self.rollback_participant_admission_under_scope(
+                                sender, room_undo, rollback,
+                            );
+                            Err(JoinError::InputStreamController(
+                                rollback_error.err().unwrap_or(error),
+                            ))
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
             (admission, previous)
         };
         match admission {
             Ok(label) => {
-                self.dispatch_local_match_admission(sender, previous, handoff.room_id, false);
+                if let Err(error) =
+                    self.dispatch_local_match_admission(sender, previous, handoff.room_id, false)
+                {
+                    self.rollback_failed_input_stream_admission(sender, handoff.room_id);
+                    tracing::error!(
+                        ?error,
+                        "matchmaker handoff rolled back after input-stream failure"
+                    );
+                    return self.reply_rpc(
+                        sender,
+                        request_id,
+                        protocol::RPC_STATUS_ERROR,
+                        SCRIPT_UNAVAILABLE_MESSAGE.as_bytes(),
+                    );
+                }
                 if let Ok(mut handoffs) = self.handoffs.lock() {
                     let remove_ticket = if let Some(pending) = handoffs.pending.get_mut(ticket) {
                         pending.retain(|candidate| {
@@ -6811,7 +7721,7 @@ impl Gateway {
                 sent
             }
             KIND_TSYNC_V2_INPUT => {
-                // Authoritative match: epoch-validate the v2 wrapper, then route
+                // Authoritative match: epoch-validate the TSYNC wrapper, then route
                 // the inner bundle through the validator (bypass B3 closed).
                 if let Some((room_id, binding)) = self.authoritative_match(sender) {
                     let Some(bundle) = hub.decode_v2_input(sender.get(), &env.body) else {
@@ -7189,16 +8099,45 @@ impl Gateway {
             .map_err(JoinError::from)?;
         let (label, previous) = {
             let _scope = self.lock_room_scope();
+            let rollback = self
+                .capture_local_admission_rollback_under_scope(participant)
+                .map_err(JoinError::InputStreamController)?;
             let previous = self
                 .rooms
                 .room_of(participant)
                 .and_then(|id| self.room_snapshot_for_lifecycle(id));
-            let label = self.rooms.join(participant, room_id)?;
+            let (label, room_undo) =
+                self.rooms
+                    .admit_bound_with_undo(participant, room_id, false, None)?;
             self.bind_rep_connection_to_room_under_scope(participant, room_id);
+            if let Err(error) = self.commit_input_stream_admission_under_scope(
+                participant,
+                previous.as_ref(),
+                room_id,
+            ) {
+                let rollback_error = self.rollback_participant_admission_under_scope(
+                    participant,
+                    room_undo,
+                    rollback,
+                );
+                return Err(JoinError::InputStreamController(
+                    rollback_error.err().unwrap_or(error),
+                ));
+            }
             (label, previous)
         };
-        self.dispatch_local_match_admission(participant, previous, room_id, false);
+        self.dispatch_local_match_admission(participant, previous, room_id, false)
+            .map_err(JoinError::InputStreamController)?;
         Ok(label)
+    }
+
+    /// Atomically join a named trusted room or create it and bind the caller.
+    fn rollback_failed_input_stream_admission(&self, participant: ParticipantId, room_id: RoomId) {
+        let _scope = self.lock_room_scope();
+        if self.rooms.room_of(participant) == Some(room_id) {
+            let _ = self.rooms.leave(participant);
+            self.unbind_rep_connection_under_scope(participant);
+        }
     }
 
     /// Atomically join a named trusted room or create it and bind the caller.
@@ -7223,25 +8162,41 @@ impl Gateway {
     ) -> Result<(RoomId, RoomLabel), JoinError> {
         self.require_native_match_lifecycle()
             .map_err(JoinError::from)?;
-        let (room_id, label, created, previous) = {
-            let _scope = self.lock_room_scope();
-            let existing_rooms: HashSet<RoomId> = self
-                .rooms
-                .snapshot()
-                .into_iter()
-                .map(|room| room.id)
-                .collect();
-            let previous = self
-                .rooms
-                .room_of(participant)
-                .and_then(|id| self.room_snapshot_for_lifecycle(id));
-            let (room_id, label) =
-                self.rooms
-                    .join_or_create_bound(participant, name, binding, make_label)?;
-            self.bind_rep_connection_to_room_under_scope(participant, room_id);
-            (room_id, label, !existing_rooms.contains(&room_id), previous)
-        };
-        self.dispatch_local_match_admission(participant, previous, room_id, created);
+        let (room_id, label, created, previous) =
+            {
+                let _scope = self.lock_room_scope();
+                let rollback = self
+                    .capture_local_admission_rollback_under_scope(participant)
+                    .map_err(JoinError::InputStreamController)?;
+                let previous = self
+                    .rooms
+                    .room_of(participant)
+                    .and_then(|id| self.room_snapshot_for_lifecycle(id));
+                let (room_id, label, room_undo, created) = self
+                    .rooms
+                    .join_or_create_bound_with_undo(participant, name, binding, make_label)?;
+                self.bind_rep_connection_to_room_under_scope(participant, room_id);
+                if let Err(error) = self.commit_input_stream_admission_under_scope(
+                    participant,
+                    previous.as_ref(),
+                    room_id,
+                ) {
+                    let rollback_error = self.rollback_participant_admission_under_scope(
+                        participant,
+                        room_undo,
+                        rollback,
+                    );
+                    return Err(JoinError::InputStreamController(
+                        rollback_error.err().unwrap_or(error),
+                    ));
+                }
+                (room_id, label, created, previous)
+            };
+        // The lifecycle record is dispatched only after the whole admission
+        // transaction committed under room_scope; callbacks never observe a
+        // provisional membership or lease.
+        self.dispatch_local_match_admission(participant, previous, room_id, created)
+            .map_err(JoinError::InputStreamController)?;
         Ok((room_id, label))
     }
 
@@ -7349,16 +8304,63 @@ impl Gateway {
                 .snapshot()
                 .into_iter()
                 .find(|snapshot| snapshot.id == room_id);
+            let Some(snapshot) = room.as_ref() else {
+                return 0;
+            };
+            // Retirement must win while the room is still live. Closing first
+            // would briefly make membership disappear while a lease remained
+            // usable; a failed revoke instead leaves the whole room intact.
+            for member in &snapshot.members {
+                if let Err(error) = self.revoke_current_input_stream_under_scope(room_id, *member) {
+                    tracing::error!(
+                        room_id,
+                        participant = member.get(),
+                        ?error,
+                        "match close forced fail-closed room teardown after input-stream retirement failure"
+                    );
+                    // The controller may be unavailable after earlier members
+                    // retired. Never keep this room open with a mixed lease
+                    // image: removing membership fences every remaining lease
+                    // at Gateway ingress even if a best-effort revoke cannot
+                    // run, and the closure path removes the delivery index.
+                    break;
+                }
+            }
             let Some(members) = self.rooms.close(room_id) else {
                 return 0;
             };
+            // A failed exact revoke may have left a controller-only lease after
+            // the member was fenced by room closure. Reclaim every residual room
+            // slot as the final teardown step; ingress remains closed even if a
+            // poisoned controller refuses this best-effort reclamation.
+            if let Err(error) = self
+                .input_streams
+                .with_active(|controller| controller.retire_room(room_id))
+            {
+                tracing::error!(
+                    room_id,
+                    ?error,
+                    "match close could not reclaim residual input-stream controller state"
+                );
+            }
+            if let Ok(mut leases) = self.input_stream_leases.lock() {
+                for member in &members {
+                    // Membership is now gone, so retaining an index entry could
+                    // only delay reclamation; it must never preserve ingress.
+                    leases.remove(&(room_id, *member));
+                }
+            }
             for member in &members {
                 self.unbind_rep_connection_under_scope(*member);
             }
+            self.retire_rep_room_bindings_under_scope(room_id);
             // A late validator answer must not observe the room as closed but
             // still find a live ledger. Remove both identities in the same
             // transaction as the membership/binding transition.
             self.drop_bridge_match(room_id);
+            if let Ok(mut generations) = self.worker_match_generations.lock() {
+                generations.remove(&room_id);
+            }
             (members, room)
         };
         if let Some(room) = room {
@@ -7490,6 +8492,10 @@ impl Gateway {
                 let params = create.params.clone();
                 let (admission, previous, existing_rooms) = {
                     let _scope = self.lock_room_scope();
+                    let rollback = match self.capture_local_admission_rollback_under_scope(sender) {
+                        Ok(rollback) => rollback,
+                        Err(_) => return self.reply_room_reject(sender, KIND_ROOM_CREATE),
+                    };
                     let previous = self
                         .rooms
                         .room_of(sender)
@@ -7500,12 +8506,30 @@ impl Gateway {
                         .into_iter()
                         .map(|room| room.id)
                         .collect();
-                    let admission = self.rooms.join_or_create_bound(sender, &name, binding, || {
-                        self.room_label_for_create(sender, &params)
-                    });
-                    if let Ok((room_id, _)) = &admission {
-                        self.bind_rep_connection_to_room_under_scope(sender, *room_id);
-                    }
+                    let admission =
+                        self.rooms
+                            .join_or_create_bound_with_undo(sender, &name, binding, || {
+                                self.room_label_for_create(sender, &params)
+                            });
+                    let admission = match admission {
+                        Ok((room_id, label, room_undo, _created)) => {
+                            self.bind_rep_connection_to_room_under_scope(sender, room_id);
+                            match self.commit_input_stream_admission_under_scope(
+                                sender,
+                                previous.as_ref(),
+                                room_id,
+                            ) {
+                                Ok(()) => Ok((room_id, label)),
+                                Err(error) => {
+                                    let _ = self.rollback_participant_admission_under_scope(
+                                        sender, room_undo, rollback,
+                                    );
+                                    Err(JoinError::InputStreamController(error))
+                                }
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
                     (admission, previous, existing_rooms)
                 };
                 match admission {
@@ -7517,12 +8541,19 @@ impl Gateway {
                             map = %label.map,
                             "room: join-or-create"
                         );
-                        self.dispatch_local_match_admission(
+                        if let Err(error) = self.dispatch_local_match_admission(
                             sender,
                             previous,
                             room_id,
                             !existing_rooms.contains(&room_id),
-                        );
+                        ) {
+                            self.rollback_failed_input_stream_admission(sender, room_id);
+                            tracing::error!(
+                                ?error,
+                                "room create rolled back after input-stream failure"
+                            );
+                            return self.reply_room_reject(sender, KIND_ROOM_CREATE);
+                        }
                         self.reply_joined(sender, room_id, label)
                     }
                     Err(JoinError::StaleScript) => {
@@ -7612,19 +8643,47 @@ impl Gateway {
         }
         let (admission, previous) = {
             let _scope = self.lock_room_scope();
+            let rollback = match self.capture_local_admission_rollback_under_scope(sender) {
+                Ok(rollback) => rollback,
+                Err(_) => return self.reply_room_reject(sender, KIND_ROOM_JOIN),
+            };
             let previous = self
                 .rooms
                 .room_of(sender)
                 .and_then(|id| self.room_snapshot_for_lifecycle(id));
-            let admission = self.rooms.join_bound(sender, room_id, binding.as_ref());
-            if admission.is_ok() {
-                self.bind_rep_connection_to_room_under_scope(sender, room_id);
-            }
+            let admission =
+                self.rooms
+                    .admit_bound_with_undo(sender, room_id, false, binding.as_ref());
+            let admission = match admission {
+                Ok((label, room_undo)) => {
+                    self.bind_rep_connection_to_room_under_scope(sender, room_id);
+                    match self.commit_input_stream_admission_under_scope(
+                        sender,
+                        previous.as_ref(),
+                        room_id,
+                    ) {
+                        Ok(()) => Ok(label),
+                        Err(error) => {
+                            let _ = self.rollback_participant_admission_under_scope(
+                                sender, room_undo, rollback,
+                            );
+                            Err(JoinError::InputStreamController(error))
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
             (admission, previous)
         };
         match admission {
             Ok(label) => {
-                self.dispatch_local_match_admission(sender, previous, room_id, false);
+                if let Err(error) =
+                    self.dispatch_local_match_admission(sender, previous, room_id, false)
+                {
+                    self.rollback_failed_input_stream_admission(sender, room_id);
+                    tracing::error!(?error, "room join rolled back after input-stream failure");
+                    return self.reply_room_reject(sender, KIND_ROOM_JOIN);
+                }
                 self.reply_joined(sender, room_id, label)
             }
             Err(JoinError::StaleScript) => self.reply_room_reject(sender, KIND_ROOM_JOIN),
@@ -7674,6 +8733,21 @@ impl Gateway {
                     .into_iter()
                     .find(|room| room.id == room_id)
             });
+            if let Some(room) = before.as_ref()
+                && let Err(error) = self.revoke_current_input_stream_under_scope(room.id, sender)
+            {
+                tracing::error!(
+                    room_id = room.id,
+                    participant = sender.get(),
+                    ?error,
+                    "room leave refused because input-stream retirement could not commit"
+                );
+                return 0;
+            }
+            // Leaving closes the opt-in as well as its bearer lease. A later
+            // admission needs a fresh post-auth offer/acceptance and cannot
+            // reuse a challenge or capability bit from the departed room.
+            self.clear_authoritative_input_capability(sender);
             let leave = self.rooms.leave(sender);
             self.unbind_rep_connection_under_scope(sender);
             (leave, before)
@@ -7681,6 +8755,10 @@ impl Gateway {
         let Some((room_id, remaining)) = leave else {
             return 0;
         };
+        // A still-authenticated transport must prove support again after a
+        // server-owned leave. This offer is non-bearer and cannot revive the
+        // retired lease; a later rejoin needs its own one-use canonical echo.
+        self.offer_authoritative_input(sender);
         let ended = self.room_snapshot_for_lifecycle(room_id).is_none();
         if let Some(mut room) = self
             .rooms
@@ -7903,8 +8981,40 @@ impl Gateway {
     /// uses to size its interpolation buffer. Snapshots are emitted separately by
     /// [`transform_snapshot_step`](Self::transform_snapshot_step) at a lower rate.
     pub fn transform_sim_step(&self) {
+        let _scope = self.lock_room_scope();
         if let Some(hub) = &self.transform {
+            let before_epoch = hub.gameplay_clock().map(|clock| clock.epoch);
             hub.sim_tick();
+            if hub.gameplay_clock().map(|clock| clock.epoch) != before_epoch {
+                self.revoke_all_input_streams_under_scope();
+            }
+        }
+    }
+
+    /// Retire every current input lease while the caller owns `room_scope`.
+    /// This is the clock-transition counterpart of ordinary room teardown: the
+    /// same scope fences a fixed-tick drain from reading an old epoch and issuing
+    /// a bridge batch after the transform world has advanced to a new one.
+    fn revoke_all_input_streams_under_scope(&self) {
+        let retiring = self
+            .input_stream_leases
+            .lock()
+            .map(|leases| {
+                leases
+                    .iter()
+                    .map(|(key, lease)| (*key, *lease))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for ((_, participant), lease) in retiring {
+            if let Err(error) = self.revoke_input_stream_lease_under_scope(participant, lease) {
+                tracing::error!(
+                    room_id = lease.match_id(),
+                    participant = participant.get(),
+                    ?error,
+                    "input-stream clock retirement failed closed"
+                );
+            }
         }
     }
 
@@ -8345,6 +9455,15 @@ pub fn shared() -> Arc<Gateway> {
     Arc::new(Gateway::new())
 }
 
+/// Input-stream receipt correlation retained only while its bridge batch awaits
+/// a fenced response. The lease is exact server-owned capability state, never
+/// client-provided material.
+#[derive(Clone, Copy)]
+struct PendingInputReceipt {
+    lease: InputStreamLease,
+    batch_id: u64,
+}
+
 /// Per-node authoritative-bridge state: one [`PendingBatchLedger`] per live
 /// authoritative match plus the per-batch quotas. Held behind the gateway's
 /// optional `bridge` field; absent on non-authoritative deployments.
@@ -8368,6 +9487,10 @@ struct GatewayBridge {
     /// the decoded field values ride the normalized event. Dropped on any other
     /// outcome and when the match closes.
     pending_rep: Mutex<HashMap<(RoomId, u64), Validated>>,
+    /// Input-stream leases captured when their exact fixed-tick batch is issued.
+    /// Kept only until the fenced answer materializes, then rechecked against
+    /// current room/capability/lease authority before a receipt can be sent.
+    pending_input_receipts: Mutex<HashMap<(RoomId, u64), PendingInputReceipt>>,
 }
 
 impl GatewayBridge {
@@ -8377,6 +9500,7 @@ impl GatewayBridge {
             quotas,
             capabilities,
             pending_rep: Mutex::new(HashMap::new()),
+            pending_input_receipts: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -8453,7 +9577,12 @@ impl Gateway {
         {
             return;
         }
-        let batch = self.issue_bridge_batch(room_id, binding, drafts);
+        let reserved_kind_mode = if self.authoritative_input_negotiated(sender) {
+            ReservedKindMode::AuthoritativeInput
+        } else {
+            ReservedKindMode::Legacy
+        };
+        let batch = self.issue_bridge_batch(room_id, binding, drafts, reserved_kind_mode);
         drop(scope);
         if let (Some(batch), Some(runtime)) = (batch, &self.runtime) {
             runtime.deliver_event_batch(batch);
@@ -8480,7 +9609,13 @@ impl Gateway {
             {
                 return;
             }
-            let Some(batch) = self.issue_bridge_batch(room_id, binding, drafts) else {
+            let reserved_kind_mode = if self.authoritative_input_negotiated(sender) {
+                ReservedKindMode::AuthoritativeInput
+            } else {
+                ReservedKindMode::Legacy
+            };
+            let Some(batch) = self.issue_bridge_batch(room_id, binding, drafts, reserved_kind_mode)
+            else {
                 return;
             };
             if let Some(hub) = &self.transform {
@@ -8505,6 +9640,7 @@ impl Gateway {
         room_id: RoomId,
         binding: &ScriptBinding,
         drafts: Vec<EventDraft>,
+        reserved_kind_mode: ReservedKindMode,
     ) -> Option<NormalizedEventBatch> {
         let bridge = self.bridge.as_ref()?;
         let (clock_epoch, tick) = self
@@ -8526,7 +9662,7 @@ impl Gateway {
         if ledger.clock_epoch() != clock_epoch {
             ledger.set_clock_epoch(clock_epoch);
         }
-        Some(ledger.issue(drafts, tick))
+        Some(ledger.issue_with_reserved_kind_mode(drafts, tick, reserved_kind_mode))
     }
 
     /// Structural stage for a generic custom envelope in an authoritative
@@ -8624,7 +9760,14 @@ impl Gateway {
                 fields,
             },
         };
-        let Some(batch) = self.issue_bridge_batch(room_id, binding, vec![draft]) else {
+        let reserved_kind_mode = if self.authoritative_input_negotiated(sender) {
+            ReservedKindMode::AuthoritativeInput
+        } else {
+            ReservedKindMode::Legacy
+        };
+        let Some(batch) =
+            self.issue_bridge_batch(room_id, binding, vec![draft], reserved_kind_mode)
+        else {
             return 0;
         };
         if let Some(event) = batch.events.first() {
@@ -8821,6 +9964,8 @@ impl Gateway {
         let mut delivered = 0;
         for outcome in batch.outcomes {
             delivered += self.materialize_outcome(room_id, &outcome);
+            delivered +=
+                self.emit_input_receipt_after_materialization(room_id, batch.tick, &outcome);
         }
         for command in batch.commands {
             let exclude = match &command {
@@ -8877,9 +10022,84 @@ impl Gateway {
             }
             Decision::Reject { .. } => 0,
         }
-        // NOTE: InputOutcome::reply delivery is deferred — it needs a dedicated
-        // reply wire kind (a citadel-wire + contract-manifest change), tracked
-        // for a later step. The validator already bounds reply size.
+        // Generic InputOutcome::reply delivery remains deferred pending its own
+        // wire kind. The stream-bound input route below is deliberately narrower:
+        // it uses the validator-bounded opaque reply as InputReceipt correction.
+    }
+
+    /// Emit the V1 receipt only after this exact validated outcome has been
+    /// materialized. The pending lease image was captured at fixed-tick issue;
+    /// every authority coordinate is checked again under `room_scope` before the
+    /// acknowledgement watermark advances or any bearer-bearing receipt is sent.
+    fn emit_input_receipt_after_materialization(
+        &self,
+        room_id: RoomId,
+        authoritative_tick: u64,
+        outcome: &ValidatedOutcome,
+    ) -> usize {
+        let _scope = self.lock_room_scope();
+        let Some(pending) = self.bridge.as_ref().and_then(|bridge| {
+            bridge
+                .pending_input_receipts
+                .lock()
+                .ok()?
+                .remove(&(room_id, outcome.event.event_id))
+        }) else {
+            return 0;
+        };
+        let lease = pending.lease;
+        let NormalizedPayload::MatchMessage {
+            sequence: Some(decided_sequence),
+            ..
+        } = &outcome.event.payload
+        else {
+            return 0;
+        };
+        let participant = lease.participant();
+        let Some((current_room, binding)) = self.authoritative_match(participant) else {
+            return 0;
+        };
+        if !self.authoritative_input_negotiated(participant)
+            || current_room != room_id
+            || self.current_input_stream_lease(room_id, participant) != Some(lease)
+            || binding.generation != lease.binding_generation()
+            || self.input_stream_clock_epoch() != Some(lease.clock_epoch())
+        {
+            return 0;
+        }
+        let Ok(acknowledged_sequence) = self
+            .input_streams
+            .with_active(|controller| controller.acknowledge_if_current(lease, *decided_sequence))
+        else {
+            return 0;
+        };
+        let disposition = match outcome.decision {
+            Decision::Reject { .. } => AuthoritativeInputDisposition::Rejected,
+            Decision::Accept | Decision::Correct { .. } => AuthoritativeInputDisposition::Accepted,
+        };
+        let receipt = InputReceipt {
+            match_id: room_id,
+            stream_id: lease.stream_id(),
+            stream_token: lease.token(),
+            acknowledged_sequence,
+            decided_sequence: *decided_sequence,
+            disposition,
+            authoritative_tick,
+            // Bridge replies are already quota-bounded opaque bytes. For this
+            // stream route they are the optional client reconciliation payload.
+            correction: outcome.reply.clone(),
+        };
+        let Ok(body) = receipt.encode() else {
+            return 0;
+        };
+        let outbound = Outbound::reliable(Envelope::new(protocol::KIND_AUTHORITATIVE_INPUT, body));
+        if self.registry.send_to(participant, &outbound) {
+            self.metrics
+                .record_message_out(outbound.envelope.body.len() as u64);
+            1
+        } else {
+            0
+        }
     }
 
     /// Take (and remove) the stashed replicated-delta proposal for one event.
@@ -9079,6 +10299,11 @@ impl Gateway {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|(rid, _), _| *rid != room_id);
+            bridge
+                .pending_input_receipts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(rid, _), _| *rid != room_id);
         }
     }
 }
@@ -9199,6 +10424,15 @@ impl BridgeCommandSink for Gateway {
             match ledger.validate(&context, &bridge.quotas, &answer) {
                 Ok(validated) => validated,
                 Err(rejection) => {
+                    if !ledger.has_pending_batch(answer.batch_id) {
+                        bridge
+                            .pending_input_receipts
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .retain(|(pending_room, _), pending| {
+                                *pending_room != room_id || pending.batch_id != answer.batch_id
+                            });
+                    }
                     tracing::debug!(
                         room_id,
                         ?rejection,
@@ -9214,6 +10448,26 @@ impl BridgeCommandSink for Gateway {
         self.record_validated_decisions(&validated);
         self.materialize_validated_batch(room_id, validated);
     }
+
+    fn deliver_command_batch_from_worker(&self, worker_epoch: u64, answer: ScriptCommandBatch) {
+        let room_id = answer.match_id;
+        let _scope = self.lock_room_scope();
+        let current = self
+            .worker_match_generations
+            .lock()
+            .ok()
+            .and_then(|generations| generations.get(&room_id).copied());
+        if self.room_snapshot_for_lifecycle(room_id).is_none() || current != Some(worker_epoch) {
+            tracing::debug!(
+                room_id,
+                worker_epoch,
+                "stale worker bridge batch dropped before validation"
+            );
+            return;
+        }
+        drop(_scope);
+        self.deliver_command_batch(answer);
+    }
 }
 
 /// The gateway is where an external worker's match results land: command
@@ -9226,12 +10480,64 @@ impl crate::runtime::external_worker::MatchCommandSink for Gateway {
         self.apply_external_match_commands(room_id, commands)
     }
 
+    fn register_match_generation(&self, room_id: u64, worker_epoch: u64) {
+        let _scope = self.lock_room_scope();
+        if self.room_snapshot_for_lifecycle(room_id).is_none() {
+            return;
+        }
+        if let Ok(mut generations) = self.worker_match_generations.lock() {
+            generations.entry(room_id).or_insert(worker_epoch);
+        }
+    }
+
+    fn apply_match_commands_fenced(
+        &self,
+        room_id: u64,
+        worker_epoch: u64,
+        commands: Vec<OutboundCommand>,
+    ) -> usize {
+        let _scope = self.lock_room_scope();
+        let live = self.room_snapshot_for_lifecycle(room_id).is_some();
+        let current = self
+            .worker_match_generations
+            .lock()
+            .ok()
+            .and_then(|generations| generations.get(&room_id).copied());
+        if !live || current != Some(worker_epoch) {
+            return 0;
+        }
+        drop(_scope);
+        // `apply_commands_scoped` revalidates member/actor scope before every
+        // mutation and delivery. The worker epoch has been checked before its
+        // command bytes can reach any of those stateful paths.
+        self.apply_commands_scoped(None, Some(room_id), commands)
+    }
+
     fn on_match_closed(
         &self,
         room_id: u64,
         _reason: crate::runtime::worker_data_protocol::MatchCloseReason,
     ) {
         self.close_match(room_id);
+    }
+
+    fn on_match_closed_fenced(
+        &self,
+        room_id: u64,
+        worker_epoch: u64,
+        reason: crate::runtime::worker_data_protocol::MatchCloseReason,
+    ) {
+        let _scope = self.lock_room_scope();
+        let current = self
+            .worker_match_generations
+            .lock()
+            .ok()
+            .and_then(|generations| generations.get(&room_id).copied());
+        if self.room_snapshot_for_lifecycle(room_id).is_none() || current != Some(worker_epoch) {
+            return;
+        }
+        drop(_scope);
+        self.on_match_closed(room_id, reason);
     }
 }
 
@@ -10619,6 +11925,135 @@ mod transform_tests {
         assert_eq!(gw.close_match(room_id), 0);
     }
 
+    #[test]
+    fn close_after_a_later_lease_revoke_failure_fences_every_authoritative_input_ingress_index() {
+        use citadel_wire::authoritative_input::SequencedInput;
+        use citadel_wire::protocol::KIND_AUTHORITATIVE_INPUT;
+
+        let readiness = Arc::new(GameScriptReadiness::new(TimestampMillis::from_unix_millis(
+            0,
+        )));
+        readiness.record_loaded("sha256:close-fence", TimestampMillis::from_unix_millis(1));
+        let runtime: Arc<dyn Runtime> = Arc::new(
+            crate::runtime::LuaRuntime::from_source(
+                "",
+                "close-fence",
+                crate::runtime::DEFAULT_DEADLINE_MS,
+            )
+            .expect("embedded Lua runtime"),
+        );
+        let gateway =
+            Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
+                .with_script_readiness(Arc::clone(&readiness))
+                .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new());
+        let (first, mut first_rx) = register(&gateway);
+        let (second, mut second_rx) = register(&gateway);
+        let binding = readiness.gate().expect("ready binding");
+        let (room_id, _) = gateway
+            .join_or_create_room_bound(first, "close-fence", Some(binding.clone()), || {
+                RoomLabel::with_map("close-fence")
+            })
+            .expect("first authoritative admission");
+        gateway
+            .join_or_create_room_bound(second, "close-fence", Some(binding), || {
+                RoomLabel::with_map("close-fence")
+            })
+            .expect("second authoritative admission");
+
+        let first_lease = gateway
+            .current_input_stream_lease(room_id, first)
+            .expect("first lease");
+        let second_lease = gateway
+            .current_input_stream_lease(room_id, second)
+            .expect("second lease");
+        let first_input = SequencedInput {
+            stream_token: first_lease.token(),
+            sequence: 1,
+            original_custom_kind: 901,
+            body: vec![1],
+        }
+        .encode()
+        .expect("first authoritative input encodes");
+        let second_input = SequencedInput {
+            stream_token: second_lease.token(),
+            sequence: 1,
+            original_custom_kind: 902,
+            body: vec![2],
+        }
+        .encode()
+        .expect("second authoritative input encodes");
+        gateway.handle_inbound(
+            first,
+            &Envelope::new(KIND_AUTHORITATIVE_INPUT, first_input.clone()),
+        );
+        gateway.handle_inbound(
+            second,
+            &Envelope::new(KIND_AUTHORITATIVE_INPUT, second_input.clone()),
+        );
+        assert_eq!(gateway.queued_authoritative_input_count(), 2);
+
+        // The first revoke succeeds; the controller injects an exact failure for
+        // the later member. This is deterministic and does not depend on queue
+        // capacity, scheduling, or a poisoned global lock.
+        gateway
+            .input_streams
+            .with_active(|controller| controller.fail_revoke_after_for_test(1));
+        assert_eq!(gateway.close_match(room_id), 2);
+
+        assert!(
+            gateway.room_snapshot().is_empty(),
+            "no partially closed room remains"
+        );
+        assert_eq!(gateway.rooms().room_of(first), None);
+        assert_eq!(gateway.rooms().room_of(second), None);
+        assert!(
+            gateway
+                .rep_rooms
+                .lock()
+                .expect("replication bindings lock")
+                .connections
+                .is_empty(),
+            "all replication membership is removed with the room"
+        );
+        let rep_bindings = gateway.rep_rooms.lock().expect("replication bindings lock");
+        assert!(
+            rep_bindings.room_matches.is_empty() && rep_bindings.match_rooms.is_empty(),
+            "room closure removes both directions of the replication room index"
+        );
+        assert!(
+            rep_bindings.objects.is_empty(),
+            "room closure leaves no replicated object scoped to the dead room"
+        );
+        drop(rep_bindings);
+        assert!(
+            gateway
+                .input_stream_leases
+                .lock()
+                .expect("lease index lock")
+                .is_empty(),
+            "the delivery index cannot retain a stale capability"
+        );
+        assert_eq!(
+            gateway
+                .input_streams
+                .with_active(|controller| controller.active_lease_count()),
+            Ok(0)
+        );
+        assert_eq!(gateway.queued_authoritative_input_count(), 0);
+        for (member, body) in [(first, first_input), (second, second_input)] {
+            gateway.handle_inbound(member, &Envelope::new(KIND_AUTHORITATIVE_INPUT, body));
+        }
+        assert_eq!(
+            gateway.queued_authoritative_input_count(),
+            0,
+            "neither former member can enqueue authoritative input after the fail-closed close"
+        );
+        // Drain initial advertisements and the close notifications only after all
+        // state assertions, so no outbound timing contributes to the test.
+        while first_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+    }
+
     /// Records every match-closure notification the gateway sends its runtime.
     /// Every other surface is inert, mirroring [`Runtime`]'s defaults.
     #[derive(Default)]
@@ -10817,6 +12252,58 @@ mod transform_tests {
             assert_eq!(outbound.envelope.kind, KIND_MATCH_CLOSED);
         }
         assert_eq!(gw.rooms().room_count(), 0, "the room is pruned");
+    }
+
+    #[tokio::test]
+    async fn stale_external_worker_generation_cannot_mutate_or_close_a_live_room() {
+        use crate::runtime::external_worker::MatchCommandSink;
+        use citadel_wire::room::{RoomCreate, RoomJoined};
+
+        let gw = Gateway::new();
+        let (member, mut receiver) = register(&gw);
+        gw.handle_inbound(
+            member,
+            &Envelope::new(
+                KIND_ROOM_CREATE,
+                RoomCreate {
+                    params: b"worker-fence".to_vec(),
+                }
+                .encode(),
+            ),
+        );
+        let room_id = RoomJoined::decode(&receiver.recv().await.expect("joined").envelope.body)
+            .expect("joined body")
+            .room_id;
+        MatchCommandSink::register_match_generation(&gw, room_id, 9);
+
+        assert_eq!(
+            MatchCommandSink::apply_match_commands_fenced(
+                &gw,
+                room_id,
+                8,
+                vec![OutboundCommand::Broadcast {
+                    kind: 40,
+                    body: b"stale".to_vec(),
+                    unreliable: false,
+                }],
+            ),
+            0,
+            "a late worker command cannot deliver or mutate room state"
+        );
+        MatchCommandSink::on_match_closed_fenced(
+            &gw,
+            room_id,
+            8,
+            crate::runtime::worker_data_protocol::MatchCloseReason::ServerError,
+        );
+        assert!(
+            gw.rooms().label(room_id).is_some(),
+            "stale close is ignored"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "stale command has no side effect"
+        );
     }
 
     #[tokio::test]

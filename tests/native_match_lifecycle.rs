@@ -17,9 +17,12 @@ use citadel::storage::UserId;
 use citadel::time::TimestampMillis;
 use citadel::transport::TransportKind;
 use citadel_wire::Envelope;
+use citadel_wire::authoritative_input::{
+    CAPABILITY_AUTHORITATIVE_INPUT, CAPABILITY_CHALLENGE_BYTES, CapabilityOffer,
+};
 use citadel_wire::protocol::{
-    KIND_MATCHMAKER_MATCHED, KIND_ROOM_CREATE, KIND_ROOM_JOIN, KIND_ROOM_LEAVE, KIND_ROOM_REJECT,
-    KIND_RPC_REQUEST, KIND_RPC_RESPONSE,
+    KIND_CAPABILITY_OFFER, KIND_INPUT_STREAM_CONTROL, KIND_MATCHMAKER_MATCHED, KIND_ROOM_CREATE,
+    KIND_ROOM_JOIN, KIND_ROOM_LEAVE, KIND_ROOM_REJECT, KIND_RPC_REQUEST, KIND_RPC_RESPONSE,
 };
 use citadel_wire::room::{RoomCreate, RoomJoin, RoomLeave, RoomReject};
 use tokio::sync::mpsc;
@@ -381,6 +384,30 @@ fn matchmaker_birth_and_admission_dispatch_native_lifecycle_once() {
         Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime.clone()));
     let (alice, mut alice_rx) = register_authenticated(&gateway, "alice");
     let (bob, mut bob_rx) = register_authenticated(&gateway, "bob");
+
+    for receiver in [&mut alice_rx, &mut bob_rx] {
+        let offer = receiver.try_recv().expect("post-auth capability offer");
+        assert_eq!(offer.envelope.kind, KIND_CAPABILITY_OFFER);
+        let offer = CapabilityOffer::decode(&offer.envelope.body).expect("decode capability offer");
+        assert_eq!(offer.capability(), CAPABILITY_AUTHORITATIVE_INPUT);
+        assert_ne!(offer.challenge(), [0; CAPABILITY_CHALLENGE_BYTES]);
+        match receiver.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Ok(outbound) if outbound.envelope.kind == KIND_INPUT_STREAM_CONTROL => {
+                panic!(
+                    "an unaccepted capability offer must not send an InputStreamControl::Advertise bearer"
+                );
+            }
+            Ok(outbound) => panic!(
+                "unexpected post-auth outbound kind {}",
+                outbound.envelope.kind
+            ),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                panic!("authenticated session disconnected")
+            }
+        }
+    }
+
     let request = serde_json::json!({ "min_count": 2, "max_count": 2, "ttl_ms": 60_000 });
 
     gateway.handle_inbound(alice, &matchmaker_rpc(1, "matchmaker.add", request.clone()));

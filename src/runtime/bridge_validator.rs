@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use citadel_wire::protocol::KIND_ROOM_REJECT;
+use citadel_wire::protocol::{KIND_AUTHORITATIVE_INPUT, KIND_DIAG_STATUS};
 
 use super::bridge_protocol::{
     BridgeRepField, BridgeRepValue, Correction, Decision, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome,
@@ -33,7 +33,7 @@ use super::bridge_protocol::{
 /// script may not emit a raw message on any kind `<=` this: reserved kinds are
 /// reachable only through typed commands (§3.5). Sourced from the protocol
 /// registry so a newly reserved kind extends the guard automatically.
-pub const MAX_RESERVED_KIND: u16 = KIND_ROOM_REJECT;
+pub const MAX_RESERVED_KIND: u16 = KIND_AUTHORITATIVE_INPUT;
 
 /// A capability a match's revision manifest must declare before the matching
 /// [`ScriptCommand`] family is permitted.
@@ -246,6 +246,17 @@ pub struct ValidatedBatch {
 struct PendingBatch {
     tick: u64,
     events: Vec<NormalizedEvent>,
+    reserved_kind_mode: ReservedKindMode,
+}
+
+/// Reserved-kind policy captured when the server issues a bridge batch.
+///
+/// Legacy custom kinds 40 and 41 remain available unless the originating
+/// session opted into the post-auth authoritative-input capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedKindMode {
+    Legacy,
+    AuthoritativeInput,
 }
 
 /// A draft event the gateway hands the ledger; the ledger assigns the
@@ -323,6 +334,14 @@ impl PendingBatchLedger {
         self.pending.len()
     }
 
+    /// Whether this exact batch id still awaits an answer. This exposes only a
+    /// server-generated correlation state so callers can clean up companion
+    /// pending records after validation consumed an invalid batch.
+    #[must_use]
+    pub fn has_pending_batch(&self, batch_id: u64) -> bool {
+        self.pending.contains_key(&batch_id)
+    }
+
     /// Advance to a new activation generation (a reload). Every pending batch is
     /// dropped, so a stale-generation answer can never materialize.
     pub fn advance_generation(&mut self, generation: u64) {
@@ -342,6 +361,19 @@ impl PendingBatchLedger {
     /// `batch_id`, record the pending batch, and return the fenced
     /// [`NormalizedEventBatch`] to deliver. `tick` is the gameplay-clock tick.
     pub fn issue(&mut self, drafts: Vec<EventDraft>, tick: u64) -> NormalizedEventBatch {
+        self.issue_with_reserved_kind_mode(drafts, tick, ReservedKindMode::Legacy)
+    }
+
+    /// Issue a batch under the exact reserved-kind policy the server selected
+    /// for its originating session. This policy is stored with the pending batch
+    /// so an asynchronous script response cannot be reinterpreted after a
+    /// session negotiates or disconnects.
+    pub fn issue_with_reserved_kind_mode(
+        &mut self,
+        drafts: Vec<EventDraft>,
+        tick: u64,
+        reserved_kind_mode: ReservedKindMode,
+    ) -> NormalizedEventBatch {
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
         let events: Vec<NormalizedEvent> = drafts
@@ -362,6 +394,7 @@ impl PendingBatchLedger {
             PendingBatch {
                 tick,
                 events: events.clone(),
+                reserved_kind_mode,
             },
         );
         NormalizedEventBatch {
@@ -430,7 +463,13 @@ impl PendingBatchLedger {
             });
         }
 
-        validate_content(&pending, context, quotas, answer)
+        validate_content(
+            &pending,
+            context,
+            quotas,
+            answer,
+            pending.reserved_kind_mode,
+        )
     }
 }
 
@@ -441,6 +480,7 @@ fn validate_content(
     context: &dyn BridgeMatchContext,
     quotas: &BridgeQuotas,
     answer: &ScriptCommandBatch,
+    reserved_kind_mode: ReservedKindMode,
 ) -> Result<ValidatedBatch, BatchRejection> {
     // ---- correlation completeness: exactly one outcome per issued event ----
     let mut event_by_id: HashMap<u64, &NormalizedEvent> = HashMap::new();
@@ -499,7 +539,7 @@ fn validate_content(
     let mut persist_ops: usize = 0;
     let mut schedule_ops: usize = 0;
     for command in &answer.commands {
-        validate_command(command, context)?;
+        validate_command(command, context, reserved_kind_mode)?;
         body_bytes = body_bytes.saturating_add(command_body_bytes(command));
         if body_bytes > quotas.max_command_body_bytes {
             return Err(BatchRejection::QuotaExceeded {
@@ -602,6 +642,7 @@ fn validate_correction(
 fn validate_command(
     command: &ScriptCommand,
     context: &dyn BridgeMatchContext,
+    reserved_kind_mode: ReservedKindMode,
 ) -> Result<(), BatchRejection> {
     match command {
         // State mutations on an existing object must target this match's world.
@@ -636,7 +677,7 @@ fn validate_command(
         ScriptCommand::SendTo {
             participant, kind, ..
         } => {
-            reject_reserved_kind(*kind)?;
+            reject_reserved_kind(*kind, reserved_kind_mode)?;
             if !context.is_member(*participant) {
                 return Err(BatchRejection::RecipientNotMember {
                     participant: *participant,
@@ -646,7 +687,7 @@ fn validate_command(
         ScriptCommand::SendToMany {
             participants, kind, ..
         } => {
-            reject_reserved_kind(*kind)?;
+            reject_reserved_kind(*kind, reserved_kind_mode)?;
             for participant in participants {
                 if !context.is_member(*participant) {
                     return Err(BatchRejection::RecipientNotMember {
@@ -656,7 +697,7 @@ fn validate_command(
             }
         }
         ScriptCommand::BroadcastMatch { kind, exclude, .. } => {
-            reject_reserved_kind(*kind)?;
+            reject_reserved_kind(*kind, reserved_kind_mode)?;
             if let Some(participant) = exclude
                 && !context.is_member(*participant)
             {
@@ -699,8 +740,14 @@ fn require_capability(
     }
 }
 
-fn reject_reserved_kind(kind: u16) -> Result<(), BatchRejection> {
-    if kind <= MAX_RESERVED_KIND {
+fn reject_reserved_kind(
+    kind: u16,
+    reserved_kind_mode: ReservedKindMode,
+) -> Result<(), BatchRejection> {
+    let reserved = kind <= KIND_DIAG_STATUS
+        || (reserved_kind_mode == ReservedKindMode::AuthoritativeInput
+            && kind <= MAX_RESERVED_KIND);
+    if reserved {
         Err(BatchRejection::ReservedKind { kind })
     } else {
         Ok(())
@@ -1047,6 +1094,96 @@ mod tests {
             ledger.validate(&ctx, &BridgeQuotas::default(), &answer),
             Err(BatchRejection::RecipientNotMember { participant: 4242 })
         );
+    }
+
+    #[test]
+    fn every_script_message_direction_rejects_reserved_authoritative_input_kind() {
+        let commands = [
+            ScriptCommand::SendTo {
+                participant: 1001,
+                kind: KIND_AUTHORITATIVE_INPUT,
+                body: vec![1],
+                unreliable: false,
+            },
+            ScriptCommand::SendToMany {
+                participants: vec![1001],
+                kind: KIND_AUTHORITATIVE_INPUT,
+                body: vec![1],
+                unreliable: false,
+            },
+            ScriptCommand::BroadcastMatch {
+                kind: KIND_AUTHORITATIVE_INPUT,
+                body: vec![1],
+                unreliable: false,
+                exclude: None,
+            },
+        ];
+        for command in commands {
+            let mut ledger = PendingBatchLedger::new(1, 5, 9);
+            let batch = ledger.issue_with_reserved_kind_mode(
+                vec![input_draft(1001, 7)],
+                100,
+                ReservedKindMode::AuthoritativeInput,
+            );
+            let mut answer = accept_all(&batch);
+            answer.commands.push(command);
+            assert_eq!(
+                ledger.validate(
+                    &TestContext::permissive(),
+                    &BridgeQuotas::default(),
+                    &answer
+                ),
+                Err(BatchRejection::ReservedKind {
+                    kind: KIND_AUTHORITATIVE_INPUT
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_kinds_40_and_41_are_mode_aware() {
+        for kind in [40, KIND_AUTHORITATIVE_INPUT] {
+            let mut legacy = PendingBatchLedger::new(1, 5, 9);
+            let legacy_batch = legacy.issue(vec![input_draft(1001, 7)], 100);
+            let mut legacy_answer = accept_all(&legacy_batch);
+            legacy_answer.commands.push(ScriptCommand::BroadcastMatch {
+                kind,
+                body: vec![1],
+                unreliable: false,
+                exclude: None,
+            });
+            assert!(
+                legacy
+                    .validate(
+                        &TestContext::permissive(),
+                        &BridgeQuotas::default(),
+                        &legacy_answer
+                    )
+                    .is_ok()
+            );
+
+            let mut v2 = PendingBatchLedger::new(1, 5, 9);
+            let v2_batch = v2.issue_with_reserved_kind_mode(
+                vec![input_draft(1001, 7)],
+                100,
+                ReservedKindMode::AuthoritativeInput,
+            );
+            let mut v2_answer = accept_all(&v2_batch);
+            v2_answer.commands.push(ScriptCommand::BroadcastMatch {
+                kind,
+                body: vec![1],
+                unreliable: false,
+                exclude: None,
+            });
+            assert_eq!(
+                v2.validate(
+                    &TestContext::permissive(),
+                    &BridgeQuotas::default(),
+                    &v2_answer
+                ),
+                Err(BatchRejection::ReservedKind { kind })
+            );
+        }
     }
 
     #[test]

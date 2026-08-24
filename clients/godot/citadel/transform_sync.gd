@@ -44,7 +44,7 @@ func handle_envelope(client: Variant, kind: int, payload: PackedByteArray) -> vo
 		free_runtime()
 		_view = client.transform_view_new(payload)
 		# V2 is an explicit opt-in. A peer that never confirms this manifest stays
-		# on the existing v1 path rather than receiving guessed v2 frames.
+		# on the existing v1 path rather than receiving guessed epoch-bearing TSYNC frames.
 		client.send(Protocol.KIND_TSYNC_V2_HELLO, PackedByteArray([2, 1]), true)
 		return
 	if kind == Protocol.KIND_TSYNC_V2_HELLO:

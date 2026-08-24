@@ -376,6 +376,9 @@ export const KIND_TSYNC_REWIND: number;
 export const KIND_TSYNC_V2_HELLO: number;
 export const KIND_TSYNC_V2_SNAPSHOT: number;
 export const KIND_TSYNC_V2_INPUT: number;
+export const TSYNC_V2_VERSION: number;
+export const TSYNC_V2_CLOCK_CAPABILITY: number;
+export const TSYNC_V2_KNOWN_CAPABILITIES: number;
 export const KIND_REP_DELTA: number;
 export const KIND_REP_ACK: number;
 export const KIND_REP_SCHEMA: number;
@@ -398,6 +401,27 @@ export const KIND_DIAG_CLOCK_SYNC: number;
 export const KIND_DIAG_START: number;
 export const KIND_DIAG_FLUSH: number;
 export const KIND_DIAG_STATUS: number;
+/** Server-to-client authoritative input-stream lease control (reliable only). */
+export const KIND_INPUT_STREAM_CONTROL: number;
+/** Canonical input-stream control body version. */
+export const INPUT_STREAM_CONTROL_VERSION: number;
+/** Canonical opcode that installs a server-issued stream lease. */
+export const INPUT_STREAM_CONTROL_ADVERTISE: number;
+/** Canonical opcode that retires a server-issued stream lease. */
+export const INPUT_STREAM_CONTROL_REVOKE: number;
+/** Exact opaque input-stream token width. */
+export const INPUT_STREAM_TOKEN_BYTES: number;
+/** Client-to-server stream-bound authoritative custom input. */
+export const KIND_AUTHORITATIVE_INPUT: number;
+/** Canonical stream-bound input body version. */
+export const AUTHORITATIVE_INPUT_VERSION: number;
+export const KIND_CAPABILITY_OFFER: number;
+export const KIND_CAPABILITY_ACCEPTANCE: number;
+export const CAPABILITY_NEGOTIATION_VERSION: number;
+export const CAPABILITY_AUTHORITATIVE_INPUT: number;
+export const CAPABILITY_CHALLENGE_BYTES: number;
+/** Maximum opaque body bytes in a stream-bound input. */
+export const MAX_SEQUENCED_INPUT_BODY_BYTES: number;
 
 export const TSYNC_KIND_MIN: number;
 export const TSYNC_KIND_MAX: number;
@@ -414,6 +438,7 @@ export const NOTIFICATION_KIND_MAX: number;
 export const CHAT_KIND_MIN: number;
 export const CHAT_KIND_MAX: number;
 export const TSYNC_V2_CLOCK_BYTES: number;
+export const TSYNC_V2_MANIFEST_BYTES: number;
 
 export const AUTH_STATUS_AUTHENTICATED: number;
 export const AUTH_STATUS_GUEST: number;
@@ -455,6 +480,50 @@ export function encodeRoomCreate(name: string): Uint8Array;
 export function encodeRoomId(roomId: bigint | number): Uint8Array;
 export function decodeRoomJoined(body: Uint8Array): RoomInfo | null;
 export function decodeRoomId(body: Uint8Array): bigint | null;
+
+export function decodeCapabilityOffer(body: Uint8Array): { capability: number; challenge: Uint8Array } | null;
+export function encodeCapabilityAcceptance(offer: Uint8Array): Uint8Array;
+
+/** Decode a canonical input-stream lease advertisement or revocation, or null if malformed. */
+export function decodeInputStreamControl(body: Uint8Array):
+  | { opcode: 1; matchId: bigint; streamId: bigint; token: Uint8Array }
+  | { opcode: 2; matchId: bigint; streamId: bigint }
+  | null;
+
+/** Canonical stream-bound authoritative input. u64 fields accept lossless bigint or safe number values. */
+export function encodeSequencedInput(
+  streamToken: Uint8Array,
+  sequence: bigint | number,
+  originalCustomKind: number,
+  body?: Uint8Array,
+): Uint8Array;
+export function decodeSequencedInput(body: Uint8Array): {
+  streamToken: Uint8Array; sequence: bigint; originalCustomKind: number; body: Uint8Array;
+} | null;
+
+export interface InputReceipt {
+  matchId: bigint | number;
+  streamId: bigint | number;
+  streamToken: Uint8Array;
+  acknowledgedSequence: bigint | number;
+  decidedSequence: bigint | number;
+  disposition: 0 | 1;
+  authoritativeTick: bigint | number;
+  /** null is absent; an empty Uint8Array is a present empty correction. */
+  correction?: Uint8Array | null;
+}
+export function encodeInputReceipt(receipt: InputReceipt): Uint8Array;
+export function decodeInputReceipt(body: Uint8Array): {
+  matchId: bigint; streamId: bigint; streamToken: Uint8Array;
+  acknowledgedSequence: bigint; decidedSequence: bigint; disposition: 0 | 1;
+  authoritativeTick: bigint; correction: Uint8Array | null;
+} | null;
+
+export function decodeTsyncV2Manifest(body: Uint8Array): {
+  capabilities: number; authoritativeInput: boolean;
+} | null;
+export function encodeTsyncV2Manifest(capabilities?: number): Uint8Array;
+
 export function decodeTsyncV2Snapshot(body: Uint8Array): {
   epoch: bigint; tick: bigint; tickHz: number; snapshotBody: Uint8Array;
 } | null;

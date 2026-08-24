@@ -107,6 +107,22 @@ namespace Citadel
         public const ushort KindNotification = 27;
         /// <summary>Server-to-client authorized chat presence, ephemeral typing, or durable mutation event (UTF-8 JSON).</summary>
         public const ushort KindChatEvent = 28;
+        /// <summary>Server-to-client reliable authoritative input-stream lease control.</summary>
+        public const ushort KindInputStreamControl = 40;
+        public const byte InputStreamControlVersion = 1;
+        public const byte InputStreamControlAdvertise = 1;
+        public const byte InputStreamControlRevoke = 2;
+        public const int InputStreamTokenBytes = 16;
+        /// <summary>Client-to-server canonical stream-bound custom input.</summary>
+        public const ushort KindAuthoritativeInput = 41;
+        public const byte AuthoritativeInputVersion = 1;
+        /// <summary>Standalone post-auth non-bearer capability offer.</summary>
+        public const ushort KindCapabilityOffer = 42;
+        public const ushort KindCapabilityAcceptance = 43;
+        public const byte CapabilityNegotiationVersion = 1;
+        public const byte CapabilityAuthoritativeInput = 1;
+        public const int CapabilityChallengeBytes = 16;
+        public const int MaxSequencedInputBodyBytes = 64 * 1024;
 
         /// <summary>
         /// Auth result status: the token validated; the connection is bound to the
@@ -338,6 +354,143 @@ namespace Citadel
             roomId = 0;
             if (body == null || length != RoomIdBytes || length > body.Length) return false;
             roomId = ReadBeUInt64(body, 0);
+            return true;
+        }
+
+        /// <summary>Validate a canonical non-bearer V1 offer/acceptance body.</summary>
+        public static bool TryDecodeCapabilityOffer(byte[] body, int length, out byte[] challenge)
+        {
+            challenge = Array.Empty<byte>();
+            if (body == null || length != 2 + CapabilityChallengeBytes || length > body.Length
+                || body[0] != CapabilityNegotiationVersion || body[1] != CapabilityAuthoritativeInput) return false;
+            challenge = new byte[CapabilityChallengeBytes]; Array.Copy(body, 2, challenge, 0, challenge.Length);
+            bool nonzero = false; foreach (byte value in challenge) nonzero |= value != 0;
+            return nonzero;
+        }
+
+        /// <summary>Copy one validated offer into its exact canonical acceptance echo.</summary>
+        public static bool TryEncodeCapabilityAcceptance(byte[] offer, int length, out byte[] acceptance)
+        {
+            acceptance = Array.Empty<byte>();
+            if (!TryDecodeCapabilityOffer(offer, length, out _)) return false;
+            acceptance = new byte[length]; Array.Copy(offer, acceptance, length); return true;
+        }
+
+        public readonly struct InputStreamControl
+        {
+            public readonly byte Opcode;
+            public readonly ulong MatchId;
+            public readonly ulong StreamId;
+            public readonly byte[] Token;
+            public InputStreamControl(byte opcode, ulong matchId, ulong streamId, byte[] token)
+            { Opcode = opcode; MatchId = matchId; StreamId = streamId; Token = token; }
+        }
+
+        /// <summary>Decode an exact server-issued input-stream control body.</summary>
+        public static bool TryDecodeInputStreamControl(byte[] body, int length, out InputStreamControl control)
+        {
+            control = default(InputStreamControl);
+            if (body == null || length < 18 || length > body.Length || body[0] != InputStreamControlVersion) return false;
+            byte opcode = body[1];
+            ulong matchId = ReadBeUInt64(body, 2);
+            ulong streamId = ReadBeUInt64(body, 10);
+            if (opcode == InputStreamControlRevoke)
+            {
+                if (length != 18) return false;
+                control = new InputStreamControl(opcode, matchId, streamId, Array.Empty<byte>());
+                return true;
+            }
+            if (opcode != InputStreamControlAdvertise || length != 18 + InputStreamTokenBytes) return false;
+            var token = new byte[InputStreamTokenBytes];
+            Array.Copy(body, 18, token, 0, token.Length);
+            bool nonzero = false; foreach (byte value in token) nonzero |= value != 0;
+            if (!nonzero) return false;
+            control = new InputStreamControl(opcode, matchId, streamId, token);
+            return true;
+        }
+
+        public static bool TryEncodeSequencedInput(byte[] token, ulong sequence, ushort originalCustomKind, byte[] payload, out byte[] encoded)
+        {
+            encoded = Array.Empty<byte>();
+            if (token == null || token.Length != InputStreamTokenBytes || sequence == 0 || payload == null || payload.Length > MaxSequencedInputBodyBytes) return false;
+            bool nonzero = false; foreach (byte value in token) nonzero |= value != 0; if (!nonzero) return false;
+            encoded = new byte[31 + payload.Length]; encoded[0] = AuthoritativeInputVersion; Array.Copy(token, 0, encoded, 1, token.Length);
+            WriteBeUInt64(encoded, 17, sequence); WriteBeUInt16(encoded, 25, originalCustomKind);
+            encoded[27] = (byte)(payload.Length >> 24); encoded[28] = (byte)(payload.Length >> 16); encoded[29] = (byte)(payload.Length >> 8); encoded[30] = (byte)payload.Length; Array.Copy(payload, 0, encoded, 31, payload.Length); return true;
+        }
+
+        public static bool TryDecodeSequencedInput(byte[] body, int length, out ulong sequence, out ushort originalCustomKind, out byte[] token, out byte[] payload)
+        {
+            sequence = 0; originalCustomKind = 0; token = Array.Empty<byte>(); payload = Array.Empty<byte>();
+            if (body == null || length < 31 || length > body.Length || body[0] != AuthoritativeInputVersion) return false;
+            int payloadLength = (body[27] << 24) | (body[28] << 16) | (body[29] << 8) | body[30]; if (payloadLength > MaxSequencedInputBodyBytes || length != 31 + payloadLength) return false;
+            token = new byte[InputStreamTokenBytes]; Array.Copy(body, 1, token, 0, token.Length); bool nonzero = false; foreach (byte value in token) nonzero |= value != 0; sequence = ReadBeUInt64(body, 17); if (!nonzero || sequence == 0) return false;
+            originalCustomKind = (ushort)((body[25] << 8) | body[26]); payload = new byte[payloadLength]; Array.Copy(body, 31, payload, 0, payloadLength); return true;
+        }
+
+        /// <summary>One canonical stream-bound authoritative receipt.</summary>
+        public readonly struct InputReceipt
+        {
+            public readonly ulong MatchId;
+            public readonly ulong StreamId;
+            public readonly byte[] StreamToken;
+            public readonly ulong AcknowledgedSequence;
+            public readonly ulong DecidedSequence;
+            public readonly bool Accepted;
+            public readonly ulong AuthoritativeTick;
+            public readonly bool CorrectionPresent;
+            public readonly byte[] Correction;
+
+            public InputReceipt(ulong matchId, ulong streamId, byte[] streamToken,
+                ulong acknowledgedSequence, ulong decidedSequence, bool accepted,
+                ulong authoritativeTick, bool correctionPresent, byte[] correction)
+            {
+                MatchId = matchId; StreamId = streamId; StreamToken = streamToken;
+                AcknowledgedSequence = acknowledgedSequence; DecidedSequence = decidedSequence;
+                Accepted = accepted; AuthoritativeTick = authoritativeTick;
+                CorrectionPresent = correctionPresent; Correction = correction;
+            }
+        }
+
+        /// <summary>Encode an exact canonical InputReceipt body.</summary>
+        public static bool TryEncodeInputReceipt(InputReceipt receipt, out byte[] encoded)
+        {
+            encoded = Array.Empty<byte>();
+            byte[] token = receipt.StreamToken;
+            byte[] correction = receipt.Correction ?? Array.Empty<byte>();
+            if (token == null || token.Length != InputStreamTokenBytes || receipt.DecidedSequence == 0
+                || (!receipt.CorrectionPresent && correction.Length != 0)
+                || correction.Length > MaxSequencedInputBodyBytes) return false;
+            bool nonzero = false; foreach (byte value in token) nonzero |= value != 0; if (!nonzero) return false;
+            encoded = new byte[63 + correction.Length];
+            encoded[0] = AuthoritativeInputVersion;
+            WriteBeUInt64(encoded, 1, receipt.MatchId); WriteBeUInt64(encoded, 9, receipt.StreamId);
+            Array.Copy(token, 0, encoded, 17, token.Length);
+            WriteBeUInt64(encoded, 33, receipt.AcknowledgedSequence); WriteBeUInt64(encoded, 41, receipt.DecidedSequence);
+            encoded[49] = receipt.Accepted ? (byte)0 : (byte)1;
+            WriteBeUInt64(encoded, 50, receipt.AuthoritativeTick);
+            encoded[58] = receipt.CorrectionPresent ? (byte)1 : (byte)0;
+            encoded[59] = (byte)(correction.Length >> 24); encoded[60] = (byte)(correction.Length >> 16);
+            encoded[61] = (byte)(correction.Length >> 8); encoded[62] = (byte)correction.Length;
+            Array.Copy(correction, 0, encoded, 63, correction.Length);
+            return true;
+        }
+
+        /// <summary>Decode one exact canonical InputReceipt body.</summary>
+        public static bool TryDecodeInputReceipt(byte[] body, int length, out InputReceipt receipt)
+        {
+            receipt = default(InputReceipt);
+            if (body == null || length < 63 || length > body.Length || body[0] != AuthoritativeInputVersion) return false;
+            byte disposition = body[49]; byte correctionPresent = body[58];
+            int correctionLength = (body[59] << 24) | (body[60] << 16) | (body[61] << 8) | body[62];
+            if (disposition > 1 || correctionPresent > 1 || correctionLength > MaxSequencedInputBodyBytes || length != 63 + correctionLength || (correctionPresent == 0 && correctionLength != 0)) return false;
+            var token = new byte[InputStreamTokenBytes]; Array.Copy(body, 17, token, 0, token.Length);
+            bool nonzero = false; foreach (byte value in token) nonzero |= value != 0;
+            ulong decidedSequence = ReadBeUInt64(body, 41); if (!nonzero || decidedSequence == 0) return false;
+            var correction = new byte[correctionLength]; Array.Copy(body, 63, correction, 0, correctionLength);
+            receipt = new InputReceipt(ReadBeUInt64(body, 1), ReadBeUInt64(body, 9), token,
+                ReadBeUInt64(body, 33), decidedSequence, disposition == 0, ReadBeUInt64(body, 50),
+                correctionPresent == 1, correction);
             return true;
         }
 

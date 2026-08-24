@@ -272,7 +272,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Relayed realtime messages** — Game logic can validate, broadcast, or unicast relay messages.
 - **Named rooms, membership, labels, and map-ready** — All shipped runtimes expose room creation/admission hooks; the common room boundary scopes membership.
 - **Player match listing and query filters** — Operators can inspect matches; no player match-list API.
-- **Single-node authoritative matches and presence** — Server rooms, lifecycle, tick, presence, scoped relay, and protocol-v2 generic custom client-message input are usable on one node. Bound-match messages reach on_input with a bounded opaque body, kind, and native delivery metadata; returned decisions and commands remain room scoped.
+- **Single-node authoritative matches and presence** — Server rooms, lifecycle, tick, presence, scoped relay, and negotiated generic custom client-message input are usable on one node. Bound-match messages reach on_input with a bounded opaque body, kind, and native delivery metadata; returned decisions and commands remain room scoped.
 - **Multi-node match ownership, migration, and failover** — No end-to-end distributed match runtime.
 - **Local ticket matchmaker and reconnect handoff** — Typed mutual queries, TTL, cancellation, atomic cohorts, and account-bound join tokens.
 - **Cross-node matchmaker routing and durable leases** — mTLS node-control transport forwards tickets, handoffs, cancellation/status, and admission; durable fenced leases/claims protect PostgreSQL and CockroachDB. Clustered SQLite and MongoDB are rejected at startup.

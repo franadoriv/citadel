@@ -172,6 +172,20 @@ struct Inner {
     degraded_since: Option<TimestampMillis>,
 }
 
+/// Server-owned callbacks that run after a committed readiness transition.
+/// They are held outside `Inner` so an observer can acquire its own lifecycle
+/// lock without a lock-order cycle with the readiness authority.
+type ReadinessInvalidation = Arc<dyn Fn(ReadinessSnapshot) + Send + Sync + 'static>;
+
+#[derive(Default)]
+struct ReadinessInvalidations(Mutex<Vec<ReadinessInvalidation>>);
+
+impl core::fmt::Debug for ReadinessInvalidations {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ReadinessInvalidations([registered])")
+    }
+}
+
 /// The node-local authority every match surface consults before it lists,
 /// creates, or admits.
 ///
@@ -182,6 +196,10 @@ struct Inner {
 #[derive(Debug)]
 pub struct GameScriptReadiness {
     inner: Mutex<Inner>,
+    invalidations: ReadinessInvalidations,
+    /// Serializes publication and callback delivery, so a delayed older
+    /// transition cannot invalidate capabilities installed by a later load.
+    invalidation_serial: Mutex<()>,
     metrics: Option<Arc<NodeMetrics>>,
     degraded_hold: Duration,
 }
@@ -201,6 +219,8 @@ impl GameScriptReadiness {
                 recovery: None,
                 degraded_since: None,
             }),
+            invalidations: ReadinessInvalidations::default(),
+            invalidation_serial: Mutex::new(()),
             metrics: None,
             degraded_hold: DEFAULT_DEGRADED_HOLD,
         }
@@ -226,6 +246,18 @@ impl GameScriptReadiness {
     #[must_use]
     pub fn snapshot(&self) -> ReadinessSnapshot {
         self.lock().snapshot.clone()
+    }
+
+    /// Register a server-owned callback that runs after every readiness change.
+    ///
+    /// The callback runs after the readiness mutex is released and receives only
+    /// the committed server-owned snapshot, never client-controlled data.
+    pub fn register_invalidation(&self, invalidation: ReadinessInvalidation) {
+        self.invalidations
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(invalidation);
     }
 
     /// The worker recovery posture, when a supervised source reported one.
@@ -260,6 +292,10 @@ impl GameScriptReadiness {
     /// A validated script finished loading: enter `Ready`, adopt the content
     /// identity, and bump the local generation.
     pub fn record_loaded(&self, revision_id: impl Into<String>, now: TimestampMillis) {
+        let _serial = self
+            .invalidation_serial
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut g = self.lock();
         g.snapshot.state = ScriptReadinessState::Ready;
         g.snapshot.revision_id = Some(revision_id.into());
@@ -267,6 +303,9 @@ impl GameScriptReadiness {
         g.snapshot.since = now;
         g.degraded_since = None;
         self.publish_gauge(&g);
+        let snapshot = g.snapshot.clone();
+        drop(g);
+        self.invalidate_lifecycle_dependents(snapshot);
     }
 
     /// No script exists to load (missing/disappeared entrypoint): not-ready,
@@ -279,6 +318,10 @@ impl GameScriptReadiness {
     /// listing/creation/admission is gated. Idempotent while degraded (the
     /// first loss pins `since`).
     pub fn record_degraded(&self, now: TimestampMillis) {
+        let _serial = self
+            .invalidation_serial
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut g = self.lock();
         if g.snapshot.state != ScriptReadinessState::Degraded {
             g.snapshot.state = ScriptReadinessState::Degraded;
@@ -286,6 +329,9 @@ impl GameScriptReadiness {
             g.degraded_since = Some(now);
         }
         self.publish_gauge(&g);
+        let snapshot = g.snapshot.clone();
+        drop(g);
+        self.invalidate_lifecycle_dependents(snapshot);
     }
 
     /// Hard failure: nothing lists, creates, or admits until a new load.
@@ -297,6 +343,10 @@ impl GameScriptReadiness {
     /// elapses without recovery. Returns whether the escalation happened.
     /// No-op in every other state.
     pub fn expire_degraded_hold(&self, now: TimestampMillis) -> bool {
+        let _serial = self
+            .invalidation_serial
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut g = self.lock();
         let Some(degraded_since) = g.degraded_since else {
             return false;
@@ -313,6 +363,9 @@ impl GameScriptReadiness {
         g.snapshot.since = now;
         g.degraded_since = None;
         self.publish_gauge(&g);
+        let snapshot = g.snapshot.clone();
+        drop(g);
+        self.invalidate_lifecycle_dependents(snapshot);
         true
     }
 
@@ -322,6 +375,10 @@ impl GameScriptReadiness {
     }
 
     fn transition(&self, state: ScriptReadinessState, now: TimestampMillis) {
+        let _serial = self
+            .invalidation_serial
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut g = self.lock();
         g.snapshot.state = state;
         g.snapshot.since = now;
@@ -329,6 +386,21 @@ impl GameScriptReadiness {
             g.degraded_since = None;
         }
         self.publish_gauge(&g);
+        let snapshot = g.snapshot.clone();
+        drop(g);
+        self.invalidate_lifecycle_dependents(snapshot);
+    }
+
+    fn invalidate_lifecycle_dependents(&self, snapshot: ReadinessSnapshot) {
+        let callbacks = self
+            .invalidations
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        for callback in callbacks {
+            callback(snapshot.clone());
+        }
     }
 
     fn publish_gauge(&self, g: &Inner) {
@@ -522,6 +594,31 @@ mod tests {
 
     fn at(ms: u64) -> TimestampMillis {
         TimestampMillis::from_unix_millis(ms)
+    }
+
+    #[test]
+    fn readiness_invalidations_are_serialized_with_the_transition_snapshot() {
+        let readiness = GameScriptReadiness::new(at(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        readiness.register_invalidation(Arc::new(move |snapshot| {
+            sink.lock()
+                .expect("test observer lock")
+                .push((snapshot.state, snapshot.generation));
+        }));
+
+        readiness.record_loaded("sha256:v1", at(1));
+        readiness.record_activating(at(2));
+        readiness.record_loaded("sha256:v2", at(3));
+
+        assert_eq!(
+            *observed.lock().expect("test observer lock"),
+            vec![
+                (ScriptReadinessState::Ready, 1),
+                (ScriptReadinessState::Activating, 1),
+                (ScriptReadinessState::Ready, 2),
+            ]
+        );
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub struct Envelope {
 | `KIND_MATCHMAKER_MATCHED` | `26` | Reliable server-to-client matchmaker handoff. |
 | `KIND_NOTIFICATION` | `27` | Reliable, at-least-once durable-notification live delivery. |
 | `KIND_CHAT_EVENT` | `28` | Reliable, at-least-once local chat presence and committed durable-mutation delivery. |
+| `KIND_INPUT_STREAM_CONTROL` | `40` | Reliable server-only input-stream advertise/revoke control. |
+| `KIND_AUTHORITATIVE_INPUT` | `41` | Stream-bound client input and server-to-client authoritative receipt. |
+| `KIND_CAPABILITY_OFFER` / `KIND_CAPABILITY_ACCEPTANCE` | `42` / `43` | Post-auth one-use capability offer and canonical client echo. |
 | `AUTH_STATUS_AUTHENTICATED` / `GUEST` / `REJECTED` | `0` / `1` / `2` | Handshake result states. |
 | `AUTH_REASON_AUTH_FAILED` / `AUTH_REQUIRED` / `PROTOCOL` | `0` / `1` / `2` | Coarse rejection classes. |
 | `RPC_STATUS_OK` / `RPC_STATUS_ERROR` | `0` / `1` | RPC response outcome. |
@@ -747,9 +750,60 @@ For the full room lifecycle and admission hooks, see the
 and networked-actor frames have their own higher-level reference pages; their raw
 contract remains indexed above so the kind namespace has one canonical catalog.
 
+## Post-auth authoritative input (kinds 40-43)
+
+These four kinds are an opt-in, post-auth extension and are independent of
+transform-sync. Older or unauthenticated clients keep legacy custom-kind
+behavior and receive no bearer token.
+
+### `KIND_INPUT_STREAM_CONTROL` (40) — server input-stream control
+
+**Direction/delivery:** server → client; reliable. **Body:**
+`InputStreamControl::Advertise` (`version: u8 | operation: 1 | match_id: u64 BE |
+stream_id: u64 BE | stream_token: bytes[16]`) or `Revoke` (the same prefix with
+`operation: 2` and no token). **When:** only after an authenticated client has
+canonically accepted the current offer and authoritative room admission has
+validated membership, binding, and clock. **Edge behavior:** client-originated
+kind-40 frames are dropped before metrics, relay, or runtime processing; revoke
+delivery is best effort and never retains server authorization.
+
+### `KIND_AUTHORITATIVE_INPUT` (41) — stream input and receipt
+
+**Direction/delivery:** client → server input is reliable; server → client
+receipts are reliable. **Client body:** `SequencedInput` (`version: u8 |
+stream_token: bytes[16] | sequence: u64 BE | original_custom_kind: u16 BE |
+body_len: u32 BE | body`). **Server body:** `InputReceipt` (`version: u8 |
+match_id: u64 BE | stream_id: u64 BE | stream_token: bytes[16] |
+acknowledged_sequence: u64 BE | decided_sequence: u64 BE | disposition: u8 |
+authoritative_tick: u64 BE | correction_present: u8 | correction_len: u32 BE |
+correction`). **When:** queued input is revalidated and issued to the
+authoritative bridge at a fixed tick; a receipt is sent only after its exact
+fenced decision materializes. **Edge behavior:** all match, stream, token,
+decided-sequence, acknowledgement, binding, and clock coordinates must still
+match server-owned state. Stale, revoked, replayed, malformed, or reserved-kind
+input produces no queue, runtime, metric, or receipt side effect. The optional
+correction is bounded opaque bytes.
+
+### `KIND_CAPABILITY_OFFER` (42) — one-use post-auth offer
+
+**Direction/delivery:** server → authenticated client; reliable. **Body:**
+`version: u8 = 1 | capability: u8 = 1 | challenge: bytes[16]`, where the
+challenge is nonzero and non-bearer. **When:** immediately after authenticated
+registration, and again after a still-authenticated participant leaves a room.
+**Edge behavior:** the challenge is bound to one live transport generation and
+cannot authorize input by itself.
+
+### `KIND_CAPABILITY_ACCEPTANCE` (43) — canonical offer echo
+
+**Direction/delivery:** client → server; reliable. **Body:** byte-for-byte
+canonical echo of kind 42. **When:** once for the outstanding offer. **Edge
+behavior:** malformed, forged, replayed, wrong-participant, or wrong-generation
+echoes are dropped before metrics and runtime work. A successful echo is
+consumed; leave clears it, so rejoin requires the newly issued offer.
+
 ## Custom kind numbering
 
-The constants above assign kinds `1`–`28`, and Citadel keeps the rest of the low
+The constants above assign kinds `1`–`43`, and Citadel keeps the rest of the low
 range through `99` in reserve for future first-party protocol growth.
 Any custom game envelope kind an application defines for its own traffic must use a value `>= 100` so it never collides with a current or future reserved kind.
 The `100`/`101`/`102` kinds in the chat and notification relay examples follow this rule.

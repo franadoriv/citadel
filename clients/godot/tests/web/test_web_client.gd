@@ -22,6 +22,7 @@ func _init() -> void:
 	_test_framing()
 	_test_auth_decode()
 	_test_transform_v2_wrapper()
+	_test_authoritative_input_codecs()
 	_test_browser_client_contract()
 	if failures.is_empty():
 		print("Citadel Godot Web SDK tests passed")
@@ -82,6 +83,67 @@ func _test_transform_v2_wrapper() -> void:
 	_expect(client.applied.size() == 2, "reset epoch must accept its first v2 snapshot")
 	sync.handle_envelope(client, Protocol.KIND_TSYNC_SNAPSHOT, PackedByteArray([0xbb]))
 	_expect(client.applied.back() == PackedByteArray([0xbb]), "v1 snapshot fallback must remain on the native apply path")
+
+func _test_authoritative_input_codecs() -> void:
+	var fixture := _authoritative_input_fixture()
+	if fixture.is_empty():
+		return
+	var sequence_fixture: Dictionary = fixture.get("sequenced_input", {})
+	var receipt_fixture: Dictionary = fixture.get("input_receipt", {})
+	var invalid_fixture: Dictionary = fixture.get("invalid", {})
+	var token := _fixture_hex_bytes(sequence_fixture.get("token_hex", ""))
+	var max_u64 := _fixture_hex_bytes(sequence_fixture.get("sequence_hex", ""))
+	var opaque_body := _fixture_hex_bytes(sequence_fixture.get("opaque_body_hex", ""))
+	var sequence := Protocol.encode_sequenced_input(token, max_u64, int(sequence_fixture.get("original_custom_kind", -1)), opaque_body)
+	_expect(sequence == _fixture_hex_bytes(sequence_fixture.get("hex", "")), "sequenced input must emit the shared authoritative-input fixture")
+	var decoded_sequence := Protocol.decode_sequenced_input(sequence)
+	_expect(not decoded_sequence.is_empty(), "u64::MAX sequenced input must decode")
+	_expect(decoded_sequence.get("sequence", PackedByteArray()) == max_u64, "sequenced input must preserve unsigned u64 bytes")
+	_expect(decoded_sequence.get("body", PackedByteArray()) == opaque_body, "sequenced input must preserve opaque non-UTF8 bytes")
+	_expect(Protocol.decode_sequenced_input(sequence.slice(0, sequence.size() - 1)).is_empty(), "truncated sequenced input must be rejected")
+	sequence.append_array(_fixture_hex_bytes(invalid_fixture.get("trailing_byte_hex", "")))
+	_expect(Protocol.decode_sequenced_input(sequence).is_empty(), "trailing sequenced input bytes must be rejected")
+
+	var receipt := Protocol.encode_input_receipt(
+		_fixture_hex_bytes(receipt_fixture.get("match_id_hex", "")),
+		_fixture_hex_bytes(receipt_fixture.get("stream_id_hex", "")),
+		token,
+		_fixture_hex_bytes(receipt_fixture.get("acknowledged_sequence_hex", "")),
+		_fixture_hex_bytes(receipt_fixture.get("decided_sequence_hex", "")),
+		int(receipt_fixture.get("disposition", -1)),
+		_fixture_hex_bytes(receipt_fixture.get("authoritative_tick_hex", "")),
+		_fixture_hex_bytes(receipt_fixture.get("opaque_correction_hex", "")))
+	_expect(receipt == _fixture_hex_bytes(receipt_fixture.get("hex", "")), "receipt must emit the shared authoritative-input fixture")
+	var decoded_receipt := Protocol.decode_input_receipt(receipt)
+	_expect(not decoded_receipt.is_empty(), "canonical receipt must decode")
+	_expect(decoded_receipt.get("match_id", PackedByteArray()) == max_u64, "receipt must preserve full unsigned match id")
+	_expect(decoded_receipt.get("decided_sequence", PackedByteArray()) == max_u64, "receipt must preserve full unsigned decided sequence")
+	_expect(decoded_receipt.get("correction", PackedByteArray()) == _fixture_hex_bytes(receipt_fixture.get("opaque_correction_hex", "")), "receipt must preserve opaque correction bytes")
+	receipt[int(invalid_fixture.get("invalid_disposition_offset", -1))] = 2
+	_expect(Protocol.decode_input_receipt(receipt).is_empty(), "receipt must reject an invalid disposition")
+
+func _authoritative_input_fixture() -> Dictionary:
+	var file := FileAccess.open("res://authoritative-input-fixtures.json", FileAccess.READ)
+	if file == null:
+		_expect(false, "shared authoritative-input fixture must be present in the test project")
+		return {}
+	var parser := JSON.new()
+	if parser.parse(file.get_as_text()) != OK or not parser.data is Dictionary:
+		_expect(false, "shared authoritative-input fixture must be valid JSON")
+		return {}
+	return parser.data
+
+func _fixture_hex_bytes(value: String) -> PackedByteArray:
+	if value.length() % 2 != 0:
+		return PackedByteArray()
+	var bytes := PackedByteArray()
+	bytes.resize(value.length() / 2)
+	for index in bytes.size():
+		var pair := value.substr(index * 2, 2)
+		if not pair.is_valid_hex_number():
+			return PackedByteArray()
+		bytes[index] = pair.hex_to_int()
+	return bytes
 
 class FakeTransformClient:
 	extends RefCounted

@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use crate::realtime::input_stream_controller::InputStreamControllerError;
 use crate::realtime::registry::ParticipantId;
 use crate::runtime::{NativeMatchLifecycleUnavailable, ScriptBinding};
 use crate::session::NodeId;
@@ -65,6 +66,8 @@ pub struct RoomSnapshot {
     /// The GameScript `(revision, generation)` this room was born bound to.
     /// `None` on ungated nodes (`runtime.require_script` off).
     pub script_binding: Option<ScriptBinding>,
+    /// Server-owned monotonic membership/lifecycle transition generation.
+    pub lifecycle_generation: u64,
 }
 
 /// Globally scoped identity for a member proxied by another node.
@@ -90,6 +93,9 @@ pub enum JoinError {
     /// The selected runtime cannot execute the complete native authoritative
     /// match lifecycle, so gateway admission was refused before mutation.
     NativeMatchLifecycleUnavailable,
+    /// A required server-owned authoritative-input lease could not be installed.
+    /// The contained controller error is server state, never sent to clients.
+    InputStreamController(InputStreamControllerError),
 }
 
 impl From<NativeMatchLifecycleUnavailable> for JoinError {
@@ -98,7 +104,7 @@ impl From<NativeMatchLifecycleUnavailable> for JoinError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Room {
     label: RoomLabel,
     members: HashSet<ParticipantId>,
@@ -110,9 +116,10 @@ struct Room {
     /// The GameScript `(revision, generation)` captured from the readiness
     /// snapshot that admitted this room's creation. `None` on ungated nodes.
     binding: Option<ScriptBinding>,
+    lifecycle_generation: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Inner {
     rooms: HashMap<RoomId, Room>,
     /// One room per participant (MVP). Absent = not in any room.
@@ -122,6 +129,20 @@ struct Inner {
     /// the same name in the same room. Cleared when the room is pruned.
     names: HashMap<String, RoomId>,
     next_id: RoomId,
+    next_transition_generation: u64,
+}
+
+/// The participant-local undo record for one admitted membership transition.
+///
+/// This is deliberately not a registry checkpoint: it contains only the
+/// participant's source/destination rooms. Rolling it back can therefore never
+/// restore an old global `names`, `next_id`, or membership image over rooms
+/// created concurrently by other participants.
+#[derive(Debug, Clone)]
+pub(crate) struct RoomAdmissionUndo {
+    participant: ParticipantId,
+    source: Option<(RoomId, Room)>,
+    destination: RoomId,
 }
 
 /// The gateway's room state. Interior-mutable (like the session registry) so the
@@ -142,6 +163,7 @@ impl RoomRegistry {
                 remote_membership: HashMap::new(),
                 names: HashMap::new(),
                 next_id: 1,
+                next_transition_generation: 1,
             }),
         }
     }
@@ -158,6 +180,8 @@ impl RoomRegistry {
         let mut g = self.lock();
         let id = g.next_id;
         g.next_id += 1;
+        let lifecycle_generation = g.next_transition_generation;
+        g.next_transition_generation += 1;
         g.rooms.insert(
             id,
             Room {
@@ -166,6 +190,7 @@ impl RoomRegistry {
                 remote_members: HashSet::new(),
                 name: None,
                 binding,
+                lifecycle_generation,
             },
         );
         id
@@ -205,6 +230,8 @@ impl RoomRegistry {
         // Create the named room, then join the creator into it.
         let id = g.next_id;
         g.next_id += 1;
+        let lifecycle_generation = g.next_transition_generation;
+        g.next_transition_generation += 1;
         g.rooms.insert(
             id,
             Room {
@@ -213,10 +240,61 @@ impl RoomRegistry {
                 remote_members: HashSet::new(),
                 name: Some(name.to_owned()),
                 binding: binding.clone(),
+                lifecycle_generation,
             },
         );
         g.names.insert(name.to_owned(), id);
         Self::join_locked(&mut g, participant, id, false, binding.as_ref())
+    }
+
+    /// `join_or_create_bound` with the participant-scoped undo record needed by
+    /// a gateway admission transaction. It never snapshots the registry.
+    pub(crate) fn join_or_create_bound_with_undo(
+        &self,
+        participant: ParticipantId,
+        name: &str,
+        binding: Option<ScriptBinding>,
+        make_label: impl FnOnce() -> RoomLabel,
+    ) -> Result<(RoomId, RoomLabel, RoomAdmissionUndo, bool), JoinError> {
+        let mut g = self.lock();
+        let source = g
+            .membership
+            .get(&participant)
+            .copied()
+            .and_then(|source| g.rooms.get(&source).cloned().map(|room| (source, room)));
+        let (room_id, created) = if let Some(&existing) = g.names.get(name) {
+            (existing, false)
+        } else {
+            let id = g.next_id;
+            g.next_id += 1;
+            let lifecycle_generation = g.next_transition_generation;
+            g.next_transition_generation += 1;
+            g.rooms.insert(
+                id,
+                Room {
+                    label: make_label(),
+                    members: HashSet::new(),
+                    remote_members: HashSet::new(),
+                    name: Some(name.to_owned()),
+                    binding: binding.clone(),
+                    lifecycle_generation,
+                },
+            );
+            g.names.insert(name.to_owned(), id);
+            (id, true)
+        };
+        let label = Self::join_locked(&mut g, participant, room_id, false, binding.as_ref())
+            .map(|(_, label)| label)?;
+        Ok((
+            room_id,
+            label,
+            RoomAdmissionUndo {
+                participant,
+                source: source.filter(|(source, _)| *source != room_id),
+                destination: room_id,
+            },
+            created,
+        ))
     }
 
     /// Add `participant` to `room_id`, first removing it from any prior room (MVP:
@@ -244,19 +322,15 @@ impl RoomRegistry {
         Self::join_locked(&mut g, participant, room_id, false, expected).map(|(_, label)| label)
     }
 
-    /// Admit a participant selected by the trusted matchmaker into a closed
-    /// match room. This is deliberately separate from [`Self::join_bound`]: a
-    /// raw `ROOM_JOIN` frame cannot bypass a room's `open = false` policy.
-    /// See [`Self::join_bound`] for the `expected` binding contract
-    /// (`None` = ungated node).
-    pub(crate) fn admit_match_bound(
+    #[cfg(test)]
+    fn admit_match_bound(
         &self,
         participant: ParticipantId,
         room_id: RoomId,
         expected: Option<&ScriptBinding>,
     ) -> Result<RoomLabel, JoinError> {
-        let mut g = self.lock();
-        Self::join_locked(&mut g, participant, room_id, true, expected).map(|(_, label)| label)
+        self.admit_bound_with_undo(participant, room_id, true, expected)
+            .map(|(label, _)| label)
     }
 
     /// Join logic operating on an already-locked `Inner` (shared by [`Self::join`]
@@ -286,21 +360,82 @@ impl RoomRegistry {
                 return Err(JoinError::Full);
             }
         }
-        if let Some(prev) = g.membership.get(&participant).copied()
+        let previous = g.membership.get(&participant).copied();
+        if let Some(prev) = previous
             && prev != room_id
         {
             Self::remove_member(g, participant, prev);
+            Self::advance_room_generation(g, prev);
         }
-        let label = {
+        let (label, inserted) = {
             let room = g
                 .rooms
                 .get_mut(&room_id)
                 .expect("room existence checked above");
-            room.members.insert(participant);
-            room.label.clone()
+            let inserted = room.members.insert(participant);
+            (room.label.clone(), inserted)
         };
         g.membership.insert(participant, room_id);
+        if inserted {
+            Self::advance_room_generation(g, room_id);
+        }
         Ok((room_id, label))
+    }
+
+    /// Admit one local participant and return a participant-scoped undo record.
+    /// Gateway callers use this for every path that must atomically install a
+    /// later authority capability (direct joins, handoffs, and matchmaker
+    /// accepts). The caller serializes companion state with its room scope.
+    pub(crate) fn admit_bound_with_undo(
+        &self,
+        participant: ParticipantId,
+        room_id: RoomId,
+        bypass_closed: bool,
+        expected: Option<&ScriptBinding>,
+    ) -> Result<(RoomLabel, RoomAdmissionUndo), JoinError> {
+        let mut g = self.lock();
+        let source = g
+            .membership
+            .get(&participant)
+            .copied()
+            .filter(|source| *source != room_id)
+            .and_then(|source| g.rooms.get(&source).cloned().map(|room| (source, room)));
+        let label = Self::join_locked(&mut g, participant, room_id, bypass_closed, expected)
+            .map(|(_, label)| label)?;
+        Ok((
+            label,
+            RoomAdmissionUndo {
+                participant,
+                source,
+                destination: room_id,
+            },
+        ))
+    }
+
+    /// Undo only the participant transition described by `undo`.
+    ///
+    /// Other rooms, memberships, names, and allocation state remain untouched.
+    /// In particular, this cannot erase rooms another participant created while
+    /// the admission was pending.
+    pub(crate) fn rollback_admission(&self, undo: RoomAdmissionUndo) {
+        let mut g = self.lock();
+        if g.membership.get(&undo.participant).copied() == Some(undo.destination) {
+            g.membership.remove(&undo.participant);
+            Self::remove_member(&mut g, undo.participant, undo.destination);
+            Self::advance_room_generation(&mut g, undo.destination);
+        }
+        if let Some((source_id, source)) = undo.source {
+            let name = {
+                let room = g.rooms.entry(source_id).or_insert(source);
+                room.members.insert(undo.participant);
+                room.name.clone()
+            };
+            g.membership.insert(undo.participant, source_id);
+            Self::advance_room_generation(&mut g, source_id);
+            if let Some(name) = name {
+                g.names.entry(name).or_insert(source_id);
+            }
+        }
     }
 
     /// Admit a member whose transport is owned by another node. This trusted
@@ -331,10 +466,23 @@ impl RoomRegistry {
             && previous != room_id
         {
             Self::remove_remote_member(&mut g, &member, previous);
+            Self::advance_room_generation(&mut g, previous);
         }
-        let label = g.rooms.get_mut(&room_id).ok_or(JoinError::NoSuchRoom)?;
-        label.remote_members.insert(member.clone());
-        let label = label.label.clone();
+        let inserted = g
+            .rooms
+            .get_mut(&room_id)
+            .ok_or(JoinError::NoSuchRoom)?
+            .remote_members
+            .insert(member.clone());
+        if inserted {
+            Self::advance_room_generation(&mut g, room_id);
+        }
+        let label = g
+            .rooms
+            .get(&room_id)
+            .expect("room existence checked above")
+            .label
+            .clone();
         g.remote_membership.insert(member, room_id);
         Ok(label)
     }
@@ -346,6 +494,7 @@ impl RoomRegistry {
         let mut g = self.lock();
         let room_id = g.membership.remove(&participant)?;
         Self::remove_member(&mut g, participant, room_id);
+        Self::advance_room_generation(&mut g, room_id);
         let remaining = g
             .rooms
             .get(&room_id)
@@ -494,6 +643,7 @@ impl RoomRegistry {
                     members,
                     remote_member_count: room.remote_members.len(),
                     script_binding: room.binding.clone(),
+                    lifecycle_generation: room.lifecycle_generation,
                 }
             })
             .collect();
@@ -540,6 +690,14 @@ impl RoomRegistry {
         let mut members: Vec<ParticipantId> = room.members.into_iter().collect();
         members.sort_unstable();
         Some(members)
+    }
+
+    fn advance_room_generation(g: &mut Inner, room_id: RoomId) {
+        let generation = g.next_transition_generation;
+        g.next_transition_generation += 1;
+        if let Some(room) = g.rooms.get_mut(&room_id) {
+            room.lifecycle_generation = generation;
+        }
     }
 
     fn remove_member(g: &mut Inner, participant: ParticipantId, room_id: RoomId) {
@@ -597,6 +755,42 @@ mod tests {
 
     fn pid(n: u64) -> ParticipantId {
         ParticipantId::from_raw(n)
+    }
+
+    #[test]
+    fn participant_scoped_admission_rollback_never_erases_another_room() {
+        let r = RoomRegistry::new();
+        let source = r.create(RoomLabel::with_map("source"));
+        let destination = r.create(RoomLabel::with_map("destination"));
+        let concurrent = r.create(RoomLabel::with_map("concurrent"));
+        r.join(pid(1), source).expect("source admission");
+        r.join(pid(2), destination).expect("destination peer");
+        let before = r
+            .snapshot()
+            .into_iter()
+            .map(|room| (room.id, room.lifecycle_generation))
+            .collect::<HashMap<_, _>>();
+
+        let (_, undo) = r
+            .admit_bound_with_undo(pid(1), destination, false, None)
+            .expect("provisional move");
+        // Simulate a different participant's independent room mutation while
+        // the gateway holds its participant transaction image.
+        r.join(pid(3), concurrent)
+            .expect("concurrent room admission");
+        r.rollback_admission(undo);
+
+        assert_eq!(r.room_of(pid(1)), Some(source));
+        assert_eq!(r.room_of(pid(2)), Some(destination));
+        assert_eq!(r.room_of(pid(3)), Some(concurrent));
+        assert_eq!(r.members(concurrent), vec![pid(3)]);
+        let after = r
+            .snapshot()
+            .into_iter()
+            .map(|room| (room.id, room.lifecycle_generation))
+            .collect::<HashMap<_, _>>();
+        assert!(after[&source] > before[&source]);
+        assert!(after[&destination] > before[&destination]);
     }
 
     #[test]
@@ -678,7 +872,7 @@ mod tests {
             open: false,
         });
         assert_eq!(r.join(pid(3), closed), Err(JoinError::Closed));
-        assert!(r.admit_match_bound(pid(3), closed, None).is_ok());
+        assert!(r.admit_bound_with_undo(pid(3), closed, true, None).is_ok());
         assert_eq!(r.room_of(pid(3)), Some(closed));
     }
 
@@ -820,6 +1014,53 @@ mod tests {
         assert_eq!(
             r.join_bound(pid(3), placeholder, Some(&v1)),
             Err(JoinError::StaleScript)
+        );
+    }
+
+    #[test]
+    fn remote_admission_advances_each_affected_room_lifecycle_generation() {
+        let r = RoomRegistry::new();
+        let first = r.create(RoomLabel::with_map("first"));
+        let second = r.create(RoomLabel::with_map("second"));
+        let member = RemoteRoomMember {
+            node_id: NodeId::new("node-b").expect("node id"),
+            user_id: "member".to_owned(),
+        };
+        r.join(pid(9), first)
+            .expect("local peer keeps first room live");
+        let before = r
+            .snapshot()
+            .into_iter()
+            .map(|room| (room.id, room.lifecycle_generation))
+            .collect::<HashMap<_, _>>();
+
+        r.admit_remote_match_bound(member.clone(), first, None)
+            .expect("first remote admission");
+        let after_first = r
+            .snapshot()
+            .into_iter()
+            .find(|room| room.id == first)
+            .expect("first room remains");
+        assert!(after_first.lifecycle_generation > before[&first]);
+
+        r.admit_remote_match_bound(member, second, None)
+            .expect("remote move");
+        let after_move = r.snapshot();
+        assert!(
+            after_move
+                .iter()
+                .find(|room| room.id == first)
+                .expect("first room remains empty but live")
+                .lifecycle_generation
+                > after_first.lifecycle_generation
+        );
+        assert!(
+            after_move
+                .iter()
+                .find(|room| room.id == second)
+                .expect("second room remains")
+                .lifecycle_generation
+                > before[&second]
         );
     }
 

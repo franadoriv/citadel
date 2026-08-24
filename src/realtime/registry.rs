@@ -1593,6 +1593,24 @@ impl SessionRegistry {
         })
     }
 
+    /// Return the exact live transport generation for a participant. Callers
+    /// must re-check this reference while committing any security-sensitive
+    /// post-auth state so a replacement transport cannot inherit it.
+    #[must_use]
+    pub fn connection_ref(&self, id: ParticipantId) -> Option<ConnectionRef> {
+        if !self.accepts_work(id) {
+            return None;
+        }
+        self.sessions
+            .lock()
+            .ok()?
+            .get(&id)
+            .map(|entry| ConnectionRef {
+                id,
+                generation: entry.generation,
+            })
+    }
+
     /// The authenticated account id bound to a participant, if any.
     ///
     /// Returns the `user_id` string for an authenticated participant, or `None`
