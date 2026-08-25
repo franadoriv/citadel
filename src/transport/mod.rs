@@ -442,6 +442,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         Arc::clone(app.runtime_event_bus()),
         Arc::clone(app.runtime_shared_cache()),
         app.telemetry_slices(),
+        app.match_log_writer(),
         readiness_source.as_ref(),
     )?;
     // Build the realtime authenticator from the node's session service and the
@@ -1223,6 +1224,7 @@ pub(crate) fn validate_runtime_for_check(config: &Config) -> AppResult<()> {
             Arc::new(crate::observability::NodeMetrics::new()),
         )),
         None,
+        None,
     )?;
     Ok(())
 }
@@ -1322,6 +1324,7 @@ fn build_runtime(
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
     telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<BuiltRuntime> {
     build_runtime_with_readiness(
         config,
@@ -1331,6 +1334,7 @@ fn build_runtime(
         event_bus,
         shared_cache,
         telemetry_slices,
+        match_log,
         None,
     )
 }
@@ -1355,6 +1359,7 @@ fn build_runtime_with_readiness(
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
     telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
     readiness: Option<&crate::runtime::InProcessRuntimeSource>,
 ) -> AppResult<BuiltRuntime> {
     let rc = &config.runtime;
@@ -1440,6 +1445,10 @@ fn build_runtime_with_readiness(
                         Some(slices) => runtime.with_telemetry_slices(slices),
                         None => runtime,
                     };
+                    let runtime = match match_log.clone() {
+                        Some(writer) => runtime.with_match_log(writer),
+                        None => runtime,
+                    };
                     let runtime = match transform_hub {
                         Some(hub) => runtime.with_transform_hub(hub),
                         None => runtime,
@@ -1465,6 +1474,7 @@ fn build_runtime_with_readiness(
                 event_bus,
                 shared_cache,
                 telemetry_slices.clone(),
+                match_log.clone(),
             )? {
                 Some(runtime) => BuiltRuntime::embedded(runtime),
                 None => BuiltRuntime::none(),
@@ -1479,6 +1489,7 @@ fn build_runtime_with_readiness(
                 event_bus,
                 shared_cache,
                 telemetry_slices.clone(),
+                match_log.clone(),
             )? {
                 Some(runtime) => BuiltRuntime::embedded(runtime),
                 None => BuiltRuntime::none(),
@@ -1514,6 +1525,7 @@ fn load_python_runtime(
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
     telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     match PythonRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
@@ -1538,6 +1550,10 @@ fn load_python_runtime(
             .with_shared_cache(shared_cache);
             let runtime = match telemetry_slices {
                 Some(slices) => runtime.with_telemetry_slices(slices),
+                None => runtime,
+            };
+            let runtime = match match_log {
+                Some(writer) => runtime.with_match_log(writer),
                 None => runtime,
             };
             let runtime = match transform_hub {
@@ -1566,6 +1582,7 @@ fn load_python_runtime(
     _event_bus: Arc<crate::runtime::RuntimeEventBus>,
     _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
     _telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    _match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,
@@ -1585,6 +1602,7 @@ fn load_js_runtime(
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
     telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     match JsRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
@@ -1609,6 +1627,10 @@ fn load_js_runtime(
             .with_shared_cache(shared_cache);
             let runtime = match telemetry_slices {
                 Some(slices) => runtime.with_telemetry_slices(slices),
+                None => runtime,
+            };
+            let runtime = match match_log {
+                Some(writer) => runtime.with_match_log(writer),
                 None => runtime,
             };
             let runtime = match transform_hub {
@@ -1637,6 +1659,7 @@ fn load_js_runtime(
     _event_bus: Arc<crate::runtime::RuntimeEventBus>,
     _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
     _telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    _match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,
