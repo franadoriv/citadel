@@ -9451,7 +9451,7 @@ mod transform_tests {
     async fn player_slots_are_distinct_and_freed_on_disconnect() {
         let (gw, _hub) = gateway_with_player_slots(2);
 
-        let (a, mut ra) = register(&gw);
+        let (a, mut ra) = register_session(&gw);
         gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         let _ = ra.recv().await; // hello
         let role_a = ra.recv().await.expect("A role");
@@ -9459,7 +9459,7 @@ mod transform_tests {
             .expect("decode")
             .object_id;
 
-        let (b, mut rb) = register(&gw);
+        let (b, mut rb) = register_session(&gw);
         gw.handle_inbound(b, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         let _ = rb.recv().await; // hello
         let role_b = rb.recv().await.expect("B role");
@@ -9471,7 +9471,7 @@ mod transform_tests {
 
         // A disconnects: its slot frees, so a new client reuses that id.
         gw.unregister_session(a);
-        let (c, mut rc) = register(&gw);
+        let (c, mut rc) = register_session(&gw);
         gw.handle_inbound(c, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         let _ = rc.recv().await; // hello
         let role_c = rc.recv().await.expect("C role");
@@ -10762,7 +10762,7 @@ mod transform_tests {
             Arc::new(NodeMetrics::new()),
             Some(Arc::clone(&runtime) as Arc<dyn Runtime>),
         );
-        let (a, mut ra) = register(&gw);
+        let (a, mut ra) = register_session(&gw);
         gw.handle_inbound(
             a,
             &Envelope::new(
@@ -10776,7 +10776,7 @@ mod transform_tests {
         let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
             .unwrap()
             .room_id;
-        let (b, _rb) = register(&gw);
+        let (b, _rb) = register_session(&gw);
         gw.handle_inbound(
             b,
             &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
@@ -10907,7 +10907,7 @@ mod transform_tests {
     async fn disconnect_notifies_remaining_room_members() {
         use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined, RoomLeave};
         let gw = Gateway::new();
-        let (a, mut ra) = register(&gw);
+        let (a, mut ra) = register_session(&gw);
         gw.handle_inbound(
             a,
             &Envelope::new(
@@ -10921,7 +10921,7 @@ mod transform_tests {
         let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
             .unwrap()
             .room_id;
-        let (b, mut rb) = register(&gw);
+        let (b, mut rb) = register_session(&gw);
         gw.handle_inbound(
             b,
             &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
@@ -11107,7 +11107,15 @@ mod transform_tests {
     #[test]
     fn gateway_records_only_validated_authoritative_decisions() {
         let recorder = Arc::new(AuthoritativeDecisionRecorder::new(8));
+        // A Correct decision is validated against real match membership, so the
+        // corrected object must live in this match; Accept and Reject never
+        // touch it. Without a hub `object_in_match` fails closed and the whole
+        // batch is rejected before a single decision is recorded.
+        let hub = Arc::new(TransformHub::new(TransformHubConfig::default()).expect("hub"));
+        hub.spawn_server_simulated(12, TransformState::at([0.0, 0.0, 0.0]));
+        hub.set_object_room(12, Some(7));
         let gateway = Gateway::new()
+            .with_transform_hub(Arc::clone(&hub))
             .with_authoritative_decision_recorder(Arc::clone(&recorder))
             .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new());
         let bridge = gateway.bridge.as_ref().expect("bridge attached");
@@ -12503,7 +12511,7 @@ mod transform_tests {
         let (gw, _hub) = gateway_with_hub();
         let t = NaTransform::identity();
 
-        let (a, _ra) = register(&gw);
+        let (a, _ra) = register_session(&gw);
         gw.handle_inbound(
             a,
             &Envelope::new(
@@ -12515,7 +12523,7 @@ mod transform_tests {
                 .encode(),
             ),
         );
-        let (b, mut rb) = register(&gw);
+        let (b, mut rb) = register_session(&gw);
         gw.handle_inbound(
             b,
             &Envelope::new(
@@ -12580,7 +12588,7 @@ mod transform_tests {
     #[tokio::test]
     async fn leave_drops_transform_client_state() {
         let (gw, hub) = gateway_with_hub();
-        let (a, _ra) = register(&gw);
+        let (a, _ra) = register_session(&gw);
         gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         assert_eq!(hub.client_count(), 1);
         gw.unregister_session(a);
