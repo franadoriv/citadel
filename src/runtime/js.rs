@@ -20,11 +20,17 @@ use rquickjs::{
 };
 
 use crate::authoritative_telemetry_slices::{
-    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, active_runtime_scope,
+    set_active_runtime_scope,
 };
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
+use crate::match_recorder::MatchLogWriter;
 use crate::realtime::TransformHub;
+use crate::runtime::host_api_spec::{
+    validate_log_level, validate_log_message, validate_log_payload, validate_log_tag,
+    validate_match_result,
+};
 use crate::runtime::outbound_http::{
     AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
     TrustedHttpClient,
@@ -141,6 +147,8 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "telemetry.begin",
     "telemetry.mark",
     "telemetry.finish",
+    "log.write",
+    "match.set_result",
 ];
 
 const JS_HOST_PRELUDE: &str = r#"
@@ -342,6 +350,22 @@ const JS_HOST_PRELUDE: &str = r#"
     logs.push([String(level || "info").toLowerCase(), String(message)]);
   }
 
+  // `citadel.log` keeps its volatile behaviour; `citadel.log.write` is the
+  // durable stream, hung off the same name because a JavaScript function is
+  // already an object.
+  log.write = function (level, tag, message, payloadJson) {
+    if (typeof globalThis.__citadel_log_write !== "function") {
+      throw new Error("durable logs are unavailable");
+    }
+    const error = globalThis.__citadel_log_write(
+      String(level),
+      String(tag),
+      String(message),
+      payloadJson === null || payloadJson === undefined ? null : String(payloadJson)
+    );
+    if (error) throw new Error(error);
+  };
+
   const citadel = {
     Reply,
     on_message(kind, handler) {
@@ -406,6 +430,17 @@ const JS_HOST_PRELUDE: &str = r#"
       begin() { const error = globalThis.__citadel_telemetry_begin(); if (error) throw new Error(error); },
       mark(marker) { const error = globalThis.__citadel_telemetry_mark(String(marker)); if (error) throw new Error(error); },
       finish() { const error = globalThis.__citadel_telemetry_finish(); if (error) throw new Error(error); },
+    },
+    // The server owns match open and close; a script may only stamp a result on
+    // the match it is already playing, so there is no open/close beside this.
+    match: {
+      set_result(resultJson) {
+        if (typeof globalThis.__citadel_match_set_result !== "function") {
+          throw new Error("durable logs are unavailable");
+        }
+        const error = globalThis.__citadel_match_set_result(String(resultJson));
+        if (error) throw new Error(error);
+      },
     },
     http: {
       fetch(url, opts) {
@@ -1076,6 +1111,8 @@ pub struct JsRuntime {
     /// Transform hub retained across hot reload for `citadel.physics_state`.
     transform_hub: Option<Arc<TransformHub>>,
     telemetry_slices: Option<Arc<TelemetrySliceService>>,
+    /// Durable log/result write handle retained across hot reload.
+    match_log: Option<Arc<MatchLogWriter>>,
     /// Where this runtime's authoritative-bridge answers land (the gateway),
     /// held weakly to avoid an `Arc` cycle. Lives on the runtime so it survives
     /// a hot-reload's whole-context swap.
@@ -1187,6 +1224,7 @@ impl JsRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         }))
     }
@@ -1230,6 +1268,7 @@ impl JsRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1274,6 +1313,7 @@ impl JsRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1301,6 +1341,18 @@ impl JsRuntime {
         {
             let guard = lock_mutex(&self.vm);
             apply_telemetry_slices(&guard.context, &self.telemetry_slices);
+        }
+        self
+    }
+
+    /// Attach the durable log/result write handle behind `citadel.log.write`
+    /// and `citadel.match.set_result`.
+    #[must_use]
+    pub fn with_match_log(mut self, writer: Arc<MatchLogWriter>) -> Self {
+        self.match_log = Some(writer);
+        {
+            let guard = lock_mutex(&self.vm);
+            apply_match_log(&guard.context, &self.match_log);
         }
         self
     }
@@ -1424,6 +1476,7 @@ impl JsRuntime {
         apply_map_catalog(&fresh.context, &self.maps);
         apply_transform_hub(&fresh.context, &self.transform_hub);
         apply_telemetry_slices(&fresh.context, &self.telemetry_slices);
+        apply_match_log(&fresh.context, &self.match_log);
         {
             let mut guard = lock_mutex(&self.vm);
             *guard = fresh;
@@ -4030,6 +4083,75 @@ fn apply_telemetry_slices(context: &Context, slices: &Option<Arc<TelemetrySliceS
     });
 }
 
+/// Install the durable log/result natives. Both return the empty string on
+/// success and a message on refusal; the prelude turns a non-empty answer into
+/// a thrown `Error`, matching the telemetry natives beside them.
+fn apply_match_log(context: &Context, writer: &Option<Arc<MatchLogWriter>>) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let writer = Arc::clone(writer);
+    let _ = context.with(|ctx| -> JsHostResult<()> {
+        let log_writer = Arc::clone(&writer);
+        let write = caught(
+            &ctx,
+            Function::new(
+                ctx.clone(),
+                move |level: String,
+                      tag: String,
+                      message: String,
+                      payload_json: Option<String>|
+                      -> String {
+                    let level = match validate_log_level(&level) {
+                        Ok(level) => level,
+                        Err(error) => return error,
+                    };
+                    let tag = match validate_log_tag(&tag) {
+                        Ok(tag) => tag,
+                        Err(error) => return error,
+                    };
+                    let message = match validate_log_message(&message) {
+                        Ok(message) => message,
+                        Err(error) => return error,
+                    };
+                    let payload = payload_json
+                        .as_deref()
+                        .map(validate_log_payload)
+                        .transpose();
+                    let payload = match payload {
+                        Ok(payload) => payload,
+                        Err(error) => return error,
+                    };
+                    // Match scope is optional: a line written outside a
+                    // match-scoped callback is stored with no match.
+                    log_writer.write(active_runtime_scope(), level, tag, message, payload);
+                    String::new()
+                },
+            ),
+        )?;
+        let result_writer = Arc::clone(&writer);
+        let set_result = caught(
+            &ctx,
+            Function::new(ctx.clone(), move |result_json: String| -> String {
+                let result_json = match validate_match_result(&result_json) {
+                    Ok(result_json) => result_json,
+                    Err(error) => return error,
+                };
+                result_writer
+                    .set_result(active_runtime_scope(), result_json.to_owned())
+                    .err()
+                    .map(|error| error.message().to_owned())
+                    .unwrap_or_default()
+            }),
+        )?;
+        caught(&ctx, ctx.globals().set("__citadel_log_write", write))?;
+        caught(
+            &ctx,
+            ctx.globals().set("__citadel_match_set_result", set_result),
+        )
+    });
+}
+
 /// Install a native synchronous physics-state query. JSON keeps QuickJS values
 /// within the context closure; the prelude turns it into an object/null.
 fn apply_transform_hub(context: &Context, hub: &Option<Arc<TransformHub>>) {
@@ -4208,6 +4330,81 @@ mod tests {
 
     fn runtime(src: &str) -> JsRuntime {
         JsRuntime::from_source(src, "test.js", 100).expect("javascript runtime loads")
+    }
+
+    fn match_log_writer(
+        capacity: usize,
+    ) -> (
+        Arc<crate::match_recorder::MatchRecorder>,
+        Arc<MatchLogWriter>,
+    ) {
+        let writer = Arc::new(crate::durable_logs::DurableLogWriter::new(
+            Arc::new(crate::ids::NodeIdentity::new("node-js")),
+            crate::config::LogsConfig::default(),
+        ));
+        let recorder = Arc::new(crate::match_recorder::MatchRecorder::with_capacity(
+            writer, capacity,
+        ));
+        let log = Arc::new(MatchLogWriter::new(Arc::clone(&recorder)));
+        (recorder, log)
+    }
+
+    #[test]
+    fn log_write_persists_a_line_and_leaves_the_plain_log_callable() {
+        let (recorder, log) = match_log_writer(8);
+        recorder.bind(7, "mt1-js".to_owned());
+        let runtime = runtime(
+            r#"
+citadel.on_message(1, () => {
+  citadel.log("still a plain tracing call");
+  citadel.log.write("WARN", "combat.hit", "  round over  ", JSON.stringify({ dmg: 3 }));
+  citadel.log.write("info", "world", "no payload");
+});
+"#,
+        )
+        .with_match_log(log);
+
+        assert!(
+            runtime
+                .dispatch_in_room(7, Some("user-7"), 7, 1, b"")
+                .is_empty()
+        );
+        assert_eq!(recorder.writer().queued_total(), 2);
+    }
+
+    #[test]
+    fn log_write_refuses_a_malformed_argument_and_set_result_needs_a_match() {
+        let (_recorder, log) = match_log_writer(8);
+        let runtime = runtime(
+            r#"
+citadel.on_message(1, () => {
+  const failures = [];
+  const refuse = (fn) => {
+    try { fn(); failures.push("accepted"); } catch (e) { failures.push("false:" + e.message); }
+  };
+  refuse(() => citadel.log.write("nope", "world", "hi"));
+  refuse(() => citadel.log.write("info", "Bad Tag", "hi"));
+  refuse(() => citadel.log.write("info", "world", "   "));
+  refuse(() => citadel.log.write("info", "world", "hi", "not json"));
+  refuse(() => citadel.match.set_result('{"winner":"a"}'));
+  citadel.broadcast(2, failures.join("\n"), true);
+});
+"#,
+        )
+        .with_match_log(log);
+
+        let commands = runtime.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            panic!("expected a broadcast command");
+        };
+        let report = String::from_utf8_lossy(body);
+        assert_eq!(report.matches("false:").count(), 5, "{report}");
+        assert!(!report.contains("accepted"), "{report}");
+        assert!(report.contains("log level must be one of"));
+        assert!(report.contains("log tag must be"));
+        assert!(report.contains("log message must be 1-1024 bytes"));
+        assert!(report.contains("payload_json must be a JSON object or array"));
+        assert!(report.contains("match results require a match-scoped context"));
     }
 
     #[test]

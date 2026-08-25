@@ -513,6 +513,7 @@ pre.code {
     database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
     trophy: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0V4z"/><path d="M7 4H4v2a3 3 0 0 0 3 3M17 4h3v2a3 3 0 0 1-3 3"/>',
     grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+    layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
     chat: '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
     group: '<path d="M9 21v-2a4 4 0 0 1 4-4h0a4 4 0 0 1 4 4v2"/><circle cx="13" cy="7" r="3"/><path d="M3 21v-1.5A3.5 3.5 0 0 1 6.5 16"/>',
     bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
@@ -864,16 +865,18 @@ pre.code {
     { label: 'Commerce', items: [
       { id: 'purchases', title: 'Purchases & Subscriptions', icon: 'cart' }
     ]},
-    { label: 'Operations', items: [
+    { label: 'Logs & Diagnostics', items: [
+      { id: 'logs', title: 'Script Logs', icon: 'scroll' },
+      { id: 'match-records', title: 'Match Records', icon: 'layers' },
       { id: 'telemetry-slices', title: 'Telemetry Slices', icon: 'activity' },
-      { id: 'lag-diagnostics', title: 'Lag Diagnostics', icon: 'activity' }
+      { id: 'lag-diagnostics', title: 'Lag Diagnostics', icon: 'activity' },
+      { id: 'audit', title: 'Audit Logs', icon: 'scroll' },
+      { id: 'errors', title: 'Error Journal', icon: 'alert' }
     ]},
     { label: 'System', items: [
       { id: 'configuration', title: 'Configuration', icon: 'settings' },
       { id: 'api-keys', title: 'API Keys', icon: 'key', adminOnly: true },
-      { id: 'api', title: 'API Explorer / Runtime', icon: 'terminal' },
-      { id: 'audit', title: 'Audit Logs', icon: 'scroll' },
-      { id: 'errors', title: 'Error Journal', icon: 'alert' }
+      { id: 'api', title: 'API Explorer / Runtime', icon: 'terminal' }
     ]}
   ];
 
@@ -2129,7 +2132,8 @@ pre.code {
     'telemetry:read', 'config:read', 'audit:read', 'errors:read',
     'accounts:read', 'groups:read', 'runtime:read', 'matches:read',
     'storage:read', 'database:read', 'chat:read', 'notifications:read',
-    'leaderboards:read', 'tournaments:read', 'purchases:read', 'subscriptions:read'
+    'leaderboards:read', 'tournaments:read', 'purchases:read', 'subscriptions:read',
+    'logs:read'
   ];
 
   function apiKeyStateTag(status) {
@@ -2398,81 +2402,162 @@ pre.code {
 
 
   // ==== Telemetry Slices =======================================================
-  function renderTelemetrySlices() {
-    setPage(pageHead('Telemetry Slices', 'Closed, bounded authoritative-decision reports. No packet payloads or player identity are retained.')
-      + '<div class="toolbar"><div class="grow"></div><button class="btn" data-act="ts-refresh">' + svg('refresh') + 'Refresh</button></div>'
-      + '<div class="panel"><div class="panel-head"><h2>Closed reports</h2><span class="sub" id="ts-meta"></span></div><div id="ts-table">' + loadingRows(7) + '</div></div>');
-    ACT['ts-refresh'] = loadTelemetrySlices;
-    loadTelemetrySlices();
+  // Aggregate-only closed reports. On a backend with the durable table this is
+  // history rather than a process-local cache, so it pages by cursor and says
+  // which of the two it is reading.
+  var slices = { match_id: '', limit: 100, items: [], next: null, loading: false, page: null };
+
+  function slicesAreCurrent() { return currentRoute() === 'telemetry-slices'; }
+
+  function slicePath(after) {
+    var q = '/console/v1/telemetry/slices?limit=' + slices.limit;
+    if (slices.match_id) q += '&match_id=' + encodeURIComponent(slices.match_id);
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
   }
 
-  function loadTelemetrySlices() {
-    api('GET', '/console/v1/telemetry/slices?limit=100').then(function (d) {
-      var rows = '';
-      (d.items || []).forEach(function (r) {
-        var totals = fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total);
-        rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(r.closed_at_ms)) + '</td>'
-          + '<td class="mono">' + esc(r.report_id) + '</td>'
-          + '<td>' + esc(r.context_kind) + '</td><td>' + esc(r.close_reason) + '</td>'
-          + '<td>' + esc(fmtNum(r.duration_ms)) + ' ms</td><td>' + esc(totals) + '</td>'
-          + '<td>' + (r.truncated ? '<span class="tag-soft off">truncated</span>' : '<span class="tag-soft on">complete</span>') + '</td>'
-          + '<td><button class="btn small" data-act="ts-detail" data-id="' + esc(r.report_id) + '">View</button></td></tr>';
-      });
-      if (!rows) rows = emptyRowHtml(8, 'No closed telemetry slices are retained.');
-      setHtml('ts-table', tableHtml(['Closed', 'Report', 'Context', 'Close reason', 'Duration', 'Accept / Reject / Correct', 'Completeness', ''], rows));
-      setText('ts-meta', fmtNum((d.items || []).length) + ' retained reports');
-      document.querySelectorAll('[data-act="ts-detail"]').forEach(function (button) {
-        button.addEventListener('click', function () {
-          var id = button.getAttribute('data-id');
-          api('GET', '/console/v1/telemetry/slices/' + encodeURIComponent(id)).then(function (r) {
-            openModal('Telemetry slice ' + r.report_id,
-              '<div class="panel-body"><p><b>Context:</b> ' + esc(r.context_kind) + '</p><p><b>Close reason:</b> ' + esc(r.close_reason) + '</p><p><b>Duration:</b> ' + esc(fmtNum(r.duration_ms)) + ' ms</p><p><b>Markers:</b> ' + esc(fmtNum(r.marker_total || 0)) + '</p><p><b>Accepted / rejected / corrected:</b> ' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</p><p><b>Completeness:</b> ' + esc(r.truncated ? 'truncated by bounded retention' : 'complete within retained window') + '</p></div>');
-          }).catch(fail);
-        });
-      });
+  function renderTelemetrySlices() {
+    ACT = {}; FORM = {};
+    slices.items = []; slices.next = null; slices.loading = false; slices.page = null;
+    setPage(pageHead('Telemetry Slices', 'Closed, bounded authoritative-decision reports. No packet payloads or player identity are retained.')
+      + '<div class="toolbar">' + searchBox('ts-match', 'Filter by match id', slices.match_id)
+      + '<div class="grow"></div><button class="btn" data-act="ts-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Closed reports</h2><span class="sub" id="ts-meta"></span></div>'
+      + '<div id="ts-table">' + loadingRows(9) + '</div>'
+      + '<div class="pager" id="ts-pager"></div></div>');
+    bindSearch('ts-match', function (v) { slices.match_id = v; loadTelemetrySlices(true); });
+    ACT['ts-refresh'] = function () { loadTelemetrySlices(true); };
+    ACT['ts-more'] = function () { loadTelemetrySlices(false); };
+    ACT['ts-detail'] = function (data) { openTelemetrySlice(data.id); };
+    loadTelemetrySlices(true);
+  }
+
+  function loadTelemetrySlices(reset) {
+    if (slices.loading || (!reset && !slices.next)) return;
+    var after = reset ? null : slices.next;
+    var viewGeneration = state.viewGeneration;
+    slices.loading = true;
+    api('GET', slicePath(after)).then(function (page) {
+      if (!slicesAreCurrent() || viewGeneration !== state.viewGeneration) return;
+      slices.items = reset ? (page.items || []) : slices.items.concat(page.items || []);
+      slices.next = page.next_after || null;
+      slices.page = page;
+      slices.loading = false;
+      renderTelemetrySlicesTable();
+    }).catch(function (error) {
+      if (!slicesAreCurrent() || viewGeneration !== state.viewGeneration) return;
+      slices.loading = false;
+      renderTelemetrySlicesTable();
+      fail(error);
+    });
+  }
+
+  function renderTelemetrySlicesTable() {
+    var page = slices.page || {};
+    var rows = '';
+    slices.items.forEach(function (r) {
+      var totals = fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total);
+      rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(r.closed_at_ms)) + '</td>'
+        + '<td class="mono">' + esc(r.report_id) + '</td>'
+        + '<td class="mono">' + esc(r.match_id || '—') + '</td>'
+        + '<td>' + esc(r.context_kind) + '</td><td>' + esc(r.close_reason) + '</td>'
+        + '<td>' + esc(fmtNum(r.duration_ms)) + ' ms</td><td>' + esc(totals) + '</td>'
+        + '<td>' + (r.truncated ? '<span class="tag-soft off">truncated</span>' : '<span class="tag-soft on">complete</span>') + '</td>'
+        + '<td><button class="btn small" data-act="ts-detail" data-id="' + esc(r.report_id) + '">View</button></td></tr>';
+    });
+    if (!rows) rows = emptyRowHtml(9, 'No closed telemetry slices are retained.');
+    setHtml('ts-table', tableHtml(['Closed', 'Report', 'Match', 'Context', 'Close reason', 'Duration', 'Accept / Reject / Correct', 'Completeness', ''], rows));
+    setText('ts-meta', fmtNum(slices.items.length) + ' loaded');
+    setHtml('ts-pager', durabilityNote(page) + '<div class="grow"></div>'
+      + (slices.next ? '<button class="btn small" data-act="ts-more">Load more</button>' : ''));
+  }
+
+  function openTelemetrySlice(reportId) {
+    if (!reportId) return;
+    var viewGeneration = state.viewGeneration;
+    api('GET', '/console/v1/telemetry/slices/' + encodeURIComponent(reportId)).then(function (r) {
+      if (!state.user || viewGeneration !== state.viewGeneration) return;
+      openModal('Telemetry slice ' + r.report_id,
+        '<div class="panel-body"><p><b>Match:</b> ' + esc(r.match_id || 'no match scope') + '</p><p><b>Context:</b> ' + esc(r.context_kind) + '</p><p><b>Close reason:</b> ' + esc(r.close_reason) + '</p><p><b>Duration:</b> ' + esc(fmtNum(r.duration_ms)) + ' ms</p><p><b>Markers:</b> ' + esc(fmtNum(r.marker_total || 0)) + '</p><p><b>Accepted / rejected / corrected:</b> ' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</p><p><b>Completeness:</b> ' + esc(r.truncated ? 'truncated by bounded retention' : 'complete within retained window') + '</p></div>');
     }).catch(fail);
   }
 
   // ==== Audit Logs =============================================================
-  var aud = { actor: '', action: '', limit: 100 };
+  // Operator actions are deliberately not match-scoped: the match filter exists
+  // to answer "what did an operator do to this match", and almost every entry
+  // carries no match at all.
+  var aud = { actor: '', action: '', match_id: '', limit: 100, entries: [], next: null, loading: false };
+
+  function auditIsCurrent() { return currentRoute() === 'audit'; }
+
+  function auditPath(after) {
+    var q = '/console/v1/audit?limit=' + aud.limit;
+    if (aud.actor) q += '&actor=' + encodeURIComponent(aud.actor);
+    if (aud.action) q += '&action=' + encodeURIComponent(aud.action);
+    if (aud.match_id) q += '&match_id=' + encodeURIComponent(aud.match_id);
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
+  }
 
   function renderAudit() {
     ACT = {}; FORM = {};
+    aud.entries = []; aud.next = null; aud.loading = false;
     setPage(pageHead('Audit Logs', 'Every console mutation and login attempt: who did what, when.')
       + '<div class="toolbar">'
       + searchBox('aud-actor', 'Filter by actor', aud.actor)
       + searchBox('aud-action', 'Filter by action prefix', aud.action)
+      + searchBox('aud-match', 'Filter by match id', aud.match_id)
       + '<input class="form-in" id="aud-limit" type="number" min="1" max="500" value="' + aud.limit + '" style="width:90px" title="page size">'
       + '<div class="grow"></div>'
       + '<button class="btn" data-act="aud-refresh">' + svg('refresh') + 'Refresh</button></div>'
       + '<div class="panel"><div class="panel-head"><h2>Trail</h2><span class="sub" id="aud-meta"></span></div>'
-      + '<div id="aud-table">' + loadingRows(6) + '</div></div>');
-    bindSearch('aud-actor', function (v) { aud.actor = v; loadAudit(); });
-    bindSearch('aud-action', function (v) { aud.action = v; loadAudit(); });
-    ACT['aud-refresh'] = loadAudit;
-    loadAudit();
+      + '<div id="aud-table">' + loadingRows(7) + '</div>'
+      + '<div class="pager" id="aud-pager"></div></div>');
+    bindSearch('aud-actor', function (v) { aud.actor = v; loadAudit(true); });
+    bindSearch('aud-action', function (v) { aud.action = v; loadAudit(true); });
+    bindSearch('aud-match', function (v) { aud.match_id = v; loadAudit(true); });
+    ACT['aud-refresh'] = function () { loadAudit(true); };
+    ACT['aud-more'] = function () { loadAudit(false); };
+    loadAudit(true);
   }
 
-  function loadAudit() {
+  function loadAudit(reset) {
+    if (aud.loading || (!reset && !aud.next)) return;
     var limitEl = qs('aud-limit');
     if (limitEl) aud.limit = Math.max(1, Math.min(500, Number(limitEl.value) || 100));
-    var q = '/console/v1/audit?limit=' + aud.limit;
-    if (aud.actor) q += '&actor=' + encodeURIComponent(aud.actor);
-    if (aud.action) q += '&action=' + encodeURIComponent(aud.action);
-    api('GET', q).then(function (d) {
-      var rows = '';
-      d.entries.forEach(function (e) {
-        rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(e.time_unix_ms)) + '</td>'
-          + '<td><b>' + esc(e.actor) + '</b></td>'
-          + '<td><span class="tag-soft' + (e.role === 'admin' ? ' on' : '') + '">' + esc(e.role) + '</span></td>'
-          + '<td class="mono">' + esc(e.action) + '</td>'
-          + '<td>' + esc(e.target) + '</td>'
-          + '<td>' + esc(e.details) + '</td></tr>';
-      });
-      if (!d.entries.length) rows = emptyRowHtml(6, 'No audit entries match.');
-      setHtml('aud-table', tableHtml(['Time', 'Actor', 'Role', 'Action', 'Target', 'Details'], rows));
-      setText('aud-meta', fmtNum(d.retained) + ' retained of ' + fmtNum(d.capacity) + ' capacity');
-    }).catch(fail);
+    var after = reset ? null : aud.next;
+    var viewGeneration = state.viewGeneration;
+    aud.loading = true;
+    api('GET', auditPath(after)).then(function (d) {
+      if (!auditIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      aud.entries = reset ? (d.entries || []) : aud.entries.concat(d.entries || []);
+      aud.next = d.next_after || null;
+      aud.loading = false;
+      renderAuditTable(d);
+    }).catch(function (error) {
+      if (!auditIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      aud.loading = false;
+      fail(error);
+    });
+  }
+
+  function renderAuditTable(page) {
+    var rows = '';
+    aud.entries.forEach(function (e) {
+      rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(e.time_unix_ms)) + '</td>'
+        + '<td><b>' + esc(e.actor) + '</b></td>'
+        + '<td><span class="tag-soft' + (e.role === 'admin' ? ' on' : '') + '">' + esc(e.role) + '</span></td>'
+        + '<td class="mono">' + esc(e.action) + '</td>'
+        + '<td>' + esc(e.target) + '</td>'
+        + '<td class="mono">' + esc(e.match_id || '—') + '</td>'
+        + '<td>' + esc(e.details) + '</td></tr>';
+    });
+    if (!aud.entries.length) rows = emptyRowHtml(7, 'No audit entries match.');
+    setHtml('aud-table', tableHtml(['Time', 'Actor', 'Role', 'Action', 'Target', 'Match', 'Details'], rows));
+    setText('aud-meta', fmtNum(page.retained) + ' retained of ' + fmtNum(page.capacity) + ' capacity');
+    setHtml('aud-pager', '<span>' + esc(fmtNum(aud.entries.length)) + ' loaded</span>'
+      + durabilityNote(page) + '<div class="grow"></div>'
+      + (aud.next ? '<button class="btn small" data-act="aud-more">Load more</button>' : ''));
   }
 
   // ==== Error Journal ==========================================================
@@ -2514,6 +2599,391 @@ pre.code {
       ACT['err-prev'] = function () { incidents.offset = Math.max(0, incidents.offset - incidents.limit); loadErrors(); };
       ACT['err-next'] = function () { if (incidents.next != null) { incidents.offset = incidents.next; loadErrors(); } };
     }).catch(fail);
+  }
+
+  // ==== Logs ===================================================================
+  // The durable stream a game script writes with citadel.log.write. Every value
+  // on this page is author-supplied: the server stores `message` and
+  // `payload_json` exactly as the script wrote them and redacts neither, so the
+  // page escapes everything and warns before showing a payload.
+  var LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
+  var logs = {
+    match_id: '', level: '', tag: '', limit: 50,
+    items: [], next: null, loading: false, page: null
+  };
+
+  // A backend without durable log tables answers 200 with an empty page and
+  // `durable: false` rather than an error, so the page says which it got instead
+  // of implying a process-local cache is history.
+  function durabilityNote(page) {
+    if (!page || page.durable === undefined || page.durable === null) return '';
+    if (!page.durable) return '<span class="tag-soft off">not durable on this backend</span>';
+    var dropped = page.dropped_total || 0;
+    return '<span class="tag-soft on">durable</span>'
+      + (dropped ? '<span class="tag-soft warn">' + esc(fmtNum(dropped)) + ' dropped before flush</span>' : '');
+  }
+
+  function jsonText(raw) {
+    if (raw == null || raw === '') return 'none';
+    try { return jsonPretty(JSON.parse(raw)); } catch (e) { return String(raw); }
+  }
+
+  function logLevelTag(level) {
+    var value = String(level || 'info');
+    var cls = value === 'error' ? 'bad' : (value === 'warn' ? 'warn' : (value === 'info' ? 'on' : 'off'));
+    return '<span class="tag-soft ' + cls + '">' + esc(value) + '</span>';
+  }
+
+  // A listing never carries payload text, only has_payload: a page of 200
+  // author-supplied payloads is a large response for rows nobody opened yet.
+  function logRowsHtml(items, showMatch) {
+    var rows = '';
+    (items || []).forEach(function (entry) {
+      rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(entry.created_at_unix_ms)) + '</td>'
+        + '<td>' + logLevelTag(entry.level) + '</td>'
+        + '<td class="mono">' + esc(entry.tag) + '</td>'
+        + (showMatch ? '<td class="mono">' + esc(entry.match_id || '—') + '</td>' : '')
+        + '<td>' + esc(entry.message) + '</td>'
+        + '<td>' + (entry.has_payload ? '<span class="tag-soft">payload</span>' : '<span class="lag-muted">—</span>') + '</td>'
+        + '<td><button class="btn small" data-act="log-open" data-log="' + esc(entry.log_id) + '">View</button></td></tr>';
+    });
+    return rows;
+  }
+
+  function logsIsCurrent() { return currentRoute() === 'logs'; }
+
+  function logPath(after) {
+    var q = '/console/v1/logs?limit=' + logs.limit;
+    if (logs.match_id) q += '&match_id=' + encodeURIComponent(logs.match_id);
+    if (logs.level) q += '&level=' + encodeURIComponent(logs.level);
+    if (logs.tag) q += '&tag=' + encodeURIComponent(logs.tag);
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
+  }
+
+  function renderLogs() {
+    ACT = {}; FORM = {};
+    logs.items = []; logs.next = null; logs.loading = false; logs.page = null;
+    var levelOptions = '<option value="">All levels</option>';
+    LOG_LEVELS.forEach(function (level) {
+      levelOptions += '<option value="' + esc(level) + '"' + (logs.level === level ? ' selected' : '') + '>' + esc(level) + '</option>';
+    });
+    setPage(pageHead('Script Logs', 'The durable log stream your game script writes. Messages and payloads are stored verbatim and are never redacted.')
+      + '<div class="toolbar">' + searchBox('log-tag', 'Filter by tag prefix', logs.tag)
+      + searchBox('log-match', 'Filter by match id', logs.match_id)
+      + '<select class="form-in" id="log-level" style="width:140px" title="level">' + levelOptions + '</select>'
+      + '<div class="grow"></div>'
+      + '<button class="btn" data-act="log-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Stream</h2><span class="sub" id="log-meta"></span></div>'
+      + '<div id="log-table">' + loadingRows(7) + '</div>'
+      + '<div class="pager" id="log-pager"></div></div>');
+    bindSearch('log-tag', function (v) { logs.tag = v; loadLogs(true); });
+    bindSearch('log-match', function (v) { logs.match_id = v; loadLogs(true); });
+    var levelEl = qs('log-level');
+    if (levelEl) levelEl.addEventListener('change', function () { logs.level = levelEl.value; loadLogs(true); });
+    ACT['log-refresh'] = function () { loadLogs(true); };
+    ACT['log-more'] = function () { loadLogs(false); };
+    ACT['log-open'] = function (data) { openLog(data.log); };
+    loadLogs(true);
+  }
+
+  function loadLogs(reset) {
+    if (logs.loading || (!reset && !logs.next)) return;
+    var after = reset ? null : logs.next;
+    var viewGeneration = state.viewGeneration;
+    logs.loading = true;
+    api('GET', logPath(after)).then(function (page) {
+      if (!logsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      logs.items = reset ? (page.items || []) : logs.items.concat(page.items || []);
+      logs.next = page.next_after || null;
+      logs.page = page;
+      logs.loading = false;
+      renderLogsTable();
+    }).catch(function (error) {
+      if (!logsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      logs.loading = false;
+      renderLogsTable();
+      fail(error);
+    });
+  }
+
+  function renderLogsTable() {
+    var page = logs.page || {};
+    var rows = logRowsHtml(logs.items, true);
+    if (!rows) {
+      rows = emptyRowHtml(7, page.durable === false
+        ? 'This backend keeps no durable log storage, so script logs are not retained.'
+        : 'No script log lines match.');
+    }
+    setHtml('log-table', tableHtml(['Written', 'Level', 'Tag', 'Match', 'Message', 'Payload', ''], rows));
+    setText('log-meta', fmtNum(logs.items.length) + ' loaded');
+    setHtml('log-pager', durabilityNote(page) + '<div class="grow"></div>'
+      + (logs.next ? '<button class="btn small" data-act="log-more">Load more</button>' : ''));
+  }
+
+  function openLog(logId) {
+    if (!logId) return;
+    var viewGeneration = state.viewGeneration;
+    api('GET', '/console/v1/logs/' + encodeURIComponent(logId)).then(function (entry) {
+      if (!state.user || viewGeneration !== state.viewGeneration) return;
+      openModal('Log ' + entry.log_id,
+        '<table class="kv">'
+        + kv('Written', fmtTime(entry.created_at_unix_ms))
+        + kv('UTC', fmtUtc(entry.created_at_unix_ms))
+        + kvRaw('Level', logLevelTag(entry.level))
+        + kv('Tag', entry.tag)
+        + kv('Match', entry.match_id || 'no match scope')
+        + kv('Node', entry.node_id)
+        + '</table>'
+        + '<pre class="code">' + esc(entry.message) + '</pre>'
+        + '<p class="lag-note">Payload is written by your game script and is stored verbatim. Do not write secrets into it.</p>'
+        + '<pre class="code">' + esc(jsonText(entry.payload_json)) + '</pre>');
+    }).catch(fail);
+  }
+
+  // ==== Match Records ==========================================================
+  // The durable, server-owned record of a match. Distinct from Matches, which is
+  // the live room registry: a record outlives its room, its node and its boot,
+  // and only the server ever opens or closes one.
+  var matchRecords = {
+    open_only: false, limit: 50, items: [], next: null, loading: false, page: null,
+    view: 'list', detail: null, entries: [], entriesNext: null, entriesLoading: false
+  };
+
+  function matchRecordsIsCurrent() { return currentRoute() === 'match-records'; }
+
+  function matchRecordPath(after) {
+    var q = '/console/v1/matchlogs?limit=' + matchRecords.limit;
+    if (matchRecords.open_only) q += '&open=true';
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
+  }
+
+  function matchStateTag(record) {
+    if (record.open) return '<span class="tag-soft on">open</span>';
+    return '<span class="tag-soft off">' + esc(record.termination_reason || 'closed') + '</span>';
+  }
+
+  function renderMatchRecords() {
+    ACT = {}; FORM = {};
+    matchRecords.view = 'list';
+    matchRecords.items = []; matchRecords.next = null; matchRecords.loading = false; matchRecords.page = null;
+    matchRecords.detail = null; matchRecords.entries = []; matchRecords.entriesNext = null; matchRecords.entriesLoading = false;
+    setPage(pageHead('Match Records', 'Durable records of the matches this node ran, and everything it retained about each one.')
+      + '<div class="toolbar"><select class="form-in" id="mr-open" style="width:170px" title="lifecycle filter">'
+      + '<option value="all">All matches</option>'
+      + '<option value="open"' + (matchRecords.open_only ? ' selected' : '') + '>Still open only</option></select>'
+      + '<div class="grow"></div>'
+      + '<button class="btn" data-act="mr-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Records</h2><span class="sub" id="mr-meta"></span></div>'
+      + '<div id="mr-table">' + loadingRows(7) + '</div>'
+      + '<div class="pager" id="mr-pager"></div></div>');
+    var openEl = qs('mr-open');
+    if (openEl) {
+      openEl.addEventListener('change', function () {
+        matchRecords.open_only = openEl.value === 'open';
+        loadMatchRecords(true);
+      });
+    }
+    ACT['mr-refresh'] = function () { loadMatchRecords(true); };
+    ACT['mr-more'] = function () { loadMatchRecords(false); };
+    ACT['mr-open-record'] = function (data) { openMatchRecord(data.match); };
+    loadMatchRecords(true);
+  }
+
+  function loadMatchRecords(reset) {
+    if (matchRecords.loading || (!reset && !matchRecords.next)) return;
+    var after = reset ? null : matchRecords.next;
+    var viewGeneration = state.viewGeneration;
+    matchRecords.loading = true;
+    api('GET', matchRecordPath(after)).then(function (page) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.view !== 'list') return;
+      matchRecords.items = reset ? (page.items || []) : matchRecords.items.concat(page.items || []);
+      matchRecords.next = page.next_after || null;
+      matchRecords.page = page;
+      matchRecords.loading = false;
+      renderMatchRecordsTable();
+    }).catch(function (error) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.view !== 'list') return;
+      matchRecords.loading = false;
+      renderMatchRecordsTable();
+      fail(error);
+    });
+  }
+
+  function renderMatchRecordsTable() {
+    var page = matchRecords.page || {};
+    var rows = '';
+    matchRecords.items.forEach(function (record) {
+      rows += '<tr class="rowlink" data-act="mr-open-record" data-match="' + esc(record.match_id) + '">'
+        + '<td style="white-space:nowrap">' + esc(fmtTime(record.opened_at_unix_ms)) + '</td>'
+        + '<td class="mono">' + esc(record.match_id) + '</td>'
+        + '<td><b>' + esc(record.name || '—') + '</b></td>'
+        + '<td>' + esc((record.map || '—') + ' / ' + (record.mode || '—')) + '</td>'
+        + '<td>' + esc(fmtNum(record.peak_participants || 0) + ' peak · ' + fmtNum(record.join_total || 0) + ' joins') + '</td>'
+        + '<td>' + matchStateTag(record) + '</td>'
+        + '<td style="white-space:nowrap">' + esc(record.closed_at_unix_ms ? fmtTime(record.closed_at_unix_ms) : '—') + '</td></tr>';
+    });
+    if (!rows) {
+      rows = emptyRowHtml(7, page.durable === false
+        ? 'This backend keeps no durable match records.'
+        : 'No matches have been recorded yet.');
+    }
+    setHtml('mr-table', tableHtml(['Opened', 'Match', 'Name', 'Map / Mode', 'Participants', 'State', 'Closed'], rows));
+    setText('mr-meta', fmtNum(matchRecords.items.length) + ' loaded');
+    setHtml('mr-pager', durabilityNote(page) + '<div class="grow"></div>'
+      + (matchRecords.next ? '<button class="btn small" data-act="mr-more">Load more</button>' : ''));
+  }
+
+  // The drill-down is one request: the entries route returns the record, the
+  // first page of logs and every other retained domain together.
+  function openMatchRecord(matchId) {
+    if (!matchId) return;
+    matchRecords.view = 'detail';
+    var viewGeneration = state.viewGeneration;
+    setPage(pageHead('Match record', 'Loading the durable record and everything retained for it…') + loadingRows(6));
+    api('GET', '/console/v1/matchlogs/' + encodeURIComponent(matchId) + '/entries?limit=' + matchRecords.limit).then(function (detail) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      matchRecords.detail = detail;
+      matchRecords.entries = detail.logs || [];
+      matchRecords.entriesNext = detail.logs_next_after || null;
+      matchRecords.entriesLoading = false;
+      renderMatchDrillDown();
+    }).catch(function (error) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      ACT = {}; FORM = {};
+      setPage(pageHead('Match record', 'The record is unavailable.')
+        + '<div class="toolbar">' + backBtn('mr-back') + '</div><div class="panel">'
+        + emptyBlock('layers', 'Could not load the match record',
+          error && error.message ? error.message : 'Request failed. Refresh and try again.')
+        + '</div>');
+      ACT['mr-back'] = renderMatchRecords;
+    });
+  }
+
+  // Later pages leave the drill-down route for the match-filtered log stream:
+  // both keyset on log_id, and re-running four domain queries and their counts
+  // for every page of one of them is work nobody asked for.
+  function loadMatchEntries(reset) {
+    var detail = matchRecords.detail;
+    if (!detail || matchRecords.entriesLoading || (!reset && !matchRecords.entriesNext)) return;
+    var record = detail.record || {};
+    if (!record.match_id) return;
+    var after = reset ? null : matchRecords.entriesNext;
+    var viewGeneration = state.viewGeneration;
+    matchRecords.entriesLoading = true;
+    api('GET', '/console/v1/logs?limit=' + matchRecords.limit + '&match_id=' + encodeURIComponent(record.match_id)
+      + (after ? '&after=' + encodeURIComponent(after) : '')).then(function (page) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.detail !== detail) return;
+      matchRecords.entries = reset ? (page.items || []) : matchRecords.entries.concat(page.items || []);
+      matchRecords.entriesNext = page.next_after || null;
+      matchRecords.entriesLoading = false;
+      renderMatchEntries();
+    }).catch(function (error) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.detail !== detail) return;
+      matchRecords.entriesLoading = false;
+      renderMatchEntries();
+      fail(error);
+    });
+  }
+
+  function renderMatchEntries() {
+    var rows = logRowsHtml(matchRecords.entries, false);
+    if (!rows) rows = emptyRowHtml(6, 'This match wrote no script logs.');
+    setHtml('mr-entries', tableHtml(['Written', 'Level', 'Tag', 'Message', 'Payload', ''], rows));
+    setHtml('mr-entries-pager', '<span>' + esc(fmtNum(matchRecords.entries.length)) + ' loaded</span><div class="grow"></div>'
+      + (matchRecords.entriesNext ? '<button class="btn small" data-act="mr-more-entries">Load more</button>' : ''));
+  }
+
+  function renderMatchDrillDown() {
+    var detail = matchRecords.detail;
+    if (!detail) return;
+    ACT = {}; FORM = {};
+    var record = detail.record || {};
+    var counts = detail.counts || {};
+    var html = pageHead('Match ' + (record.match_id || ''),
+      'One durable record and everything the node retained under it: script logs, telemetry slices, lag reports and operator actions.')
+      + '<div class="toolbar">' + backBtn('mr-back') + '<div class="grow"></div>'
+      + '<button class="btn" data-act="mr-reload">' + svg('refresh') + 'Refresh</button></div>'
+      // No gauge key: these are exact per-match totals, and a bar scaled to the
+      // largest match an operator happened to open earlier would invent a
+      // comparison the numbers do not make.
+      + '<div class="stat-grid">'
+      + statCard('Log lines', 'scroll', counts.logs || 0, 'written by the game script')
+      + statCard('Telemetry slices', 'activity', counts.telemetry_slices || 0, 'closed authoritative reports')
+      + statCard('Lag reports', 'zap', counts.lag_reports || 0, 'derived arrival observations')
+      + statCard('Audit entries', 'key', counts.audit || 0, 'operator actions are match-exempt')
+      + '</div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Record</h2><div class="spacer"></div>' + matchStateTag(record) + '</div>'
+      + '<div class="panel-body"><table class="kv">'
+      + kv('Match ID', record.match_id || '—')
+      + kv('Node', record.node_id || '—')
+      + kv('Boot', record.boot_id || '—')
+      + kv('Room ID', record.room_id == null ? '—' : fmtNum(record.room_id))
+      + kv('Name', record.name || '—')
+      + kv('Map', record.map || '—')
+      + kv('Mode', record.mode || '—')
+      + kv('Max players', record.max_players ? fmtNum(record.max_players) : 'unlimited')
+      + kv('Peak participants', fmtNum(record.peak_participants || 0))
+      + kv('Joins', fmtNum(record.join_total || 0))
+      + kv('Opened', fmtTime(record.opened_at_unix_ms) + ' · ' + fmtUtc(record.opened_at_unix_ms))
+      + kv('Closed', record.closed_at_unix_ms ? (fmtTime(record.closed_at_unix_ms) + ' · ' + fmtUtc(record.closed_at_unix_ms)) : 'still open')
+      + kv('Termination reason', record.termination_reason || '—')
+      + (record.script_revision_id
+        ? kv('Script revision', record.script_revision_id + ' (generation ' + (record.script_generation == null ? '—' : record.script_generation) + ')')
+        : '')
+      + kv('Clock epoch', record.clock_epoch == null ? '—' : fmtNum(record.clock_epoch))
+      + '</table>'
+      + '<p class="lag-note">The result below is written by your game script and is stored verbatim. Do not write secrets into it.</p>'
+      + '<pre class="code">' + esc(jsonText(record.result_json)) + '</pre></div></div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Script logs</h2><span class="sub">newest first · keyset paged</span></div>'
+      + '<div id="mr-entries">' + loadingRows(6) + '</div>'
+      + '<div class="pager" id="mr-entries-pager"></div></div>';
+
+    var sliceRows = '';
+    (detail.telemetry_slices || []).forEach(function (r) {
+      sliceRows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(r.closed_at_unix_ms)) + '</td>'
+        + '<td class="mono">' + esc(r.report_id) + '</td>'
+        + '<td>' + esc(r.context_kind) + '</td><td>' + esc(r.close_reason) + '</td>'
+        + '<td>' + esc(fmtNum(r.duration_ms)) + ' ms</td>'
+        + '<td>' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</td>'
+        + '<td>' + (r.truncated ? '<span class="tag-soft off">truncated</span>' : '<span class="tag-soft on">complete</span>') + '</td></tr>';
+    });
+    if (!sliceRows) sliceRows = emptyRowHtml(7, 'No telemetry slices closed under this match.');
+    html += '<div class="panel"><div class="panel-head"><h2>Telemetry slices</h2><span class="sub">aggregate counts only · no marker text is ever retained</span></div>'
+      + tableHtml(['Closed', 'Report', 'Context', 'Close reason', 'Duration', 'Accept / Reject / Correct', 'Completeness'], sliceRows) + '</div>';
+
+    var lagRows = '';
+    (detail.lag_reports || []).forEach(function (r) {
+      lagRows += '<tr><td class="mono">' + esc(r.report_id) + '</td>'
+        + '<td class="mono">' + esc(r.capture_id || '—') + '</td>'
+        + '<td>' + lagStatusTag(r.status) + '</td>'
+        + '<td>' + esc(fmtUtc(r.created_at_unix_ms)) + '</td></tr>';
+    });
+    if (!lagRows) lagRows = emptyRowHtml(4, 'No lag reports are linked to this match.');
+    html += '<div class="panel"><div class="panel-head"><h2>Lag reports</h2><span class="sub">derived arrival observations · not RTT or packet-loss measurements</span></div>'
+      + tableHtml(['Report', 'Capture', 'Status', 'Created UTC'], lagRows) + '</div>';
+
+    var auditRows = '';
+    (detail.audit || []).forEach(function (e) {
+      auditRows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(e.time_unix_ms)) + '</td>'
+        + '<td><b>' + esc(e.actor) + '</b></td>'
+        + '<td class="mono">' + esc(e.action) + '</td>'
+        + '<td>' + esc(e.target) + '</td>'
+        + '<td>' + esc(e.details) + '</td></tr>';
+    });
+    if (!auditRows) auditRows = emptyRowHtml(5, 'No operator action was recorded against this match.');
+    html += '<div class="panel"><div class="panel-head"><h2>Operator actions</h2><span class="sub">operator actions are deliberately never forced into a match, so this is usually empty</span></div>'
+      + tableHtml(['Time', 'Actor', 'Action', 'Target', 'Details'], auditRows) + '</div>';
+
+    setPage(html);
+    ACT['mr-back'] = renderMatchRecords;
+    ACT['mr-reload'] = function () { openMatchRecord(record.match_id); };
+    ACT['mr-more-entries'] = function () { loadMatchEntries(false); };
+    ACT['log-open'] = function (data) { openLog(data.log); };
+    renderMatchEntries();
   }
 
   // ==== Lag Diagnostics ========================================================
@@ -2927,6 +3397,8 @@ pre.code {
     leaderboards: renderLeaderboards,
     matches: renderMatches,
     purchases: renderPurchases,
+    logs: renderLogs,
+    'match-records': renderMatchRecords,
     'lag-diagnostics': renderLagDiagnostics,
     'telemetry-slices': renderTelemetrySlices,
     configuration: renderConfiguration,

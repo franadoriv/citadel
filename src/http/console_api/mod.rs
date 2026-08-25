@@ -35,7 +35,9 @@ pub mod errors;
 pub mod groups;
 pub mod lag_diagnostics;
 pub mod leaderboards;
+pub mod logs;
 pub mod matches;
+pub mod matchlogs;
 pub mod notifications;
 pub mod purchases;
 pub mod runtime;
@@ -249,6 +251,11 @@ impl FromRequestParts<App> for ConsolePrincipal {
             authorize_api_key(&parts.method, parts.uri.path(), &key.scopes)?;
             let principal = ConsolePrincipal::ApiKey(key);
             let path = parts.uri.path();
+            // Every authorized machine read is recorded here, reads of the log
+            // surfaces included. That is unbounded self-amplification in a
+            // table but not in the ring, so the durable writer drops exactly
+            // those entries (`durable_logs::RING_ONLY_AUDIT_TARGETS`) instead
+            // of this call site branching on the path.
             app.audit_log().record(AuditEntry::for_principal(
                 SystemClock.now(),
                 &principal,
@@ -298,6 +305,10 @@ fn authorize_api_key(method: &Method, path: &str, scopes: &[ApiKeyScope]) -> Res
         ["accounts", _, "export" | "wallet" | "friends"] => ApiKeyScope::AccountsRead,
         ["groups"] | ["groups", _] => ApiKeyScope::GroupsRead,
         ["matches"] | ["matches", _] => ApiKeyScope::MatchesRead,
+        // Durable match records answer the same question as the live registry,
+        // one match later, so they reuse its scope.
+        ["matchlogs"] | ["matchlogs", _] | ["matchlogs", _, "entries"] => ApiKeyScope::MatchesRead,
+        ["logs"] | ["logs", _] => ApiKeyScope::LogsRead,
         ["storage"] | ["storage", _] | ["storage", _, _] => ApiKeyScope::StorageRead,
         ["database"] | ["database", "rows" | "row"] | ["database", _, _] => {
             ApiKeyScope::DatabaseRead
@@ -380,6 +391,17 @@ pub(super) fn routes() -> Router<App> {
         .route(
             lag_diagnostics::LAG_CAPTURE_REGENERATE_PATH,
             post(lag_diagnostics::regenerate_handler),
+        )
+        .route(logs::LOGS_PATH, get(logs::list_handler))
+        .route(logs::LOG_DETAIL_PATH, get(logs::detail_handler))
+        .route(matchlogs::MATCHLOGS_PATH, get(matchlogs::list_handler))
+        .route(
+            matchlogs::MATCHLOG_DETAIL_PATH,
+            get(matchlogs::detail_handler),
+        )
+        .route(
+            matchlogs::MATCHLOG_ENTRIES_PATH,
+            get(matchlogs::entries_handler),
         )
         .route(errors::ERRORS_PATH, get(errors::list_handler))
         .route(telemetry::TELEMETRY_PATH, get(telemetry::get_handler))

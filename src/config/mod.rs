@@ -68,6 +68,8 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     /// Local incident-journal retention settings.
     pub errors: ErrorJournalConfig,
+    /// Write-behind and retention bounds for the durable log family.
+    pub logs: LogsConfig,
     /// Realtime transport listener settings.
     pub transport: TransportConfig,
     /// Embedded game-logic runtime settings.
@@ -2121,6 +2123,219 @@ impl ErrorJournalConfig {
     }
 }
 
+/// Write-behind and retention bounds for the durable log family.
+///
+/// The family is four tables — script logs, the console action trail, closed
+/// telemetry slice reports, and match lifecycle records — written through one
+/// bounded queue per domain and one batched flush, so a hot game tick or a
+/// polling machine credential costs a queue push instead of a database round
+/// trip. This section does not touch the local incident journal, which stays a
+/// file on disk and is configured by `[errors]`.
+///
+/// A backend with no durable log capability (in-memory, MongoDB) ignores every
+/// bound here except `audit.capacity` and keeps its in-process rings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogsConfig {
+    /// Whether validated records are queued for durable persistence at all.
+    pub enabled: bool,
+    /// How often the flush service drains the queues. A commit-triggered wake
+    /// can drain sooner; this is the ceiling on how long a record waits.
+    pub flush_interval_ms: u64,
+    /// Rows taken per domain per flush. Also the queue depth that wakes the
+    /// flush service early.
+    pub flush_batch_items: usize,
+    /// How long shutdown waits for the queues to drain before abandoning what
+    /// is left. Queued records are in memory only, so this is what keeps the
+    /// last flush interval of the trail.
+    pub shutdown_drain_timeout_ms: u64,
+    /// How often retention runs.
+    pub prune_interval_secs: u64,
+    /// Rows deleted per table per prune pass, so a retention backlog never
+    /// becomes one unbounded delete.
+    pub prune_batch_limit: usize,
+    /// Console action trail.
+    pub audit: AuditLogsConfig,
+    /// Game-script log stream.
+    pub match_logs: MatchLogsConfig,
+    /// Closed authoritative-telemetry slice reports.
+    pub telemetry_slices: SliceLogsConfig,
+    /// Match lifecycle records.
+    pub matches: MatchRecordsConfig,
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            flush_interval_ms: 250,
+            flush_batch_items: 128,
+            shutdown_drain_timeout_ms: 5_000,
+            prune_interval_secs: 300,
+            prune_batch_limit: 500,
+            audit: AuditLogsConfig::default(),
+            match_logs: MatchLogsConfig::default(),
+            telemetry_slices: SliceLogsConfig::default(),
+            matches: MatchRecordsConfig::default(),
+        }
+    }
+}
+
+/// Retention for the console action trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditLogsConfig {
+    /// Entries kept in the in-process ring, which every backend has.
+    pub capacity: usize,
+    /// Records held for the durable store before the oldest are dropped.
+    pub max_queue_items: usize,
+    /// How long a trail row is kept. Deliberately the longest retention in the
+    /// family: an operator action's record must not be deleted because the
+    /// match it happened during ended.
+    pub retention_days: u32,
+}
+
+impl Default for AuditLogsConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 1_024,
+            max_queue_items: 16_384,
+            retention_days: 365,
+        }
+    }
+}
+
+/// Retention for the game-script log stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MatchLogsConfig {
+    pub max_queue_items: usize,
+    /// Widest `payload_json` a script may attach to one line. The payload is
+    /// author-supplied and stored verbatim.
+    pub max_payload_bytes: usize,
+    pub retention_days: u32,
+}
+
+impl Default for MatchLogsConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_items: 8_192,
+            max_payload_bytes: 8_192,
+            retention_days: 30,
+        }
+    }
+}
+
+/// Retention for closed authoritative-telemetry slice reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SliceLogsConfig {
+    pub max_queue_items: usize,
+    pub retention_days: u32,
+}
+
+impl Default for SliceLogsConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_items: 2_048,
+            retention_days: 30,
+        }
+    }
+}
+
+/// Retention for match lifecycle records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MatchRecordsConfig {
+    pub max_queue_items: usize,
+    /// Strictly longer than the script-log and slice retentions, so a row is
+    /// never left referencing a match that has already been pruned.
+    pub retention_days: u32,
+}
+
+impl Default for MatchRecordsConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_items: 4_096,
+            retention_days: 90,
+        }
+    }
+}
+
+impl LogsConfig {
+    /// Retention horizon for `days`, measured back from `now_ms`.
+    #[must_use]
+    pub fn retention_horizon_ms(now_ms: u64, days: u32) -> u64 {
+        now_ms.saturating_sub(u64::from(days) * 86_400_000)
+    }
+
+    /// Reject every zero bound.
+    ///
+    /// Checked even when disabled: `audit.capacity` sizes the in-process ring,
+    /// which exists on every backend, and a zero anywhere else is a typo worth
+    /// failing on rather than silently clamping to one.
+    fn validate(&self) -> AppResult<()> {
+        let millis: [(&str, u64); 3] = [
+            ("logs.flush_interval_ms", self.flush_interval_ms),
+            (
+                "logs.shutdown_drain_timeout_ms",
+                self.shutdown_drain_timeout_ms,
+            ),
+            ("logs.prune_interval_secs", self.prune_interval_secs),
+        ];
+        let counts: [(&str, usize); 8] = [
+            ("logs.flush_batch_items", self.flush_batch_items),
+            ("logs.prune_batch_limit", self.prune_batch_limit),
+            ("logs.audit.capacity", self.audit.capacity),
+            ("logs.audit.max_queue_items", self.audit.max_queue_items),
+            (
+                "logs.match_logs.max_queue_items",
+                self.match_logs.max_queue_items,
+            ),
+            (
+                "logs.match_logs.max_payload_bytes",
+                self.match_logs.max_payload_bytes,
+            ),
+            (
+                "logs.telemetry_slices.max_queue_items",
+                self.telemetry_slices.max_queue_items,
+            ),
+            ("logs.matches.max_queue_items", self.matches.max_queue_items),
+        ];
+        let days: [(&str, u32); 4] = [
+            ("logs.audit.retention_days", self.audit.retention_days),
+            (
+                "logs.match_logs.retention_days",
+                self.match_logs.retention_days,
+            ),
+            (
+                "logs.telemetry_slices.retention_days",
+                self.telemetry_slices.retention_days,
+            ),
+            ("logs.matches.retention_days", self.matches.retention_days),
+        ];
+        for (field, zero) in millis
+            .iter()
+            .map(|(field, value)| (*field, *value == 0))
+            .chain(counts.iter().map(|(field, value)| (*field, *value == 0)))
+            .chain(days.iter().map(|(field, value)| (*field, *value == 0)))
+        {
+            if zero {
+                return Err(AppError::config(format!("{field} must be >= 1")));
+            }
+        }
+        if self.matches.retention_days < self.match_logs.retention_days
+            || self.matches.retention_days < self.telemetry_slices.retention_days
+        {
+            return Err(AppError::config(
+                "logs.matches.retention_days must be >= logs.match_logs.retention_days and \
+                 logs.telemetry_slices.retention_days, so no retained row references a pruned match",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Narrow CLI flag overrides applied last in the precedence chain.
 ///
 /// Only high-signal startup options are exposed as flags; most settings belong
@@ -2301,6 +2516,7 @@ impl Config {
             return Err(AppError::config("logging.level must not be empty"));
         }
         self.errors.validate()?;
+        self.logs.validate()?;
         self.telemetry.validate()?;
         self.purchases.validate()?;
         self.cluster

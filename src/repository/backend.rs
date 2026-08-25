@@ -238,6 +238,40 @@ pub trait Backend: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Optional durable console audit trail. SQLite, PostgreSQL, and CockroachDB
+    /// expose this capability; the in-memory and MongoDB backends deliberately
+    /// return `None` and keep the bounded in-process ring as their only trail.
+    fn audit_repository(&self) -> Option<Arc<dyn crate::repository::DurableAuditRepository>> {
+        None
+    }
+
+    /// Optional durable, aggregate-only authoritative-telemetry slice store.
+    /// Marker text never crosses this boundary. SQLite, PostgreSQL, and
+    /// CockroachDB expose this capability; the in-memory and MongoDB backends
+    /// deliberately return `None` and keep the process-local ring.
+    fn telemetry_slice_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::repository::DurableTelemetrySliceRepository>> {
+        None
+    }
+
+    /// Optional durable game-script log stream. SQLite, PostgreSQL, and
+    /// CockroachDB expose this capability; the in-memory and MongoDB backends
+    /// deliberately return `None`, and the console reports `durable: false`
+    /// rather than presenting a process-local cache as history.
+    fn match_log_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::repository::DurableMatchLogRepository>> {
+        None
+    }
+
+    /// Optional durable match lifecycle records. SQLite, PostgreSQL, and
+    /// CockroachDB expose this capability; the in-memory and MongoDB backends
+    /// deliberately return `None` and create no match rows at all.
+    fn match_repository(&self) -> Option<Arc<dyn crate::repository::DurableMatchRepository>> {
+        None
+    }
+
     /// Optional read-only administrative database explorer.
     ///
     /// This is deliberately a capability accessor, not a domain repository:

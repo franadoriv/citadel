@@ -55,7 +55,7 @@ V1 API keys are read-only. The exact supported scopes are:
 | `accounts:read` | Account metadata and detail. |
 | `groups:read` | Group metadata and membership. |
 | `runtime:read` | Runtime status and introspection. |
-| `matches:read` | Live match metadata and detail. |
+| `matches:read` | Live match metadata and detail, plus durable match records. |
 | `storage:read` | Storage metadata and objects. |
 | `database:read` | Read-only database explorer. |
 | `chat:read` | Chat channels and history. |
@@ -64,6 +64,7 @@ V1 API keys are read-only. The exact supported scopes are:
 | `tournaments:read` | Tournaments and records. |
 | `purchases:read` | Purchase records. |
 | `subscriptions:read` | Subscription records. |
+| `logs:read` | Durable game-script log stream. |
 
 Grant only the scopes the process needs. Scope checks happen at each HTTP
 endpoint, not only in the dashboard. An absent scope, malformed or unknown

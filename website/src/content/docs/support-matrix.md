@@ -190,7 +190,7 @@ language columns show which embedded game-logic runtimes expose it.
 | Purchase record persistence and replay rejection | ✅ | — | — | — | — | — |
 | Production store receipt validation | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
 | Subscriptions and provider lifecycle | 🟡 | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
-| Event and telemetry ingestion | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
+| Event and telemetry ingestion | 🟡 | ✅ | ✅ | ✅ | ⬜ | ⬜ |
 
 <details>
 <summary>Row-by-row notes &amp; caveats</summary>
@@ -207,7 +207,7 @@ language columns show which embedded game-logic runtimes expose it.
 - **Purchase record persistence and replay rejection** — Durable receipts are hashed; transaction ids cannot be replayed.
 - **Production store receipt validation** — An asynchronous server-owned validation foundation, redacted configuration, bounded provider egress, and disabled-provider guard ship; Apple, Google, and Huawei adapters remain pending. Only custom deterministic development receipts are enabled.
 - **Subscriptions and provider lifecycle** — Admin view derives active/expired state; provider renewal/refund events are pending.
-- **Event and telemetry ingestion** — No player event ingestion or telemetry pipeline. Runtime-local best-effort callbacks are available separately to trusted Lua, Python, and JavaScript.
+- **Event and telemetry ingestion** — Trusted game logic writes a durable, match-scoped log stream with citadel.log.write and stamps a match result with citadel.match.set_result; the server owns match open and close, closed authoritative-telemetry slices and the console action trail persist alongside them, and every table is retention-bounded and readable from the operator console. There is still no player-client event ingestion endpoint or analytics pipeline, and runtime-local best-effort callbacks remain a separate surface.
 
 </details>
 

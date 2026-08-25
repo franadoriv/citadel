@@ -710,4 +710,198 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         status: HostApiStatus::Shipped,
         since: "TASK-0418",
     },
+    HostApiFn {
+        name: "log.write",
+        category: HostApiCategory::Log,
+        params: &[
+            "level:string",
+            "tag:string",
+            "message:string",
+            "payload_json:string?",
+        ],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
+        name: "match.set_result",
+        category: HostApiCategory::Log,
+        params: &["result_json:string"],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
 ];
+
+/// Widest `tag` a script may attach to one durable log line.
+///
+/// Mirrors the `match_logs.tag` CHECK constraint, so a line the adapter accepts
+/// can never be rejected by the database after it has been acknowledged.
+pub const MAX_LOG_TAG_BYTES: usize = 64;
+
+/// Widest `message`, mirroring the `match_logs.message` CHECK constraint.
+pub const MAX_LOG_MESSAGE_BYTES: usize = 1_024;
+
+/// Widest `payload_json` one line may carry.
+///
+/// The operator knob is `logs.match_logs.max_payload_bytes`; the runtime
+/// adapters hold no configuration handle, so this constant is what every
+/// adapter enforces and the test below locks it to the configured default.
+pub const MAX_LOG_PAYLOAD_BYTES: usize = 8_192;
+
+/// Validate `citadel.log.write`'s `level` argument.
+///
+/// Strict about the vocabulary and lenient only about ASCII case, matching the
+/// volatile `citadel.log`. It deliberately does not fall back to `info`: this
+/// line is persisted, and a stored row that says `info` when the author wrote
+/// `eror` is a lie no operator can detect later.
+///
+/// # Errors
+/// Returns the script-facing message for any name outside the five levels.
+pub fn validate_log_level(value: &str) -> Result<crate::repository::LogLevel, String> {
+    crate::repository::LogLevel::parse(&value.to_ascii_lowercase())
+        .map_err(|_| "log level must be one of trace, debug, info, warn, error".to_owned())
+}
+
+/// Validate `citadel.log.write`'s `tag` argument.
+///
+/// The tag is the console's prefix filter, so it is restricted to a shape that
+/// stays index-usable and unambiguous: lowercase, no whitespace, and no empty
+/// dotted segment.
+///
+/// # Errors
+/// Returns the script-facing message when the tag is empty, too long, carries a
+/// character outside `[a-z0-9_.-]`, or has a leading, trailing, or repeated `.`.
+pub fn validate_log_tag(value: &str) -> Result<&str, String> {
+    const REQUIREMENT: &str =
+        "log tag must be 1-64 bytes of [a-z0-9_.-] with no leading, trailing, or repeated '.'";
+    if value.is_empty() || value.len() > MAX_LOG_TAG_BYTES {
+        return Err(REQUIREMENT.to_owned());
+    }
+    let shaped = value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+    });
+    if !shaped || value.starts_with('.') || value.ends_with('.') || value.contains("..") {
+        return Err(REQUIREMENT.to_owned());
+    }
+    Ok(value)
+}
+
+/// Validate `citadel.log.write`'s `message` argument, returning what is stored.
+///
+/// The trimmed slice is the return value because trimming happens before the
+/// length check: a message that is only whitespace is empty, not 1 byte long.
+///
+/// # Errors
+/// Returns the script-facing message when the trimmed text is empty, exceeds
+/// [`MAX_LOG_MESSAGE_BYTES`], or contains an ASCII control character.
+pub fn validate_log_message(value: &str) -> Result<&str, String> {
+    let message = value.trim();
+    if message.is_empty() || message.len() > MAX_LOG_MESSAGE_BYTES {
+        return Err("log message must be 1-1024 bytes after trimming".to_owned());
+    }
+    if message.chars().any(|ch| ch.is_ascii_control()) {
+        return Err("log message must not contain ASCII control characters".to_owned());
+    }
+    Ok(message)
+}
+
+/// Validate `citadel.log.write`'s optional `payload_json` argument.
+///
+/// The payload is stored verbatim and is never inspected again, so this is the
+/// only place its shape is checked. The size test runs first so an oversized
+/// document is refused without parsing it.
+///
+/// # Errors
+/// Returns the script-facing message when the payload exceeds
+/// [`MAX_LOG_PAYLOAD_BYTES`] or is not a JSON object or array.
+pub fn validate_log_payload(value: &str) -> Result<&str, String> {
+    if value.len() > MAX_LOG_PAYLOAD_BYTES {
+        return Err(format!(
+            "log payload_json must be at most {MAX_LOG_PAYLOAD_BYTES} bytes"
+        ));
+    }
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_)) => Ok(value),
+        _ => Err("log payload_json must be a JSON object or array".to_owned()),
+    }
+}
+
+/// Validate `citadel.match.set_result`'s `result_json` argument.
+///
+/// Narrower than a log payload on purpose: a match result is one document
+/// describing one match, so an array or a bare scalar is a mistake rather than
+/// a style choice.
+///
+/// # Errors
+/// Returns the script-facing message when the document exceeds
+/// [`crate::match_recorder::MAX_RESULT_JSON_BYTES`] or is not a JSON object.
+pub fn validate_match_result(value: &str) -> Result<&str, String> {
+    let max = crate::match_recorder::MAX_RESULT_JSON_BYTES;
+    if value.len() > max {
+        return Err(format!("match result_json must be at most {max} bytes"));
+    }
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::Object(_)) => Ok(value),
+        _ => Err("match result_json must be a JSON object".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository::LogLevel;
+
+    #[test]
+    fn the_adapter_payload_bound_tracks_the_configured_default() {
+        // The adapters hold no config handle, so this constant is the only
+        // enforcement point. Drift between the two would silently accept a
+        // payload the operator disabled.
+        assert_eq!(
+            MAX_LOG_PAYLOAD_BYTES,
+            crate::config::MatchLogsConfig::default().max_payload_bytes
+        );
+    }
+
+    #[test]
+    fn levels_are_case_insensitive_but_never_default() {
+        assert_eq!(validate_log_level("WARN"), Ok(LogLevel::Warn));
+        assert_eq!(validate_log_level("info"), Ok(LogLevel::Info));
+        assert!(validate_log_level("eror").is_err());
+        assert!(validate_log_level("").is_err());
+    }
+
+    #[test]
+    fn tags_keep_a_prefix_filterable_shape() {
+        assert_eq!(validate_log_tag("combat.hit-1_a"), Ok("combat.hit-1_a"));
+        for rejected in ["", ".lead", "trail.", "double..dot", "Upper", "has space"] {
+            assert!(validate_log_tag(rejected).is_err(), "{rejected}");
+        }
+        assert!(validate_log_tag(&"a".repeat(MAX_LOG_TAG_BYTES)).is_ok());
+        assert!(validate_log_tag(&"a".repeat(MAX_LOG_TAG_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn messages_are_trimmed_before_they_are_measured() {
+        assert_eq!(validate_log_message("  round over  "), Ok("round over"));
+        assert!(validate_log_message("   ").is_err());
+        assert!(validate_log_message("line\nbreak").is_err());
+        assert!(validate_log_message(&"m".repeat(MAX_LOG_MESSAGE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn payloads_must_be_json_containers_and_results_must_be_objects() {
+        assert!(validate_log_payload(r#"{"dmg":3}"#).is_ok());
+        assert!(validate_log_payload("[1,2,3]").is_ok());
+        assert!(validate_log_payload("3").is_err());
+        assert!(validate_log_payload("not json").is_err());
+        assert!(validate_log_payload(&"x".repeat(MAX_LOG_PAYLOAD_BYTES + 1)).is_err());
+
+        assert!(validate_match_result(r#"{"winner":"kitsune"}"#).is_ok());
+        assert!(validate_match_result("[1]").is_err());
+        assert!(
+            validate_match_result(&"x".repeat(crate::match_recorder::MAX_RESULT_JSON_BYTES + 1))
+                .is_err()
+        );
+    }
+}

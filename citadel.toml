@@ -61,6 +61,58 @@ format = "pretty"
 max_bytes = 8388608
 max_entries = 2000
 
+[logs]
+# Durable logging, separate from [errors] above: that one is this server's own
+# crash journal on disk, this one is four database tables.
+#
+# RETAINED: what your game script writes with citadel.log.write (its message and
+# its payload_json, verbatim and unredacted), the console action trail, closed
+# telemetry slice aggregates, and one row per match with its map, mode, peak
+# player count and why it ended.
+#
+# NOT RETAINED: player account ids, session or connection identifiers, chat
+# message bodies, passwords, bearer tokens or API-key secrets, and the marker
+# text inside a telemetry slice. A match record stores counts, never who played.
+#
+# Writes are queued and flushed in batches, so a busy tick costs a queue push
+# rather than a database round trip. A full queue drops its OLDEST records and
+# never blocks the game; the console reports how many were lost. On a backend
+# with no durable log tables (in-memory, MongoDB) everything below is inert and
+# the in-process rings remain the only history.
+enabled = true
+flush_interval_ms = 250
+flush_batch_items = 128
+# How long a graceful shutdown waits for the queues to drain. Queued records
+# live in memory only, so this is what keeps the last quarter-second of them.
+shutdown_drain_timeout_ms = 5000
+prune_interval_secs = 300
+prune_batch_limit = 500
+
+[logs.audit]
+# capacity sizes the in-process ring the console reads on every backend.
+capacity = 1024
+max_queue_items = 16384
+# Kept the longest on purpose: an operator's action must not be deleted because
+# the match it happened during ended.
+retention_days = 365
+
+[logs.match_logs]
+max_queue_items = 8192
+# Widest payload_json one citadel.log.write may attach. It is stored verbatim
+# and is visible to console operators — do not write secrets into it.
+max_payload_bytes = 8192
+retention_days = 30
+
+[logs.telemetry_slices]
+max_queue_items = 2048
+retention_days = 30
+
+[logs.matches]
+max_queue_items = 4096
+# Must be >= the two retentions above, or a retained row would reference a
+# match record that has already been pruned.
+retention_days = 90
+
 [telemetry.authoritative_decisions]
 # Node-local, bounded records for validated authoritative decisions. Only opaque
 # numeric correlations plus generic outcome/reason categories are retained; no

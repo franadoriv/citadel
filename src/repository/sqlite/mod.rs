@@ -56,10 +56,13 @@ use crate::database_explorer::{DatabaseExplorer, SqliteMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    ApiKeyRepository, AuthIdentityRepository, ChatRepository, DurableLagReportRepository,
-    FriendsRepository, GameScriptRepository, GroupsRepository, LeaderboardsRepository,
-    NotificationsRepository, PurchasesRepository, SessionRepository, SqliteLagReportRepository,
-    StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, DurableAuditRepository,
+    DurableLagReportRepository, DurableMatchLogRepository, DurableMatchRepository,
+    DurableTelemetrySliceRepository, FriendsRepository, GameScriptRepository, GroupsRepository,
+    LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
+    SqliteAuditRepository, SqliteLagReportRepository, SqliteMatchLogRepository,
+    SqliteMatchRepository, SqliteTelemetrySliceRepository, StorageRepository,
+    TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
@@ -443,6 +446,10 @@ impl SqliteDatabase {
     #[doc(hidden)]
     pub async fn reset_storage_for_tests(&self) -> AppResult<()> {
         for table in [
+            "match_logs",
+            "telemetry_slice_reports",
+            "console_audit_entries",
+            "matches",
             "api_keys",
             "gamescript_outbox",
             "gamescript_audit",
@@ -634,6 +641,24 @@ impl BackendTrait for SqliteDatabase {
 
     fn lag_report_repository(&self) -> Option<Arc<dyn DurableLagReportRepository>> {
         Some(Arc::new(SqliteLagReportRepository::new(self.pool.clone())))
+    }
+
+    fn audit_repository(&self) -> Option<Arc<dyn DurableAuditRepository>> {
+        Some(Arc::new(SqliteAuditRepository::new(self.pool.clone())))
+    }
+
+    fn telemetry_slice_repository(&self) -> Option<Arc<dyn DurableTelemetrySliceRepository>> {
+        Some(Arc::new(SqliteTelemetrySliceRepository::new(
+            self.pool.clone(),
+        )))
+    }
+
+    fn match_log_repository(&self) -> Option<Arc<dyn DurableMatchLogRepository>> {
+        Some(Arc::new(SqliteMatchLogRepository::new(self.pool.clone())))
+    }
+
+    fn match_repository(&self) -> Option<Arc<dyn DurableMatchRepository>> {
+        Some(Arc::new(SqliteMatchRepository::new(self.pool.clone())))
     }
 
     fn database_explorer(&self) -> Option<Arc<dyn DatabaseExplorer>> {

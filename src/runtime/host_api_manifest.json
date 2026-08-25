@@ -776,5 +776,28 @@
     "returns": "{value:bytes,version:u64,expires_in_ms:u64}?",
     "status": "shipped",
     "since": "TASK-0418"
+  },
+  {
+    "name": "log.write",
+    "category": "log",
+    "params": [
+      "level:string",
+      "tag:string",
+      "message:string",
+      "payload_json:string?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "match.set_result",
+    "category": "log",
+    "params": [
+      "result_json:string"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
   }
 ]

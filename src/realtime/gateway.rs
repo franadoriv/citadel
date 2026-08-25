@@ -38,6 +38,7 @@ use crate::chat_cluster::{
 use crate::lag_diagnostics::{CaptureFlushGrant, CaptureFlushPlan, LagDiagnosticsService};
 use crate::lifecycle::CancellationToken;
 use crate::maps::MapCatalog;
+use crate::match_recorder::{MatchRecorder, MatchTerminationReason};
 use crate::matchmaker::{Matchmaker, MatchmakerStats, TicketId, TicketRequest, TicketState};
 use crate::matchmaker_cluster::{
     InMemoryMatchmakerCluster, InMemoryMatchmakerHandoffRouter, MatchmakerRouterError,
@@ -2471,6 +2472,14 @@ pub struct Gateway {
     /// Trusted native lag-diagnostics lifecycle and post-auth capability state.
     /// It is intentionally not exposed to the embedded GameScript runtime.
     diagnostics: LagCaptureManager,
+    /// Optional durable match-record emitter. Attached only when the node has a
+    /// durable log store; `None` keeps every lifecycle path byte for byte and
+    /// leaves the room registry as the only match history.
+    ///
+    /// The gateway is the sole writer: a match row is opened when the server
+    /// creates the room and closed with the server's own end timestamp and
+    /// termination reason. No script-facing surface reaches it.
+    matches: Option<Arc<MatchRecorder>>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -2501,6 +2510,7 @@ impl std::fmt::Debug for Gateway {
             .field("script_readiness", &self.script_readiness.is_some())
             .field("bridge", &self.bridge.is_some())
             .field("diagnostics", &self.diagnostics)
+            .field("match_recorder", &self.matches.is_some())
             .finish()
     }
 }
@@ -2883,6 +2893,7 @@ impl Gateway {
             script_readiness: None,
             bridge: None,
             diagnostics: LagCaptureManager::default(),
+            matches: None,
         }
     }
 
@@ -2926,6 +2937,20 @@ impl Gateway {
         recorder: Arc<AuthoritativeDecisionRecorder>,
     ) -> Self {
         self.authoritative_decision_recorder = Some(recorder);
+        self
+    }
+
+    /// Attach the durable match-record emitter before the gateway is shared.
+    ///
+    /// Also hands the room registry the node's own identity, so that a room's
+    /// minted `match_id` and the `node_id` its record is written under agree.
+    /// Rooms cannot exist yet at this point in the builder, so no live match
+    /// ever sees its key change.
+    #[must_use]
+    pub fn with_match_recorder(mut self, recorder: Arc<MatchRecorder>) -> Self {
+        self.rooms
+            .adopt_identity(Arc::clone(recorder.writer().identity()));
+        self.matches = Some(recorder);
         self
     }
 
@@ -4552,11 +4577,19 @@ impl Gateway {
     /// Dispatch one server-owned native match lifecycle callback. The room
     /// snapshot is copied before entering script code, so a handler cannot select
     /// or mutate its own match identity, membership, clock, or close reason.
+    ///
+    /// This is also the single funnel the durable match record is written from:
+    /// every one of the gateway's firing sites reaches the recorder here, so a
+    /// match cannot be created or closed without its row being queued. The
+    /// observation is deliberately split around the script dispatch — the
+    /// handler runs *inside* it, so the room must already be in the recorder's
+    /// directory before `on_match_created` can write a match-scoped log line,
+    /// and must still be there when `on_match_ended` returns.
     fn dispatch_match_lifecycle(
         &self,
         hook: NativeMatchLifecycleHook,
         room: RoomSnapshot,
-        termination_reason: Option<&str>,
+        termination_reason: Option<MatchTerminationReason>,
         budget: std::time::Duration,
     ) {
         let Some(runtime) = &self.runtime else {
@@ -4568,6 +4601,18 @@ impl Gateway {
             .and_then(|hub| hub.gameplay_clock())
             .map(|clock| (clock.epoch, clock.tick))
             .unwrap_or((0, 0));
+        let room_id = room.id;
+        // Before the context is built: building it moves `room.label` out from
+        // under the snapshot the recorder still needs whole.
+        if let Some(recorder) = &self.matches {
+            recorder.observe_before(
+                hook,
+                &room,
+                termination_reason,
+                clock_epoch,
+                SystemClock.now().unix_millis(),
+            );
+        }
         let context = NativeMatchContext {
             match_id: room.id,
             lifecycle_generation: room
@@ -4581,10 +4626,13 @@ impl Gateway {
             mode: room.label.mode,
             max_players: room.label.max_players,
             open: termination_reason.is_none() && room.label.open,
-            termination_reason: termination_reason.map(str::to_owned),
+            termination_reason: termination_reason.map(|reason| reason.as_str().to_owned()),
         };
         let commands = runtime.dispatch_match_lifecycle(hook, context, budget);
-        self.apply_commands_scoped(None, Some(room.id), commands);
+        self.apply_commands_scoped(None, Some(room_id), commands);
+        if let Some(recorder) = &self.matches {
+            recorder.observe_after(hook, room_id);
+        }
     }
 
     /// Require the selected adapter to carry every server-owned native lifecycle
@@ -4658,7 +4706,7 @@ impl Gateway {
                 self.dispatch_match_lifecycle(
                     NativeMatchLifecycleHook::Ended,
                     leaving,
-                    Some("final_departure"),
+                    Some(MatchTerminationReason::FinalDeparture),
                     budget,
                 );
             }
@@ -4714,7 +4762,7 @@ impl Gateway {
                 self.dispatch_match_lifecycle(
                     NativeMatchLifecycleHook::Ended,
                     leaving,
-                    Some("final_departure"),
+                    Some(MatchTerminationReason::FinalDeparture),
                     budget,
                 );
             }
@@ -7259,7 +7307,7 @@ impl Gateway {
                 self.dispatch_match_lifecycle(
                     NativeMatchLifecycleHook::Ended,
                     room,
-                    Some("formation_abandoned"),
+                    Some(MatchTerminationReason::FormationAbandoned),
                     self.native_match_budget(),
                 );
             }
@@ -7385,7 +7433,7 @@ impl Gateway {
             self.dispatch_match_lifecycle(
                 NativeMatchLifecycleHook::Ended,
                 leaving,
-                Some("server_closed"),
+                Some(MatchTerminationReason::ServerClosed),
                 budget,
             );
         }
@@ -7701,7 +7749,7 @@ impl Gateway {
                 self.dispatch_match_lifecycle(
                     NativeMatchLifecycleHook::Ended,
                     room,
-                    Some("final_departure"),
+                    Some(MatchTerminationReason::FinalDeparture),
                     budget,
                 );
             }
@@ -9403,7 +9451,7 @@ mod transform_tests {
     async fn player_slots_are_distinct_and_freed_on_disconnect() {
         let (gw, _hub) = gateway_with_player_slots(2);
 
-        let (a, mut ra) = register(&gw);
+        let (a, mut ra) = register_session(&gw);
         gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         let _ = ra.recv().await; // hello
         let role_a = ra.recv().await.expect("A role");
@@ -9411,7 +9459,7 @@ mod transform_tests {
             .expect("decode")
             .object_id;
 
-        let (b, mut rb) = register(&gw);
+        let (b, mut rb) = register_session(&gw);
         gw.handle_inbound(b, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         let _ = rb.recv().await; // hello
         let role_b = rb.recv().await.expect("B role");
@@ -9423,7 +9471,7 @@ mod transform_tests {
 
         // A disconnects: its slot frees, so a new client reuses that id.
         gw.unregister_session(a);
-        let (c, mut rc) = register(&gw);
+        let (c, mut rc) = register_session(&gw);
         gw.handle_inbound(c, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         let _ = rc.recv().await; // hello
         let role_c = rc.recv().await.expect("C role");
@@ -10714,7 +10762,7 @@ mod transform_tests {
             Arc::new(NodeMetrics::new()),
             Some(Arc::clone(&runtime) as Arc<dyn Runtime>),
         );
-        let (a, mut ra) = register(&gw);
+        let (a, mut ra) = register_session(&gw);
         gw.handle_inbound(
             a,
             &Envelope::new(
@@ -10728,7 +10776,7 @@ mod transform_tests {
         let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
             .unwrap()
             .room_id;
-        let (b, _rb) = register(&gw);
+        let (b, _rb) = register_session(&gw);
         gw.handle_inbound(
             b,
             &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
@@ -10859,7 +10907,7 @@ mod transform_tests {
     async fn disconnect_notifies_remaining_room_members() {
         use citadel_wire::room::{RoomCreate, RoomJoin, RoomJoined, RoomLeave};
         let gw = Gateway::new();
-        let (a, mut ra) = register(&gw);
+        let (a, mut ra) = register_session(&gw);
         gw.handle_inbound(
             a,
             &Envelope::new(
@@ -10873,7 +10921,7 @@ mod transform_tests {
         let room_id = RoomJoined::decode(&ra.recv().await.unwrap().envelope.body)
             .unwrap()
             .room_id;
-        let (b, mut rb) = register(&gw);
+        let (b, mut rb) = register_session(&gw);
         gw.handle_inbound(
             b,
             &Envelope::new(KIND_ROOM_JOIN, RoomJoin { room_id }.encode()),
@@ -11059,7 +11107,15 @@ mod transform_tests {
     #[test]
     fn gateway_records_only_validated_authoritative_decisions() {
         let recorder = Arc::new(AuthoritativeDecisionRecorder::new(8));
+        // A Correct decision is validated against real match membership, so the
+        // corrected object must live in this match; Accept and Reject never
+        // touch it. Without a hub `object_in_match` fails closed and the whole
+        // batch is rejected before a single decision is recorded.
+        let hub = Arc::new(TransformHub::new(TransformHubConfig::default()).expect("hub"));
+        hub.spawn_server_simulated(12, TransformState::at([0.0, 0.0, 0.0]));
+        hub.set_object_room(12, Some(7));
         let gateway = Gateway::new()
+            .with_transform_hub(Arc::clone(&hub))
             .with_authoritative_decision_recorder(Arc::clone(&recorder))
             .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new());
         let bridge = gateway.bridge.as_ref().expect("bridge attached");
@@ -12455,7 +12511,7 @@ mod transform_tests {
         let (gw, _hub) = gateway_with_hub();
         let t = NaTransform::identity();
 
-        let (a, _ra) = register(&gw);
+        let (a, _ra) = register_session(&gw);
         gw.handle_inbound(
             a,
             &Envelope::new(
@@ -12467,7 +12523,7 @@ mod transform_tests {
                 .encode(),
             ),
         );
-        let (b, mut rb) = register(&gw);
+        let (b, mut rb) = register_session(&gw);
         gw.handle_inbound(
             b,
             &Envelope::new(
@@ -12532,7 +12588,7 @@ mod transform_tests {
     #[tokio::test]
     async fn leave_drops_transform_client_state() {
         let (gw, hub) = gateway_with_hub();
-        let (a, _ra) = register(&gw);
+        let (a, _ra) = register_session(&gw);
         gw.handle_inbound(a, &Envelope::new(KIND_TSYNC_HELLO, Vec::new()));
         assert_eq!(hub.client_count(), 1);
         gw.unregister_session(a);

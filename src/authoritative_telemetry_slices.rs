@@ -19,6 +19,14 @@ const MAX_CONTEXTS: usize = 256;
 /// One slice may span a long-lived operation, but never retain in-process state
 /// for longer than one day without a new bounded report being closed.
 const MAX_TTL_MS: u64 = 86_400_000;
+/// Total width of a report id: `ats1-` plus 13 hex digits of close time, 4 of
+/// node salt, and 12 of per-boot sequence.
+const REPORT_ID_LEN: usize = 34;
+/// Close time and sequence are truncated to these widths so a report id is
+/// always exactly [`REPORT_ID_LEN`] bytes and lexicographic order stays
+/// chronological.
+const REPORT_MILLIS_MASK: u64 = (1 << 52) - 1;
+const REPORT_SEQUENCE_MASK: u64 = (1 << 48) - 1;
 
 thread_local! {
     /// The authoritative room being dispatched on this thread. Runtime adapters
@@ -60,6 +68,17 @@ impl Drop for RuntimeScopeGuard {
     fn drop(&mut self) {
         ACTIVE_RUNTIME_SCOPE.with(|scope| scope.set(self.previous));
     }
+}
+
+/// Return the raw server-owned room correlation for the active invocation.
+///
+/// Host functions that attribute a script-supplied record to a match resolve
+/// this through the match directory. It is the same server-set correlation
+/// [`active_runtime_context`] wraps, exposed unwrapped because that directory is
+/// keyed by room id. It is never supplied by script input and never reaches an
+/// operator response.
+pub(crate) fn active_runtime_scope() -> Option<u64> {
+    ACTIVE_RUNTIME_SCOPE.with(Cell::get)
 }
 
 /// Return the context derived from the active runtime invocation, if any.
@@ -185,6 +204,27 @@ pub struct ClosedTelemetrySliceReport {
     pub corrected_total: u64,
 }
 
+/// Durable sink for closed slice reports.
+///
+/// Declared inside this module deliberately. `tests/authoritative_telemetry_slices_unit.rs`
+/// compiles this file standalone through `#[path]`, which resolves `crate::`
+/// against the *test* crate root, so this file may not import from the crate at
+/// all. The concrete implementation therefore lives in
+/// `crate::telemetry_slice_persistence`.
+pub trait TelemetrySliceSink: Send + Sync + fmt::Debug {
+    /// Publish one closed report.
+    ///
+    /// `correlation` is the raw process-local correlation of the slice's
+    /// context — a room id for a `match` context. Resolving it to a durable
+    /// identity is the sink's job; neither the correlation nor anything derived
+    /// from it is added to the report an operator reads.
+    ///
+    /// This runs while the service holds its state lock, on threads that may be
+    /// inside a script VM. An implementation must only enqueue: never block,
+    /// never await, never touch a database.
+    fn publish(&self, report: &ClosedTelemetrySliceReport, correlation: u64);
+}
+
 /// Slice operation failure, deliberately without sensitive context or state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetrySliceError {
@@ -228,6 +268,10 @@ struct SliceState {
 pub struct TelemetrySliceService {
     recorder: Arc<AuthoritativeDecisionRecorder>,
     policy: TelemetrySlicePolicy,
+    /// Node and boot salt woven into every minted report id. Zero until a
+    /// bootstrap supplies one, which is only safe while reports stay in process.
+    id_salt: u16,
+    sink: Option<Arc<dyn TelemetrySliceSink>>,
     state: Mutex<SliceState>,
 }
 
@@ -237,8 +281,31 @@ impl TelemetrySliceService {
         Self {
             recorder,
             policy,
+            id_salt: 0,
+            sink: None,
             state: Mutex::new(SliceState::default()),
         }
+    }
+
+    /// Stamp this node's 16-bit identity salt into every minted report id.
+    ///
+    /// The sequence a report id ends with restarts at zero on every boot, so
+    /// without the salt a second run of one node re-mints the ids of the first
+    /// — fatal the moment `report_id` becomes a primary key. Taken as a plain
+    /// `u16` rather than a node identity type because this module may not
+    /// import from the crate (see [`TelemetrySliceSink`]).
+    #[must_use]
+    pub fn with_identity(mut self, id_prefix_salt: u16) -> Self {
+        self.id_salt = id_prefix_salt;
+        self
+    }
+
+    /// Persist every closed report through `sink` as well as retaining it in
+    /// the bounded in-process list.
+    #[must_use]
+    pub fn with_sink(mut self, sink: Arc<dyn TelemetrySliceSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Begin a slice for a trusted context. Existing same-context slices are closed.
@@ -383,7 +450,14 @@ impl TelemetrySliceService {
         }
         state.next_report = state.next_report.saturating_add(1);
         let report = ClosedTelemetrySliceReport {
-            report_id: format!("ats1-{:024x}", state.next_report),
+            // Close time first, then the node salt, then the per-boot sequence:
+            // sortable, and unique across reboots and across nodes.
+            report_id: format!(
+                "ats1-{:013x}{:04x}{:012x}",
+                now_ms & REPORT_MILLIS_MASK,
+                self.id_salt,
+                state.next_report & REPORT_SEQUENCE_MASK
+            ),
             context_kind: context.kind_code(),
             close_reason,
             closed_at_ms: now_ms,
@@ -398,6 +472,11 @@ impl TelemetrySliceService {
             state.closed.pop_front();
         }
         state.closed.push_back(report.clone());
+        if let Some(sink) = &self.sink {
+            // Enqueue only. This is inside the state lock, reached from a
+            // blocking script VM call as often as from the reaper.
+            sink.publish(&report, context.correlation);
+        }
         Some(report)
     }
 
@@ -431,7 +510,7 @@ fn valid_marker(marker: &str) -> bool {
 
 /// Validate an opaque server-generated closed-report id before lookup.
 pub fn valid_report_id(value: &str) -> bool {
-    value.len() == 29
+    value.len() == REPORT_ID_LEN
         && value.starts_with("ats1-")
         && value[5..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }

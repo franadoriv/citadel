@@ -21,18 +21,22 @@
 pub mod api_keys;
 pub mod backend;
 pub mod chat;
+pub mod console_audit;
 pub mod friends;
 pub mod gamescript;
 pub mod groups;
 pub mod identity;
 pub mod lag_reports;
 pub mod leaderboards;
+pub mod match_logs;
+pub mod match_records;
 pub mod mongodb;
 pub mod notifications;
 pub mod pg;
 pub mod purchases;
 pub mod session;
 pub mod sqlite;
+pub mod telemetry_slice_reports;
 pub mod tournaments;
 pub mod wallet;
 
@@ -46,6 +50,10 @@ pub use chat::{
     ChannelSummary, ChannelType, ChatChannel, ChatDeliveryOutboxRecord, ChatDeliveryRequest,
     ChatMessage, ChatModerationAudit, ChatRateLimit, ChatRepository, DEFAULT_CHANNEL_HISTORY_CAP,
     InMemoryChatRepository,
+};
+pub use console_audit::{
+    DurableAuditFilter, DurableAuditRepository, DurableAuditRow, PgAuditRepository,
+    SqliteAuditRepository,
 };
 pub use friends::{
     AddPlan, FriendRow, FriendState, FriendsRepository, InMemoryFriendsRepository, plan_add,
@@ -74,6 +82,14 @@ pub use leaderboards::{
     LeaderboardRecord, LeaderboardSummary, LeaderboardsRepository, Operator, RankedRecord,
     RecordsPage, SortOrder,
 };
+pub use match_logs::{
+    DurableMatchLogRepository, LogLevel, MatchLogEntry, MatchLogFilter, PgMatchLogRepository,
+    SqliteMatchLogRepository,
+};
+pub use match_records::{
+    DurableMatchRepository, MatchClose, MatchOpen, MatchRecord, PgMatchRepository,
+    SqliteMatchRepository,
+};
 pub use mongodb::{
     MongoChatRepository, MongoDatabase, MongoLeaderboardResetRepository, MongoSchemaPlan,
     MongoUnitOfWork,
@@ -88,6 +104,10 @@ pub use purchases::{
 };
 pub use session::{InMemorySessionRepository, SessionRepository};
 pub use sqlite::{SqliteDatabase, SqliteUnitOfWork};
+pub use telemetry_slice_reports::{
+    DurableSliceRow, DurableTelemetrySliceRepository, PgTelemetrySliceRepository,
+    SqliteTelemetrySliceRepository,
+};
 pub use tournaments::{
     CreateTournamentRequest, InMemoryTournamentsRepository, Tournament, TournamentEntry,
     TournamentResult, TournamentSettlementCallback, TournamentSettlementOutboxDispatcher,
