@@ -14,12 +14,18 @@ use citadel_physics::{PhysicsConfig, Shape};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
 use crate::authoritative_telemetry_slices::{
-    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, active_runtime_scope,
+    set_active_runtime_scope,
 };
 use crate::config::LuaExecutionMode;
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
+use crate::match_recorder::MatchLogWriter;
 use crate::realtime::TransformHub;
+use crate::runtime::host_api_spec::{
+    validate_log_level, validate_log_message, validate_log_payload, validate_log_tag,
+    validate_match_result,
+};
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
 use crate::runtime::outbound_http::{
     AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
@@ -376,6 +382,11 @@ struct TransformHubHandle(Arc<TransformHub>);
 /// Private trusted-runtime bridge; scripts receive no recorder or report handles.
 struct TelemetrySlicesHandle(Arc<TelemetrySliceService>);
 
+/// Durable log/result write handle. Scripts reach it only through
+/// `citadel.log.write` and `citadel.match.set_result`; it can neither open nor
+/// close a match, which stays the server's alone.
+struct MatchLogHandle(Arc<MatchLogWriter>);
+
 /// Install (or refresh) the domain-host seam on a VM's app-data.
 ///
 /// Called after each VM build (initial + hot-reload) so `citadel.friends_*` can
@@ -401,6 +412,12 @@ fn apply_transform_hub(lua: &Lua, hub: &Option<Arc<TransformHub>>) {
 fn apply_telemetry_slices(lua: &Lua, slices: &Option<Arc<TelemetrySliceService>>) {
     if let Some(slices) = slices {
         lua.set_app_data(TelemetrySlicesHandle(Arc::clone(slices)));
+    }
+}
+
+fn apply_match_log(lua: &Lua, writer: &Option<Arc<MatchLogWriter>>) {
+    if let Some(writer) = writer {
+        lua.set_app_data(MatchLogHandle(Arc::clone(writer)));
     }
 }
 
@@ -531,6 +548,8 @@ pub struct LuaRuntime {
     transform_hub: Option<Arc<TransformHub>>,
     /// Private trusted host bridge for context-derived telemetry slices.
     telemetry_slices: Option<Arc<TelemetrySliceService>>,
+    /// Durable log/result write handle, retained so a hot-reload re-applies it.
+    match_log: Option<Arc<MatchLogWriter>>,
     /// The capability mode used when constructing this VM. Retained so a reload
     /// cannot accidentally change the script's authority.
     execution_mode: LuaExecutionMode,
@@ -681,6 +700,7 @@ impl LuaRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             execution_mode,
             outbound_http_policy,
             http_endpoint_policy,
@@ -733,6 +753,7 @@ impl LuaRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             execution_mode: LuaExecutionMode::Sandboxed,
             outbound_http_policy: OutboundHttpPolicy::default(),
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
@@ -784,6 +805,7 @@ impl LuaRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             execution_mode: LuaExecutionMode::Sandboxed,
             outbound_http_policy: OutboundHttpPolicy::default(),
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
@@ -816,6 +838,18 @@ impl LuaRuntime {
         {
             let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
             apply_telemetry_slices(&guard.lua, &self.telemetry_slices);
+        }
+        self
+    }
+
+    /// Attach the durable log/result write handle behind `citadel.log.write`
+    /// and `citadel.match.set_result`.
+    #[must_use]
+    pub fn with_match_log(mut self, writer: Arc<MatchLogWriter>) -> Self {
+        self.match_log = Some(writer);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_match_log(&guard.lua, &self.match_log);
         }
         self
     }
@@ -1081,6 +1115,7 @@ impl LuaRuntime {
         apply_map_catalog(&fresh, &self.maps);
         apply_transform_hub(&fresh, &self.transform_hub);
         apply_telemetry_slices(&fresh, &self.telemetry_slices);
+        apply_match_log(&fresh, &self.match_log);
         // Guard against an accidental empty/handlerless save (e.g. an editor's
         // transient zero-byte write caught mid-save): swapping it in would leave
         // the node with no handlers. Reject and keep the working script.
@@ -2727,9 +2762,13 @@ fn install_host_api(
     // `citadel.log(message [, level])`: structured logging tagged as script
     // output. `level` is an optional case-insensitive string
     // (trace/debug/info/warn/error); anything else falls back to info.
+    //
+    // The name is a callable table rather than a plain function so it can also
+    // carry `citadel.log.write` — Lua values have no properties, and the call
+    // behaviour above is unchanged. `__call` receives the table itself first.
     let label = source_label.to_string();
     let log = lua.create_function(
-        move |_, (message, level): (mlua::String, Option<mlua::String>)| {
+        move |_, (_self, message, level): (Table, mlua::String, Option<mlua::String>)| {
             let message = message.to_string_lossy();
             let level = level.map(|l| l.to_string_lossy().to_ascii_lowercase());
             match level.as_deref() {
@@ -2750,7 +2789,62 @@ fn install_host_api(
             Ok(())
         },
     )?;
-    citadel.set("log", log)?;
+
+    let log_ns = lua.create_table()?;
+    let write = lua.create_function(
+        |lua,
+         (level, tag, message, payload_json): (
+            mlua::String,
+            mlua::String,
+            mlua::String,
+            Option<mlua::String>,
+        )| {
+            let level =
+                validate_log_level(&level.to_string_lossy()).map_err(mlua::Error::RuntimeError)?;
+            let tag = tag.to_string_lossy();
+            let tag = validate_log_tag(&tag).map_err(mlua::Error::RuntimeError)?;
+            let message = message.to_string_lossy();
+            let message = validate_log_message(&message).map_err(mlua::Error::RuntimeError)?;
+            let payload = payload_json.map(|value| value.to_string_lossy());
+            let payload = payload
+                .as_deref()
+                .map(validate_log_payload)
+                .transpose()
+                .map_err(mlua::Error::RuntimeError)?;
+            let handle = lua.app_data_ref::<MatchLogHandle>().ok_or_else(|| {
+                mlua::Error::RuntimeError("durable logs are unavailable".to_string())
+            })?;
+            // Match scope is optional: a line written outside a match-scoped
+            // callback is stored with no match, never refused.
+            handle
+                .0
+                .write(active_runtime_scope(), level, tag, message, payload);
+            Ok(())
+        },
+    )?;
+    log_ns.set("write", write)?;
+    let log_meta = lua.create_table()?;
+    log_meta.set("__call", log)?;
+    log_ns.set_metatable(Some(log_meta));
+    citadel.set("log", log_ns)?;
+
+    // `citadel.match.set_result(result_json)`: the only script influence over a
+    // match record. The server still owns open and close, so there is
+    // deliberately no `match.open` or `match.close` beside it.
+    let match_ns = lua.create_table()?;
+    let set_result = lua.create_function(|lua, result_json: mlua::String| {
+        let result_json = result_json.to_string_lossy();
+        let result_json = validate_match_result(&result_json).map_err(mlua::Error::RuntimeError)?;
+        let handle = lua
+            .app_data_ref::<MatchLogHandle>()
+            .ok_or_else(|| mlua::Error::RuntimeError("durable logs are unavailable".to_string()))?;
+        handle
+            .0
+            .set_result(active_runtime_scope(), result_json.to_string())
+            .map_err(|error| mlua::Error::RuntimeError(error.message().to_string()))
+    })?;
+    match_ns.set("set_result", set_result)?;
+    citadel.set("match", match_ns)?;
 
     let http_api = lua.create_table()?;
     if http_endpoint_policy.enabled {
@@ -4283,6 +4377,86 @@ mod tests {
         assert_eq!(reports[0].marker_total, 1);
     }
 
+    fn match_log_writer(
+        capacity: usize,
+    ) -> (
+        Arc<crate::match_recorder::MatchRecorder>,
+        Arc<MatchLogWriter>,
+    ) {
+        let writer = Arc::new(crate::durable_logs::DurableLogWriter::new(
+            Arc::new(crate::ids::NodeIdentity::new("node-lua")),
+            crate::config::LogsConfig::default(),
+        ));
+        let recorder = Arc::new(crate::match_recorder::MatchRecorder::with_capacity(
+            writer, capacity,
+        ));
+        let log = Arc::new(MatchLogWriter::new(Arc::clone(&recorder)));
+        (recorder, log)
+    }
+
+    #[test]
+    fn log_write_persists_a_line_and_leaves_the_plain_log_callable() {
+        let (recorder, log) = match_log_writer(8);
+        recorder.bind(7, "mt1-lua".to_string());
+        let runtime = runtime(
+            r#"
+                citadel.on_message(1, function()
+                    citadel.log("still a plain tracing call")
+                    citadel.log.write("WARN", "combat.hit", "  round over  ", '{"dmg":3}')
+                    citadel.log.write("info", "world", "no payload")
+                end)
+            "#,
+        )
+        .with_match_log(log);
+
+        assert!(
+            runtime
+                .dispatch_in_room(7, Some("user-7"), 7, 1, b"")
+                .is_empty()
+        );
+        assert_eq!(recorder.writer().queued_total(), 2);
+    }
+
+    #[test]
+    fn log_write_refuses_a_malformed_argument_and_set_result_needs_a_match() {
+        let (_recorder, log) = match_log_writer(8);
+        let runtime = runtime(
+            r#"
+                citadel.on_message(1, function()
+                    local failures = {}
+                    local function refused(...)
+                        local ok, err = pcall(citadel.log.write, ...)
+                        failures[#failures + 1] = tostring(ok) .. ":" .. tostring(err)
+                    end
+                    refused("nope", "world", "hi")
+                    refused("info", "Bad Tag", "hi")
+                    refused("info", "world", "   ")
+                    refused("info", "world", "hi", "not json")
+                    local ok, err = pcall(citadel.match.set_result, '{"winner":"a"}')
+                    failures[#failures + 1] = tostring(ok) .. ":" .. tostring(err)
+                    citadel.broadcast(2, table.concat(failures, "\n"), true)
+                end)
+            "#,
+        )
+        .with_match_log(log);
+
+        let commands = runtime.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            unreachable!("expected a broadcast command");
+        };
+        let report = String::from_utf8_lossy(body);
+        // Every one of the five calls must have been refused. An mlua error
+        // string may carry position information, so count refusals rather than
+        // lines.
+        assert_eq!(report.matches("false:").count(), 5, "{report}");
+        assert!(!report.contains("true:"), "{report}");
+        assert!(report.contains("log level must be one of"));
+        assert!(report.contains("log tag must be"));
+        assert!(report.contains("log message must be 1-1024 bytes"));
+        assert!(report.contains("payload_json must be a JSON object or array"));
+        assert!(report.contains("match results require a match-scoped context"));
+    }
+
     #[test]
     fn native_match_lifecycle_telemetry_uses_its_context_and_restores_prior_scope() {
         let slices = Arc::new(TelemetrySliceService::new(
@@ -5358,6 +5532,8 @@ mod tests {
             "telemetry.begin",
             "telemetry.mark",
             "telemetry.finish",
+            "log.write",
+            "match.set_result",
         ]
         .into_iter()
         .collect();

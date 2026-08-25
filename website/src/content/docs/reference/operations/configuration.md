@@ -290,6 +290,45 @@ indicator. Marker text is never retained. They never contain raw payloads, playe
 replies, commands, or corrected values.
 
 
+### Durable log tables
+
+SQLite, PostgreSQL, and CockroachDB carry four tables for durable server
+history, plus a nullable `match_id` column on `lag_diagnostic_reports`:
+
+| Table | Holds | Never holds |
+| --- | --- | --- |
+| `matches` | The server-owned shape of a match: room, map, mode, player cap, open and close time, termination reason, and a script-supplied `result_json`. | Participant identities, account ids, session or transport identifiers. |
+| `match_logs` | Your game script's own log lines — level, tag, message, and a verbatim `payload_json`. | Credentials, bearer tokens, session ids, participant ids. |
+| `console_audit_entries` | The console action trail: who acted, with which role and credential id, what they did, on what, and when. | Passwords, bearer tokens, API-key secrets, console session tokens, raw request or response payloads. |
+| `telemetry_slice_reports` | Aggregate slice outcomes: close reason, duration, marker count, truncation flag, and accepted/rejected/corrected totals. | Marker text, event payloads, participant or account identity, replies, commands, corrected values. |
+
+Three facts about these tables are deliberate and worth knowing before you plan
+around them:
+
+- **The server owns match open and close.** A game script can never open or
+  close a match record; its only influence is stamping `result_json` on a match
+  that is still open. That is what makes the record trustworthy as evidence.
+- **`match_id` is nullable everywhere.** A game with no match concept — an
+  MMORPG world, a global scheduled job — still writes logs; the row simply
+  carries no match. A log outside a match is stored, never rejected.
+- **Operator actions are not match-scoped.** `console_audit_entries.match_id`
+  exists but is almost always empty, and nothing forces an operator action into
+  a match.
+
+`credential_id` is a public machine-credential identifier, but the database
+explorer auto-redacts any column whose name contains `credential`, so it appears
+redacted there. That is expected, not a defect.
+
+**On the in-memory and MongoDB backends none of this is persisted.** Those
+backends expose no durable log capability: audit entries and telemetry slices
+stay in their bounded in-process rings, script log writes are dropped at the
+sink with a counter, and no match rows are created.
+
+`lag_diagnostic_reports.match_id` ships as a working read filter over a column
+nothing populates yet: a lag capture is node-scoped, so associating one with a
+match is separate work. Treat it as always empty for now.
+
+
 ### `[errors]`
 
 The local incident journal is always enabled. It writes redacted failure and

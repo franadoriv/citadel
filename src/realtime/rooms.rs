@@ -12,14 +12,22 @@
 //! in Phase A4, not here). Object-id space stays global.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::ids::NodeIdentity;
 use crate::realtime::registry::ParticipantId;
 use crate::runtime::{NativeMatchLifecycleUnavailable, ScriptBinding};
 use crate::session::NodeId;
+use crate::time::{Clock, SystemClock};
 
 /// Server-assigned room identifier (monotonic, starts at 1; `0` is never a room).
 pub type RoomId = u64;
+
+/// Prefix of every durable match identity minted here.
+///
+/// The durable record, the log rows that reference it, and the console cursor
+/// validator all read the same shape, so the prefix is stated once.
+pub const MATCH_ID_PREFIX: &str = "mt1-";
 
 /// A room's game-defined metadata. The `map` is the load-bearing field: it is what
 /// the server sends a joining client in `KIND_ROOM_JOINED`.
@@ -53,6 +61,10 @@ impl RoomLabel {
 pub struct RoomSnapshot {
     /// Server-assigned room id.
     pub id: RoomId,
+    /// Durable server-minted match identity. Stable for the room's whole life
+    /// and never reused, so it survives the process the `id` is local to. Game
+    /// code can neither choose it nor change it.
+    pub match_id: String,
     /// The matchmaking name the room was created under, if any.
     pub name: Option<String>,
     /// The room's game-defined label (map, mode, cap, open).
@@ -100,6 +112,9 @@ impl From<NativeMatchLifecycleUnavailable> for JoinError {
 
 #[derive(Debug)]
 struct Room {
+    /// Minted once at birth, before the room can admit anyone. This is what
+    /// makes the durable record keyed by something a restart cannot recycle.
+    match_id: String,
     label: RoomLabel,
     members: HashSet<ParticipantId>,
     remote_members: HashSet<RemoteRoomMember>,
@@ -122,6 +137,10 @@ struct Inner {
     /// the same name in the same room. Cleared when the room is pruned.
     names: HashMap<String, RoomId>,
     next_id: RoomId,
+    /// Mints every room's durable match identity. Held here rather than passed
+    /// per call so the two creation sites are the only places a match id can
+    /// come into existence.
+    identity: Arc<NodeIdentity>,
 }
 
 /// The gateway's room state. Interior-mutable (like the session registry) so the
@@ -132,9 +151,20 @@ pub struct RoomRegistry {
 }
 
 impl RoomRegistry {
-    /// An empty registry (no rooms).
+    /// An empty registry (no rooms) minting under an unattributed identity.
+    ///
+    /// The identity is still unique per construction, so ids never collide;
+    /// production replaces it with the node's own through
+    /// [`Self::adopt_identity`] so a row's `match_id` and `node_id` agree.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_identity(Arc::new(NodeIdentity::new(String::new())))
+    }
+
+    /// An empty registry whose rooms mint their match identity under
+    /// `identity`.
+    #[must_use]
+    pub fn with_identity(identity: Arc<NodeIdentity>) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 rooms: HashMap::new(),
@@ -142,8 +172,18 @@ impl RoomRegistry {
                 remote_membership: HashMap::new(),
                 names: HashMap::new(),
                 next_id: 1,
+                identity,
             }),
         }
+    }
+
+    /// Mint every subsequent room's match identity under `identity`.
+    ///
+    /// Called once while the gateway is still being built. Rooms already born
+    /// keep the identity they were minted with — an id is the row's key and
+    /// must never change under a live match.
+    pub(crate) fn adopt_identity(&self, identity: Arc<NodeIdentity>) {
+        self.lock().identity = identity;
     }
 
     /// Create a new, empty room with `label`; returns its id. Does not add members.
@@ -158,9 +198,11 @@ impl RoomRegistry {
         let mut g = self.lock();
         let id = g.next_id;
         g.next_id += 1;
+        let match_id = g.mint_match_id();
         g.rooms.insert(
             id,
             Room {
+                match_id,
                 label,
                 members: HashSet::new(),
                 remote_members: HashSet::new(),
@@ -205,9 +247,11 @@ impl RoomRegistry {
         // Create the named room, then join the creator into it.
         let id = g.next_id;
         g.next_id += 1;
+        let match_id = g.mint_match_id();
         g.rooms.insert(
             id,
             Room {
+                match_id,
                 label: make_label(),
                 members: HashSet::new(),
                 remote_members: HashSet::new(),
@@ -442,6 +486,12 @@ impl RoomRegistry {
         self.lock().rooms.get(&room_id).map(|r| r.label.clone())
     }
 
+    /// A room's durable match identity, if it is still live.
+    #[must_use]
+    pub fn match_id(&self, room_id: RoomId) -> Option<String> {
+        self.lock().rooms.get(&room_id).map(|r| r.match_id.clone())
+    }
+
     /// The script binding a room was born with, if the room exists and was
     /// created under the readiness gate.
     #[must_use]
@@ -489,6 +539,7 @@ impl RoomRegistry {
                 members.sort_unstable();
                 RoomSnapshot {
                     id,
+                    match_id: room.match_id.clone(),
                     name: room.name.clone(),
                     label: room.label.clone(),
                     members,
@@ -580,6 +631,15 @@ impl RoomRegistry {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Inner {
+    /// Mint the durable identity of a room being born. Called under the
+    /// registry lock so id allocation and minting cannot interleave.
+    fn mint_match_id(&self) -> String {
+        self.identity
+            .mint(MATCH_ID_PREFIX, SystemClock.now().unix_millis())
     }
 }
 
@@ -842,6 +902,47 @@ mod tests {
         assert_ne!(id, id2);
         // Closing a nonexistent room is a no-op.
         assert_eq!(r.close(id), None);
+    }
+
+    #[test]
+    fn every_room_is_born_with_a_unique_durable_match_identity() {
+        use crate::ids::{SHORT_PREFIX_ID_LEN, valid_id};
+
+        let r = RoomRegistry::new();
+        let created = r.create(RoomLabel::with_map("M"));
+        let (named, _) = r
+            .join_or_create(pid(1), "lobby", || RoomLabel::with_map("M"))
+            .unwrap();
+        let first = r.match_id(created).expect("created room mints an identity");
+        let second = r.match_id(named).expect("named room mints an identity");
+        assert!(valid_id(&first, MATCH_ID_PREFIX, SHORT_PREFIX_ID_LEN));
+        assert!(valid_id(&second, MATCH_ID_PREFIX, SHORT_PREFIX_ID_LEN));
+        assert_ne!(first, second, "both creation sites mint independently");
+        for room in r.snapshot() {
+            assert_eq!(
+                r.match_id(room.id).as_deref(),
+                Some(room.match_id.as_str()),
+                "the snapshot carries the room's own identity"
+            );
+        }
+        // A pruned room takes its identity with it: ids are never reused.
+        r.leave(pid(1));
+        assert_eq!(r.match_id(named), None);
+    }
+
+    #[test]
+    fn adopting_an_identity_leaves_live_rooms_keyed_as_they_were_born() {
+        let r = RoomRegistry::new();
+        let early = r.create(RoomLabel::with_map("M"));
+        let born_as = r.match_id(early).expect("identity");
+        r.adopt_identity(Arc::new(NodeIdentity::new("node-a")));
+        let late = r.create(RoomLabel::with_map("M"));
+        assert_eq!(
+            r.match_id(early).as_deref(),
+            Some(born_as.as_str()),
+            "a live match's durable key never changes under it"
+        );
+        assert_ne!(r.match_id(late), Some(born_as));
     }
 
     #[test]

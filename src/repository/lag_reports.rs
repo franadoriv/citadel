@@ -36,6 +36,17 @@ pub trait DurableLagReportRepository: Send + Sync {
         artifact_digest_sha256: &str,
     ) -> AppResult<()>;
     async fn list(&self, after_report_id: Option<&str>, limit: usize) -> AppResult<Vec<LagReport>>;
+    /// Reports produced inside one durable match, oldest first.
+    ///
+    /// The `match_id` column is nullable and, until the capture write path
+    /// carries one, always `NULL`: this filter is a working read over a column
+    /// nothing populates yet.
+    async fn list_for_match(
+        &self,
+        match_id: &str,
+        after_report_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<LagReport>>;
     async fn list_capture_overviews(
         &self,
         after_capture_id: Option<&str>,
@@ -165,10 +176,10 @@ impl DurableLagReportRepository for SqliteLagReportRepository {
         let generation_value = generation(identity.generation)?;
         sqlx::query(
             "INSERT OR IGNORE INTO lag_diagnostic_reports \
-             (report_id,capture_id,generation,artifact_digest_sha256,decoder_version,analyzer_version,options_hash,status,raw_available,report_json) \
+             (report_id,capture_id,generation,artifact_digest_sha256,decoder_version,analyzer_version,options_hash,status,raw_available,report_json,match_id) \
              SELECT ?,?,?,?,?,?,?,?, \
                 CASE WHEN EXISTS (SELECT 1 FROM lag_diagnostic_raw_tombstones \
-                    WHERE capture_id=? AND generation=? AND artifact_digest_sha256=?) THEN 0 ELSE ? END, ?",
+                    WHERE capture_id=? AND generation=? AND artifact_digest_sha256=?) THEN 0 ELSE ? END, ?, ?",
         )
         .bind(&report.report_id)
         .bind(&identity.capture_id)
@@ -183,6 +194,7 @@ impl DurableLagReportRepository for SqliteLagReportRepository {
         .bind(&identity.artifact_digest_sha256)
         .bind(report.raw_available)
         .bind(value)
+        .bind(report.match_id.as_deref())
         .execute(&self.pool)
         .await
         .map_err(db)?;
@@ -220,6 +232,23 @@ impl DurableLagReportRepository for SqliteLagReportRepository {
     async fn list(&self, after: Option<&str>, limit: usize) -> AppResult<Vec<LagReport>> {
         let rows = sqlx::query("SELECT report_json, CASE WHEN raw_available=1 AND NOT EXISTS (SELECT 1 FROM lag_diagnostic_raw_tombstones t WHERE t.capture_id=lag_diagnostic_reports.capture_id AND t.generation=lag_diagnostic_reports.generation AND t.artifact_digest_sha256=lag_diagnostic_reports.artifact_digest_sha256) THEN 1 ELSE 0 END AS raw_available FROM lag_diagnostic_reports WHERE (? IS NULL OR report_id > ?) ORDER BY report_id LIMIT ?")
             .bind(after).bind(after).bind(i64::try_from(limit.clamp(1, 101)).unwrap_or(101)).fetch_all(&self.pool).await.map_err(db)?;
+        rows.into_iter()
+            .map(|row| {
+                decode_projection(
+                    row.try_get::<String, _>("report_json").map_err(db)?,
+                    row.try_get::<bool, _>("raw_available").map_err(db)?,
+                )
+            })
+            .collect()
+    }
+    async fn list_for_match(
+        &self,
+        match_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<LagReport>> {
+        let rows = sqlx::query("SELECT report_json, CASE WHEN raw_available=1 AND NOT EXISTS (SELECT 1 FROM lag_diagnostic_raw_tombstones t WHERE t.capture_id=lag_diagnostic_reports.capture_id AND t.generation=lag_diagnostic_reports.generation AND t.artifact_digest_sha256=lag_diagnostic_reports.artifact_digest_sha256) THEN 1 ELSE 0 END AS raw_available FROM lag_diagnostic_reports WHERE match_id=? AND (? IS NULL OR report_id > ?) ORDER BY report_id LIMIT ?")
+            .bind(match_id).bind(after).bind(after).bind(i64::try_from(limit.clamp(1, 101)).unwrap_or(101)).fetch_all(&self.pool).await.map_err(db)?;
         rows.into_iter()
             .map(|row| {
                 decode_projection(
@@ -332,10 +361,10 @@ impl DurableLagReportRepository for PgLagReportRepository {
         let generation_value = generation(identity.generation)?;
         sqlx::query(
             "INSERT INTO lag_diagnostic_reports \
-             (report_id,capture_id,generation,artifact_digest_sha256,decoder_version,analyzer_version,options_hash,status,raw_available,report_json) \
+             (report_id,capture_id,generation,artifact_digest_sha256,decoder_version,analyzer_version,options_hash,status,raw_available,report_json,match_id) \
              SELECT $1,$2,$3,$4,$5,$6,$7,$8, \
                 CASE WHEN EXISTS (SELECT 1 FROM lag_diagnostic_raw_tombstones \
-                    WHERE capture_id=$9 AND generation=$10 AND artifact_digest_sha256=$11) THEN false ELSE $12 END, $13::jsonb \
+                    WHERE capture_id=$9 AND generation=$10 AND artifact_digest_sha256=$11) THEN false ELSE $12 END, $13::jsonb, $14 \
              ON CONFLICT (capture_id,generation,artifact_digest_sha256,analyzer_version,options_hash) DO NOTHING",
         )
         .bind(&report.report_id)
@@ -351,6 +380,7 @@ impl DurableLagReportRepository for PgLagReportRepository {
         .bind(&identity.artifact_digest_sha256)
         .bind(report.raw_available)
         .bind(value)
+        .bind(report.match_id.as_deref())
         .execute(&self.pool)
         .await
         .map_err(db)?;
@@ -374,6 +404,23 @@ impl DurableLagReportRepository for PgLagReportRepository {
     async fn list(&self, after: Option<&str>, limit: usize) -> AppResult<Vec<LagReport>> {
         let rows = sqlx::query("SELECT report_json::text AS report_json, raw_available AND NOT EXISTS (SELECT 1 FROM lag_diagnostic_raw_tombstones t WHERE t.capture_id=lag_diagnostic_reports.capture_id AND t.generation=lag_diagnostic_reports.generation AND t.artifact_digest_sha256=lag_diagnostic_reports.artifact_digest_sha256) AS raw_available FROM lag_diagnostic_reports WHERE ($1::text IS NULL OR report_id > $1) ORDER BY report_id LIMIT $2")
             .bind(after).bind(i64::try_from(limit.clamp(1, 101)).unwrap_or(101)).fetch_all(&self.pool).await.map_err(db)?;
+        rows.into_iter()
+            .map(|row| {
+                decode_projection(
+                    row.try_get::<String, _>("report_json").map_err(db)?,
+                    row.try_get::<bool, _>("raw_available").map_err(db)?,
+                )
+            })
+            .collect()
+    }
+    async fn list_for_match(
+        &self,
+        match_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<LagReport>> {
+        let rows = sqlx::query("SELECT report_json::text AS report_json, raw_available AND NOT EXISTS (SELECT 1 FROM lag_diagnostic_raw_tombstones t WHERE t.capture_id=lag_diagnostic_reports.capture_id AND t.generation=lag_diagnostic_reports.generation AND t.artifact_digest_sha256=lag_diagnostic_reports.artifact_digest_sha256) AS raw_available FROM lag_diagnostic_reports WHERE match_id=$1 AND ($2::text IS NULL OR report_id > $2) ORDER BY report_id LIMIT $3")
+            .bind(match_id).bind(after).bind(i64::try_from(limit.clamp(1, 101)).unwrap_or(101)).fetch_all(&self.pool).await.map_err(db)?;
         rows.into_iter()
             .map(|row| {
                 decode_projection(
@@ -459,6 +506,7 @@ mod tests {
             summaries: Vec::new(),
             windows: Vec::<LagTimelineWindow>::new(),
             supersedes_report_id: None,
+            match_id: None,
         }
     }
 
@@ -479,6 +527,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("tombstone migration");
+        sqlx::raw_sql(include_str!(
+            "../../migrations-sqlite/20260824094000_add_lag_report_match_id.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("match column migration");
         let repository = SqliteLagReportRepository::new(pool);
         let key = identity();
         let saved = repository
@@ -537,6 +591,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("tombstone migration");
+        sqlx::raw_sql(include_str!(
+            "../../migrations-sqlite/20260824094000_add_lag_report_match_id.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("match column migration");
         let repository = SqliteLagReportRepository::new(pool);
         let first_key = identity();
         let first_report = report();
@@ -614,6 +674,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("tombstone migration");
+        sqlx::raw_sql(include_str!(
+            "../../migrations-sqlite/20260824094000_add_lag_report_match_id.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("match column migration");
         let repository = SqliteLagReportRepository::new(pool);
 
         for index in 0..102_u16 {
@@ -655,5 +721,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["capture-100", "capture-101"]
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_lists_reports_for_one_match_and_ignores_unscoped_ones() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("sqlite");
+        sqlx::raw_sql(include_str!(
+            "../../migrations-sqlite/20260819130000_create_lag_diagnostic_reports.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("migration");
+        sqlx::raw_sql(include_str!(
+            "../../migrations-sqlite/20260819131000_create_lag_diagnostic_raw_tombstones.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("tombstone migration");
+        sqlx::raw_sql(include_str!(
+            "../../migrations-sqlite/20260824094000_add_lag_report_match_id.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("match column migration");
+        let repository = SqliteLagReportRepository::new(pool);
+
+        for (index, match_id) in [Some("mt1-a"), None, Some("mt1-a"), Some("mt1-b")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut report = report();
+            report.report_id = format!("lr1-{index:03}");
+            report.match_id = match_id.map(str::to_string);
+            let mut key = identity();
+            key.options_hash = format!("{index:064x}");
+            report.options_hash = key.options_hash.clone();
+            repository
+                .insert_immutable(&key, &report)
+                .await
+                .expect("insert");
+        }
+
+        let scoped = repository
+            .list_for_match("mt1-a", None, 10)
+            .await
+            .expect("scoped list");
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|report| report.report_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lr1-000", "lr1-002"]
+        );
+        // A report written outside a match is stored and simply never matches.
+        assert_eq!(repository.list(None, 10).await.expect("list all").len(), 4);
     }
 }

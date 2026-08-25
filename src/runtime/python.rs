@@ -18,11 +18,17 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyTuple};
 
 use crate::authoritative_telemetry_slices::{
-    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, set_active_runtime_scope,
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, active_runtime_scope,
+    set_active_runtime_scope,
 };
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
+use crate::match_recorder::MatchLogWriter;
 use crate::realtime::TransformHub;
+use crate::runtime::host_api_spec::{
+    validate_log_level, validate_log_message, validate_log_payload, validate_log_tag,
+    validate_match_result,
+};
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
 use crate::runtime::outbound_http::{
     AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
@@ -148,6 +154,8 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "telemetry.begin",
     "telemetry.mark",
     "telemetry.finish",
+    "log.write",
+    "match.set_result",
 ];
 
 /// The Python-side `citadel` module. Keeping this in Python avoids Rust-side
@@ -323,6 +331,27 @@ def log(message, level="info"):
         logger.error(str(message))
     else:
         logger.info(str(message))
+
+def _log_write(level, tag, message, payload_json=None):
+    """Persist one durable log line, match-scoped when the caller is."""
+    if "_match_log_bridge" not in globals():
+        raise RuntimeError("durable logs are unavailable")
+    _match_log_bridge.write(
+        str(level), str(tag), str(message),
+        None if payload_json is None else str(payload_json))
+
+# `citadel.log` keeps its volatile behaviour; `citadel.log.write` is the durable
+# stream, hung off the same name because a Python function is already an object.
+log.write = _log_write
+
+class _Match:
+    """The server owns match open and close; a script may only stamp a result."""
+    def set_result(self, result_json):
+        if "_match_log_bridge" not in globals():
+            raise RuntimeError("durable logs are unavailable")
+        return _match_log_bridge.set_result(str(result_json))
+
+match = _Match()
 
 class _Http:
     def fetch(self, url, opts=None):
@@ -953,6 +982,46 @@ impl TelemetrySlicesHandle {
             .finish(context, SystemClock.now().unix_millis())
             .map(|_| ())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+/// PyO3 wrapper exposing the durable log/result writer to Python scripts.
+///
+/// It carries no match lifecycle: the server opens and closes a match, and a
+/// script can only append a line or stamp a result on the one it is playing.
+#[pyclass]
+struct MatchLogHandle {
+    writer: Arc<MatchLogWriter>,
+}
+
+#[pymethods]
+impl MatchLogHandle {
+    fn write(
+        &self,
+        level: &str,
+        tag: &str,
+        message: &str,
+        payload_json: Option<&str>,
+    ) -> PyResult<()> {
+        let level = validate_log_level(level).map_err(PyRuntimeError::new_err)?;
+        let tag = validate_log_tag(tag).map_err(PyRuntimeError::new_err)?;
+        let message = validate_log_message(message).map_err(PyRuntimeError::new_err)?;
+        let payload = payload_json
+            .map(validate_log_payload)
+            .transpose()
+            .map_err(PyRuntimeError::new_err)?;
+        // Match scope is optional: a line written outside a match-scoped
+        // callback is stored with no match, never refused.
+        self.writer
+            .write(active_runtime_scope(), level, tag, message, payload);
+        Ok(())
+    }
+
+    fn set_result(&self, result_json: &str) -> PyResult<()> {
+        let result_json = validate_match_result(result_json).map_err(PyRuntimeError::new_err)?;
+        self.writer
+            .set_result(active_runtime_scope(), result_json.to_owned())
+            .map_err(|error| PyRuntimeError::new_err(error.message()))
     }
 }
 
@@ -1767,6 +1836,8 @@ pub struct PythonRuntime {
     maps: Option<Arc<MapCatalog>>,
     transform_hub: Option<Arc<TransformHub>>,
     telemetry_slices: Option<Arc<TelemetrySliceService>>,
+    /// Durable log/result write handle retained across hot reload.
+    match_log: Option<Arc<MatchLogWriter>>,
     /// Where this runtime's authoritative-bridge answers land (the gateway),
     /// held weakly. Lives on the runtime so it survives a hot-reload swap.
     bridge_sink: Mutex<Option<Weak<dyn BridgeCommandSink>>>,
@@ -1880,6 +1951,7 @@ impl PythonRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         }))
     }
@@ -1926,6 +1998,7 @@ impl PythonRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1973,6 +2046,7 @@ impl PythonRuntime {
             maps: None,
             transform_hub: None,
             telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -2004,6 +2078,18 @@ impl PythonRuntime {
         {
             let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
             apply_telemetry_slices(&guard.citadel, &self.telemetry_slices);
+        }
+        self
+    }
+
+    /// Attach the durable log/result write handle behind `citadel.log.write`
+    /// and `citadel.match.set_result`.
+    #[must_use]
+    pub fn with_match_log(mut self, writer: Arc<MatchLogWriter>) -> Self {
+        self.match_log = Some(writer);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_match_log(&guard.citadel, &self.match_log);
         }
         self
     }
@@ -2115,6 +2201,7 @@ impl PythonRuntime {
             }
         };
         apply_telemetry_slices(&fresh.citadel, &self.telemetry_slices);
+        apply_match_log(&fresh.citadel, &self.match_log);
         if !vm_has_any_handler(&fresh) {
             tracing::warn!(
                 script = %label,
@@ -2853,6 +2940,22 @@ fn apply_telemetry_slices(citadel: &Py<PyModule>, slices: &Option<Arc<TelemetryS
                 },
             ) {
                 tracing::warn!(error = %e, "failed to set telemetry slices bridge on python module");
+            }
+        });
+    }
+}
+
+/// Apply the durable log/result write bridge to a freshly-built VM.
+fn apply_match_log(citadel: &Py<PyModule>, writer: &Option<Arc<MatchLogWriter>>) {
+    if let Some(writer) = writer {
+        Python::attach(|py| {
+            if let Err(e) = citadel.bind(py).setattr(
+                "_match_log_bridge",
+                MatchLogHandle {
+                    writer: Arc::clone(writer),
+                },
+            ) {
+                tracing::warn!(error = %e, "failed to set match log bridge on python module");
             }
         });
     }
@@ -3756,6 +3859,91 @@ mod tests {
 
     fn runtime(src: &str) -> PythonRuntime {
         PythonRuntime::from_source(src, "test.py", 100).expect("python runtime loads")
+    }
+
+    fn match_log_writer(
+        capacity: usize,
+    ) -> (
+        Arc<crate::match_recorder::MatchRecorder>,
+        Arc<MatchLogWriter>,
+    ) {
+        let writer = Arc::new(crate::durable_logs::DurableLogWriter::new(
+            Arc::new(crate::ids::NodeIdentity::new("node-python")),
+            crate::config::LogsConfig::default(),
+        ));
+        let recorder = Arc::new(crate::match_recorder::MatchRecorder::with_capacity(
+            writer, capacity,
+        ));
+        let log = Arc::new(MatchLogWriter::new(Arc::clone(&recorder)));
+        (recorder, log)
+    }
+
+    #[test]
+    fn log_write_persists_a_line_and_leaves_the_plain_log_callable() {
+        let (recorder, log) = match_log_writer(8);
+        recorder.bind(7, "mt1-py".to_owned());
+        let runtime = runtime(
+            r#"
+import citadel
+import json
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    citadel.log("still a plain logging call")
+    citadel.log.write("WARN", "combat.hit", "  round over  ", json.dumps({"dmg": 3}))
+    citadel.log.write("info", "world", "no payload")
+"#,
+        )
+        .with_match_log(log);
+
+        assert!(
+            runtime
+                .dispatch_in_room(7, Some("user-7"), 7, 1, b"")
+                .is_empty()
+        );
+        assert_eq!(recorder.writer().queued_total(), 2);
+    }
+
+    #[test]
+    fn log_write_refuses_a_malformed_argument_and_set_result_needs_a_match() {
+        let (_recorder, log) = match_log_writer(8);
+        let runtime = runtime(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    failures = []
+
+    def refuse(fn):
+        try:
+            fn()
+            failures.append("accepted")
+        except RuntimeError as error:
+            failures.append("false:" + str(error))
+
+    refuse(lambda: citadel.log.write("nope", "world", "hi"))
+    refuse(lambda: citadel.log.write("info", "Bad Tag", "hi"))
+    refuse(lambda: citadel.log.write("info", "world", "   "))
+    refuse(lambda: citadel.log.write("info", "world", "hi", "not json"))
+    refuse(lambda: citadel.match.set_result('{"winner":"a"}'))
+    citadel.broadcast(2, "\n".join(failures).encode("utf-8"), True)
+"#,
+        )
+        .with_match_log(log);
+
+        let commands = runtime.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            panic!("expected a broadcast command");
+        };
+        let report = String::from_utf8_lossy(body);
+        assert_eq!(report.matches("false:").count(), 5, "{report}");
+        assert!(!report.contains("accepted"), "{report}");
+        assert!(report.contains("log level must be one of"));
+        assert!(report.contains("log tag must be"));
+        assert!(report.contains("log message must be 1-1024 bytes"));
+        assert!(report.contains("payload_json must be a JSON object or array"));
+        assert!(report.contains("match results require a match-scoped context"));
     }
 
     #[test]

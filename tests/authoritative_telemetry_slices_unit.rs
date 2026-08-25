@@ -10,10 +10,37 @@ use authoritative_decision_telemetry::{
     AuthoritativeDecisionRecorder,
 };
 use authoritative_telemetry_slices::{
-    RuntimeScopeGuard, TelemetrySliceContext, TelemetrySlicePolicy, TelemetrySliceService,
-    active_runtime_context, set_active_runtime_scope,
+    ClosedTelemetrySliceReport, RuntimeScopeGuard, TelemetrySliceContext, TelemetrySlicePolicy,
+    TelemetrySliceService, TelemetrySliceSink, active_runtime_context, set_active_runtime_scope,
+    valid_report_id,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// A durable sink stands in for `crate::telemetry_slice_persistence`, which this
+/// binary cannot reach: the module under test is compiled standalone through
+/// `#[path]`, so `crate::` resolves to this test binary and not to the server.
+#[derive(Debug, Default)]
+struct RecordingSink {
+    published: Mutex<Vec<(String, &'static str, u64)>>,
+}
+
+impl RecordingSink {
+    fn published(&self) -> Vec<(String, &'static str, u64)> {
+        self.published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl TelemetrySliceSink for RecordingSink {
+    fn publish(&self, report: &ClosedTelemetrySliceReport, correlation: u64) {
+        self.published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((report.report_id.clone(), report.close_reason, correlation));
+    }
+}
 
 #[test]
 fn closed_slice_is_redacted_and_derived_from_its_context_decisions() {
@@ -178,4 +205,82 @@ fn runtime_scope_guard_overrides_and_restores_a_prior_scope() {
         "unwinding a lifecycle callback must restore the previous scope"
     );
     set_active_runtime_scope(None);
+}
+
+#[test]
+fn report_ids_are_salted_so_two_nodes_never_mint_the_same_id() {
+    let policy = TelemetrySlicePolicy::new(1, 1, 10_000, 4).expect("bounded policy");
+    let mint = |salt: u16| {
+        let service =
+            TelemetrySliceService::new(Arc::new(AuthoritativeDecisionRecorder::new(1)), policy)
+                .with_identity(salt);
+        let context = TelemetrySliceContext::scope_context(1);
+        service.begin(context, 1_700_000_000_000).expect("begin");
+        service
+            .finish(context, 1_700_000_000_100)
+            .expect("finish")
+            .report_id
+    };
+    // Two boots of two nodes at the same millisecond, each on its first report:
+    // every component of the id is identical except the salt.
+    let first = mint(0x0001);
+    let second = mint(0xfffe);
+    assert_ne!(first, second, "a shared close time must not mint one id");
+    assert_eq!(first.len(), 34);
+    assert!(first.starts_with("ats1-"));
+    assert_eq!(
+        &first[5..18],
+        &second[5..18],
+        "close time leads, so lexicographic order stays chronological"
+    );
+    assert_eq!(&first[18..22], "0001");
+    assert_eq!(&second[18..22], "fffe");
+    assert_eq!(
+        &first[22..],
+        &second[22..],
+        "the per-boot sequence restarts at the same value, which is why the salt exists"
+    );
+    assert!(valid_report_id(&first));
+    // The pre-salt shape was `ats1-` plus 24 hex digits and must no longer pass.
+    assert!(!valid_report_id("ats1-000000000000000000000000"));
+}
+
+#[test]
+fn every_close_reaches_the_durable_sink_with_its_private_correlation() {
+    let sink = Arc::new(RecordingSink::default());
+    let service = TelemetrySliceService::new(
+        Arc::new(AuthoritativeDecisionRecorder::new(4)),
+        TelemetrySlicePolicy::new(1, 1, 50, 4).expect("bounded policy"),
+    )
+    .with_identity(0xbeef)
+    .with_sink(Arc::clone(&sink) as Arc<dyn TelemetrySliceSink>);
+    let context = TelemetrySliceContext::match_context(9);
+    service.begin(context, 10).expect("begin");
+    assert!(
+        sink.published().is_empty(),
+        "an open slice is in-process state and must publish nothing"
+    );
+    let finished = service.finish(context, 20).expect("finish");
+    // A server-closed slice publishes too: the reaper is the only thing that
+    // closes an abandoned match, and its reports are the ones worth keeping.
+    service.begin(context, 30).expect("begin again");
+    service.reap(200);
+    let published = sink.published();
+    assert_eq!(published.len(), 2);
+    assert_eq!(published[0].0, finished.report_id);
+    assert_eq!(published[0].1, "finished");
+    assert_eq!(published[1].1, "ttl");
+    for (_, _, correlation) in &published {
+        assert_eq!(
+            *correlation, 9,
+            "the sink is the only place a slice's correlation is visible"
+        );
+    }
+    assert!(
+        service
+            .list_closed(8)
+            .iter()
+            .all(|report| report.report_id.starts_with("ats1-")),
+        "publishing does not change what an operator reads"
+    );
 }

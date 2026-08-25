@@ -110,6 +110,11 @@ pub enum ApiKeyScope {
     PurchasesRead,
     #[serde(rename = "subscriptions:read")]
     SubscriptionsRead,
+    // Appended, never inserted: `validate_scopes` requires a stored scope
+    // vector to be strictly ascending by this derived `Ord`, so a variant added
+    // in the middle would invalidate every vector already in the database.
+    #[serde(rename = "logs:read")]
+    LogsRead,
 }
 
 impl ApiKeyScope {
@@ -132,6 +137,7 @@ impl ApiKeyScope {
             Self::TournamentsRead => "tournaments:read",
             Self::PurchasesRead => "purchases:read",
             Self::SubscriptionsRead => "subscriptions:read",
+            Self::LogsRead => "logs:read",
         }
     }
 
@@ -153,6 +159,7 @@ impl ApiKeyScope {
             "tournaments:read" => Ok(Self::TournamentsRead),
             "purchases:read" => Ok(Self::PurchasesRead),
             "subscriptions:read" => Ok(Self::SubscriptionsRead),
+            "logs:read" => Ok(Self::LogsRead),
             _ => Err(AppError::validation("unsupported API key scope")),
         }
     }

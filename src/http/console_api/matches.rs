@@ -228,6 +228,7 @@ mod tests {
     fn snapshot(name: Option<&str>, map: &str, mode: &str) -> RoomSnapshot {
         RoomSnapshot {
             id: 1,
+            match_id: "mt1-0000000000001000100000000000a".to_string(),
             name: name.map(str::to_string),
             label: RoomLabel {
                 map: map.to_string(),

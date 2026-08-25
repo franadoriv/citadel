@@ -3,9 +3,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use citadel::config::LogsConfig;
+use citadel::durable_logs::DurableLogWriter;
+use citadel::ids::{NodeIdentity, SHORT_PREFIX_ID_LEN, valid_id};
+use citadel::match_recorder::{MatchLogWriter, MatchRecorder, MatchRecorderError};
 use citadel::observability::NodeMetrics;
 use citadel::realtime::registry::{Outbound, ParticipantIdentity, SessionHandle};
-use citadel::realtime::rooms::JoinError;
+use citadel::realtime::rooms::{JoinError, MATCH_ID_PREFIX};
 use citadel::realtime::{Gateway, ParticipantId, RoomLabel};
 use citadel::runtime::{
     LifecycleHook, NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext,
@@ -151,6 +155,21 @@ fn register_authenticated(
         }),
     });
     (id, receiver)
+}
+
+/// A gateway wired to a recorder whose writer has no repository behind it: the
+/// queue is the observable, which is exactly what the funnel must fill.
+fn recorded_gateway() -> (Gateway, Arc<MatchRecorder>) {
+    let recorder = Arc::new(MatchRecorder::new(Arc::new(DurableLogWriter::new(
+        Arc::new(NodeIdentity::new("native-match-node")),
+        LogsConfig::default(),
+    ))));
+    let gateway = Gateway::with_metrics_and_runtime(
+        Arc::new(NodeMetrics::new()),
+        Some(Arc::new(RecordingRuntime::default())),
+    )
+    .with_match_recorder(Arc::clone(&recorder));
+    (gateway, recorder)
 }
 
 fn matchmaker_rpc(request_id: u64, method: &str, body: serde_json::Value) -> Envelope {
@@ -430,5 +449,165 @@ fn matchmaker_birth_and_admission_dispatch_native_lifecycle_once() {
             NativeMatchLifecycleHook::Join,
             NativeMatchLifecycleHook::Join,
         ]
+    );
+}
+
+#[test]
+fn the_gateway_opens_and_closes_a_durable_record_for_every_match() {
+    let (gateway, recorder) = recorded_gateway();
+    let first = register(&gateway);
+    let second = register(&gateway);
+
+    let room = gateway
+        .create_room(RoomLabel::with_map("arena"))
+        .expect("recording runtime supports lifecycle");
+    let match_id = recorder
+        .match_id_of(room)
+        .expect("Created binds the room to its durable match before any handler runs");
+    assert!(valid_id(&match_id, MATCH_ID_PREFIX, SHORT_PREFIX_ID_LEN));
+    assert_eq!(
+        gateway
+            .room_snapshot()
+            .first()
+            .map(|snapshot| snapshot.match_id.clone()),
+        Some(match_id.clone()),
+        "the room carries the identity its record is keyed by"
+    );
+    assert_eq!(
+        recorder.writer().queued_total(),
+        1,
+        "room birth queues exactly one open"
+    );
+
+    gateway.join_room(first, room).unwrap();
+    gateway.join_room(second, room).unwrap();
+    let entry = recorder.entry(room).expect("the match is still open");
+    assert_eq!(entry.match_id, match_id, "a live match never changes key");
+    assert_eq!(entry.join_total, 2);
+    assert_eq!(
+        entry.peak_participants, 2,
+        "the watermark counts local plus remote membership, not the context's participants"
+    );
+
+    gateway.close_match(room);
+    assert_eq!(
+        recorder.match_id_of(room),
+        None,
+        "Ended releases the directory row only after the handler returned"
+    );
+    assert_eq!(
+        recorder.writer().queued_total(),
+        2,
+        "the close joins the open; no lifecycle transition queues anything else"
+    );
+}
+
+#[test]
+fn every_room_is_recorded_under_its_own_identity_and_final_departure_closes_it() {
+    let (gateway, recorder) = recorded_gateway();
+    let participant = register(&gateway);
+
+    let first = gateway
+        .create_room(RoomLabel::with_map("first"))
+        .expect("recording runtime supports lifecycle");
+    let second = gateway
+        .create_room(RoomLabel::with_map("second"))
+        .expect("recording runtime supports lifecycle");
+    let first_id = recorder.match_id_of(first).expect("first is tracked");
+    let second_id = recorder.match_id_of(second).expect("second is tracked");
+    assert_ne!(
+        first_id, second_id,
+        "a per-process room counter is not an identity; the minted id is"
+    );
+    assert_eq!(recorder.len(), 2);
+
+    gateway.join_room(participant, first).unwrap();
+    gateway.join_room(participant, second).unwrap();
+    assert_eq!(
+        recorder.match_id_of(first),
+        None,
+        "emptying a room is a final departure, and the server closes its record"
+    );
+    assert_eq!(
+        recorder.match_id_of(second).as_deref(),
+        Some(second_id.as_str()),
+        "the room the participant moved into stays open"
+    );
+    assert_eq!(
+        recorder.writer().queued_total(),
+        3,
+        "two opens and the one close"
+    );
+}
+
+#[test]
+fn a_script_result_is_stamped_only_while_the_server_owned_match_is_open() {
+    let (gateway, recorder) = recorded_gateway();
+    let participant = register(&gateway);
+    let room = gateway
+        .create_room(RoomLabel::with_map("arena"))
+        .expect("recording runtime supports lifecycle");
+    gateway.join_room(participant, room).unwrap();
+
+    let writer = MatchLogWriter::new(Arc::clone(&recorder));
+    writer
+        .set_result(Some(room), r#"{"winner":"kitsune"}"#.to_owned())
+        .expect("an open match accepts its own result");
+    assert_eq!(
+        recorder
+            .entry(room)
+            .and_then(|entry| entry.result_json)
+            .as_deref(),
+        Some(r#"{"winner":"kitsune"}"#),
+        "the result is held until the server writes the close it belongs to"
+    );
+
+    gateway.close_match(room);
+    assert_eq!(
+        writer.set_result(Some(room), "{}".to_owned()),
+        Err(MatchRecorderError::NoActiveMatch),
+        "game code can neither reopen a closed match nor rewrite its record"
+    );
+    assert_eq!(
+        writer.set_result(None, "{}".to_owned()),
+        Err(MatchRecorderError::NoActiveMatch),
+        "a result outside a match-scoped callback has no row to land on"
+    );
+}
+
+#[test]
+fn a_gateway_without_a_recorder_drives_the_lifecycle_unchanged() {
+    let runtime = Arc::new(RecordingRuntime::default());
+    let gateway =
+        Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime.clone()));
+    let participant = register(&gateway);
+    let room = gateway
+        .create_room(RoomLabel::with_map("arena"))
+        .expect("recording runtime supports lifecycle");
+    gateway.join_room(participant, room).unwrap();
+    for snapshot in gateway.room_snapshot() {
+        assert!(
+            valid_id(&snapshot.match_id, MATCH_ID_PREFIX, SHORT_PREFIX_ID_LEN),
+            "a room always mints an identity, even where nothing records it"
+        );
+    }
+    gateway.close_match(room);
+
+    assert_eq!(
+        runtime
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(hook, _)| *hook)
+            .collect::<Vec<_>>(),
+        vec![
+            NativeMatchLifecycleHook::Created,
+            NativeMatchLifecycleHook::Started,
+            NativeMatchLifecycleHook::Join,
+            NativeMatchLifecycleHook::Leave,
+            NativeMatchLifecycleHook::Ended,
+        ],
+        "durable recording is additive: a node with no durable store is byte for byte unchanged"
     );
 }

@@ -6,15 +6,22 @@
 //! handler execution; mutation and human-read entries remain explicit in their
 //! owning handlers.
 //!
-//! The log is a bounded in-process ring: the newest [`AuditLog::capacity`]
-//! entries are kept, older ones are dropped, and a node restart clears it.
-//! Durable audit persistence is recorded technical debt.
+//! Every entry lands in a bounded in-process ring — the newest
+//! [`AuditLog::capacity`] entries, oldest evicted — and, on a node whose
+//! backend stores one, in a durable trail behind an [`AuditSink`]. The ring is
+//! never switched off: it answers a read on every backend, and it is the whole
+//! trail on the in-memory and MongoDB ones, where a restart clears it.
+//!
+//! [`AuditLog::record`] and [`AuditLog::list`] stay synchronous because their
+//! callers cannot await — one of them is a `map_err` closure. Publishing to the
+//! sink is therefore an enqueue onto a bounded queue, never a database write,
+//! and an acknowledged record means only that it entered that queue.
 //!
 //! Entries must never carry secrets: passwords, tokens, and raw payloads stay
 //! out of `details` by construction at every call site.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
@@ -51,6 +58,14 @@ pub struct AuditEntry {
     pub target: String,
     /// Sanitized, human-readable summary. Never carries secrets.
     pub details: String,
+    /// Optional durable match reference.
+    ///
+    /// Operator actions are deliberately exempt from being forced into a match,
+    /// so this is `None` at every console call site; it exists for the entries a
+    /// match-scoped subsystem records. Declared last and skipped when absent, so
+    /// an entry without one serializes exactly as it did before this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_id: Option<String>,
 }
 
 impl AuditEntry {
@@ -80,6 +95,7 @@ impl AuditEntry {
             action: action.into(),
             target: target.into(),
             details: details.into(),
+            match_id: None,
         }
     }
 
@@ -116,7 +132,15 @@ impl AuditEntry {
             action: action.into(),
             target: target.into(),
             details: details.into(),
+            match_id: None,
         }
+    }
+
+    /// Attach a durable match reference to an entry that has one.
+    #[must_use]
+    pub fn with_match_id(mut self, match_id: impl Into<String>) -> Self {
+        self.match_id = Some(match_id.into());
+        self
     }
 }
 
@@ -127,16 +151,36 @@ pub struct AuditFilter {
     pub actor: Option<String>,
     /// Action prefix match (`storage` matches `storage.write`).
     pub action: Option<String>,
+    /// Exact durable match reference. `None` matches every entry, including the
+    /// ones recorded outside a match — an operator action is never forced into
+    /// one.
+    pub match_id: Option<String>,
     /// Maximum entries returned (newest first). `0` means no explicit limit;
     /// reads are always bounded by the ring capacity.
     pub limit: usize,
 }
 
-/// A bounded, in-process, newest-first audit ring.
+/// Durable destination for the console trail.
+///
+/// Declared here so [`AuditLog::record`] keeps its synchronous signature: the
+/// implementation is a bounded write-behind queue, so `publish` enqueues and
+/// returns rather than awaiting a database round trip.
+pub trait AuditSink: Send + Sync + std::fmt::Debug {
+    /// Hand one recorded entry to the durable trail.
+    ///
+    /// `match_id` repeats `entry.match_id` so a sink that stores the reference
+    /// in its own column does not have to reach into the entry for it. This
+    /// must never block, await, or fail the caller.
+    fn publish(&self, entry: &AuditEntry, match_id: Option<&str>);
+}
+
+/// A bounded, in-process, newest-first audit ring with an optional durable
+/// sink. The ring answers every read; the sink is what survives a restart.
 #[derive(Debug)]
 pub struct AuditLog {
     capacity: usize,
     entries: Mutex<VecDeque<AuditEntry>>,
+    sink: Option<Arc<dyn AuditSink>>,
 }
 
 impl Default for AuditLog {
@@ -152,7 +196,22 @@ impl AuditLog {
         Self {
             capacity: capacity.max(1),
             entries: Mutex::new(VecDeque::new()),
+            sink: None,
         }
+    }
+
+    /// Publish every recorded entry to `sink` as well as to the ring.
+    #[must_use]
+    pub fn with_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Whether a durable trail is attached. The console reports it so an
+    /// operator is never shown a process-local ring as durable history.
+    #[must_use]
+    pub fn has_sink(&self) -> bool {
+        self.sink.is_some()
     }
 
     /// The retention bound.
@@ -163,11 +222,33 @@ impl AuditLog {
 
     /// Record one entry, evicting the oldest beyond [`Self::capacity`].
     pub fn record(&self, entry: AuditEntry) {
-        let mut entries = self.lock();
-        if entries.len() == self.capacity {
-            entries.pop_front();
+        self.record_for_match(entry, None);
+    }
+
+    /// Record one entry against a durable match reference.
+    ///
+    /// An explicit `match_id` overrides whatever the entry carried; passing
+    /// `None` keeps the entry's own, so a caller that built the reference into
+    /// the entry does not have to repeat it here.
+    pub fn record_for_match(&self, entry: AuditEntry, match_id: Option<&str>) {
+        let mut entry = entry;
+        if let Some(match_id) = match_id {
+            entry.match_id = Some(match_id.to_string());
         }
-        entries.push_back(entry);
+        if let Some(sink) = &self.sink {
+            sink.publish(&entry, entry.match_id.as_deref());
+        }
+        self.push(entry);
+    }
+
+    /// Record one entry in the ring only, never in the durable trail.
+    ///
+    /// This is for the central `console.read` a machine credential leaves when
+    /// it reads the trail itself: in a ring that entry evicts, but a durable
+    /// row per poll would be an unbounded, self-feeding write whose only reader
+    /// is the poller that produced it.
+    pub fn record_volatile(&self, entry: AuditEntry) {
+        self.push(entry);
     }
 
     /// Read entries newest-first, applying `filter`.
@@ -194,6 +275,12 @@ impl AuditLog {
                     .as_ref()
                     .is_none_or(|action| entry.action.starts_with(action.as_str()))
             })
+            .filter(|entry| {
+                filter
+                    .match_id
+                    .as_ref()
+                    .is_none_or(|match_id| entry.match_id.as_deref() == Some(match_id.as_str()))
+            })
             .take(limit)
             .cloned()
             .collect()
@@ -209,6 +296,15 @@ impl AuditLog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    /// Append to the ring, evicting the oldest beyond [`Self::capacity`].
+    fn push(&self, entry: AuditEntry) {
+        let mut entries = self.lock();
+        if entries.len() == self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
     }
 
     /// Lock the ring, recovering from a poisoned lock: the deque holds no
@@ -271,6 +367,7 @@ mod tests {
             actor: Some("ops".to_string()),
             action: Some("storage".to_string()),
             limit: 0,
+            ..AuditFilter::default()
         };
         let hits = log.list(&filter);
         assert_eq!(hits.len(), 1);
@@ -307,5 +404,106 @@ mod tests {
         assert_eq!(value["actor"], "ops");
         assert_eq!(value["role"], "admin");
         assert_eq!(value["action"], "console.login");
+        assert!(
+            value.get("match_id").is_none(),
+            "an entry outside a match serializes exactly as it did before the field existed"
+        );
+    }
+
+    /// Records what a durable sink was handed, in order.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        published: Mutex<Vec<(AuditEntry, Option<String>)>>,
+    }
+
+    impl RecordingSink {
+        fn published(&self) -> Vec<(AuditEntry, Option<String>)> {
+            self.published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl AuditSink for RecordingSink {
+        fn publish(&self, entry: &AuditEntry, match_id: Option<&str>) {
+            self.published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((entry.clone(), match_id.map(str::to_string)));
+        }
+    }
+
+    #[test]
+    fn a_sink_sees_every_recorded_entry_and_the_ring_still_answers() {
+        let sink = Arc::new(RecordingSink::default());
+        let log = AuditLog::new(10).with_sink(Arc::clone(&sink) as Arc<dyn AuditSink>);
+        assert!(log.has_sink());
+        log.record(entry(1, "ops", "storage.write"));
+        log.record(entry(2, "ops", "accounts.ban"));
+        assert_eq!(log.len(), 2, "durability never replaces the ring");
+        let published = sink.published();
+        assert_eq!(
+            published
+                .iter()
+                .map(|(entry, _)| entry.action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["storage.write", "accounts.ban"],
+            "the sink sees entries oldest-first, as recorded"
+        );
+        assert!(published.iter().all(|(_, match_id)| match_id.is_none()));
+    }
+
+    #[test]
+    fn a_match_scoped_record_stamps_the_entry_and_the_sink_argument() {
+        let sink = Arc::new(RecordingSink::default());
+        let log = AuditLog::new(10).with_sink(Arc::clone(&sink) as Arc<dyn AuditSink>);
+        log.record_for_match(entry(1, "ops", "matchlog.detail"), Some("mt1-abc"));
+        // An entry that already carries a reference keeps it when none is passed.
+        log.record_for_match(
+            entry(2, "ops", "matchlog.entries").with_match_id("mt1-def"),
+            None,
+        );
+        let published = sink.published();
+        assert_eq!(
+            published
+                .iter()
+                .map(|(_, match_id)| match_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("mt1-abc"), Some("mt1-def")]
+        );
+        assert_eq!(
+            published
+                .iter()
+                .map(|(entry, _)| entry.match_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("mt1-abc"), Some("mt1-def")],
+            "the entry and the sink argument never disagree"
+        );
+        let scoped = log.list(&AuditFilter {
+            match_id: Some("mt1-abc".to_string()),
+            ..AuditFilter::default()
+        });
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].action, "matchlog.detail");
+        assert_eq!(
+            log.list(&AuditFilter::default()).len(),
+            2,
+            "an absent match filter matches entries with no match at all"
+        );
+    }
+
+    #[test]
+    fn a_volatile_record_stays_out_of_the_durable_trail() {
+        let sink = Arc::new(RecordingSink::default());
+        let log = AuditLog::new(1_024).with_sink(Arc::clone(&sink) as Arc<dyn AuditSink>);
+        for seq in 1..=100 {
+            log.record_volatile(entry(seq, "poller", "console.read"));
+        }
+        assert_eq!(log.len(), 100, "the ring still holds the read trail");
+        assert!(
+            sink.published().is_empty(),
+            "a credential polling the trail must not write one durable row per poll"
+        );
     }
 }

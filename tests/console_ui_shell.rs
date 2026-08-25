@@ -212,6 +212,7 @@ async fn dashboard_api_keys_section_is_admin_only_and_covers_the_management_life
         "tournaments:read",
         "purchases:read",
         "subscriptions:read",
+        "logs:read",
     ] {
         assert!(
             dashboard.body.contains(scope),
@@ -589,6 +590,179 @@ fn lag_dashboard_rejects_stale_keysets_and_downloads_after_context_changes() {
     assert!(
         output.status.success(),
         "lag stale-context regression failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn dashboard_durable_logs_and_match_records_are_keyset_paged_and_labelled_verbatim() {
+    let (addr, tx, server) = spawn_server(App::new(console_config())).await;
+
+    let dashboard = get(addr, http::DASHBOARD_PATH, None).await;
+    assert_eq!(dashboard.status, 200);
+    for required in [
+        // Both pages join the existing group; neither invents one.
+        "label: 'Logs & Diagnostics'",
+        "{ id: 'logs', title: 'Logs', icon: 'scroll' }",
+        "{ id: 'match-records', title: 'Match Records', icon: 'layers' }",
+        // A NAV id with no SECTIONS entry throws on the first render.
+        "logs: renderLogs,",
+        "'match-records': renderMatchRecords,",
+        // The exact endpoint paths, including the deeper-static drill-down that
+        // matchit accepts after a :param.
+        "'/console/v1/logs?limit='",
+        "'/console/v1/logs/'",
+        "'/console/v1/matchlogs?limit='",
+        "'/console/v1/matchlogs/'",
+        "'/entries?limit='",
+        // Author-supplied columns are labelled as such wherever they render.
+        "Payload is written by your game script and is stored verbatim.",
+        "The result below is written by your game script and is stored verbatim.",
+        // A backend with no durable tables answers 200 with an empty page, and
+        // the page must say so instead of implying a cache is history.
+        "not durable on this backend",
+        "dropped before flush",
+        "This backend keeps no durable log storage",
+        "This backend keeps no durable match records.",
+        // The drill-down's per-domain totals stay exact beside the inline caps.
+        "counts.logs",
+        "counts.telemetry_slices",
+        "counts.lag_reports",
+        "counts.audit",
+        "operator actions are deliberately never forced into a match",
+        // The match filter added to the two pre-existing surfaces.
+        "searchBox('aud-match', 'Filter by match id'",
+        "searchBox('ts-match', 'Filter by match id'",
+        "'Closed', 'Report', 'Match', 'Context'",
+        "fmtNum(page.retained)",
+        "fmtNum(page.capacity)",
+    ] {
+        assert!(
+            dashboard.body.contains(required),
+            "durable log console is missing {required:?}"
+        );
+    }
+
+    // Payload and result text reach the DOM only through esc(); a raw
+    // interpolation of either is the one injection this surface can have.
+    for verbatim in ["entry.payload_json", "record.result_json"] {
+        let escaped = format!("esc(jsonText({verbatim}))");
+        assert!(
+            dashboard.body.contains(&escaped),
+            "author-supplied {verbatim} must be escaped before it reaches the DOM"
+        );
+    }
+
+    // Keyset, not offset: an append-only table paged by offset duplicates and
+    // skips rows as it grows underneath the reader.
+    for (loader, next) in [
+        ("loadLogs", "renderLogsTable"),
+        ("loadMatchRecords", "renderMatchRecordsTable"),
+        ("loadMatchEntries", "renderMatchEntries"),
+        ("loadAudit", "renderAuditTable"),
+        ("loadTelemetrySlices", "renderTelemetrySlicesTable"),
+    ] {
+        let source = function_source(&dashboard.body, loader, next);
+        assert!(
+            source.contains("var viewGeneration = state.viewGeneration;"),
+            "{loader} must snapshot the view generation before requesting"
+        );
+        assert!(
+            source.contains("viewGeneration !== state.viewGeneration"),
+            "{loader} must discard a response that outlived its view"
+        );
+        assert_eq!(
+            source
+                .matches("viewGeneration !== state.viewGeneration")
+                .count(),
+            2,
+            "{loader} must re-check the view generation in both .then and .catch"
+        );
+        assert!(
+            source.contains("var after = reset ? null : "),
+            "{loader} must carry the previous page's cursor, not a row offset"
+        );
+        assert!(
+            source.contains("|| (!reset && !"),
+            "{loader} must refuse to page once the cursor is exhausted"
+        );
+        assert!(
+            !source.contains("offset"),
+            "{loader} must not page an append-only table by offset"
+        );
+    }
+
+    let _ = tx.send(());
+    let _ = server.await;
+}
+
+#[test]
+fn logs_page_rejects_stale_keysets_and_never_pages_past_its_cursor() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dashboard = std::fs::read_to_string(root.join("src/http/assets/console.html"))
+        .expect("read console shell");
+    let is_current = function_source(&dashboard, "logsIsCurrent", "logPath");
+    let path = function_source(&dashboard, "logPath", "renderLogs");
+    let render = function_source(&dashboard, "renderLogs", "loadLogs");
+    let load = function_source(&dashboard, "loadLogs", "renderLogsTable");
+
+    // The harness below re-mounts the page by hand; that is only faithful if
+    // renderLogs really does clear the keyset on every mount.
+    assert!(
+        render
+            .contains("logs.items = []; logs.next = null; logs.loading = false; logs.page = null;"),
+        "renderLogs must clear the keyset so a remount cannot inherit a stale cursor"
+    );
+
+    let mut harness = String::from(
+        "var route = 'logs';\n\
+         var state = { user: { role: 'admin' }, sessionGeneration: 1, viewGeneration: 4 };\n\
+         var logs = { match_id: '', level: '', tag: '', limit: 50, items: [], next: null, loading: false, page: null };\n\
+         function currentRoute() { return route; }\n\
+         function renderLogsTable() {}\n\
+         function fail() {}\n\
+         var pending = [];\n\
+         function api() { return { then: function (resolve) { pending.push(resolve); return { catch: function () {} }; } }; }\n",
+    );
+    harness.push_str(is_current);
+    harness.push_str(path);
+    harness.push_str(load);
+    harness.push_str(
+        "\nloadLogs(true);\n\
+         if (pending.length !== 1) throw new Error('the first page was not requested');\n\
+         loadLogs(true);\n\
+         if (pending.length !== 1) throw new Error('a second request was admitted while one was in flight');\n\
+         state.viewGeneration += 1;\n\
+         logs.items = []; logs.next = null; logs.loading = false; logs.page = null;\n\
+         loadLogs(true);\n\
+         if (pending.length !== 2) throw new Error('the remounted page did not issue its own request');\n\
+         pending[0]({ items: [{ log_id: 'stale' }], next_after: 'stale' });\n\
+         if (logs.items.length !== 0 || logs.next !== null) throw new Error('a stale response mutated the remounted view');\n\
+         pending[1]({ items: [{ log_id: 'fresh' }], next_after: null, durable: true });\n\
+         if (logs.loading || logs.items.length !== 1 || logs.items[0].log_id !== 'fresh') throw new Error('the fresh response was not applied');\n\
+         loadLogs(false);\n\
+         if (pending.length !== 2) throw new Error('paging past the end issued a request');\n\
+         logs.next = 'ml1-cursor';\n\
+         loadLogs(false);\n\
+         if (pending.length !== 3) throw new Error('the next page was not requested');\n\
+         pending[2]({ items: [{ log_id: 'older' }], next_after: null, durable: true });\n\
+         if (logs.items.length !== 2 || logs.items[1].log_id !== 'older') throw new Error('the next page replaced instead of appending');\n\
+         logs.match_id = 'mt1-abc'; logs.level = 'error'; logs.tag = 'combat.round';\n\
+         var filtered = logPath('ml1-cursor');\n\
+         ['/console/v1/logs?limit=50', 'match_id=mt1-abc', 'level=error', 'tag=combat.round', 'after=ml1-cursor'].forEach(function (part) {\n\
+           if (filtered.indexOf(part) < 0) throw new Error('logPath dropped ' + part);\n\
+         });\n\
+         logs.match_id = ''; logs.level = ''; logs.tag = '';\n\
+         if (logPath(null) !== '/console/v1/logs?limit=50') throw new Error('an unfiltered page must send no empty filters');\n",
+    );
+
+    let output = Command::new("node")
+        .args(["--input-type=commonjs", "-e", &harness])
+        .output()
+        .expect("execute logs keyset regression with Node.js");
+    assert!(
+        output.status.success(),
+        "logs keyset regression failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

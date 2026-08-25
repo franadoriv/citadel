@@ -43,7 +43,7 @@ pub use crate::repository::ApiKeyScope;
 pub use api_keys::{
     ApiKeyMetadata, ApiKeyPrincipal, ApiKeySecretResponse, ApiKeyService, CreateApiKeyRequest,
 };
-pub use audit::{AuditEntry, AuditFilter, AuditLog, DEFAULT_AUDIT_CAPACITY};
+pub use audit::{AuditEntry, AuditFilter, AuditLog, AuditSink, DEFAULT_AUDIT_CAPACITY};
 pub use chat::{
     ChannelSummary, ChannelType, ChatDeliveryRequest, ChatMessage, ChatService,
     DEFAULT_AUTHOR_DELETE_WINDOW_MS, DEFAULT_AUTHOR_EDIT_WINDOW_MS, DEFAULT_CHANNEL_HISTORY_CAP,

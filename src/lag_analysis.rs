@@ -218,6 +218,14 @@ pub struct LagReport {
     pub windows: Vec<LagTimelineWindow>,
     /// A newer options/analyzer run can identify its immutable predecessor.
     pub supersedes_report_id: Option<String>,
+    /// Optional durable match reference.
+    ///
+    /// Always `None` today: a capture is node-scoped and nothing constructs a
+    /// capture participant carrying a match outside tests, so the column, the
+    /// index, and this read filter ship ahead of a write path. `default` keeps
+    /// every already-stored `report_json` deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_id: Option<String>,
 }
 
 /// Compact report-only capture grouping used by the Console capture keyset.
@@ -798,6 +806,7 @@ pub fn analyze_clag(
             summaries: Vec::new(),
             windows: Vec::new(),
             supersedes_report_id,
+            match_id: None,
         };
     }
     let mut groups = BTreeMap::<ObservationKey, GroupAccumulator>::new();
@@ -880,6 +889,7 @@ pub fn analyze_clag(
         summaries,
         windows,
         supersedes_report_id,
+        match_id: None,
     }
 }
 

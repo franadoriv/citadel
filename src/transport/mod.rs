@@ -464,6 +464,12 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     if let Some(recorder) = app.authoritative_decision_recorder() {
         gateway = gateway.with_authoritative_decision_recorder(recorder);
     }
+    // Also adopts the node identity into the room registry, so a room's minted
+    // `mt1-` id and the `node_id` its row is written under agree. Without this
+    // no durable match record is ever written.
+    if let Some(recorder) = app.match_recorder() {
+        gateway = gateway.with_match_recorder(recorder);
+    }
     if let Some(readiness) = &script_readiness {
         gateway = gateway.with_script_readiness(Arc::clone(readiness));
         // A require_script node runs authoritative matches: enable the gameplay
@@ -781,6 +787,17 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // Expose the gateway to the HTTP surface (console Matches section reads
     // live room state through this seam; ).
     app.attach_realtime_gateway(Arc::clone(&gateway));
+
+    // Durable logging is supervised, never a bare `tokio::spawn`: the shutdown
+    // drain is what keeps the last flush interval of the trail, and a detached
+    // task would not participate in graceful shutdown at all.
+    if let Some(writer) = app.durable_logs() {
+        supervisor.spawn(crate::durable_logs::DurableLogFlushService::new(
+            writer,
+            app.durable_log_repositories(),
+            app.telemetry_slices(),
+        ));
+    }
 
     // The ticket index has a single local leader in this deployment. Keep its
     // 250 ms lifecycle independent from an optional game-script tick so TTL
