@@ -5,8 +5,29 @@ All notable changes to Citadel are documented here. Version numbers follow
 
 ## Unreleased
 
+## [0.11.0] - 2026-08-25
+
 ### Added
 
+- **Scoped machine credentials.** Human administrators can create, rotate, and
+  revoke durable, hash-only `ctdl_k1_` API keys with explicit read scopes. Keys
+  are header-only, return their secret exactly once, and cannot mutate data or
+  manage credentials.
+- **Opt-in lag diagnostics.** The JavaScript SDK can record bounded movement
+  metadata only when application source enables it and a trusted server issues
+  a capture lifecycle. Citadel uses one-use upload grants, private raw retention,
+  and redacted derived reports; it does not claim RTT, one-way latency, or packet
+  loss. SQLite, PostgreSQL, and CockroachDB persist reports; MongoDB supports
+  raw collection only with analysis disabled.
+- **Authoritative match lifecycle, input, and telemetry.** Embedded Lua, Python,
+  and JavaScript runtimes receive server-owned match lifecycle callbacks and
+  protocol-v2 custom match messages through the fenced `citadel.on_input`
+  bridge. Trusted scripts can create bounded context-derived telemetry slices;
+  report identifiers and payload/identity retention remain server controlled.
+- **Receipt-validation foundation.** The console can persist validated purchase
+  records without storing raw receipts. Only deterministic custom development
+  receipts are enabled today; Apple, Google, and Huawei validators remain
+  disabled pending verified provider adapters.
 - **Durable logging, telemetry persistence, and match records.** The console
   action trail, authoritative telemetry slice reports, and a new game-script log
   stream are persisted through a bounded write-behind queue instead of living
