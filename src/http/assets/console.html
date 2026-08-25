@@ -866,7 +866,7 @@ pre.code {
       { id: 'purchases', title: 'Purchases & Subscriptions', icon: 'cart' }
     ]},
     { label: 'Logs & Diagnostics', items: [
-      { id: 'logs', title: 'Logs', icon: 'scroll' },
+      { id: 'logs', title: 'Script Logs', icon: 'scroll' },
       { id: 'match-records', title: 'Match Records', icon: 'layers' },
       { id: 'telemetry-slices', title: 'Telemetry Slices', icon: 'activity' },
       { id: 'lag-diagnostics', title: 'Lag Diagnostics', icon: 'activity' },
@@ -2668,7 +2668,7 @@ pre.code {
     LOG_LEVELS.forEach(function (level) {
       levelOptions += '<option value="' + esc(level) + '"' + (logs.level === level ? ' selected' : '') + '>' + esc(level) + '</option>';
     });
-    setPage(pageHead('Logs', 'The durable log stream your game script writes. Messages and payloads are stored verbatim and are never redacted.')
+    setPage(pageHead('Script Logs', 'The durable log stream your game script writes. Messages and payloads are stored verbatim and are never redacted.')
       + '<div class="toolbar">' + searchBox('log-tag', 'Filter by tag prefix', logs.tag)
       + searchBox('log-match', 'Filter by match id', logs.match_id)
       + '<select class="form-in" id="log-level" style="width:140px" title="level">' + levelOptions + '</select>'

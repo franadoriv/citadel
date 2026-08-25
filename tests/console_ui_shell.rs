@@ -603,7 +603,7 @@ async fn dashboard_durable_logs_and_match_records_are_keyset_paged_and_labelled_
     for required in [
         // Both pages join the existing group; neither invents one.
         "label: 'Logs & Diagnostics'",
-        "{ id: 'logs', title: 'Logs', icon: 'scroll' }",
+        "{ id: 'logs', title: 'Script Logs', icon: 'scroll' }",
         "{ id: 'match-records', title: 'Match Records', icon: 'layers' }",
         // A NAV id with no SECTIONS entry throws on the first render.
         "logs: renderLogs,",
