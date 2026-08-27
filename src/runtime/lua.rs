@@ -259,6 +259,14 @@ pub enum OutboundCommand {
         /// Whether best-effort delivery was requested.
         unreliable: bool,
     },
+    /// Internal match-input acknowledgement request. Generic command execution
+    /// must never materialize this; only a validated bridge batch may do so.
+    SetInputAck {
+        /// Target participant in the current authoritative match.
+        participant: u64,
+        /// Exact last processed input sequence.
+        sequence: u64,
+    },
     /// Spawn a server-owned networked actor (an NPC) with a script-assigned
     /// `object_id`. The gateway places it in the transform world and fans out an
     /// `NA_SPAWN` so every client instantiates the proxy for `archetype`. Movement
@@ -342,6 +350,7 @@ struct Deadline(Option<Instant>);
 enum InvocationMode {
     Normal,
     RealtimeInterceptor,
+    MatchInput,
 }
 
 /// Base object id for server-owned actors (NPCs). Player/presence ids grow from 1,
@@ -1260,6 +1269,20 @@ impl LuaRuntime {
                 };
                 let mut outcomes = Vec::with_capacity(batch.events.len());
                 for event in &batch.events {
+                    set_invocation_mode(
+                        lua,
+                        if matches!(
+                            event.payload,
+                            NormalizedPayload::MatchMessage {
+                                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                                ..
+                            }
+                        ) {
+                            InvocationMode::MatchInput
+                        } else {
+                            InvocationMode::Normal
+                        },
+                    );
                     let ev = build_event_table(lua, batch, event)?;
                     let ret: Value = handler.call(ev)?;
                     let (decision, reply) = parse_input_decision(ret)?;
@@ -1891,6 +1914,10 @@ impl Runtime for LuaRuntime {
         true
     }
 
+    fn supports_match_input_v1(&self) -> bool {
+        true
+    }
+
     fn on_leaderboard_reset(
         &self,
         epoch: &crate::leaderboard_scheduler::ResetEpoch,
@@ -2143,10 +2170,17 @@ fn build_event_table(
         } => {
             t.set("kind", "message")?;
             t.set("message_kind", *kind)?;
+            if *kind == crate::realtime::gateway::KIND_MATCH_INPUT {
+                t.set("participant_id", event.participant.to_string())?;
+            }
             t.set("body", lua.create_string(body)?)?;
             t.set("reliable", *reliable)?;
             if let Some(sequence) = sequence {
-                t.set("sequence", *sequence)?;
+                if *kind == crate::realtime::gateway::KIND_MATCH_INPUT {
+                    t.set("sequence", sequence.to_string())?;
+                } else {
+                    t.set("sequence", *sequence)?;
+                }
             }
         }
         NormalizedPayload::ParticipantJoined => {
@@ -2844,6 +2878,28 @@ fn install_host_api(
             .map_err(|error| mlua::Error::RuntimeError(error.message().to_string()))
     })?;
     match_ns.set("set_result", set_result)?;
+    let set_input_ack = lua.create_function(
+        |lua, (participant, sequence): (mlua::String, mlua::String)| {
+            if !lua
+                .app_data_ref::<InvocationMode>()
+                .is_some_and(|mode| *mode == InvocationMode::MatchInput)
+            {
+                return Err(mlua::Error::RuntimeError(
+                    "match.set_input_ack requires a V1 match-input callback".to_string(),
+                ));
+            }
+            let participant = parse_canonical_u64(&participant, "participant")?;
+            let sequence = parse_canonical_u64(&sequence, "last_processed_sequence")?;
+            push_internal_command(
+                lua,
+                OutboundCommand::SetInputAck {
+                    participant,
+                    sequence,
+                },
+            )
+        },
+    )?;
+    match_ns.set("set_input_ack", set_input_ack)?;
     citadel.set("match", match_ns)?;
 
     let http_api = lua.create_table()?;
@@ -3993,6 +4049,35 @@ fn advance_patrols(lua: &Lua, dt: f32) -> mlua::Result<()> {
     Ok(())
 }
 
+fn parse_canonical_u64(value: &mlua::String, name: &str) -> mlua::Result<u64> {
+    let value = value.to_str()?;
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{name} must be a canonical decimal u64 string"
+        )));
+    }
+    value.parse::<u64>().map_err(|_| {
+        mlua::Error::RuntimeError(format!("{name} must be a canonical decimal u64 string"))
+    })
+}
+
+/// Queue an internal command with no opaque body allocation. These commands are
+/// still subject to the invocation command-count cap and are later converted to
+/// typed bridge commands; generic gateway execution drops them fail closed.
+fn push_internal_command(lua: &Lua, command: OutboundCommand) -> mlua::Result<()> {
+    if let Some(mut sink) = lua.app_data_mut::<CommandSink>() {
+        if sink.commands.len() >= MAX_OUTBOUND_COMMANDS {
+            sink.overflowed = true;
+        } else {
+            sink.commands.push(command);
+        }
+    }
+    Ok(())
+}
+
 /// Validate `body`, build a command via `make`, and push it into the sink.
 ///
 /// Borrows the command sink only for the push and drops the guard immediately,
@@ -4593,6 +4678,57 @@ mod tests {
                 .iter()
                 .any(|report| report.marker_total == 1),
             "the failing batch still closes its own telemetry slice"
+        );
+    }
+
+    #[test]
+    fn match_input_callback_preserves_authenticated_participant_sequence_body_and_ack() {
+        let runtime = runtime(
+            r#"citadel.on_input(function(event)
+                assert(event.kind == "message")
+                assert(event.message_kind == 41)
+                assert(event.participant_id == "1001")
+                assert(event.sequence == "18446744073709551615")
+                assert(event.body == string.char(0, 255, 7))
+                citadel.match.set_input_ack(event.participant_id, event.sequence)
+                return nil
+            end)"#,
+        );
+        let batch = batch_with(vec![NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: Some("authenticated-user".to_owned()),
+            payload: NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: vec![0, 255, 7],
+                reliable: true,
+                sequence: Some(u64::MAX),
+            },
+        }]);
+        let answer = runtime.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.input_outcomes[0].decision, Decision::Accept);
+        assert_eq!(
+            answer.commands,
+            vec![crate::runtime::ScriptCommand::SetInputAck {
+                participant: 1001,
+                sequence: u64::MAX,
+            }]
+        );
+    }
+
+    #[test]
+    fn match_input_ack_fails_closed_outside_explicit_match_input_event() {
+        let runtime = runtime(
+            r#"citadel.on_input(function()
+                citadel.match.set_input_ack("1001", "77")
+                return nil
+            end)"#,
+        );
+        assert!(
+            runtime
+                .evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none(),
+            "a generic normalized event may not manufacture a match-input acknowledgement"
         );
     }
 
@@ -5481,6 +5617,7 @@ mod tests {
             "on_input",
             "broadcast",
             "send",
+            "match.set_input_ack",
             "spawn_actor",
             "move_actor",
             "despawn_actor",

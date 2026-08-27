@@ -229,6 +229,17 @@ pub const HOST_API_SURFACE: &[HostApiFn] = &[
         since: "pre-1.0",
     },
     HostApiFn {
+        name: "match.set_input_ack",
+        category: HostApiCategory::Action,
+        params: &[
+            "participant:canonical_u64_string",
+            "last_processed_sequence:canonical_u64_string",
+        ],
+        returns: "void",
+        status: HostApiStatus::Shipped,
+        since: "unreleased",
+    },
+    HostApiFn {
         name: "spawn_actor",
         category: HostApiCategory::Action,
         params: &["opts:{archetype:u16?,x:f32?,y:f32?,z:f32?}"],

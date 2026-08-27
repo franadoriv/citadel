@@ -25,6 +25,7 @@ pub mod bits;
 pub mod codec;
 pub mod diagnostics;
 pub mod interest;
+pub mod match_input;
 pub mod na;
 pub mod netpeer;
 pub mod protocol;

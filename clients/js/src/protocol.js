@@ -73,6 +73,11 @@ export const KIND_DIAG_FLUSH = 38;
 /** Client-to-server capture lifecycle/status counters. */
 export const KIND_DIAG_STATUS = 39;
 
+/** Client-to-server explicit native-match input: V1 sequence + opaque game bytes. */
+export const KIND_MATCH_INPUT = 41;
+/** Server-to-client private acknowledgement of processed native-match input. */
+export const KIND_MATCH_INPUT_ACK = 42;
+
 // Reserved-range bounds (inclusive), for callers that want to test membership.
 export const TSYNC_KIND_MIN = 7;
 export const TSYNC_KIND_MAX = 12;

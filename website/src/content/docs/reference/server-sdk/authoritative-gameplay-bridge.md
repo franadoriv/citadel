@@ -98,7 +98,50 @@ issues the usual generation, clock-epoch, tick, and batch fences before calling
 dropped before runtime execution. `join` and `leave` remain planned.
 :::
 
-## Decisions
+:::note[Explicit match input V1]
+`KIND_MATCH_INPUT` is a reserved reliable client-to-server envelope for one
+native authoritative match. Its V1 body is a one-byte version followed by the
+client's `u64` input sequence and up to 64 KiB of opaque game bytes. Malformed,
+oversized, unreliable, roomless, stale-binding, or non-member frames are
+dropped before a script runs; the raw body is never logged by this route.
+
+The bridge delivers it as a `message` event with
+`message_kind == KIND_MATCH_INPUT`. `participant_id` and `sequence` are
+canonical decimal strings so Lua, JavaScript, and Python preserve the complete
+`u64` range. `participant_id` is transport-authenticated and `match_id` remains
+server-owned. The sequence is supplied by the client and is delivered exactly;
+game logic can retain it per `participant_id` to distinguish fresh, duplicate,
+and out-of-order input. Citadel never substitutes a transport frame counter.
+
+Within that callback only, `citadel.match.set_input_ack(participant_id,
+sequence)` queues a reliable private acknowledgement for that same currently
+validated native room. It accepts canonical decimal strings, never exposes an
+ACK to another participant, and is discarded if leave, reconnect, close, reload,
+or room succession changes the target scope before materialization. Client-sent
+ACK frames are reserved and dropped. Admission is also bounded by the operator's
+`[runtime.bridge]` per-match and node-wide pending-batch caps, plus
+per-participant message/minute and opaque byte/minute limits; an exhausted limit
+drops the new input without invoking the runtime or retaining its body.
+:::
+
+### Lua example
+
+```lua
+citadel.on_input(function(event)
+  if event.kind ~= "message" or event.message_kind ~= 41 then
+    return nil
+  end
+
+  -- `body` is opaque bytes; these identifiers are exact decimal strings.
+  local sequence = event.sequence
+  local participant_id = event.participant_id
+  -- Apply only game-owned simulation here. Keep per-participant sequence state
+  -- if the game needs to reject a duplicate or stale input.
+  citadel.match.set_input_ack(participant_id, sequence)
+  return nil
+end)
+```
+
 
 The handler returns one **decision** per event. The bridge collects all
 decisions into a fenced answer for Rust to validate and materialize:

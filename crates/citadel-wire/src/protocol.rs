@@ -211,6 +211,14 @@ pub const KIND_DIAG_START: u16 = 37;
 pub const KIND_DIAG_FLUSH: u16 = 38;
 /// Lag-diagnostics client progress/terminal status (`C→S`, reliable).
 pub const KIND_DIAG_STATUS: u16 = 39;
+/// Browser-to-server explicit game-defined input for one native authoritative
+/// match (`C→S`, reliable). The V1 body is `version, sequence, opaque body`.
+/// The gateway derives identity and match scope; clients cannot name either.
+pub const KIND_MATCH_INPUT: u16 = 41;
+/// Private server acknowledgement of a participant's processed input sequence
+/// (`S→C`, reliable). The gateway enqueues it only while the target remains in
+/// the authoritative match scope.
+pub const KIND_MATCH_INPUT_ACK: u16 = 42;
 
 // Compile-time guarantees that the reserved ranges are disjoint and sit above the
 // legacy kinds (1..=6). A future edit that overlaps them fails to build rather
@@ -240,6 +248,8 @@ const _: () = assert!(KIND_MATCH_CLOSED > KIND_TSYNC_V2_INPUT);
 const _: () = assert!(KIND_ROOM_REJECT > KIND_MATCH_CLOSED);
 const _: () = assert!(KIND_DIAG_SERVER_TIME == KIND_ROOM_REJECT + 1);
 const _: () = assert!(KIND_DIAG_STATUS == KIND_DIAG_SERVER_TIME + 5);
+const _: () = assert!(KIND_MATCH_INPUT == KIND_DIAG_STATUS + 2);
+const _: () = assert!(KIND_MATCH_INPUT_ACK == KIND_MATCH_INPUT + 1);
 
 /// [`KIND_AUTH_RESULT`] status: the token validated; the connection is bound to
 /// the `user_id` that follows in the body.

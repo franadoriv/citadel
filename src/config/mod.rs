@@ -1193,6 +1193,15 @@ pub struct BridgeConfig {
     pub max_persist_ops: usize,
     /// Max schedule ops per batch.
     pub max_schedule_ops: usize,
+    /// Max bridge batches retained per authoritative match awaiting a script
+    /// answer. New ingress drops fail closed at this bound.
+    pub max_pending_batches: usize,
+    /// Node-wide cap across all matches awaiting a script answer.
+    pub max_pending_batches_total: usize,
+    /// Per-participant accepted V1 match-input messages in one fixed minute.
+    pub max_match_input_messages_per_minute: usize,
+    /// Per-participant accepted V1 match-input opaque bytes in one fixed minute.
+    pub max_match_input_bytes_per_minute: usize,
     /// Permit `Persist` commands (storage writes).
     pub allow_persist: bool,
     /// Permit `Schedule` commands (deferred re-entry).
@@ -1211,6 +1220,10 @@ impl Default for BridgeConfig {
             max_recipients: 1_024,
             max_persist_ops: 64,
             max_schedule_ops: 64,
+            max_pending_batches: 64,
+            max_pending_batches_total: 1_024,
+            max_match_input_messages_per_minute: 120,
+            max_match_input_bytes_per_minute: 1 << 20,
             allow_persist: false,
             allow_schedule: false,
             allow_physics: false,

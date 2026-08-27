@@ -485,6 +485,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             max_recipients: bridge_cfg.max_recipients,
             max_persist_ops: bridge_cfg.max_persist_ops,
             max_schedule_ops: bridge_cfg.max_schedule_ops,
+            max_pending_batches: bridge_cfg.max_pending_batches,
+            max_pending_batches_total: bridge_cfg.max_pending_batches_total,
+            max_match_input_messages_per_minute: bridge_cfg.max_match_input_messages_per_minute,
+            max_match_input_bytes_per_minute: bridge_cfg.max_match_input_bytes_per_minute,
         };
         let mut capabilities = std::collections::HashSet::new();
         if bridge_cfg.allow_persist {

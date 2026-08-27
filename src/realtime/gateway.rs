@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use citadel_wire::diagnostics::{
@@ -96,17 +97,19 @@ use crate::session::SessionTokenSecret;
 use crate::session::{NodeId, OwnershipGeneration};
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 use crate::transport::{Delivery, Envelope};
+use citadel_wire::match_input::{MatchInput, MatchInputAck};
 use citadel_wire::netpeer::{FieldDelta, RepSchema};
 
 pub use citadel_wire::protocol::{
     KIND_AUTH, KIND_AUTH_RESULT, KIND_CHAT_EVENT, KIND_DIAG_CAPABILITIES, KIND_DIAG_CLOCK_SYNC,
-    KIND_DIAG_FLUSH, KIND_DIAG_SERVER_TIME, KIND_DIAG_START, KIND_DIAG_STATUS,
-    KIND_MATCHMAKER_MATCHED, KIND_NA_DESPAWN, KIND_NA_PRESENCE, KIND_NA_SPAWN, KIND_NA_SPAWN_BATCH,
-    KIND_NA_STATE, KIND_NOTIFICATION, KIND_PEER_POSITION, KIND_POSITION, KIND_REP_ACK,
-    KIND_REP_DELTA, KIND_ROOM_CREATE, KIND_ROOM_JOIN, KIND_ROOM_JOINED, KIND_ROOM_LEAVE,
-    KIND_ROOM_MAP_READY, KIND_RPC_REQUEST, KIND_RPC_RESPONSE, KIND_TSYNC_ACK, KIND_TSYNC_HELLO,
-    KIND_TSYNC_INPUT, KIND_TSYNC_REWIND, KIND_TSYNC_ROLE, KIND_TSYNC_SNAPSHOT, KIND_TSYNC_V2_HELLO,
-    KIND_TSYNC_V2_INPUT, ROOM_KIND_MAX, ROOM_KIND_MIN, RPC_STATUS_OK,
+    KIND_DIAG_FLUSH, KIND_DIAG_SERVER_TIME, KIND_DIAG_START, KIND_DIAG_STATUS, KIND_MATCH_INPUT,
+    KIND_MATCH_INPUT_ACK, KIND_MATCHMAKER_MATCHED, KIND_NA_DESPAWN, KIND_NA_PRESENCE,
+    KIND_NA_SPAWN, KIND_NA_SPAWN_BATCH, KIND_NA_STATE, KIND_NOTIFICATION, KIND_PEER_POSITION,
+    KIND_POSITION, KIND_REP_ACK, KIND_REP_DELTA, KIND_ROOM_CREATE, KIND_ROOM_JOIN,
+    KIND_ROOM_JOINED, KIND_ROOM_LEAVE, KIND_ROOM_MAP_READY, KIND_RPC_REQUEST, KIND_RPC_RESPONSE,
+    KIND_TSYNC_ACK, KIND_TSYNC_HELLO, KIND_TSYNC_INPUT, KIND_TSYNC_REWIND, KIND_TSYNC_ROLE,
+    KIND_TSYNC_SNAPSHOT, KIND_TSYNC_V2_HELLO, KIND_TSYNC_V2_INPUT, ROOM_KIND_MAX, ROOM_KIND_MIN,
+    RPC_STATUS_OK,
 };
 
 const MATCHMAKER_HANDOFF_TTL_MS: u64 = 30_000;
@@ -4692,6 +4695,10 @@ impl Gateway {
         let budget = self.native_match_budget();
         if let Some(previous) = previous {
             let ended = self.room_snapshot_for_lifecycle(previous.id).is_none();
+            self.forget_match_input_admission(previous.id, participant);
+            if ended {
+                self.drop_bridge_match(previous.id);
+            }
             let mut leaving = self
                 .room_snapshot_for_lifecycle(previous.id)
                 .unwrap_or(previous);
@@ -4867,6 +4874,34 @@ impl Gateway {
         let user_id = self.registry.user_id_of(sender);
         let room_id = self.rooms.room_of(sender);
         let runtime = self.runtime.as_deref();
+        if env.kind == KIND_MATCH_INPUT_ACK {
+            tracing::debug!(%sender, "gateway dropped client-sent match input acknowledgement");
+            return 0;
+        }
+        // Explicit V1 match input is a reserved core route: it never reaches a
+        // global interceptor, legacy on_message, or relay path. The envelope
+        // body names only a sequence and opaque game bytes; membership, identity,
+        // match and binding come from server registries.
+        if env.kind == KIND_MATCH_INPUT {
+            if !self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.supports_match_input_v1())
+            {
+                tracing::debug!(%sender, "gateway dropped match input for an adapter without V1 input parity");
+                return 0;
+            }
+            let Some((authoritative_room, binding)) = self.authoritative_match(sender) else {
+                return 0;
+            };
+            return self.route_bridge_match_input(
+                sender,
+                env,
+                authoritative_room,
+                &binding,
+                metadata,
+            );
+        }
         // Generic custom traffic in a bound match must not traverse a global
         // runtime interceptor before membership/binding validation. The native
         // bridge is its first script boundary; protected/reserved kinds retain
@@ -7730,6 +7765,7 @@ impl Gateway {
             return 0;
         };
         let ended = self.room_snapshot_for_lifecycle(room_id).is_none();
+        self.forget_match_input_admission(room_id, sender);
         if let Some(mut room) = self
             .rooms
             .snapshot()
@@ -7760,11 +7796,11 @@ impl Gateway {
         // no-op); without this, an exodus-abandoned match ticks until worker
         // restart. Room ids are never reused, so a pruned id observed here
         // cannot belong to a later room.
-        if remaining.is_empty()
-            && self.rooms.label(room_id).is_none()
-            && let Some(runtime) = &self.runtime
-        {
-            runtime.on_match_closed(room_id);
+        if remaining.is_empty() && self.rooms.label(room_id).is_none() {
+            self.drop_bridge_match(room_id);
+            if let Some(runtime) = &self.runtime {
+                runtime.on_match_closed(room_id);
+            }
         }
         let body = citadel_wire::room::RoomLeave { room_id }.encode();
         let mut sent = 0;
@@ -8183,6 +8219,11 @@ impl Gateway {
                         hub.set_move_intent(object_id, intent);
                     }
                 }
+                OutboundCommand::SetInputAck { .. } => {
+                    tracing::debug!(
+                        "dropped internal input acknowledgement outside validated bridge materialization"
+                    );
+                }
                 OutboundCommand::DespawnActor { object_id } => {
                     delivered_total += self.despawn_server_actor(object_id, room_id);
                 }
@@ -8393,6 +8434,23 @@ pub fn shared() -> Arc<Gateway> {
     Arc::new(Gateway::new())
 }
 
+/// One participant's bounded fixed-window explicit-input admission counters.
+struct MatchInputRateWindow {
+    started_at: Instant,
+    messages: usize,
+    bytes: usize,
+}
+
+impl MatchInputRateWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            messages: 0,
+            bytes: 0,
+        }
+    }
+}
+
 /// Per-node authoritative-bridge state: one [`PendingBatchLedger`] per live
 /// authoritative match plus the per-batch quotas. Held behind the gateway's
 /// optional `bridge` field; absent on non-authoritative deployments.
@@ -8400,6 +8458,9 @@ struct GatewayBridge {
     /// One ledger per authoritative match (keyed by `RoomId`). Created lazily on
     /// the match's first protected frame, dropped when the match closes.
     ledgers: Mutex<HashMap<RoomId, PendingBatchLedger>>,
+    /// Per-active-participant ingress windows for explicit V1 input. Entries are
+    /// removed on leave/close; each window is fixed at one minute.
+    input_rate_windows: Mutex<HashMap<(RoomId, ParticipantId), MatchInputRateWindow>>,
     /// Per-batch quotas the validator enforces (from `[runtime.bridge]`;
     /// PROVISIONAL measure-first defaults).
     quotas: BridgeQuotas,
@@ -8422,6 +8483,7 @@ impl GatewayBridge {
     fn new(quotas: BridgeQuotas, capabilities: std::collections::HashSet<Capability>) -> Self {
         Self {
             ledgers: Mutex::new(HashMap::new()),
+            input_rate_windows: Mutex::new(HashMap::new()),
             quotas,
             capabilities,
             pending_rep: Mutex::new(HashMap::new()),
@@ -8562,6 +8624,7 @@ impl Gateway {
             .map(|clock| (clock.epoch, clock.tick))
             .unwrap_or((0, 0));
         let mut ledgers = bridge.ledgers.lock().unwrap_or_else(|e| e.into_inner());
+        let total_pending: usize = ledgers.values().map(PendingBatchLedger::pending_len).sum();
         let ledger = ledgers
             .entry(room_id)
             .or_insert_with(|| PendingBatchLedger::new(room_id, binding.generation, clock_epoch));
@@ -8573,6 +8636,19 @@ impl Gateway {
         }
         if ledger.clock_epoch() != clock_epoch {
             ledger.set_clock_epoch(clock_epoch);
+        }
+        if ledger.pending_len() >= bridge.quotas.max_pending_batches
+            || total_pending >= bridge.quotas.max_pending_batches_total
+        {
+            tracing::debug!(
+                room_id = %room_id,
+                pending = ledger.pending_len(),
+                total_pending,
+                per_match_cap = bridge.quotas.max_pending_batches,
+                total_cap = bridge.quotas.max_pending_batches_total,
+                "bridge dropped ingress because pending batch capacity is exhausted"
+            );
+            return None;
         }
         Some(ledger.issue(drafts, tick))
     }
@@ -8608,6 +8684,85 @@ impl Gateway {
                 body: env.body.to_vec(),
                 reliable: metadata.reliable,
                 sequence: metadata.sequence,
+            },
+        };
+        self.deliver_bridge_batch_for_member(sender, room_id, binding, vec![draft]);
+        0
+    }
+
+    /// Atomically consume one bounded explicit-input admission slot for the
+    /// current `(room, participant)` pair. The caller has already authenticated
+    /// the sender and decoded a bounded V1 body. Zero limits intentionally deny
+    /// all input; an operator cannot accidentally turn an exhausted limiter into
+    /// unlimited admission.
+    fn admit_match_input(&self, room_id: RoomId, sender: ParticipantId, body_bytes: usize) -> bool {
+        let _scope = self.lock_room_scope();
+        if self.rooms.room_of(sender) != Some(room_id) {
+            return false;
+        }
+        let Some(bridge) = &self.bridge else {
+            return false;
+        };
+        let now = Instant::now();
+        let mut windows = bridge
+            .input_rate_windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let window = windows
+            .entry((room_id, sender))
+            .or_insert_with(|| MatchInputRateWindow::new(now));
+        if now.duration_since(window.started_at) >= Duration::from_secs(60) {
+            *window = MatchInputRateWindow::new(now);
+        }
+        let next_messages = window.messages.saturating_add(1);
+        let next_bytes = window.bytes.saturating_add(body_bytes);
+        if next_messages > bridge.quotas.max_match_input_messages_per_minute
+            || next_bytes > bridge.quotas.max_match_input_bytes_per_minute
+        {
+            tracing::debug!(
+                %sender,
+                room_id = %room_id,
+                "bridge dropped explicit match input at configured ingress rate limit"
+            );
+            return false;
+        }
+        window.messages = next_messages;
+        window.bytes = next_bytes;
+        true
+    }
+
+    /// Structural stage for an explicit V1 match-input envelope. Decoding is
+    /// bounded before body allocation; the gateway installs authenticated sender
+    /// identity and authoritative room/binding before the opaque game bytes cross
+    /// the bridge. A transport sequence is deliberately not substituted here:
+    /// the V1 body carries the exact game input sequence.
+    fn route_bridge_match_input(
+        &self,
+        sender: ParticipantId,
+        env: &Envelope,
+        room_id: RoomId,
+        binding: &ScriptBinding,
+        metadata: InboundMessageMetadata,
+    ) -> usize {
+        if !metadata.reliable {
+            tracing::debug!(%sender, "bridge dropped unreliable explicit match input");
+            return 0;
+        }
+        let Ok(input) = MatchInput::decode(&env.body) else {
+            tracing::debug!(%sender, "bridge dropped malformed explicit match input");
+            return 0;
+        };
+        if !self.admit_match_input(room_id, sender, input.body.len()) {
+            return 0;
+        }
+        let draft = EventDraft {
+            participant: sender.get(),
+            user_id: self.registry.user_id_of(sender),
+            payload: NormalizedPayload::MatchMessage {
+                kind: KIND_MATCH_INPUT,
+                body: input.body,
+                reliable: metadata.reliable,
+                sequence: Some(input.sequence),
             },
         };
         self.deliver_bridge_batch_for_member(sender, room_id, binding, vec![draft]);
@@ -8871,6 +9026,14 @@ impl Gateway {
             delivered += self.materialize_outcome(room_id, &outcome);
         }
         for command in batch.commands {
+            if let ScriptCommand::SetInputAck {
+                participant,
+                sequence,
+            } = command
+            {
+                delivered += self.send_match_input_ack(room_id, participant, sequence);
+                continue;
+            }
             let exclude = match &command {
                 ScriptCommand::BroadcastMatch { exclude, .. } => {
                     exclude.map(ParticipantId::from_raw)
@@ -8882,6 +9045,24 @@ impl Gateway {
             delivered += self.apply_commands_scoped(exclude, Some(room_id), commands);
         }
         delivered
+    }
+
+    fn send_match_input_ack(&self, room_id: RoomId, participant: u64, sequence: u64) -> usize {
+        let participant = ParticipantId::from_raw(participant);
+        let _scope = self.lock_room_scope();
+        if self.rooms.room_of(participant) != Some(room_id) {
+            return 0;
+        }
+        let body = MatchInputAck {
+            last_processed_sequence: sequence,
+        }
+        .encode();
+        usize::from(self.send_reliable_in_scope_under_scope(
+            participant,
+            Some(room_id),
+            KIND_MATCH_INPUT_ACK,
+            body,
+        ))
     }
 
     /// Materialize one validated per-event outcome. `Reject` mutates nothing.
@@ -9111,6 +9292,19 @@ impl Gateway {
         }
     }
 
+    /// Remove a departed participant's input-admission state immediately so
+    /// reconnect/session replacement starts with a fresh server-owned key and
+    /// no inactive participant consumes retained limiter capacity.
+    fn forget_match_input_admission(&self, room_id: RoomId, participant: ParticipantId) {
+        if let Some(bridge) = &self.bridge {
+            bridge
+                .input_rate_windows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(room_id, participant));
+        }
+    }
+
     /// Drop a match's ledger (on close), so a late answer for it is rejected as
     /// an unknown batch rather than resurrecting a dead match.
     fn drop_bridge_match(&self, room_id: RoomId) {
@@ -9120,6 +9314,11 @@ impl Gateway {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&room_id);
+            bridge
+                .input_rate_windows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(rid, _), _| *rid != room_id);
             // Drop any replicated-delta proposals still awaiting an answer for
             // this match, so a late answer cannot resurrect a dead match.
             bridge
@@ -9212,6 +9411,11 @@ fn push_outbound_from_script_command(out: &mut Vec<OutboundCommand>, command: Sc
         }
         ScriptCommand::SetMoveIntent { object_id, intent } => {
             out.push(OutboundCommand::SetMoveIntent { object_id, intent })
+        }
+        // `SetInputAck` is consumed by `materialize_validated_batch` before this
+        // generic converter. Reaching here is a fail-closed internal drop.
+        ScriptCommand::SetInputAck { .. } => {
+            tracing::debug!("typed input acknowledgement bypassed its executor; dropped");
         }
         // No OutboundCommand twin yet: rep writes go through RepAuthority, and
         // persist/schedule through the DomainHost seam — both wired in a later
@@ -11227,6 +11431,13 @@ mod transform_tests {
     // ---- authoritative bridge: KIND_NA_STATE flows through the validator ----
 
     fn authoritative_gateway(on_input_src: &str) -> (Arc<Gateway>, Arc<TransformHub>) {
+        authoritative_gateway_with_quotas(on_input_src, BridgeQuotas::default())
+    }
+
+    fn authoritative_gateway_with_quotas(
+        on_input_src: &str,
+        quotas: BridgeQuotas,
+    ) -> (Arc<Gateway>, Arc<TransformHub>) {
         let hub = Arc::new(TransformHub::new(TransformHubConfig::default()).expect("hub"));
         let runtime: Arc<dyn Runtime> = Arc::new(
             crate::runtime::LuaRuntime::from_source(
@@ -11239,7 +11450,7 @@ mod transform_tests {
         let gw = Arc::new(
             Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime))
                 .with_transform_hub(Arc::clone(&hub))
-                .with_bridge(BridgeQuotas::default(), std::collections::HashSet::new()),
+                .with_bridge(quotas, std::collections::HashSet::new()),
         );
         gw.attach_bridge_sink();
         (gw, hub)
@@ -11759,6 +11970,396 @@ mod transform_tests {
         assert!(
             (hub.get_transform(object_id).expect("object").position[0] - 42.0).abs() < 1e-3,
             "KIND_POSITION still drives the legacy path when no bridge is attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_custom_kind_40_remains_available_to_authoritative_on_input() {
+        let (gw, _hub) = authoritative_gateway(
+            r#"citadel.on_input(function(event)
+                if event.kind == "message" and event.message_kind == 40 then
+                    citadel.send(event.participant, 404, event.body, false)
+                end
+                return nil
+            end)"#,
+        );
+        let (participant, _object, mut receiver) = authoritative_member_in(&gw, "match-a");
+        while receiver.try_recv().is_ok() {}
+        gw.handle_inbound(participant, &Envelope::new(40, b"legacy-custom".to_vec()));
+        let delivery = receiver
+            .try_recv()
+            .expect("legacy custom message delivered to on_input");
+        assert_eq!(delivery.envelope.kind, 404);
+        assert_eq!(delivery.envelope.body.as_ref(), b"legacy-custom");
+    }
+
+    #[tokio::test]
+    async fn explicit_match_input_sequences_are_distinguishable_as_fresh_duplicate_or_stale() {
+        let (gw, _hub) = authoritative_gateway(
+            r#"local last = {}
+            citadel.on_input(function(event)
+                if event.kind == "message" and event.message_kind == 41 then
+                    local previous = last[event.participant_id]
+                    local state = "fresh"
+                    if previous ~= nil and event.sequence == previous then state = "duplicate"
+                    elseif previous ~= nil and event.sequence < previous then state = "stale"
+                    end
+                    if state == "fresh" then last[event.participant_id] = event.sequence end
+                    citadel.send(event.participant, 405, state, false)
+                end
+                return nil
+            end)"#,
+        );
+        let (participant, _object, mut receiver) = authoritative_member_in(&gw, "match-a");
+        while receiver.try_recv().is_ok() {}
+        for sequence in [7, 7, 6] {
+            let body = MatchInput {
+                sequence,
+                body: Vec::new(),
+            }
+            .encode()
+            .expect("bounded input");
+            gw.handle_inbound_with_metadata(
+                participant,
+                &Envelope::new(KIND_MATCH_INPUT, body),
+                InboundMessageMetadata::reliable(),
+            );
+        }
+        let states: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                let delivery = receiver
+                    .try_recv()
+                    .expect("one script classification per input");
+                assert_eq!(delivery.envelope.kind, 405);
+                delivery.envelope.body.to_vec()
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![b"fresh".to_vec(), b"duplicate".to_vec(), b"stale".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_match_input_rate_limit_drops_flood_before_pending_growth() {
+        let quotas = BridgeQuotas {
+            max_match_input_messages_per_minute: 1,
+            max_match_input_bytes_per_minute: 64 << 10,
+            ..BridgeQuotas::default()
+        };
+        let (gw, _hub) = authoritative_gateway_with_quotas("", quotas);
+        let (participant, _object, _receiver) = authoritative_member_in(&gw, "match-a");
+        let body = MatchInput {
+            sequence: 1,
+            body: vec![1],
+        }
+        .encode()
+        .expect("bounded input");
+        gw.handle_inbound_with_metadata(
+            participant,
+            &Envelope::new(KIND_MATCH_INPUT, body.clone()),
+            InboundMessageMetadata::reliable(),
+        );
+        gw.handle_inbound_with_metadata(
+            participant,
+            &Envelope::new(KIND_MATCH_INPUT, body),
+            InboundMessageMetadata::reliable(),
+        );
+        let room_id = gw.rooms().room_of(participant).expect("bound room");
+        let bridge = gw.bridge.as_ref().expect("bridge");
+        let ledgers = bridge.ledgers.lock().expect("ledger lock");
+        assert_eq!(
+            ledgers
+                .get(&room_id)
+                .expect("first input issued")
+                .pending_len(),
+            1,
+            "the second input must be rejected before it can retain a pending batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_wide_pending_cap_prevents_room_spray() {
+        let quotas = BridgeQuotas {
+            max_pending_batches: 10,
+            max_pending_batches_total: 1,
+            max_match_input_messages_per_minute: 10,
+            max_match_input_bytes_per_minute: 64 << 10,
+            ..BridgeQuotas::default()
+        };
+        let (gw, _hub) = authoritative_gateway_with_quotas("", quotas);
+        let (first, _object, _receiver) = authoritative_member_in(&gw, "match-a");
+        let (second, _object, _receiver) = authoritative_member_in(&gw, "match-b");
+        for participant in [first, second] {
+            let body = MatchInput {
+                sequence: 1,
+                body: vec![1],
+            }
+            .encode()
+            .expect("bounded input");
+            gw.handle_inbound_with_metadata(
+                participant,
+                &Envelope::new(KIND_MATCH_INPUT, body),
+                InboundMessageMetadata::reliable(),
+            );
+        }
+        let bridge = gw.bridge.as_ref().expect("bridge");
+        let ledgers = bridge.ledgers.lock().expect("ledger lock");
+        assert_eq!(
+            ledgers
+                .values()
+                .map(PendingBatchLedger::pending_len)
+                .sum::<usize>(),
+            1,
+            "a caller cannot evade node capacity by distributing unacknowledged input across rooms"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_match_input_pending_cap_drops_when_runtime_does_not_answer() {
+        let quotas = BridgeQuotas {
+            max_pending_batches: 1,
+            max_match_input_messages_per_minute: 10,
+            max_match_input_bytes_per_minute: 64 << 10,
+            ..BridgeQuotas::default()
+        };
+        let (gw, _hub) = authoritative_gateway_with_quotas("", quotas);
+        let (participant, _object, _receiver) = authoritative_member_in(&gw, "match-a");
+        for sequence in [1, 2] {
+            let body = MatchInput {
+                sequence,
+                body: vec![1],
+            }
+            .encode()
+            .expect("bounded input");
+            gw.handle_inbound_with_metadata(
+                participant,
+                &Envelope::new(KIND_MATCH_INPUT, body),
+                InboundMessageMetadata::reliable(),
+            );
+        }
+        let room_id = gw.rooms().room_of(participant).expect("bound room");
+        let bridge = gw.bridge.as_ref().expect("bridge");
+        let ledgers = bridge.ledgers.lock().expect("ledger lock");
+        assert_eq!(
+            ledgers
+                .get(&room_id)
+                .expect("first input issued")
+                .pending_len(),
+            1,
+            "the pending-batch cap must bound a runtime that has no on_input handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_match_input_routes_to_authenticated_member_and_private_ack_only() {
+        let (gw, _hub) = authoritative_gateway(
+            r#"citadel.on_input(function(event)
+                if event.kind == "message" and event.message_kind == 41 then
+                    assert(event.participant_id == "1")
+                    assert(event.sequence == "77")
+                    assert(event.body == "opaque\0body")
+                    citadel.match.set_input_ack(event.participant_id, event.sequence)
+                end
+                return nil
+            end)"#,
+        );
+        let (a, _a_object, mut a_rx) = authoritative_member_in(&gw, "match-a");
+        let (_b, _b_object, mut b_rx) = authoritative_member_in(&gw, "match-b");
+        while a_rx.try_recv().is_ok() {}
+        while b_rx.try_recv().is_ok() {}
+
+        let body = MatchInput {
+            sequence: 77,
+            body: b"opaque\0body".to_vec(),
+        }
+        .encode()
+        .expect("bounded input");
+        gw.handle_inbound_with_metadata(
+            a,
+            &Envelope::new(KIND_MATCH_INPUT, body),
+            InboundMessageMetadata::reliable(),
+        );
+
+        let ack = a_rx
+            .try_recv()
+            .expect("sender receives private input acknowledgement");
+        assert_eq!(ack.envelope.kind, KIND_MATCH_INPUT_ACK);
+        assert_eq!(
+            MatchInputAck::decode(&ack.envelope.body).expect("valid private acknowledgement"),
+            MatchInputAck {
+                last_processed_sequence: 77
+            }
+        );
+        assert!(
+            b_rx.try_recv().is_err(),
+            "a match input acknowledgement must never cross into another match"
+        );
+    }
+
+    #[tokio::test]
+    async fn room_move_drops_final_old_match_input_state() {
+        let (gw, _hub) = authoritative_gateway("");
+        let (participant, _object, _receiver) = authoritative_member_in(&gw, "match-a");
+        let old_room = gw.rooms().room_of(participant).expect("old room");
+        let body = MatchInput {
+            sequence: 1,
+            body: vec![1],
+        }
+        .encode()
+        .expect("bounded input");
+        gw.handle_inbound_with_metadata(
+            participant,
+            &Envelope::new(KIND_MATCH_INPUT, body),
+            InboundMessageMetadata::reliable(),
+        );
+        let binding = ScriptBinding {
+            revision_id: "sha256:test".to_owned(),
+            generation: 1,
+        };
+        gw.join_or_create_room_bound(participant, "match-b", Some(binding), || {
+            RoomLabel::with_map("match-b")
+        })
+        .expect("move to successor room");
+        let bridge = gw.bridge.as_ref().expect("bridge");
+        assert!(
+            !bridge
+                .ledgers
+                .lock()
+                .expect("ledger lock")
+                .contains_key(&old_room),
+            "moving out of a final old room must release its pending input ledger"
+        );
+        assert!(
+            !bridge
+                .input_rate_windows
+                .lock()
+                .expect("rate lock")
+                .contains_key(&(old_room, participant)),
+            "moving out of a final old room must release its participant admission state"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_leave_drops_pending_match_input_ledger() {
+        let (gw, _hub) = authoritative_gateway("");
+        let (participant, _object, _receiver) = authoritative_member_in(&gw, "match-a");
+        let room_id = gw.rooms().room_of(participant).expect("bound room");
+        let body = MatchInput {
+            sequence: 1,
+            body: vec![1],
+        }
+        .encode()
+        .expect("bounded input");
+        gw.handle_inbound_with_metadata(
+            participant,
+            &Envelope::new(KIND_MATCH_INPUT, body),
+            InboundMessageMetadata::reliable(),
+        );
+        assert!(
+            gw.bridge
+                .as_ref()
+                .expect("bridge")
+                .ledgers
+                .lock()
+                .expect("ledger lock")
+                .contains_key(&room_id),
+            "the no-answer input is retained only until lifecycle cleanup"
+        );
+        gw.leave_room(participant);
+        assert!(
+            !gw.bridge
+                .as_ref()
+                .expect("bridge")
+                .ledgers
+                .lock()
+                .expect("ledger lock")
+                .contains_key(&room_id),
+            "a final leave must release pending input and its capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_match_input_ack_cannot_leak_across_disconnect_and_successor_room() {
+        let (gw, _hub) = authoritative_gateway("citadel.on_input(function() return nil end)");
+        let (old_participant, _object, mut old_receiver) = authoritative_member_in(&gw, "match-a");
+        while old_receiver.try_recv().is_ok() {}
+        let old_room = gw.rooms().room_of(old_participant).expect("old room");
+        gw.unregister_session(old_participant);
+
+        let (_successor, _object, mut successor_receiver) = authoritative_member_in(&gw, "match-a");
+        while successor_receiver.try_recv().is_ok() {}
+        assert_eq!(
+            gw.send_match_input_ack(old_room, old_participant.get(), 77),
+            0,
+            "the disconnected participant is no longer a member of the old match"
+        );
+        assert!(
+            successor_receiver.try_recv().is_err(),
+            "a stale acknowledgement cannot be delivered to a successor session or room"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_sent_match_input_ack_is_dropped_before_script_dispatch() {
+        let (gw, _hub) = authoritative_gateway(
+            r#"citadel.on_input(function(event)
+                citadel.broadcast(403, "should-not-run", false)
+                return nil
+            end)"#,
+        );
+        let (participant, _object, mut receiver) = authoritative_member_in(&gw, "match-a");
+        while receiver.try_recv().is_ok() {}
+
+        gw.handle_inbound_with_metadata(
+            participant,
+            &Envelope::new(
+                KIND_MATCH_INPUT_ACK,
+                MatchInputAck {
+                    last_processed_sequence: 77,
+                }
+                .encode(),
+            ),
+            InboundMessageMetadata::reliable(),
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "a client cannot inject the server-owned acknowledgement control"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_match_input_after_leave_is_dropped_without_acknowledgement() {
+        let (gw, _hub) = authoritative_gateway(
+            r#"citadel.on_input(function(event)
+                if event.kind == "message" and event.message_kind == 41 then
+                    citadel.match.set_input_ack(event.participant_id, event.sequence)
+                end
+                return nil
+            end)"#,
+        );
+        let (participant, _object, mut receiver) = authoritative_member_in(&gw, "match-a");
+        while receiver.try_recv().is_ok() {}
+        gw.leave_room(participant);
+        while receiver.try_recv().is_ok() {}
+
+        let body = MatchInput {
+            sequence: 77,
+            body: b"late".to_vec(),
+        }
+        .encode()
+        .expect("bounded input");
+        assert_eq!(
+            gw.handle_inbound_with_metadata(
+                participant,
+                &Envelope::new(KIND_MATCH_INPUT, body),
+                InboundMessageMetadata::reliable(),
+            ),
+            0
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "a participant that left its old match cannot receive an old-match acknowledgement"
         );
     }
 
