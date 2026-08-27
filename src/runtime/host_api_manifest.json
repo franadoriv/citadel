@@ -197,6 +197,17 @@
     "since": "pre-1.0"
   },
   {
+    "name": "match.set_input_ack",
+    "category": "action",
+    "params": [
+      "participant:canonical_u64_string",
+      "last_processed_sequence:canonical_u64_string"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "spawn_actor",
     "category": "action",
     "params": [

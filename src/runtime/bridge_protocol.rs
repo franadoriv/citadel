@@ -545,6 +545,15 @@ pub enum ScriptCommand {
         /// Best-effort delivery.
         unreliable: bool,
     },
+    /// Internal, room-scoped acknowledgement of processed V1 match input.
+    /// The gateway owns the wire kind and sends it only after validated bridge
+    /// membership checks; scripts cannot construct an arbitrary reserved frame.
+    SetInputAck {
+        /// Current match participant that receives the acknowledgement.
+        participant: u64,
+        /// Exact input sequence processed by the authoritative script.
+        sequence: u64,
+    },
     /// Multicast to an explicit recipient list (all must be match members).
     SendToMany {
         /// Recipients (every one must be a current member of the match).

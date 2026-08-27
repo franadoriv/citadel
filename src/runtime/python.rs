@@ -38,15 +38,16 @@ use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NativeMatchContext,
-    NativeMatchLifecycleHook, NormalizedEventBatch, OutboundCommand, PhysicsOptions,
-    RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec, RpcOutcome, Runtime,
-    RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth,
-    RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome,
-    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache,
-    RuntimeSharedCacheHandle, ScriptCommandBatch, append_runtime_event_commands, bridge_event_json,
-    bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
-    disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
-    script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
+    NativeMatchLifecycleHook, NormalizedEventBatch, NormalizedPayload, OutboundCommand,
+    PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec,
+    RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
+    RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
+    RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
+    append_runtime_event_commands, bridge_event_json, bridge_input_outcome_from_json,
+    disabled_runtime_event_bus_handle, disabled_runtime_shared_cache_handle, runtime_event_bus,
+    runtime_shared_cache, script_command_from_outbound, set_runtime_event_bus,
+    set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use crate::time::{Clock, SystemClock};
@@ -103,6 +104,7 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "on_input",
     "broadcast",
     "send",
+    "match.set_input_ack",
     "spawn_actor",
     "move_actor",
     "despawn_actor",
@@ -189,6 +191,7 @@ _on_before_realtime = None
 _on_after_realtime = None
 _on_input = None
 _commands = []
+_match_input_active = False
 _total_bytes = 0
 _overflowed = False
 _next_npc_id = 0x40000000
@@ -351,6 +354,13 @@ class _Match:
             raise RuntimeError("durable logs are unavailable")
         return _match_log_bridge.set_result(str(result_json))
 
+    def set_input_ack(self, participant, last_processed_sequence):
+        if not _match_input_active:
+            raise RuntimeError("match.set_input_ack requires a V1 match-input callback")
+        participant = _canonical_u64_string(participant, "participant")
+        sequence = _canonical_u64_string(last_processed_sequence, "last_processed_sequence")
+        _push(("set_input_ack", participant, sequence))
+
 match = _Match()
 
 class _Http:
@@ -455,6 +465,13 @@ class _Telemetry:
         return self._bridge().finish()
 
 telemetry = _Telemetry()
+
+def _canonical_u64_string(value, name):
+    if not isinstance(value, str) or not value or (len(value) > 1 and value[0] == "0") or not value.isascii() or not value.isdecimal():
+        raise TypeError(f"{name} must be a canonical decimal u64 string")
+    if int(value) > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(f"{name} must be a canonical decimal u64 string")
+    return value
 
 def _push(command, body_len=0):
     global _total_bytes, _overflowed
@@ -563,8 +580,9 @@ def ground_height(origin, max_distance):
     return _transform_hub_bridge.ground_height(tuple(origin), float(max_distance))
 
 def _reset_commands():
-    global _total_bytes, _overflowed
+    global _total_bytes, _overflowed, _match_input_active
     _commands.clear()
+    _match_input_active = False
     _total_bytes = 0
     _overflowed = False
 
@@ -2332,6 +2350,16 @@ impl PythonRuntime {
                         let dispatch = module.getattr("_dispatch_input")?;
                         let mut outcomes = Vec::with_capacity(batch.events.len());
                         for event in &batch.events {
+                            module.setattr(
+                                "_match_input_active",
+                                matches!(
+                                    event.payload,
+                                    NormalizedPayload::MatchMessage {
+                                        kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                                        ..
+                                    }
+                                ),
+                            )?;
                             let event_json = bridge_event_json(batch, event);
                             let decision = dispatch.call1((event_json,))?;
                             if decision.is_none() {
@@ -3066,6 +3094,10 @@ impl Runtime for PythonRuntime {
         true
     }
 
+    fn supports_match_input_v1(&self) -> bool {
+        true
+    }
+
     fn on_leaderboard_reset(
         &self,
         epoch: &crate::leaderboard_scheduler::ResetEpoch,
@@ -3557,6 +3589,18 @@ fn dispatch_pending_runtime_events(
     commands
 }
 
+fn parse_canonical_u64(value: &str, name: &str) -> Result<u64, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{name} must be a canonical decimal u64 string"));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a canonical decimal u64 string"))
+}
+
 fn parse_commands(commands: Bound<'_, PyAny>) -> PyResult<Vec<OutboundCommand>> {
     let list: Bound<'_, PyList> = commands.cast_into()?;
     let mut out = Vec::with_capacity(list.len());
@@ -3575,6 +3619,16 @@ fn parse_commands(commands: Bound<'_, PyAny>) -> PyResult<Vec<OutboundCommand>> 
                 body: tuple.get_item(3)?.extract()?,
                 unreliable: tuple.get_item(4)?.extract()?,
             },
+            "set_input_ack" => {
+                let participant: String = tuple.get_item(1)?.extract()?;
+                let sequence: String = tuple.get_item(2)?.extract()?;
+                OutboundCommand::SetInputAck {
+                    participant: parse_canonical_u64(&participant, "participant")
+                        .map_err(PyRuntimeError::new_err)?,
+                    sequence: parse_canonical_u64(&sequence, "last_processed_sequence")
+                        .map_err(PyRuntimeError::new_err)?,
+                }
+            }
             "spawn_actor" => OutboundCommand::SpawnActor {
                 object_id: tuple.get_item(1)?.extract()?,
                 archetype: tuple.get_item(2)?.extract()?,
@@ -4079,6 +4133,66 @@ def lifecycle(context):
                 .iter()
                 .any(|report| report.marker_total == 1),
             "the failing batch still closes its own telemetry slice"
+        );
+    }
+
+    #[test]
+    fn match_input_callback_preserves_exact_strings_and_queues_typed_ack() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    assert e['message_kind'] == 41\n    assert e['participant_id'] == '1001'\n    assert e['sequence'] == '18446744073709551615'\n    assert e['body'] == [0, 255, 7]\n    citadel.match.set_input_ack(e['participant_id'], e['sequence'])\n    return None\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![crate::runtime::NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: Some("authenticated-user".to_owned()),
+            payload: crate::runtime::NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: vec![0, 255, 7],
+                reliable: true,
+                sequence: Some(u64::MAX),
+            },
+        }]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.commands,
+            vec![crate::runtime::ScriptCommand::SetInputAck {
+                participant: 1001,
+                sequence: u64::MAX,
+            }]
+        );
+    }
+
+    #[test]
+    fn match_input_ack_rejects_non_string_python_values() {
+        let rt = runtime(
+            "import citadel\ndef h(event):\n    citadel.match.set_input_ack(event['participant_id'], 77)\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![crate::runtime::NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: None,
+            payload: crate::runtime::NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: Vec::new(),
+                reliable: true,
+                sequence: Some(1),
+            },
+        }]);
+        assert!(
+            rt.evaluate_event_batch(&batch).is_none(),
+            "Python values outside the canonical decimal-string contract must fail closed"
+        );
+    }
+
+    #[test]
+    fn match_input_ack_fails_closed_outside_explicit_match_input_event() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    citadel.match.set_input_ack('1001', '77')\n    return None\ncitadel.on_input(h)\n",
+        );
+        assert!(
+            rt.evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none(),
+            "a generic normalized event may not manufacture a match-input acknowledgement"
         );
     }
 

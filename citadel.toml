@@ -194,6 +194,12 @@ max_reply_bytes = 65536
 max_recipients = 1024
 max_persist_ops = 64
 max_schedule_ops = 64
+# Hard ingress limits for V1 match-scoped input. A no-answer runtime cannot
+# retain work beyond this match cap; each participant is also bounded per minute.
+max_pending_batches = 64
+max_pending_batches_total = 1024
+max_match_input_messages_per_minute = 120
+max_match_input_bytes_per_minute = 1048576
 allow_persist = false
 allow_schedule = false
 allow_physics = false
