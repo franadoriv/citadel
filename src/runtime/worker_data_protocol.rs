@@ -385,6 +385,10 @@ enum WireCommand {
         object_id: u32,
         intent: [f32; 3],
     },
+    SetInputAck {
+        participant: u64,
+        sequence: u64,
+    },
     DespawnActor {
         object_id: u32,
     },
@@ -440,6 +444,13 @@ impl From<crate::runtime::OutboundCommand> for WireCommand {
             },
             Cmd::ApplyImpulse { object_id, impulse } => Self::ApplyImpulse { object_id, impulse },
             Cmd::SetMoveIntent { object_id, intent } => Self::SetMoveIntent { object_id, intent },
+            Cmd::SetInputAck {
+                participant,
+                sequence,
+            } => Self::SetInputAck {
+                participant,
+                sequence,
+            },
             Cmd::DespawnActor { object_id } => Self::DespawnActor { object_id },
         }
     }
@@ -498,6 +509,13 @@ impl From<WireCommand> for crate::runtime::OutboundCommand {
             WireCommand::SetMoveIntent { object_id, intent } => {
                 Self::SetMoveIntent { object_id, intent }
             }
+            WireCommand::SetInputAck {
+                participant,
+                sequence,
+            } => Self::SetInputAck {
+                participant,
+                sequence,
+            },
             WireCommand::DespawnActor { object_id } => Self::DespawnActor { object_id },
         }
     }

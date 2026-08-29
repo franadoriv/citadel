@@ -22,17 +22,16 @@
 
 use std::collections::HashMap;
 
-use citadel_wire::protocol::KIND_ROOM_REJECT;
+use citadel_wire::protocol::{KIND_MATCH_INPUT, KIND_MATCH_INPUT_ACK, KIND_ROOM_REJECT};
 
 use super::bridge_protocol::{
     BridgeRepField, BridgeRepValue, Correction, Decision, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome,
     NormalizedEvent, NormalizedEventBatch, NormalizedPayload, ScriptCommand, ScriptCommandBatch,
 };
 
-/// The highest wire kind currently reserved for infrastructure/typed frames. A
-/// script may not emit a raw message on any kind `<=` this: reserved kinds are
-/// reachable only through typed commands (§3.5). Sourced from the protocol
-/// registry so a newly reserved kind extends the guard automatically.
+/// The highest contiguous wire kind reserved for infrastructure frames. The
+/// two later explicit-input controls are reserved individually so the legacy
+/// custom kind `40` remains compatible.
 pub const MAX_RESERVED_KIND: u16 = KIND_ROOM_REJECT;
 
 /// A capability a match's revision manifest must declare before the matching
@@ -68,6 +67,17 @@ pub struct BridgeQuotas {
     pub max_persist_ops: usize,
     /// Max [`ScriptCommand::Schedule`] ops per batch.
     pub max_schedule_ops: usize,
+    /// Max bridge batches retained per authoritative match while awaiting an
+    /// answer. Reaching the cap drops new ingress before allocating another
+    /// pending event clone.
+    pub max_pending_batches: usize,
+    /// Node-wide cap across every authoritative match. This prevents callers
+    /// from bypassing the per-match cap by spraying distinct rooms.
+    pub max_pending_batches_total: usize,
+    /// Per-participant accepted V1 match-input messages in one fixed minute.
+    pub max_match_input_messages_per_minute: usize,
+    /// Per-participant accepted V1 match-input opaque bytes in one fixed minute.
+    pub max_match_input_bytes_per_minute: usize,
 }
 
 impl Default for BridgeQuotas {
@@ -81,6 +91,13 @@ impl Default for BridgeQuotas {
             max_recipients: 1_024,
             max_persist_ops: 64,
             max_schedule_ops: 64,
+            // Hard admission ceilings, independently configurable by the
+            // operator. They cap retained work even when a runtime faults or
+            // does not answer.
+            max_pending_batches: 64,
+            max_pending_batches_total: 1_024,
+            max_match_input_messages_per_minute: 120,
+            max_match_input_bytes_per_minute: 1 << 20,
         }
     }
 }
@@ -643,6 +660,13 @@ fn validate_command(
                 });
             }
         }
+        ScriptCommand::SetInputAck { participant, .. } => {
+            if !context.is_member(*participant) {
+                return Err(BatchRejection::RecipientNotMember {
+                    participant: *participant,
+                });
+            }
+        }
         ScriptCommand::SendToMany {
             participants, kind, ..
         } => {
@@ -700,7 +724,7 @@ fn require_capability(
 }
 
 fn reject_reserved_kind(kind: u16) -> Result<(), BatchRejection> {
-    if kind <= MAX_RESERVED_KIND {
+    if kind <= MAX_RESERVED_KIND || matches!(kind, KIND_MATCH_INPUT | KIND_MATCH_INPUT_ACK) {
         Err(BatchRejection::ReservedKind { kind })
     } else {
         Ok(())
@@ -1027,6 +1051,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn match_input_ack_to_foreign_participant_rejects_batch() {
+        let mut ledger = PendingBatchLedger::new(1, 5, 9);
+        let batch = ledger.issue(vec![input_draft(1001, 7)], 100);
+        let mut answer = accept_all(&batch);
+        answer.commands.push(ScriptCommand::SetInputAck {
+            participant: 4242,
+            sequence: 7,
+        });
+        let ctx = TestContext {
+            members: Some(vec![1001]),
+            ..TestContext::permissive()
+        };
+        assert_eq!(
+            ledger.validate(&ctx, &BridgeQuotas::default(), &answer),
+            Err(BatchRejection::RecipientNotMember { participant: 4242 })
+        );
+    }
+
     // ---- B20 one foreign recipient rejects the whole SendToMany ----
     #[test]
     fn recipient_list_with_one_foreign_member_rejects_whole_batch() {
@@ -1067,6 +1110,29 @@ mod tests {
                 &answer
             ),
             Err(BatchRejection::ReservedKind { kind: 9 })
+        );
+    }
+
+    #[test]
+    fn match_input_ack_kind_is_reserved_from_generic_script_messages() {
+        let mut ledger = PendingBatchLedger::new(1, 5, 9);
+        let batch = ledger.issue(vec![input_draft(1001, 7)], 100);
+        let mut answer = accept_all(&batch);
+        answer.commands.push(ScriptCommand::SendTo {
+            participant: 1001,
+            kind: citadel_wire::protocol::KIND_MATCH_INPUT_ACK,
+            body: vec![1],
+            unreliable: false,
+        });
+        assert_eq!(
+            ledger.validate(
+                &TestContext::permissive(),
+                &BridgeQuotas::default(),
+                &answer
+            ),
+            Err(BatchRejection::ReservedKind {
+                kind: citadel_wire::protocol::KIND_MATCH_INPUT_ACK
+            })
         );
     }
 

@@ -39,9 +39,9 @@ use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION,
-    NativeMatchContext, NativeMatchLifecycleHook, NormalizedEventBatch, OutboundCommand,
-    PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec,
-    RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    NativeMatchContext, NativeMatchLifecycleHook, NormalizedEventBatch, NormalizedPayload,
+    OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome,
+    RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
     RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
     RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
     RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
@@ -96,6 +96,7 @@ const JS_HOST_API_NAMES: &[&str] = &[
     "on_input",
     "broadcast",
     "send",
+    "match.set_input_ack",
     "spawn_actor",
     "move_actor",
     "despawn_actor",
@@ -177,6 +178,7 @@ const JS_HOST_PRELUDE: &str = r#"
   let afterRealtime = null;
   let onInput = null;
   let commands = [];
+  let matchInputActive = false;
   let logs = [];
   let totalBytes = 0;
   let overflowed = false;
@@ -299,6 +301,16 @@ const JS_HOST_PRELUDE: &str = r#"
     }
     args[bodyIndex] = body;
     push([tag].concat(args), body.length);
+  }
+
+  function canonicalU64String(value, field) {
+    if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) {
+      throw new TypeError(`${field} must be a canonical decimal u64 string`);
+    }
+    if (BigInt(value) > 0xffffffffffffffffn) {
+      throw new RangeError(`${field} must be a canonical decimal u64 string`);
+    }
+    return value;
   }
 
   function toSessionString(value) {
@@ -440,6 +452,14 @@ const JS_HOST_PRELUDE: &str = r#"
         }
         const error = globalThis.__citadel_match_set_result(String(resultJson));
         if (error) throw new Error(error);
+      },
+      set_input_ack(participant, lastProcessedSequence) {
+        if (!matchInputActive) {
+          throw new Error("match.set_input_ack requires a V1 match-input callback");
+        }
+        const participantId = canonicalU64String(participant, "participant");
+        const sequence = canonicalU64String(lastProcessedSequence, "lastProcessedSequence");
+        push(["set_input_ack", participantId, sequence], 0);
       },
     },
     http: {
@@ -786,8 +806,13 @@ const JS_HOST_PRELUDE: &str = r#"
     debug: (message) => log(message, "debug"),
   };
 
+  globalThis.__citadel_set_match_input_active = function (active) {
+    matchInputActive = Boolean(active);
+  };
+
   globalThis.__citadel_reset_commands = function () {
     commands = [];
+    matchInputActive = false;
     logs = [];
     totalBytes = 0;
     overflowed = false;
@@ -1593,8 +1618,18 @@ impl JsRuntime {
                         return Ok(None);
                     }
                     let dispatch: Function = caught(&ctx, globals.get("__citadel_dispatch_input"))?;
+                    let set_match_input_active: Function =
+                        caught(&ctx, globals.get("__citadel_set_match_input_active"))?;
                     let mut outcomes = Vec::with_capacity(batch.events.len());
                     for event in &batch.events {
+                        let is_match_input = matches!(
+                            event.payload,
+                            NormalizedPayload::MatchMessage {
+                                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                                ..
+                            }
+                        );
+                        let _: () = caught(&ctx, set_match_input_active.call((is_match_input,)))?;
                         let event_json = bridge_event_json(batch, event);
                         let decision_json: Option<String> =
                             caught(&ctx, dispatch.call((event_json,)))?;
@@ -1607,6 +1642,7 @@ impl JsRuntime {
                             bridge_input_outcome_from_json(event.event_id, &decision_json)?;
                         outcomes.push(outcome);
                     }
+                    let _: () = caught(&ctx, set_match_input_active.call((false,)))?;
                     let commands = take_commands(&ctx, &guard.source_label, "on_input")?;
                     Ok(Some((outcomes, commands)))
                 })
@@ -2296,6 +2332,10 @@ impl Runtime for JsRuntime {
     }
 
     fn supports_native_match_lifecycle(&self) -> bool {
+        true
+    }
+
+    fn supports_match_input_v1(&self) -> bool {
         true
     }
 
@@ -3484,6 +3524,18 @@ fn emit_js_logs(logs: Array<'_>, label: &str) {
     }
 }
 
+fn parse_canonical_u64(value: &str, name: &str) -> JsHostResult<u64> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{name} must be a canonical decimal u64 string"));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a canonical decimal u64 string"))
+}
+
 fn parse_commands(commands: Array<'_>) -> JsHostResult<Vec<OutboundCommand>> {
     let mut out = Vec::with_capacity(commands.len());
     for item in commands.iter::<Array<'_>>() {
@@ -3504,6 +3556,14 @@ fn parse_commands(commands: Array<'_>) -> JsHostResult<Vec<OutboundCommand>> {
                     kind: tuple.get(2).map_err(|e| e.to_string())?,
                     body: bytes_from_js(tuple.get(3).map_err(|e| e.to_string())?)?,
                     unreliable: tuple.get(4).map_err(|e| e.to_string())?,
+                }
+            }
+            "set_input_ack" => {
+                let participant: String = tuple.get(1).map_err(|e| e.to_string())?;
+                let sequence: String = tuple.get(2).map_err(|e| e.to_string())?;
+                OutboundCommand::SetInputAck {
+                    participant: parse_canonical_u64(&participant, "participant")?,
+                    sequence: parse_canonical_u64(&sequence, "last_processed_sequence")?,
                 }
             }
             "spawn_actor" => OutboundCommand::SpawnActor {
@@ -4543,6 +4603,64 @@ citadel.on_match_tick(() => {
                 .iter()
                 .any(|report| report.marker_total == 1),
             "the failing batch still closes its own telemetry slice"
+        );
+    }
+
+    #[test]
+    fn match_input_callback_preserves_exact_strings_and_queues_typed_ack() {
+        let rt = runtime(
+            "citadel.on_input((event) => {\n  if (event.message_kind !== 41 || event.participant_id !== '1001' || event.sequence !== '18446744073709551615') throw new Error('wrong match input metadata');\n  if (event.body.join(',') !== '0,255,7') throw new Error('wrong opaque body');\n  citadel.match.set_input_ack(event.participant_id, event.sequence);\n});",
+        );
+        let batch = batch_with(vec![crate::runtime::NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: Some("authenticated-user".to_owned()),
+            payload: crate::runtime::NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: vec![0, 255, 7],
+                reliable: true,
+                sequence: Some(u64::MAX),
+            },
+        }]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.commands,
+            vec![crate::runtime::ScriptCommand::SetInputAck {
+                participant: 1001,
+                sequence: u64::MAX,
+            }]
+        );
+    }
+
+    #[test]
+    fn match_input_ack_rejects_unsafe_javascript_numbers() {
+        let rt = runtime(
+            "citadel.on_input((event) => { citadel.match.set_input_ack(event.participant_id, 9007199254740993); });",
+        );
+        let batch = batch_with(vec![crate::runtime::NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: None,
+            payload: crate::runtime::NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: Vec::new(),
+                reliable: true,
+                sequence: Some(1),
+            },
+        }]);
+        assert!(
+            rt.evaluate_event_batch(&batch).is_none(),
+            "JS Number inputs must fail rather than silently round a u64 acknowledgement"
+        );
+    }
+
+    #[test]
+    fn match_input_ack_fails_closed_outside_explicit_match_input_event() {
+        let rt = runtime("citadel.on_input(() => { citadel.match.set_input_ack('1001', '77'); });");
+        assert!(
+            rt.evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none(),
+            "a generic normalized event may not manufacture a match-input acknowledgement"
         );
     }
 

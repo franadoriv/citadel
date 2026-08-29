@@ -266,9 +266,23 @@ pub(crate) fn bridge_event_json(batch: &NormalizedEventBatch, event: &Normalized
         } => {
             map.insert("kind".into(), json!("message"));
             map.insert("message_kind".into(), json!(*kind));
+            if *kind == crate::realtime::gateway::KIND_MATCH_INPUT {
+                map.insert(
+                    "participant_id".into(),
+                    json!(event.participant.to_string()),
+                );
+            }
             map.insert("body".into(), json!(body));
             map.insert("reliable".into(), json!(*reliable));
-            map.insert("sequence".into(), json!(sequence));
+            map.insert(
+                "sequence".into(),
+                match sequence {
+                    Some(sequence) if *kind == crate::realtime::gateway::KIND_MATCH_INPUT => {
+                        json!(sequence.to_string())
+                    }
+                    _ => json!(sequence),
+                },
+            );
         }
         NormalizedPayload::ParticipantJoined => {
             map.insert("kind".into(), json!("join"));
@@ -370,6 +384,13 @@ pub(crate) fn script_command_from_outbound(command: OutboundCommand) -> ScriptCo
             kind,
             body,
             unreliable,
+        },
+        OutboundCommand::SetInputAck {
+            participant,
+            sequence,
+        } => ScriptCommand::SetInputAck {
+            participant,
+            sequence,
         },
         OutboundCommand::SpawnActor {
             object_id,
@@ -608,6 +629,14 @@ pub trait Runtime: Send + Sync + 'static {
     /// admission before creating a native lifecycle match. The default is
     /// fail-closed so an adapter cannot silently opt into callbacks it drops.
     fn supports_native_match_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Whether this runtime can execute the full native-match V1 input and
+    /// private acknowledgement surface. The default is fail-closed so an
+    /// adapter cannot receive reserved match input until its host API and typed
+    /// command encoder are implemented with parity.
+    fn supports_match_input_v1(&self) -> bool {
         false
     }
 
