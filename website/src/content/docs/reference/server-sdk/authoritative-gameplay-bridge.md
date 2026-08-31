@@ -19,11 +19,43 @@ The script surface is one handler, `citadel.on_input`, plus the existing
 It is available identically in all three shipped runtimes (Lua, JavaScript,
 Python).
 
+## Per-room bridge mode
+
+Every room generation has an immutable server-owned `bridge_mode` selected at
+creation. It is included in room snapshots and the operator match listing.
+Returning a room spec from `on_room_create` may request one of these values:
+
+```lua
+citadel.on_room_create(function(_ctx, _params)
+  return {
+    map = "Arena",
+    bridge_mode = "authoritative", -- or "relay"
+  }
+end)
+```
+
+- `relay` is the compatibility default. Existing state and custom traffic keep
+  the legacy relay and `on_message` behavior. `KIND_MATCH_INPUT` is ignored and
+  cannot allocate bridge state.
+- `authoritative` requires a healthy embedded runtime and captures its current
+  revision/generation before the room is inserted. Protected traffic and V1
+  match input then use the fenced `on_input` bridge only for that room.
+
+The selected mode cannot be changed by a join, an existing room name, a client
+frame, or a script reload. The create callback runs only when a new named room
+generation is born; a repeat create joins the immutable existing generation. A
+failed authoritative request rejects room creation rather than silently creating
+a relay room. `runtime.require_script = true` remains strict and upgrades every
+room creation to authoritative mode; with it off, relay and authoritative rooms
+may coexist on one node. A reload first fences authoritative admissions, then
+retires every authoritative room generation before replacing the embedded VM;
+relay rooms remain available.
+
 ## Authoritative vs. relay
 
-The bridge activates only for an **authoritative match**: a node started with
-`runtime.require_script = true` (see the readiness gate) whose room is bound to a
-loaded script. For those matches:
+The bridge activates only for a room whose immutable mode is
+**authoritative** and whose captured embedded-script binding remains healthy.
+For those rooms:
 
 - Transform input, `KIND_NA_STATE`, `KIND_NA_PRESENCE`, and `KIND_REP_DELTA`
   route through `on_input`; the direct apply paths are unreachable.
@@ -35,9 +67,11 @@ loaded script. For those matches:
   a script cannot reach `move_actor`/`set_transform` or an unscoped cross-room
   send outside the validator.
 
-When `require_script = false` (the default unzip-and-run mode) there is **no
-bridge**: the built-in relay applies owner state, integrates input, and fans out
-spawns exactly as before, byte for byte. `on_input` is simply never called.
+Relay rooms retain the default unzip-and-run path byte for byte: built-in relay
+applies owner state, integrates input, and fans out spawns exactly as before;
+`on_input` is never called for them. A node with no enabled/healthy embedded
+runtime may still form relay rooms, but it rejects any authoritative-room
+request fail closed.
 
 ## Native authoritative-match lifecycle
 

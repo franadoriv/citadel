@@ -23,6 +23,15 @@ use crate::time::{Clock, SystemClock};
 /// Server-assigned room identifier (monotonic, starts at 1; `0` is never a room).
 pub type RoomId = u64;
 
+/// Immutable server-owned routing policy selected when a room generation is
+/// created. Relay rooms preserve legacy handling; authoritative rooms bind the
+/// protected bridge to one script revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeMode {
+    Relay,
+    Authoritative,
+}
+
 /// Prefix of every durable match identity minted here.
 ///
 /// The durable record, the log rows that reference it, and the console cursor
@@ -75,8 +84,10 @@ pub struct RoomSnapshot {
     /// meaningful on this node, so the console exposes only the count.
     pub remote_member_count: usize,
     /// The GameScript `(revision, generation)` this room was born bound to.
-    /// `None` on ungated nodes (`runtime.require_script` off).
+    /// `None` on relay rooms.
     pub script_binding: Option<ScriptBinding>,
+    /// Immutable bridge routing policy chosen at this room generation's birth.
+    pub bridge_mode: BridgeMode,
 }
 
 /// Globally scoped identity for a member proxied by another node.
@@ -99,6 +110,9 @@ pub enum JoinError {
     /// loaded one (or carries no binding on a gated node). Admission into a
     /// superseded match fails closed.
     StaleScript,
+    /// The selected bridge mode conflicts with the immutable mode of an existing
+    /// named room.
+    BridgeModeMismatch,
     /// The selected runtime cannot execute the complete native authoritative
     /// match lifecycle, so gateway admission was refused before mutation.
     NativeMatchLifecycleUnavailable,
@@ -123,8 +137,10 @@ struct Room {
     /// rooms created via [`RoomRegistry::create`].
     name: Option<String>,
     /// The GameScript `(revision, generation)` captured from the readiness
-    /// snapshot that admitted this room's creation. `None` on ungated nodes.
+    /// snapshot that admitted this room's creation. `None` on relay rooms.
     binding: Option<ScriptBinding>,
+    /// Immutable routing mode minted together with this room generation.
+    bridge_mode: BridgeMode,
 }
 
 #[derive(Debug)]
@@ -188,13 +204,26 @@ impl RoomRegistry {
 
     /// Create a new, empty room with `label`; returns its id. Does not add members.
     pub fn create(&self, label: RoomLabel) -> RoomId {
-        self.create_bound(label, None)
+        self.create_with_mode(label, BridgeMode::Relay, None)
     }
 
-    /// Create a new, empty room born bound to `binding` (the readiness
-    /// snapshot that admitted its creation). `None` preserves the ungated
-    /// behavior.
-    pub fn create_bound(&self, label: RoomLabel, binding: Option<ScriptBinding>) -> RoomId {
+    /// Create a new room whose server-owned bridge mode is fixed for its whole
+    /// generation. Only authoritative rooms may carry a script binding.
+    pub fn create_with_mode(
+        &self,
+        label: RoomLabel,
+        bridge_mode: BridgeMode,
+        binding: Option<ScriptBinding>,
+    ) -> RoomId {
+        let (bridge_mode, binding) = match (bridge_mode, binding) {
+            (BridgeMode::Relay, _) => (BridgeMode::Relay, None),
+            (BridgeMode::Authoritative, Some(binding)) => {
+                (BridgeMode::Authoritative, Some(binding))
+            }
+            // The infallible compatibility constructor cannot mint a
+            // contradictory authoritative room without a server binding.
+            (BridgeMode::Authoritative, None) => (BridgeMode::Relay, None),
+        };
         let mut g = self.lock();
         let id = g.next_id;
         g.next_id += 1;
@@ -208,9 +237,22 @@ impl RoomRegistry {
                 remote_members: HashSet::new(),
                 name: None,
                 binding,
+                bridge_mode,
             },
         );
         id
+    }
+
+    /// Create a new, empty room born bound to `binding` (the readiness
+    /// snapshot that admitted its creation). `None` preserves the ungated
+    /// behavior.
+    pub fn create_bound(&self, label: RoomLabel, binding: Option<ScriptBinding>) -> RoomId {
+        let bridge_mode = if binding.is_some() {
+            BridgeMode::Authoritative
+        } else {
+            BridgeMode::Relay
+        };
+        self.create_with_mode(label, bridge_mode, binding)
     }
 
     /// Join the room registered under `name`, or create it (labelled by `make_label`)
@@ -240,8 +282,34 @@ impl RoomRegistry {
         binding: Option<ScriptBinding>,
         make_label: impl FnOnce() -> RoomLabel,
     ) -> Result<(RoomId, RoomLabel), JoinError> {
+        let bridge_mode = if binding.is_some() {
+            BridgeMode::Authoritative
+        } else {
+            BridgeMode::Relay
+        };
+        self.join_or_create_with_mode(participant, name, bridge_mode, binding, make_label)
+    }
+
+    /// Join or create a named room with one immutable server-owned bridge mode.
+    /// Existing named rooms reject a conflicting request rather than mutating
+    /// their routing policy or script binding.
+    pub fn join_or_create_with_mode(
+        &self,
+        participant: ParticipantId,
+        name: &str,
+        bridge_mode: BridgeMode,
+        binding: Option<ScriptBinding>,
+        make_label: impl FnOnce() -> RoomLabel,
+    ) -> Result<(RoomId, RoomLabel), JoinError> {
+        if matches!(bridge_mode, BridgeMode::Authoritative) != binding.is_some() {
+            return Err(JoinError::StaleScript);
+        }
         let mut g = self.lock();
         if let Some(&existing) = g.names.get(name) {
+            let room = g.rooms.get(&existing).ok_or(JoinError::NoSuchRoom)?;
+            if room.bridge_mode != bridge_mode {
+                return Err(JoinError::BridgeModeMismatch);
+            }
             return Self::join_locked(&mut g, participant, existing, false, binding.as_ref());
         }
         // Create the named room, then join the creator into it.
@@ -256,6 +324,7 @@ impl RoomRegistry {
                 members: HashSet::new(),
                 remote_members: HashSet::new(),
                 name: Some(name.to_owned()),
+                bridge_mode,
                 binding: binding.clone(),
             },
         );
@@ -502,6 +571,10 @@ impl RoomRegistry {
             .and_then(|r| r.binding.clone())
     }
 
+    pub fn bridge_mode(&self, room_id: RoomId) -> Option<BridgeMode> {
+        self.lock().rooms.get(&room_id).map(|room| room.bridge_mode)
+    }
+
     /// Fail-closed script-binding check shared by every admission path.
     ///
     /// With `expected` set (a gated node's current Ready snapshot), the room
@@ -521,6 +594,27 @@ impl RoomRegistry {
     #[must_use]
     pub fn room_count(&self) -> usize {
         self.lock().rooms.len()
+    }
+
+    /// Snapshot a named room under the registry lock so a caller can join an
+    /// existing generation without re-running its creation callback.
+    #[must_use]
+    pub fn named_room(&self, name: &str) -> Option<RoomSnapshot> {
+        let g = self.lock();
+        let id = *g.names.get(name)?;
+        let room = g.rooms.get(&id)?;
+        let mut members: Vec<ParticipantId> = room.members.iter().copied().collect();
+        members.sort_unstable();
+        Some(RoomSnapshot {
+            id,
+            match_id: room.match_id.clone(),
+            name: room.name.clone(),
+            label: room.label.clone(),
+            members,
+            remote_member_count: room.remote_members.len(),
+            script_binding: room.binding.clone(),
+            bridge_mode: room.bridge_mode,
+        })
     }
 
     /// A point-in-time copy of every live room, id-ordered.
@@ -545,6 +639,7 @@ impl RoomRegistry {
                     members,
                     remote_member_count: room.remote_members.len(),
                     script_binding: room.binding.clone(),
+                    bridge_mode: room.bridge_mode,
                 }
             })
             .collect();
@@ -657,6 +752,41 @@ mod tests {
 
     fn pid(n: u64) -> ParticipantId {
         ParticipantId::from_raw(n)
+    }
+
+    #[test]
+    fn room_creation_persists_authoritative_bridge_mode() {
+        let rooms = RoomRegistry::new();
+        let room_id = rooms.create_with_mode(
+            RoomLabel::with_map("arena"),
+            BridgeMode::Authoritative,
+            Some(binding("revision-a", 1)),
+        );
+        let snapshot = rooms.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, room_id);
+        assert_eq!(snapshot[0].bridge_mode, BridgeMode::Authoritative);
+        assert_eq!(rooms.bridge_mode(room_id), Some(BridgeMode::Authoritative));
+    }
+
+    #[test]
+    fn named_room_rejects_a_mode_flip_after_creation() {
+        let rooms = RoomRegistry::new();
+        rooms
+            .join_or_create_with_mode(pid(1), "same-name", BridgeMode::Relay, None, || {
+                RoomLabel::with_map("relay")
+            })
+            .expect("relay room");
+        assert_eq!(
+            rooms.join_or_create_with_mode(
+                pid(2),
+                "same-name",
+                BridgeMode::Authoritative,
+                Some(binding("revision-a", 1)),
+                || RoomLabel::with_map("ignored"),
+            ),
+            Err(JoinError::BridgeModeMismatch)
+        );
     }
 
     #[test]
