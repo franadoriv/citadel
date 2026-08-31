@@ -4851,6 +4851,10 @@ impl Gateway {
         let Some(runtime) = &self.runtime else {
             return 0;
         };
+        let _generation = self
+            .generation_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Preserve the global tick for server-wide work, then advance each live
         // match independently. A match command fan-outs only to that match's
         // current presence snapshot.
