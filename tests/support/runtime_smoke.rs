@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use citadel::runtime::{
-    LifecycleHook, OutboundCommand, PhysicsOptions, RoomSpec, RpcOutcome, Runtime,
+    LifecycleHook, OutboundCommand, PhysicsOptions, RoomBridgeMode, RoomSpec, RpcOutcome, Runtime,
 };
 use citadel_physics::{PhysicsConfig, Shape};
 
@@ -104,6 +104,7 @@ pub fn assert_host_api_smoke_contract<R: Runtime>(runtime: &R) {
             mode: "duel".to_string(),
             max_players: 2,
             open: true,
+            bridge_mode: RoomBridgeMode::Relay,
         })
     );
     assert!(Runtime::call_room_join(runtime, 9, Some("user-1"), 7));

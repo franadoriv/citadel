@@ -109,7 +109,7 @@ pub use http_endpoint::{
 pub use js::{JS_ENTRYPOINT, JsRuntime};
 pub use lua::{
     DEFAULT_DEADLINE_MS, LifecycleHook, LuaRuntime, OutboundCommand, PhysicsOptions, ReloadOutcome,
-    RoomSpec, RpcOutcome, RuntimeIntrospection,
+    RoomBridgeMode, RoomSpec, RpcOutcome, RuntimeIntrospection,
 };
 #[cfg(feature = "runtime-python")]
 pub use python::PythonRuntime;

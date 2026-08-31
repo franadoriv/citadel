@@ -41,11 +41,11 @@ use crate::runtime::{
     BridgeCommandSink, DomainHost, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION,
     NativeMatchContext, NativeMatchLifecycleHook, NormalizedEventBatch, NormalizedPayload,
     OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome,
-    RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
-    RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
-    RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
-    RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
-    StorageWriteInput, append_runtime_event_commands, bridge_event_json,
+    RoomBridgeMode, RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus,
+    RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint,
+    RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest,
+    RuntimeHttpResponse, RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle,
+    ScriptCommandBatch, StorageWriteInput, append_runtime_event_commands, bridge_event_json,
     bridge_input_outcome_from_json, disabled_runtime_event_bus_handle,
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
     script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
@@ -332,13 +332,18 @@ const JS_HOST_PRELUDE: &str = r#"
       return null;
     }
     if (typeof value === "string") {
-      return [value, "", 0, true];
+      return [value, "", 0, true, "relay"];
+    }
+    const bridgeMode = value.bridge_mode === undefined ? value.bridgeMode : value.bridge_mode;
+    if (bridgeMode !== undefined && bridgeMode !== "relay" && bridgeMode !== "authoritative") {
+      throw new TypeError("bridge_mode must be 'relay' or 'authoritative'");
     }
     return [
       String(value.map || ""),
       String(value.mode || ""),
       Number(value.max_players || value.maxPlayers || 0),
       value.open === undefined ? true : Boolean(value.open),
+      bridgeMode === undefined ? "relay" : bridgeMode,
     ];
   }
 
@@ -3691,12 +3696,22 @@ fn parse_room_spec(spec: Value<'_>) -> JsHostResult<Option<RoomSpec>> {
     }
     let tuple = Array::from_value(spec).map_err(|e| e.to_string())?;
     let max_players: u32 = tuple.get(2).map_err(|e| e.to_string())?;
+    let bridge_mode: String = tuple.get(4).map_err(|e| e.to_string())?;
     Ok(Some(RoomSpec {
         map: tuple.get(0).map_err(|e| e.to_string())?,
         mode: tuple.get(1).map_err(|e| e.to_string())?,
         max_players: max_players.min(u32::from(u16::MAX)) as u16,
         open: tuple.get(3).map_err(|e| e.to_string())?,
+        bridge_mode: parse_room_bridge_mode(&bridge_mode)?,
     }))
+}
+
+fn parse_room_bridge_mode(value: &str) -> JsHostResult<RoomBridgeMode> {
+    match value {
+        "relay" => Ok(RoomBridgeMode::Relay),
+        "authoritative" => Ok(RoomBridgeMode::Authoritative),
+        _ => Err("bridge_mode must be 'relay' or 'authoritative'".to_string()),
+    }
 }
 
 fn bytes_from_js(value: Value<'_>) -> JsHostResult<Vec<u8>> {
@@ -5818,7 +5833,7 @@ citadel.on_rpc("nope", () => citadel.Reply.err("denied"));
     fn room_hooks_parse_spec_and_admission() {
         let rt = runtime(
             r#"
-citadel.on_room_create(() => ({ map: "Arena", mode: "duel", max_players: 2, open: false }));
+citadel.on_room_create(() => ({ map: "Arena", mode: "duel", max_players: 2, open: false, bridge_mode: "authoritative" }));
 citadel.on_room_join((_ctx, roomId) => roomId === 7n);
 "#,
         );
@@ -5829,6 +5844,7 @@ citadel.on_room_join((_ctx, roomId) => roomId === 7n);
                 mode: "duel".to_string(),
                 max_players: 2,
                 open: false,
+                bridge_mode: RoomBridgeMode::Authoritative,
             })
         );
         assert!(rt.call_room_join(1, None, 7));

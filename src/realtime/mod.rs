@@ -38,7 +38,7 @@ pub use registry::{
     SessionHandle, SessionRegistry,
 };
 pub use reload::LuaReloadService;
-pub use rooms::{JoinError, RoomId, RoomLabel, RoomRegistry, RoomSnapshot};
+pub use rooms::{BridgeMode, JoinError, RoomId, RoomLabel, RoomRegistry, RoomSnapshot};
 pub use tick::{
     ChatDeliveryDispatchService, ChatPresenceRenewalService, GameplayClock, GameplayClockSnapshot,
     LuaTickService, MatchmakerTickService, ReconnectGraceExpiryService, TransformTickService,

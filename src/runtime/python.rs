@@ -39,8 +39,8 @@ use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NativeMatchContext,
     NativeMatchLifecycleHook, NormalizedEventBatch, NormalizedPayload, OutboundCommand,
-    PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomSpec,
-    RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomBridgeMode,
+    RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
     RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
     RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
     RuntimeIntrospection, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
@@ -683,13 +683,17 @@ def _call_room_create(ctx, params):
     if spec is None:
         return None
     if isinstance(spec, str):
-        return (spec, "", 0, True)
+        return (spec, "", 0, True, "relay")
     data = dict(spec)
+    bridge_mode = str(data.get("bridge_mode", "relay"))
+    if bridge_mode not in ("relay", "authoritative"):
+        raise ValueError("bridge_mode must be 'relay' or 'authoritative'")
     return (
         str(data.get("map", "")),
         str(data.get("mode", "")),
         int(data.get("max_players", 0)),
         bool(data.get("open", True)),
+        bridge_mode,
     )
 
 def _call_room_join(ctx, room_id):
@@ -3757,12 +3761,22 @@ fn parse_room_spec(spec: Bound<'_, PyAny>) -> PyResult<Option<RoomSpec>> {
         return Ok(None);
     }
     let tuple: Bound<'_, PyTuple> = spec.cast_into()?;
+    let bridge_mode: String = tuple.get_item(4)?.extract()?;
     Ok(Some(RoomSpec {
         map: tuple.get_item(0)?.extract()?,
         mode: tuple.get_item(1)?.extract()?,
         max_players: tuple.get_item(2)?.extract()?,
         open: tuple.get_item(3)?.extract()?,
+        bridge_mode: parse_room_bridge_mode(&bridge_mode).map_err(PyRuntimeError::new_err)?,
     }))
+}
+
+fn parse_room_bridge_mode(value: &str) -> Result<RoomBridgeMode, String> {
+    match value {
+        "relay" => Ok(RoomBridgeMode::Relay),
+        "authoritative" => Ok(RoomBridgeMode::Authoritative),
+        _ => Err("bridge_mode must be 'relay' or 'authoritative'".to_owned()),
+    }
 }
 
 fn vm_has_any_handler(vm: &PythonVm) -> bool {
@@ -5262,7 +5276,7 @@ import citadel
 
 @citadel.on_room_create
 def create(ctx, params):
-    return {"map": "Arena", "mode": "duel", "max_players": 2, "open": True}
+    return {"map": "Arena", "mode": "duel", "max_players": 2, "open": True, "bridge_mode": "authoritative"}
 
 @citadel.on_room_join
 def join(ctx, room_id):
@@ -5274,6 +5288,7 @@ def join(ctx, room_id):
         assert_eq!(spec.mode, "duel");
         assert_eq!(spec.max_players, 2);
         assert!(spec.open);
+        assert_eq!(spec.bridge_mode, RoomBridgeMode::Authoritative);
         assert!(rt.call_room_join(1, None, 7));
         assert!(!rt.call_room_join(1, None, 8));
 

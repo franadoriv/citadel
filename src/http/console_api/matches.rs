@@ -21,7 +21,7 @@ use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
 use crate::matchmaker::MatchmakerStats;
-use crate::realtime::{RoomId, RoomSnapshot};
+use crate::realtime::{BridgeMode, RoomId, RoomSnapshot};
 use crate::services::ConsolePrincipal;
 
 /// The Matches section route.
@@ -67,6 +67,8 @@ pub struct MatchRow {
     pub script_revision: Option<String>,
     /// Load generation of that revision at the room's birth.
     pub script_generation: Option<u64>,
+    /// Immutable server-owned bridge mode for this room generation.
+    pub bridge_mode: &'static str,
 }
 
 impl MatchRow {
@@ -87,6 +89,10 @@ impl MatchRow {
                 .script_binding
                 .as_ref()
                 .map(|binding| binding.generation),
+            bridge_mode: match snapshot.bridge_mode {
+                BridgeMode::Relay => "relay",
+                BridgeMode::Authoritative => "authoritative",
+            },
         }
     }
 }
@@ -199,6 +205,9 @@ pub(super) async fn detail_handler(
 /// `Ok` when the node is ungated or the gate is `Ready`; otherwise counts the
 /// rejection and fails closed with the stable client-safe `503`.
 fn console_script_gate(app: &App, gateway: &crate::realtime::Gateway) -> Result<(), ApiError> {
+    if !app.config().runtime.require_script {
+        return Ok(());
+    }
     let Some(readiness) = gateway.script_readiness() else {
         return Ok(());
     };
@@ -239,7 +248,15 @@ mod tests {
             members: Vec::new(),
             remote_member_count: 0,
             script_binding: None,
+            bridge_mode: BridgeMode::Relay,
         }
+    }
+
+    #[test]
+    fn match_row_serializes_immutable_bridge_mode() {
+        let mut room = snapshot(Some("authoritative"), "MapA", "");
+        room.bridge_mode = BridgeMode::Authoritative;
+        assert_eq!(MatchRow::from_snapshot(&room).bridge_mode, "authoritative");
     }
 
     #[test]
