@@ -418,11 +418,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // install its synchronous `physics_state` read handle. The gateway receives
     // the same shared hub below.
     let transform_hub = build_transform_hub(&cfg.transform_sync);
-    // GameScript readiness gate (`runtime.require_script`): the authority is
-    // created before the runtime loads so a missing entrypoint boots the node
-    // not-ready instead of silently falling back to the relay. `None` keeps
-    // ungated deployments byte-identical.
-    let script_readiness = app.config().runtime.require_script.then(|| {
+    // Script readiness exists for every enabled embedded runtime: strict nodes
+    // gate every room, while ordinary nodes consult it only for a room that
+    // requests authoritative bridge mode.
+    let script_readiness = app.config().runtime.enabled.then(|| {
         Arc::new(
             crate::runtime::GameScriptReadiness::new(SystemClock.now())
                 .with_metrics(Arc::clone(app.metrics())),
@@ -472,11 +471,14 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         gateway = gateway.with_match_recorder(recorder);
     }
     if let Some(readiness) = &script_readiness {
-        gateway = gateway.with_script_readiness(Arc::clone(readiness));
-        // A require_script node runs authoritative matches: enable the gameplay
-        // bridge so a bound match's protected frames route through the per-match
-        // validator. Quotas + capabilities come from `[runtime.bridge]`
-        // (PROVISIONAL measure-first quota defaults; capabilities opt-in).
+        gateway = if app.config().runtime.require_script {
+            gateway.with_script_readiness(Arc::clone(readiness))
+        } else {
+            gateway.with_optional_script_readiness(Arc::clone(readiness))
+        };
+        // Enable the bridge when an embedded runtime is configured. Relay rooms
+        // still bypass it; only room generations explicitly born authoritative
+        // can use this state.
         let bridge_cfg = &app.config().runtime.bridge;
         let quotas = crate::runtime::BridgeQuotas {
             max_commands: bridge_cfg.max_commands,
@@ -897,6 +899,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     maybe_spawn_reload(
         &mut supervisor,
         runtime.as_ref(),
+        &gateway,
         &app.config().runtime,
         readiness_source.as_ref(),
     );
@@ -932,7 +935,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         }
         impl crate::runtime::worker_supervisor::WorkerGenerationObserver for CloseMatchesOnGenerationEnd {
             fn worker_generation_ended(&self) {
-                let notified = self.gateway.close_all_matches();
+                let notified = self.gateway.close_all_authoritative_matches();
                 tracing::warn!(
                     notified,
                     "external runtime worker generation ended; dependent matches closed"
@@ -1166,6 +1169,7 @@ fn maybe_spawn_tick(
 fn maybe_spawn_reload(
     supervisor: &mut Supervisor,
     runtime: Option<&Arc<dyn Runtime>>,
+    gateway: &Arc<Gateway>,
     rc: &crate::config::RuntimeConfig,
     readiness: Option<&crate::runtime::InProcessRuntimeSource>,
 ) {
@@ -1194,7 +1198,8 @@ fn maybe_spawn_reload(
         poll_ms = interval.as_millis() as u64,
         "starting embedded script hot-reload watcher"
     );
-    let mut service = crate::realtime::LuaReloadService::new(Arc::clone(runtime), path, interval);
+    let mut service = crate::realtime::LuaReloadService::new(Arc::clone(runtime), path, interval)
+        .with_gateway(Arc::clone(gateway));
     if let Some(source) = readiness {
         // Successful reloads adopt the new content identity and bump the
         // gate generation; rejected reloads keep the serving script Ready.

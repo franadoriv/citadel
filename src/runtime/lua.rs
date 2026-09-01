@@ -469,6 +469,14 @@ enum RpcInner {
     NoHandler,
 }
 
+/// Server-owned per-room bridge choice requested by an embedded room-create
+/// callback and validated by the gateway before the room is born.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomBridgeMode {
+    Relay,
+    Authoritative,
+}
+
 /// A room label produced by the Lua `on_room_create` handler. The
 /// gateway maps this onto its own `RoomLabel`; keeping it here avoids a runtime →
 /// realtime dependency. A handler may return a bare string (the map name) or a
@@ -483,6 +491,8 @@ pub struct RoomSpec {
     pub max_players: u16,
     /// Whether new joins are accepted.
     pub open: bool,
+    /// Server-owned mode requested at creation; relay is the compatibility default.
+    pub bridge_mode: RoomBridgeMode,
 }
 
 impl Default for RoomSpec {
@@ -492,6 +502,7 @@ impl Default for RoomSpec {
             mode: String::new(),
             max_players: 0,
             open: true,
+            bridge_mode: RoomBridgeMode::Relay,
         }
     }
 }
@@ -2383,11 +2394,22 @@ fn call_room_create_handler(
             mode: t.get::<Option<String>>("mode")?.unwrap_or_default(),
             max_players: t.get::<Option<u16>>("max_players")?.unwrap_or(0),
             open: t.get::<Option<bool>>("open")?.unwrap_or(true),
+            bridge_mode: parse_room_bridge_mode(t.get::<Option<String>>("bridge_mode")?)?,
         },
         // A nil/other return means "use the default label" (empty map).
         _ => RoomSpec::default(),
     };
     Ok(Some(spec))
+}
+
+fn parse_room_bridge_mode(value: Option<String>) -> mlua::Result<RoomBridgeMode> {
+    match value.as_deref().unwrap_or("relay") {
+        "relay" => Ok(RoomBridgeMode::Relay),
+        "authoritative" => Ok(RoomBridgeMode::Authoritative),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "bridge_mode must be 'relay' or 'authoritative', got {other:?}"
+        ))),
+    }
 }
 
 /// Invoke `on_room_join` (if registered), returning its admission decision.
@@ -5885,6 +5907,17 @@ mod tests {
             panic!("storage index host must return a reply");
         };
         assert_eq!(reply, b"false|true|1|alice|main");
+    }
+
+    #[test]
+    fn on_room_create_can_request_authoritative_bridge_mode() {
+        let runtime = runtime(
+            r#"citadel.on_room_create(function()
+                return { map = "Arena", bridge_mode = "authoritative" }
+            end)"#,
+        );
+        let spec = runtime.call_room_create(1, None, b"").expect("room spec");
+        assert_eq!(spec.bridge_mode, RoomBridgeMode::Authoritative);
     }
 
     #[test]

@@ -106,6 +106,18 @@ pub struct LuaReloadService {
     /// GameScript readiness source fed by reload outcomes
     /// (`runtime.require_script` deployments). `None` on ungated nodes.
     readiness: Option<crate::runtime::InProcessRuntimeSource>,
+    /// Gateway whose authoritative room generations must retire on a successful
+    /// embedded runtime replacement.
+    gateway: Option<Arc<crate::realtime::Gateway>>,
+}
+
+/// Clears the gateway's retirement suppression even if an embedded reload panics.
+struct ReloadRetirementGuard(Arc<crate::realtime::Gateway>);
+
+impl Drop for ReloadRetirementGuard {
+    fn drop(&mut self) {
+        self.0.set_reload_retiring(false);
+    }
 }
 
 impl LuaReloadService {
@@ -117,6 +129,7 @@ impl LuaReloadService {
             path,
             interval,
             readiness: None,
+            gateway: None,
         }
     }
 
@@ -126,6 +139,14 @@ impl LuaReloadService {
     #[must_use]
     pub fn with_readiness(mut self, readiness: crate::runtime::InProcessRuntimeSource) -> Self {
         self.readiness = Some(readiness);
+        self
+    }
+
+    /// Retire authoritative room generations after a successful reload while
+    /// preserving relay rooms and their legacy behavior.
+    #[must_use]
+    pub fn with_gateway(mut self, gateway: Arc<crate::realtime::Gateway>) -> Self {
+        self.gateway = Some(gateway);
         self
     }
 }
@@ -166,19 +187,47 @@ impl AsyncService for LuaReloadService {
                     }
                     last = current;
                     let runtime = Arc::clone(&self.runtime);
-                    // Run the blocking reload (file read + VM build + lock swap)
-                    // off the async workers. `reload` is failure-safe internally;
-                    // a panic here becomes a JoinError, logged, loop continues.
-                    match tokio::task::spawn_blocking(move || runtime.reload()).await {
-                        Ok(outcome) => {
-                            if let Some(readiness) = &self.readiness {
-                                readiness.record_reload(
-                                    outcome,
-                                    &self.path,
-                                    crate::time::Clock::now(&crate::time::SystemClock),
-                                );
-                            }
+                    let gateway = self.gateway.clone();
+                    let readiness = self.readiness.clone();
+                    let path = self.path.clone();
+                    // The entire retirement + VM replacement shares one
+                    // exclusive generation fence, so an already-admitted batch
+                    // finishes on the old VM and no old room/lifecycle callback
+                    // can enter the replacement VM.
+                    match tokio::task::spawn_blocking(move || {
+                        let _generation = gateway.as_ref().map(|gateway| gateway.lock_reload_generation());
+                        if let Some(readiness) = &readiness {
+                            use crate::runtime::ReadinessSource as _;
+                            readiness.authority().record_activating(
+                                crate::time::Clock::now(&crate::time::SystemClock),
+                            );
                         }
+                        let outcome = runtime.reload();
+                        // Runtime reload swaps only on success. Keep existing
+                        // authoritative rooms intact after a rejected reload;
+                        // on success the exclusive generation writer prevents
+                        // any old-room callback from reaching the replacement VM
+                        // while retirement is performed.
+                        let _retirement = if matches!(outcome, crate::runtime::ReloadOutcome::Reloaded) {
+                            gateway.as_ref().map(|gateway| {
+                                gateway.set_reload_retiring(true);
+                                let guard = ReloadRetirementGuard(Arc::clone(gateway));
+                                gateway.retire_authoritative_rooms_for_reload();
+                                guard
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(readiness) = &readiness {
+                            readiness.record_reload(
+                                outcome,
+                                &path,
+                                crate::time::Clock::now(&crate::time::SystemClock),
+                            );
+                        }
+                        outcome
+                    }).await {
+                        Ok(_outcome) => {}
                         Err(join_err) => {
                             tracing::error!(
                                 error = %join_err,
