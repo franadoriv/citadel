@@ -37,7 +37,7 @@ use crate::http::error::ApiError;
 use crate::identity::{
     AccountState, AuthCredential, AuthIdentity, DisplayName, User, UserMetadata, Username,
 };
-use crate::services::{AuditEntry, ConsoleIdentity};
+use crate::services::{AuditEntry, ConsolePrincipal};
 use crate::session::RevocationReason;
 use crate::storage::UserId;
 use crate::time::{Clock, SystemClock};
@@ -190,7 +190,7 @@ pub struct UpdateBody {
 /// `GET /console/v1/accounts`: paged, filtered account listing.
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(params): Query<ListParams>,
 ) -> Result<Json<AccountsPage>, ApiError> {
     app.metrics().record_http_request();
@@ -212,7 +212,7 @@ pub(super) async fn list_handler(
 /// `POST /console/v1/accounts`: create an account (admin).
 pub(super) async fn create_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<CreateBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<AccountRow>), ApiError> {
     app.metrics().record_http_request();
@@ -231,8 +231,8 @@ pub(super) async fn create_handler(
     let created = app.backend().user_repository().create_user(user).await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "accounts.create",
         format!("account {}", created.id.as_str()),
         format!("created username {}", created.username.as_str()),
@@ -243,7 +243,7 @@ pub(super) async fn create_handler(
 /// `GET /console/v1/accounts/{id}`: profile + linked identities.
 pub(super) async fn detail_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<AccountDetail>, ApiError> {
     app.metrics().record_http_request();
@@ -258,7 +258,7 @@ pub(super) async fn detail_handler(
 /// reshaping the detail view.
 pub(super) async fn export_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<AccountDetail>, ApiError> {
     app.metrics().record_http_request();
@@ -269,7 +269,7 @@ pub(super) async fn export_handler(
 /// `PUT /console/v1/accounts/{id}`: edit profile fields (admin).
 pub(super) async fn update_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<UpdateBody>, JsonRejection>,
 ) -> Result<Json<AccountRow>, ApiError> {
@@ -309,8 +309,8 @@ pub(super) async fn update_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "accounts.update",
         format!("account {}", id.as_str()),
         "edited profile fields",
@@ -321,7 +321,7 @@ pub(super) async fn update_handler(
 /// `POST /console/v1/accounts/{id}/ban`: disable the account (admin).
 pub(super) async fn ban_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<AccountRow>, ApiError> {
     set_state(app, operator, id, AccountState::Disabled, "accounts.ban").await
@@ -330,7 +330,7 @@ pub(super) async fn ban_handler(
 /// `POST /console/v1/accounts/{id}/unban`: re-enable the account (admin).
 pub(super) async fn unban_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<AccountRow>, ApiError> {
     set_state(app, operator, id, AccountState::Active, "accounts.unban").await
@@ -342,7 +342,7 @@ pub(super) async fn unban_handler(
 /// credential so the ids are reusable, and revokes live sessions.
 pub(super) async fn delete_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     app.metrics().record_http_request();
@@ -371,8 +371,8 @@ pub(super) async fn delete_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "accounts.delete",
         format!("account {}", id.as_str()),
         format!(
@@ -387,7 +387,7 @@ pub(super) async fn delete_handler(
 /// ban + audit entry.
 async fn set_state(
     app: App,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
     state: AccountState,
     action: &str,
@@ -412,8 +412,8 @@ async fn set_state(
     }
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         action,
         format!("account {}", id.as_str()),
         details,
@@ -499,7 +499,7 @@ pub struct FriendAddBody {
 /// `GET /console/v1/accounts/{id}/wallet`: balances + newest-first ledger.
 pub(super) async fn wallet_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<WalletResponse>, ApiError> {
     app.metrics().record_http_request();
@@ -513,7 +513,7 @@ pub(super) async fn wallet_handler(
 /// `POST /console/v1/accounts/{id}/wallet`: credit or debit (admin).
 pub(super) async fn wallet_adjust_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<WalletAdjustBody>, JsonRejection>,
 ) -> Result<Json<WalletResponse>, ApiError> {
@@ -532,8 +532,8 @@ pub(super) async fn wallet_adjust_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "accounts.wallet.adjust",
         format!("account {}", id.as_str()),
         format!(
@@ -555,7 +555,7 @@ pub(super) async fn wallet_adjust_handler(
 /// `GET /console/v1/accounts/{id}/friends`: this account's relations.
 pub(super) async fn friends_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
 ) -> Result<Json<Vec<crate::services::FriendRow>>, ApiError> {
     app.metrics().record_http_request();
@@ -569,7 +569,7 @@ pub(super) async fn friends_handler(
 /// side completes the mutual friendship.
 pub(super) async fn friend_add_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<FriendAddBody>, JsonRejection>,
 ) -> Result<Json<Vec<crate::services::FriendRow>>, ApiError> {
@@ -584,8 +584,8 @@ pub(super) async fn friend_add_handler(
     let state = app.friends().add(id.as_str(), other.as_str(), now).await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "accounts.friends.add",
         format!("account {}", id.as_str()),
         format!("relation with {} -> {}", other.as_str(), state.as_str()),
@@ -597,7 +597,7 @@ pub(super) async fn friend_add_handler(
 /// (admin; also how an operator unblocks).
 pub(super) async fn friend_remove_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     app.metrics().record_http_request();
@@ -613,8 +613,8 @@ pub(super) async fn friend_remove_handler(
     app.friends().remove(id.as_str(), other.as_str()).await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "accounts.friends.remove",
         format!("account {}", id.as_str()),
         format!("removed relation with {}", other.as_str()),

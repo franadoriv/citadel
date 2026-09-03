@@ -22,7 +22,7 @@ use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
 use crate::runtime::{RpcOutcome, RuntimeIntrospection};
-use crate::services::{AuditEntry, ConsoleIdentity};
+use crate::services::{AuditEntry, ConsolePrincipal};
 use crate::time::{Clock, SystemClock};
 
 /// The API Explorer / Runtime section route.
@@ -129,7 +129,7 @@ pub struct RpcResponse {
 /// `GET /console/v1/runtime`: runtime facts + script introspection.
 pub(super) async fn get_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
 ) -> Json<RuntimeResponse> {
     app.metrics().record_http_request();
     let runtime_config = &app.config().runtime;
@@ -182,7 +182,7 @@ pub(super) async fn get_handler(
 /// `POST /console/v1/runtime/rpc/{method}`: invoke a registered RPC (admin).
 pub(super) async fn rpc_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(method): Path<String>,
     body: Result<Json<RpcRequest>, JsonRejection>,
 ) -> Result<Json<RpcResponse>, ApiError> {
@@ -213,8 +213,8 @@ pub(super) async fn rpc_handler(
     };
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "runtime.rpc",
         format!("rpc {method}"),
         if ok {

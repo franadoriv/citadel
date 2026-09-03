@@ -12,14 +12,31 @@
 //! in Phase A4, not here). Object-id space stays global.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::ids::NodeIdentity;
 use crate::realtime::registry::ParticipantId;
-use crate::runtime::ScriptBinding;
+use crate::runtime::{NativeMatchLifecycleUnavailable, ScriptBinding};
 use crate::session::NodeId;
+use crate::time::{Clock, SystemClock};
 
 /// Server-assigned room identifier (monotonic, starts at 1; `0` is never a room).
 pub type RoomId = u64;
+
+/// Immutable server-owned routing policy selected when a room generation is
+/// created. Relay rooms preserve legacy handling; authoritative rooms bind the
+/// protected bridge to one script revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeMode {
+    Relay,
+    Authoritative,
+}
+
+/// Prefix of every durable match identity minted here.
+///
+/// The durable record, the log rows that reference it, and the console cursor
+/// validator all read the same shape, so the prefix is stated once.
+pub const MATCH_ID_PREFIX: &str = "mt1-";
 
 /// A room's game-defined metadata. The `map` is the load-bearing field: it is what
 /// the server sends a joining client in `KIND_ROOM_JOINED`.
@@ -53,6 +70,10 @@ impl RoomLabel {
 pub struct RoomSnapshot {
     /// Server-assigned room id.
     pub id: RoomId,
+    /// Durable server-minted match identity. Stable for the room's whole life
+    /// and never reused, so it survives the process the `id` is local to. Game
+    /// code can neither choose it nor change it.
+    pub match_id: String,
     /// The matchmaking name the room was created under, if any.
     pub name: Option<String>,
     /// The room's game-defined label (map, mode, cap, open).
@@ -63,8 +84,10 @@ pub struct RoomSnapshot {
     /// meaningful on this node, so the console exposes only the count.
     pub remote_member_count: usize,
     /// The GameScript `(revision, generation)` this room was born bound to.
-    /// `None` on ungated nodes (`runtime.require_script` off).
+    /// `None` on relay rooms.
     pub script_binding: Option<ScriptBinding>,
+    /// Immutable bridge routing policy chosen at this room generation's birth.
+    pub bridge_mode: BridgeMode,
 }
 
 /// Globally scoped identity for a member proxied by another node.
@@ -87,10 +110,25 @@ pub enum JoinError {
     /// loaded one (or carries no binding on a gated node). Admission into a
     /// superseded match fails closed.
     StaleScript,
+    /// The selected bridge mode conflicts with the immutable mode of an existing
+    /// named room.
+    BridgeModeMismatch,
+    /// The selected runtime cannot execute the complete native authoritative
+    /// match lifecycle, so gateway admission was refused before mutation.
+    NativeMatchLifecycleUnavailable,
+}
+
+impl From<NativeMatchLifecycleUnavailable> for JoinError {
+    fn from(_: NativeMatchLifecycleUnavailable) -> Self {
+        Self::NativeMatchLifecycleUnavailable
+    }
 }
 
 #[derive(Debug)]
 struct Room {
+    /// Minted once at birth, before the room can admit anyone. This is what
+    /// makes the durable record keyed by something a restart cannot recycle.
+    match_id: String,
     label: RoomLabel,
     members: HashSet<ParticipantId>,
     remote_members: HashSet<RemoteRoomMember>,
@@ -99,8 +137,10 @@ struct Room {
     /// rooms created via [`RoomRegistry::create`].
     name: Option<String>,
     /// The GameScript `(revision, generation)` captured from the readiness
-    /// snapshot that admitted this room's creation. `None` on ungated nodes.
+    /// snapshot that admitted this room's creation. `None` on relay rooms.
     binding: Option<ScriptBinding>,
+    /// Immutable routing mode minted together with this room generation.
+    bridge_mode: BridgeMode,
 }
 
 #[derive(Debug)]
@@ -113,6 +153,10 @@ struct Inner {
     /// the same name in the same room. Cleared when the room is pruned.
     names: HashMap<String, RoomId>,
     next_id: RoomId,
+    /// Mints every room's durable match identity. Held here rather than passed
+    /// per call so the two creation sites are the only places a match id can
+    /// come into existence.
+    identity: Arc<NodeIdentity>,
 }
 
 /// The gateway's room state. Interior-mutable (like the session registry) so the
@@ -123,9 +167,20 @@ pub struct RoomRegistry {
 }
 
 impl RoomRegistry {
-    /// An empty registry (no rooms).
+    /// An empty registry (no rooms) minting under an unattributed identity.
+    ///
+    /// The identity is still unique per construction, so ids never collide;
+    /// production replaces it with the node's own through
+    /// [`Self::adopt_identity`] so a row's `match_id` and `node_id` agree.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_identity(Arc::new(NodeIdentity::new(String::new())))
+    }
+
+    /// An empty registry whose rooms mint their match identity under
+    /// `identity`.
+    #[must_use]
+    pub fn with_identity(identity: Arc<NodeIdentity>) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 rooms: HashMap::new(),
@@ -133,33 +188,71 @@ impl RoomRegistry {
                 remote_membership: HashMap::new(),
                 names: HashMap::new(),
                 next_id: 1,
+                identity,
             }),
         }
     }
 
+    /// Mint every subsequent room's match identity under `identity`.
+    ///
+    /// Called once while the gateway is still being built. Rooms already born
+    /// keep the identity they were minted with — an id is the row's key and
+    /// must never change under a live match.
+    pub(crate) fn adopt_identity(&self, identity: Arc<NodeIdentity>) {
+        self.lock().identity = identity;
+    }
+
     /// Create a new, empty room with `label`; returns its id. Does not add members.
     pub fn create(&self, label: RoomLabel) -> RoomId {
-        self.create_bound(label, None)
+        self.create_with_mode(label, BridgeMode::Relay, None)
+    }
+
+    /// Create a new room whose server-owned bridge mode is fixed for its whole
+    /// generation. Only authoritative rooms may carry a script binding.
+    pub fn create_with_mode(
+        &self,
+        label: RoomLabel,
+        bridge_mode: BridgeMode,
+        binding: Option<ScriptBinding>,
+    ) -> RoomId {
+        let (bridge_mode, binding) = match (bridge_mode, binding) {
+            (BridgeMode::Relay, _) => (BridgeMode::Relay, None),
+            (BridgeMode::Authoritative, Some(binding)) => {
+                (BridgeMode::Authoritative, Some(binding))
+            }
+            // The infallible compatibility constructor cannot mint a
+            // contradictory authoritative room without a server binding.
+            (BridgeMode::Authoritative, None) => (BridgeMode::Relay, None),
+        };
+        let mut g = self.lock();
+        let id = g.next_id;
+        g.next_id += 1;
+        let match_id = g.mint_match_id();
+        g.rooms.insert(
+            id,
+            Room {
+                match_id,
+                label,
+                members: HashSet::new(),
+                remote_members: HashSet::new(),
+                name: None,
+                binding,
+                bridge_mode,
+            },
+        );
+        id
     }
 
     /// Create a new, empty room born bound to `binding` (the readiness
     /// snapshot that admitted its creation). `None` preserves the ungated
     /// behavior.
     pub fn create_bound(&self, label: RoomLabel, binding: Option<ScriptBinding>) -> RoomId {
-        let mut g = self.lock();
-        let id = g.next_id;
-        g.next_id += 1;
-        g.rooms.insert(
-            id,
-            Room {
-                label,
-                members: HashSet::new(),
-                remote_members: HashSet::new(),
-                name: None,
-                binding,
-            },
-        );
-        id
+        let bridge_mode = if binding.is_some() {
+            BridgeMode::Authoritative
+        } else {
+            BridgeMode::Relay
+        };
+        self.create_with_mode(label, bridge_mode, binding)
     }
 
     /// Join the room registered under `name`, or create it (labelled by `make_label`)
@@ -189,20 +282,49 @@ impl RoomRegistry {
         binding: Option<ScriptBinding>,
         make_label: impl FnOnce() -> RoomLabel,
     ) -> Result<(RoomId, RoomLabel), JoinError> {
+        let bridge_mode = if binding.is_some() {
+            BridgeMode::Authoritative
+        } else {
+            BridgeMode::Relay
+        };
+        self.join_or_create_with_mode(participant, name, bridge_mode, binding, make_label)
+    }
+
+    /// Join or create a named room with one immutable server-owned bridge mode.
+    /// Existing named rooms reject a conflicting request rather than mutating
+    /// their routing policy or script binding.
+    pub fn join_or_create_with_mode(
+        &self,
+        participant: ParticipantId,
+        name: &str,
+        bridge_mode: BridgeMode,
+        binding: Option<ScriptBinding>,
+        make_label: impl FnOnce() -> RoomLabel,
+    ) -> Result<(RoomId, RoomLabel), JoinError> {
+        if matches!(bridge_mode, BridgeMode::Authoritative) != binding.is_some() {
+            return Err(JoinError::StaleScript);
+        }
         let mut g = self.lock();
         if let Some(&existing) = g.names.get(name) {
+            let room = g.rooms.get(&existing).ok_or(JoinError::NoSuchRoom)?;
+            if room.bridge_mode != bridge_mode {
+                return Err(JoinError::BridgeModeMismatch);
+            }
             return Self::join_locked(&mut g, participant, existing, false, binding.as_ref());
         }
         // Create the named room, then join the creator into it.
         let id = g.next_id;
         g.next_id += 1;
+        let match_id = g.mint_match_id();
         g.rooms.insert(
             id,
             Room {
+                match_id,
                 label: make_label(),
                 members: HashSet::new(),
                 remote_members: HashSet::new(),
                 name: Some(name.to_owned()),
+                bridge_mode,
                 binding: binding.clone(),
             },
         );
@@ -351,6 +473,12 @@ impl RoomRegistry {
         self.lock().membership.get(&participant).copied()
     }
 
+    /// The room a trusted remote member is currently admitted to, if any.
+    #[must_use]
+    pub(crate) fn remote_room_of(&self, member: &RemoteRoomMember) -> Option<RoomId> {
+        self.lock().remote_membership.get(member).copied()
+    }
+
     /// Run `f` only while `participant` still belongs to `expected_room`.
     ///
     /// The membership comparison and `f` share the registry lock, giving
@@ -427,6 +555,12 @@ impl RoomRegistry {
         self.lock().rooms.get(&room_id).map(|r| r.label.clone())
     }
 
+    /// A room's durable match identity, if it is still live.
+    #[must_use]
+    pub fn match_id(&self, room_id: RoomId) -> Option<String> {
+        self.lock().rooms.get(&room_id).map(|r| r.match_id.clone())
+    }
+
     /// The script binding a room was born with, if the room exists and was
     /// created under the readiness gate.
     #[must_use]
@@ -435,6 +569,10 @@ impl RoomRegistry {
             .rooms
             .get(&room_id)
             .and_then(|r| r.binding.clone())
+    }
+
+    pub fn bridge_mode(&self, room_id: RoomId) -> Option<BridgeMode> {
+        self.lock().rooms.get(&room_id).map(|room| room.bridge_mode)
     }
 
     /// Fail-closed script-binding check shared by every admission path.
@@ -458,6 +596,27 @@ impl RoomRegistry {
         self.lock().rooms.len()
     }
 
+    /// Snapshot a named room under the registry lock so a caller can join an
+    /// existing generation without re-running its creation callback.
+    #[must_use]
+    pub fn named_room(&self, name: &str) -> Option<RoomSnapshot> {
+        let g = self.lock();
+        let id = *g.names.get(name)?;
+        let room = g.rooms.get(&id)?;
+        let mut members: Vec<ParticipantId> = room.members.iter().copied().collect();
+        members.sort_unstable();
+        Some(RoomSnapshot {
+            id,
+            match_id: room.match_id.clone(),
+            name: room.name.clone(),
+            label: room.label.clone(),
+            members,
+            remote_member_count: room.remote_members.len(),
+            script_binding: room.binding.clone(),
+            bridge_mode: room.bridge_mode,
+        })
+    }
+
     /// A point-in-time copy of every live room, id-ordered.
     ///
     /// Used by the console's Matches section. This clones under the same lock
@@ -474,11 +633,13 @@ impl RoomRegistry {
                 members.sort_unstable();
                 RoomSnapshot {
                     id,
+                    match_id: room.match_id.clone(),
                     name: room.name.clone(),
                     label: room.label.clone(),
                     members,
                     remote_member_count: room.remote_members.len(),
                     script_binding: room.binding.clone(),
+                    bridge_mode: room.bridge_mode,
                 }
             })
             .collect();
@@ -568,6 +729,15 @@ impl RoomRegistry {
     }
 }
 
+impl Inner {
+    /// Mint the durable identity of a room being born. Called under the
+    /// registry lock so id allocation and minting cannot interleave.
+    fn mint_match_id(&self) -> String {
+        self.identity
+            .mint(MATCH_ID_PREFIX, SystemClock.now().unix_millis())
+    }
+}
+
 impl Default for RoomRegistry {
     fn default() -> Self {
         Self::new()
@@ -582,6 +752,41 @@ mod tests {
 
     fn pid(n: u64) -> ParticipantId {
         ParticipantId::from_raw(n)
+    }
+
+    #[test]
+    fn room_creation_persists_authoritative_bridge_mode() {
+        let rooms = RoomRegistry::new();
+        let room_id = rooms.create_with_mode(
+            RoomLabel::with_map("arena"),
+            BridgeMode::Authoritative,
+            Some(binding("revision-a", 1)),
+        );
+        let snapshot = rooms.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, room_id);
+        assert_eq!(snapshot[0].bridge_mode, BridgeMode::Authoritative);
+        assert_eq!(rooms.bridge_mode(room_id), Some(BridgeMode::Authoritative));
+    }
+
+    #[test]
+    fn named_room_rejects_a_mode_flip_after_creation() {
+        let rooms = RoomRegistry::new();
+        rooms
+            .join_or_create_with_mode(pid(1), "same-name", BridgeMode::Relay, None, || {
+                RoomLabel::with_map("relay")
+            })
+            .expect("relay room");
+        assert_eq!(
+            rooms.join_or_create_with_mode(
+                pid(2),
+                "same-name",
+                BridgeMode::Authoritative,
+                Some(binding("revision-a", 1)),
+                || RoomLabel::with_map("ignored"),
+            ),
+            Err(JoinError::BridgeModeMismatch)
+        );
     }
 
     #[test]
@@ -827,6 +1032,47 @@ mod tests {
         assert_ne!(id, id2);
         // Closing a nonexistent room is a no-op.
         assert_eq!(r.close(id), None);
+    }
+
+    #[test]
+    fn every_room_is_born_with_a_unique_durable_match_identity() {
+        use crate::ids::{SHORT_PREFIX_ID_LEN, valid_id};
+
+        let r = RoomRegistry::new();
+        let created = r.create(RoomLabel::with_map("M"));
+        let (named, _) = r
+            .join_or_create(pid(1), "lobby", || RoomLabel::with_map("M"))
+            .unwrap();
+        let first = r.match_id(created).expect("created room mints an identity");
+        let second = r.match_id(named).expect("named room mints an identity");
+        assert!(valid_id(&first, MATCH_ID_PREFIX, SHORT_PREFIX_ID_LEN));
+        assert!(valid_id(&second, MATCH_ID_PREFIX, SHORT_PREFIX_ID_LEN));
+        assert_ne!(first, second, "both creation sites mint independently");
+        for room in r.snapshot() {
+            assert_eq!(
+                r.match_id(room.id).as_deref(),
+                Some(room.match_id.as_str()),
+                "the snapshot carries the room's own identity"
+            );
+        }
+        // A pruned room takes its identity with it: ids are never reused.
+        r.leave(pid(1));
+        assert_eq!(r.match_id(named), None);
+    }
+
+    #[test]
+    fn adopting_an_identity_leaves_live_rooms_keyed_as_they_were_born() {
+        let r = RoomRegistry::new();
+        let early = r.create(RoomLabel::with_map("M"));
+        let born_as = r.match_id(early).expect("identity");
+        r.adopt_identity(Arc::new(NodeIdentity::new("node-a")));
+        let late = r.create(RoomLabel::with_map("M"));
+        assert_eq!(
+            r.match_id(early).as_deref(),
+            Some(born_as.as_str()),
+            "a live match's durable key never changes under it"
+        );
+        assert_ne!(r.match_id(late), Some(born_as));
     }
 
     #[test]

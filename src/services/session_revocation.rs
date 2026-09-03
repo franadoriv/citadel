@@ -48,7 +48,8 @@ impl SessionRevocationCoordinator {
         revoked_at: TimestampMillis,
         reason: RevocationReason,
     ) -> AppResult<RevocationDispatch> {
-        self.sessions
+        let revoked = self
+            .sessions
             .revoke_session(RevokeSessionRequest {
                 session_id: command.session_id.clone(),
                 revoked_at,
@@ -62,6 +63,8 @@ impl SessionRevocationCoordinator {
                         &command.session_id,
                         &command.revocation_id,
                         command.expected_generation,
+                        revoked.expires_at,
+                        revoked_at,
                     )
                     .await
             }

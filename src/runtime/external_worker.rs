@@ -15,12 +15,15 @@
 //!
 //! Dispatch is asynchronous by design: the worker schedules matches fairly on
 //! its own cadence, so an invocation returns no commands inline; results
-//! arrive as fenced `MatchCommands` frames and are applied room-scoped. The
-//! non-match surface (global messages, RPC, lifecycle hooks) is not routed to
-//! the worker yet and fails visibly instead of silently: RPC calls return an
-//! error outcome and other hooks produce no commands.
+//! arrive as fenced `MatchCommands` frames and are applied room-scoped. Native
+//! authoritative-match lifecycle frames carrying the server-owned context are
+//! not implemented by this protocol yet. Therefore this adapter explicitly
+//! declares that it cannot host that surface; the gateway rejects admission
+//! before creating a native lifecycle match rather than silently dropping
+//! lifecycle hooks. The shipped native lifecycle surface is embedded Lua,
+//! Python, and JavaScript.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -36,7 +39,10 @@ use crate::runtime::worker_data_protocol::{
     RxCounters, decode_commands,
 };
 
-use super::{BridgeCommandSink, NormalizedEventBatch, Runtime, ScriptCommandBatch};
+use super::{
+    BridgeCommandSink, NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext,
+    NativeMatchLifecycleHook, NormalizedEventBatch, Runtime, ScriptCommandBatch,
+};
 
 /// Marker `kind` on a [`DataFrame::MatchEvent`] whose `body` is an encoded
 /// [`NormalizedEventBatch`] rather than a raw wire envelope. `u16::MAX` is never
@@ -122,6 +128,9 @@ struct ActiveGeneration {
     sender: Arc<dyn FrameSender>,
     /// Per-match outbound sequence counters; presence means "open".
     tx_seqs: HashMap<u64, u64>,
+    /// Matches whose current worker stream carries bridge-v2 batches. A command
+    /// frame for one of these matches is never eligible for legacy decoding.
+    bridge_matches: HashSet<u64>,
     /// Receive-side validator, shared with the pump thread.
     rx: Arc<Mutex<DataPlaneRx>>,
 }
@@ -227,6 +236,16 @@ impl ExternalWorkerRuntime {
     /// receives no answer.
     pub fn deliver_event_batch(&self, batch: NormalizedEventBatch) {
         let match_id = batch.match_id;
+        if batch.protocol_version != super::GS_BRIDGE_PROTOCOL_VERSION {
+            tracing::warn!(
+                match_id,
+                got = batch.protocol_version,
+                expected = super::GS_BRIDGE_PROTOCOL_VERSION,
+                "bridge batch has an incompatible protocol version; dropped before worker ingress"
+            );
+            self.counters.dropped_sends.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let body = match batch.encode() {
             Ok(body) => body,
             Err(error) => {
@@ -239,7 +258,7 @@ impl ExternalWorkerRuntime {
                 return;
             }
         };
-        self.send_match_event(match_id, 0, None, BRIDGE_EVENT_MARKER_KIND, &body);
+        self.send_match_event(match_id, 0, None, BRIDGE_EVENT_MARKER_KIND, &body, true);
     }
 
     /// Adapter-level drop counters.
@@ -293,6 +312,7 @@ impl ExternalWorkerRuntime {
             epoch,
             sender,
             tx_seqs: HashMap::new(),
+            bridge_matches: HashSet::new(),
             rx: Arc::clone(&rx),
         });
     }
@@ -391,15 +411,25 @@ impl ExternalWorkerRuntime {
             DataFrame::MatchCommands {
                 header, commands, ..
             } => {
-                // A bridge match answers with an encoded `ScriptCommandBatch`
-                // (a JSON object); a legacy match answers with an
-                // `OutboundCommand` array. The two are structurally disjoint, so
-                // try the bridge decode first when a bridge sink is attached and
-                // fall back to the legacy path otherwise.
-                if let Some(bridge_sink) = self.bridge_sink()
-                    && let Ok(answer) = ScriptCommandBatch::decode(&commands)
-                {
-                    bridge_sink.deliver_command_batch(answer);
+                let bridge_match = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .active
+                    .as_ref()
+                    .filter(|generation| generation.epoch == epoch)
+                    .is_some_and(|generation| generation.bridge_matches.contains(&header.match_id));
+                if bridge_match {
+                    let Ok(answer) = ScriptCommandBatch::decode(&commands) else {
+                        tracing::warn!(
+                            match_id = header.match_id,
+                            "dropped an incompatible bridge command batch without legacy fallback"
+                        );
+                        return;
+                    };
+                    if let Some(bridge_sink) = self.bridge_sink() {
+                        bridge_sink.deliver_command_batch(answer);
+                    }
                     return;
                 }
                 let Ok(commands) = decode_commands(&commands) else {
@@ -422,6 +452,7 @@ impl ExternalWorkerRuntime {
                         .filter(|generation| generation.epoch == epoch)
                     {
                         generation.tx_seqs.remove(&header.match_id);
+                        generation.bridge_matches.remove(&header.match_id);
                         generation
                             .rx
                             .lock()
@@ -462,6 +493,7 @@ impl ExternalWorkerRuntime {
         user_id: Option<&str>,
         kind: u16,
         body: &[u8],
+        bridge_event: bool,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(generation) = state.active.as_mut() else {
@@ -469,6 +501,9 @@ impl ExternalWorkerRuntime {
             return;
         };
         let mut frames = Vec::with_capacity(2);
+        if bridge_event {
+            generation.bridge_matches.insert(room_id);
+        }
         if !generation.tx_seqs.contains_key(&room_id) {
             generation
                 .rx
@@ -498,33 +533,6 @@ impl ExternalWorkerRuntime {
         }
     }
 
-    /// Open `room_id` on the active generation without an event (the
-    /// room-join admission path), so join-driven matches begin ticking before
-    /// their first routed message.
-    fn ensure_match_open(&self, room_id: u64) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(generation) = state.active.as_mut() else {
-            return;
-        };
-        if generation.tx_seqs.contains_key(&room_id) {
-            return;
-        }
-        generation
-            .rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .open_match(room_id);
-        let header = next_header(generation, room_id);
-        let frame = DataFrame::MatchOpen {
-            protocol_version: DATA_PROTOCOL_VERSION,
-            header,
-            script_identity: Some(self.identity.clone()),
-        };
-        if generation.sender.send(frame).is_err() {
-            self.counters.dropped_sends.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// Tell the worker a match ended gateway-side so it frees the context.
     pub fn notify_match_closed(&self, room_id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -536,6 +544,7 @@ impl ExternalWorkerRuntime {
         }
         let header = next_header(generation, room_id);
         generation.tx_seqs.remove(&room_id);
+        generation.bridge_matches.remove(&room_id);
         generation
             .rx
             .lock()
@@ -587,7 +596,7 @@ impl Runtime for ExternalWorkerRuntime {
         kind: u16,
         body: &[u8],
     ) -> Vec<OutboundCommand> {
-        self.send_match_event(room_id, sender, user_id, kind, body);
+        self.send_match_event(room_id, sender, user_id, kind, body, false);
         // Results arrive asynchronously as fenced MatchCommands frames and
         // are applied through the MatchCommandSink.
         Vec::new()
@@ -608,6 +617,28 @@ impl Runtime for ExternalWorkerRuntime {
         _user_id: Option<&str>,
     ) -> Vec<OutboundCommand> {
         Vec::new()
+    }
+
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        _budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        // This remains loud for a direct trait invocation that bypasses the
+        // gateway admission gate. A protocol frame carrying the full trusted
+        // context has not shipped, so forwarding a partial event is unsafe.
+        tracing::error!(
+            hook = hook.name(),
+            match_id = context.match_id,
+            reason = NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+            "external worker rejected native match lifecycle dispatch"
+        );
+        Vec::new()
+    }
+
+    fn supports_native_match_lifecycle(&self) -> bool {
+        false
     }
 
     fn tick(&self, _dt: Duration, _budget: Duration) -> Vec<OutboundCommand> {
@@ -648,10 +679,12 @@ impl Runtime for ExternalWorkerRuntime {
     }
 
     fn call_room_join(&self, _sender: u64, _user_id: Option<&str>, room_id: u64) -> bool {
-        // Admit, and open the match context on join so join-driven matches
-        // begin ticking before their first routed message.
-        self.ensure_match_open(room_id);
-        true
+        tracing::warn!(
+            room_id,
+            reason = NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+            "external worker rejected room admission because native lifecycle is unsupported"
+        );
+        false
     }
 
     fn has_tick_handler(&self) -> bool {
@@ -833,18 +866,24 @@ mod tests {
     }
 
     #[test]
-    fn room_join_admission_opens_the_match() {
+    fn room_admission_fails_closed_without_native_lifecycle_protocol_frames() {
         let (runtime, _dir) = runtime_with_script();
         let sender = CapturingSender::new();
         let epoch = runtime.allocate_epoch();
         runtime.install_generation(epoch, sender.clone());
-        assert!(runtime.call_room_join(7, None, 4), "join is admitted");
-        let frames = sender.frames();
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(frames[0], DataFrame::MatchOpen { .. }));
-        // The subsequent event does not re-open.
-        runtime.dispatch_in_room(7, None, 4, 9, b"x");
-        assert_eq!(sender.frames().len(), 2);
+
+        assert!(
+            !runtime.supports_native_match_lifecycle(),
+            "the worker must advertise that it cannot carry lifecycle context"
+        );
+        assert!(
+            !runtime.call_room_join(7, None, 4),
+            "admission must fail before opening a match without lifecycle frames"
+        );
+        assert!(
+            sender.frames().is_empty(),
+            "a refused admission must not create a worker match context"
+        );
     }
 
     #[test]
@@ -1155,6 +1194,21 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_bridge_event_is_not_forwarded_to_the_worker() {
+        let (runtime, _dir) = runtime_with_script();
+        let sender = CapturingSender::new();
+        let epoch = runtime.allocate_epoch();
+        runtime.install_generation(epoch, sender.clone());
+        let mut incompatible = NormalizedEventBatch::new(1, 4, 0, 0, 1);
+        incompatible.protocol_version = super::super::GS_BRIDGE_PROTOCOL_VERSION - 1;
+
+        runtime.deliver_event_batch(incompatible);
+
+        assert!(sender.frames().is_empty());
+        assert_eq!(runtime.counters().dropped_sends.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn worker_bridge_answer_reaches_the_bridge_sink() {
         let (runtime, _dir) = runtime_with_script();
         let bridge_sink = RecordingBridgeSink::new();
@@ -1184,6 +1238,77 @@ mod tests {
         );
         let got = bridge_sink.0.lock().expect("bridge sink");
         assert_eq!(got.as_slice(), &[answer]);
+    }
+
+    #[test]
+    fn incompatible_bridge_answer_never_reaches_any_worker_sink() {
+        let (runtime, _dir) = runtime_with_script();
+        let sink = RecordingSink::new();
+        let bridge_sink = RecordingBridgeSink::new();
+        runtime.attach_sink(Arc::downgrade(&sink) as Weak<dyn MatchCommandSink>);
+        runtime.attach_bridge_sink(Arc::downgrade(&bridge_sink) as Weak<dyn BridgeCommandSink>);
+        let sender = CapturingSender::new();
+        let epoch = runtime.allocate_epoch();
+        runtime.install_generation(epoch, sender);
+
+        let batch = NormalizedEventBatch::new(3, 4, 9, 100, 1);
+        runtime.deliver_event_batch(batch.clone());
+        let mut incompatible = ScriptCommandBatch::answering(&batch);
+        incompatible.protocol_version = super::super::GS_BRIDGE_PROTOCOL_VERSION - 1;
+        let rx = active_rx(&runtime);
+        runtime.handle_worker_frame(
+            epoch,
+            &rx,
+            DataFrame::MatchCommands {
+                protocol_version: DATA_PROTOCOL_VERSION,
+                header: FrameHeader {
+                    match_id: 4,
+                    epoch,
+                    seq: 1,
+                },
+                commands: incompatible.encode().expect("encode"),
+            },
+        );
+
+        assert!(bridge_sink.0.lock().expect("bridge sink").is_empty());
+        assert!(sink.commands.lock().expect("legacy sink").is_empty());
+    }
+
+    #[test]
+    fn bridge_match_command_frame_never_falls_back_to_legacy_commands() {
+        let (runtime, _dir) = runtime_with_script();
+        let sink = RecordingSink::new();
+        let bridge_sink = RecordingBridgeSink::new();
+        runtime.attach_sink(Arc::downgrade(&sink) as Weak<dyn MatchCommandSink>);
+        runtime.attach_bridge_sink(Arc::downgrade(&bridge_sink) as Weak<dyn BridgeCommandSink>);
+        let sender = CapturingSender::new();
+        let epoch = runtime.allocate_epoch();
+        runtime.install_generation(epoch, sender);
+
+        runtime.deliver_event_batch(NormalizedEventBatch::new(3, 4, 9, 100, 1));
+        let legacy = encode_commands(&[OutboundCommand::Broadcast {
+            kind: 40,
+            body: b"must-not-cross-protocols".to_vec(),
+            unreliable: false,
+        }])
+        .expect("encode legacy commands");
+        let rx = active_rx(&runtime);
+        runtime.handle_worker_frame(
+            epoch,
+            &rx,
+            DataFrame::MatchCommands {
+                protocol_version: DATA_PROTOCOL_VERSION,
+                header: FrameHeader {
+                    match_id: 4,
+                    epoch,
+                    seq: 1,
+                },
+                commands: legacy,
+            },
+        );
+
+        assert!(bridge_sink.0.lock().expect("bridge sink").is_empty());
+        assert!(sink.commands.lock().expect("legacy sink").is_empty());
     }
 
     #[test]

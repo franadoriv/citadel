@@ -102,6 +102,32 @@ relay to authoritative movement.
 | `encodeRpcRequest`, `decodeRpcResponse`, `decodeAuthResult`, `splitSender`, `tagWithSender` | Low-level codecs. |
 | `KIND_*`, `AUTH_*`, `RPC_*`, `*_BYTES` | Protocol constants (contract-checked). |
 
+### Opt-in lag diagnostics
+
+Lag recording is a debug feature and is disabled by default. Enable it only in
+application source code; the SDK never reads a URL/query parameter, browser
+storage, or server-provided setting to enable it:
+
+```js
+const client = await CitadelClient.connect("wss://game.example/realtime", {
+  diagnostics: { lagRecorder: { enabled: true } },
+});
+```
+
+With this flag omitted or false, the SDK allocates no recorder buffer, sends no
+diagnostic capability frame, ignores diagnostics controls, and makes no upload.
+Even when enabled, it waits for authenticated `SERVER_TIME` and then records
+only server-selected movement metadata allowed by its immutable local policy.
+The server must explicitly issue `START` and later `FLUSH`; capture data is a
+bounded binary `CLAG` artifact, gzip-compressed for a same-origin one-use-token
+upload. The SDK never captures application payloads or entity/private IDs, and
+does not retry a one-use token automatically. A legacy or disabled client never
+advertises the capability and remains ineligible; a server without diagnostics
+support leaves the connection unchanged. `CLAG` arrival timing is server-clock
+correlation metadata, not proof of RTT, one-way latency, packet loss, or path
+asymmetry. See the product contract in
+[`Lag diagnostics (JavaScript)`](../../website/src/content/docs/reference/client-sdk/lag-diagnostics.md).
+
 Bodies are raw `Uint8Array`; use `DataView` for typed layouts (Citadel is
 big-endian on the wire). Pick your own message kinds `>= 100` — kinds `1..25`
 are reserved by the core and netcode.

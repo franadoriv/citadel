@@ -13,11 +13,15 @@
 //! [`Config`](crate::error::ErrorCategory::Config) error category. Diagnostics
 //! never print secrets.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::authoritative_decision_telemetry::DEFAULT_AUTHORITATIVE_DECISION_CAPACITY;
+use crate::authoritative_telemetry_slices::TelemetrySlicePolicy;
 use crate::error::{AppError, AppResult};
 use crate::session::NodeId;
 use crate::storage::{
@@ -56,10 +60,16 @@ pub struct Config {
     pub server: ServerConfig,
     /// HTTP listener settings.
     pub http: HttpConfig,
+    /// Opt-in capture and private artifact ingestion for lag diagnostics.
+    pub lag_diagnostics: LagDiagnosticsConfig,
     /// Logging and tracing settings.
     pub logging: LoggingConfig,
+    /// Bounded, process-local telemetry retained without payloads or identities.
+    pub telemetry: TelemetryConfig,
     /// Local incident-journal retention settings.
     pub errors: ErrorJournalConfig,
+    /// Write-behind and retention bounds for the durable log family.
+    pub logs: LogsConfig,
     /// Realtime transport listener settings.
     pub transport: TransportConfig,
     /// Embedded game-logic runtime settings.
@@ -77,6 +87,229 @@ pub struct Config {
     /// Public HTTP authentication abuse controls. This is distinct from
     /// `transport.auth`, which configures realtime handshake behavior.
     pub authentication: AuthenticationAbuseConfig,
+    /// Server-owned production receipt-validation policy. Provider credentials
+    /// are referenced by environment-variable name, never stored in this config.
+    pub purchases: PurchaseValidationConfig,
+}
+
+/// Bounded process-local telemetry settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Validated authoritative-decision telemetry.
+    pub authoritative_decisions: AuthoritativeDecisionTelemetryConfig,
+    /// Bounded lifecycle policy for trusted authoritative telemetry slices.
+    pub slices: TelemetrySlicesConfig,
+}
+
+/// Privacy-safe retention for validated authoritative decisions.
+///
+/// The recorder stores only opaque numeric correlations, generic outcomes, and
+/// opaque numeric reason codes. It never retains request payloads, replies,
+/// commands, corrected values, participant identity, or account identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthoritativeDecisionTelemetryConfig {
+    /// Enable the node-local recorder.
+    pub enabled: bool,
+    /// Maximum retained records. Oldest records are evicted first.
+    pub capacity: usize,
+}
+
+impl Default for AuthoritativeDecisionTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity: DEFAULT_AUTHORITATIVE_DECISION_CAPACITY,
+        }
+    }
+}
+
+/// Bounds for trusted runtime-controlled telemetry slices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetrySlicesConfig {
+    /// Maximum concurrently active context-bound slices.
+    pub max_active: usize,
+    /// Maximum namespaced markers retained for one slice.
+    pub max_markers: usize,
+    /// Server-enforced lifetime after which a slice is closed on the next service maintenance pass.
+    pub ttl_ms: u64,
+    /// Maximum closed, process-local reports retained oldest-first.
+    pub max_closed_reports: usize,
+}
+
+impl Default for TelemetrySlicesConfig {
+    fn default() -> Self {
+        Self {
+            max_active: 32,
+            max_markers: 32,
+            ttl_ms: 300_000,
+            max_closed_reports: 128,
+        }
+    }
+}
+
+impl TelemetrySlicesConfig {
+    pub fn policy(&self) -> AppResult<TelemetrySlicePolicy> {
+        TelemetrySlicePolicy::new(
+            self.max_active,
+            self.max_markers,
+            self.ttl_ms,
+            self.max_closed_reports,
+        )
+        .map_err(|_| AppError::config("telemetry.slices must use nonzero bounded limits"))
+    }
+}
+
+impl TelemetryConfig {
+    fn validate(&self) -> AppResult<()> {
+        const MAX_AUTHORITATIVE_DECISION_CAPACITY: usize = 100_000;
+        let config = &self.authoritative_decisions;
+        if config.enabled
+            && (config.capacity == 0 || config.capacity > MAX_AUTHORITATIVE_DECISION_CAPACITY)
+        {
+            return Err(AppError::config(format!(
+                "telemetry.authoritative_decisions.capacity must be between 1 and {MAX_AUTHORITATIVE_DECISION_CAPACITY} when enabled"
+            )));
+        }
+        self.slices.policy()?;
+        Ok(())
+    }
+}
+
+/// Receipt-validation policy owned by the server rather than game runtimes.
+///
+/// Real store providers deliberately default disabled. Their implementation
+/// tasks must provide fixtures and provider-specific verification before an
+/// operator can enable them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PurchaseValidationConfig {
+    /// Maximum raw receipt bytes accepted at the validation boundary.
+    pub max_receipt_bytes: usize,
+    /// Maximum simultaneous provider HTTP requests.
+    pub max_concurrent_requests: u32,
+    /// Maximum provider HTTP requests per minute on this node.
+    pub max_requests_per_minute: u32,
+    /// Per-provider request deadline in milliseconds.
+    pub timeout_ms: u64,
+    /// Maximum retry attempts reserved for idempotent provider operations.
+    pub max_retries: u8,
+    /// Exact provider DNS names permitted for receipt-validation egress.
+    pub allowed_hosts: Vec<String>,
+    /// Apple provider configuration (disabled until Apple JWS ships).
+    pub apple: ReceiptProviderConfig,
+    /// Google provider configuration (disabled until Google Play ships).
+    pub google: ReceiptProviderConfig,
+    /// Huawei provider configuration (disabled until its implementation ships).
+    pub huawei: ReceiptProviderConfig,
+}
+
+impl Default for PurchaseValidationConfig {
+    fn default() -> Self {
+        Self {
+            max_receipt_bytes: 64 * 1024,
+            max_concurrent_requests: 16,
+            max_requests_per_minute: 120,
+            timeout_ms: 5_000,
+            max_retries: 2,
+            allowed_hosts: vec![
+                "api.storekit.itunes.apple.com".to_string(),
+                "androidpublisher.googleapis.com".to_string(),
+            ],
+            apple: ReceiptProviderConfig::default(),
+            google: ReceiptProviderConfig::default(),
+            huawei: ReceiptProviderConfig::default(),
+        }
+    }
+}
+
+/// One store provider's non-secret bootstrap configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReceiptProviderConfig {
+    /// Provider activation remains false until its verified adapter ships.
+    pub enabled: bool,
+    /// Name of an environment variable containing the provider secret. The
+    /// secret value itself is never accepted in TOML or emitted in diagnostics.
+    pub credential_env: Option<String>,
+}
+
+impl PurchaseValidationConfig {
+    const MAX_RECEIPT_BYTES: usize = 1024 * 1024;
+    const MAX_CONCURRENT_REQUESTS: u32 = 1_024;
+    const MAX_REQUESTS_PER_MINUTE: u32 = 1_000_000;
+    const MAX_TIMEOUT_MS: u64 = 60_000;
+
+    fn validate(&self) -> AppResult<()> {
+        if self.max_receipt_bytes == 0 || self.max_receipt_bytes > Self::MAX_RECEIPT_BYTES {
+            return Err(AppError::config(format!(
+                "purchases.max_receipt_bytes must be between 1 and {}",
+                Self::MAX_RECEIPT_BYTES
+            )));
+        }
+        if self.max_concurrent_requests == 0
+            || self.max_concurrent_requests > Self::MAX_CONCURRENT_REQUESTS
+        {
+            return Err(AppError::config(format!(
+                "purchases.max_concurrent_requests must be between 1 and {}",
+                Self::MAX_CONCURRENT_REQUESTS
+            )));
+        }
+        if self.max_requests_per_minute == 0
+            || self.max_requests_per_minute > Self::MAX_REQUESTS_PER_MINUTE
+        {
+            return Err(AppError::config(format!(
+                "purchases.max_requests_per_minute must be between 1 and {}",
+                Self::MAX_REQUESTS_PER_MINUTE
+            )));
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > Self::MAX_TIMEOUT_MS {
+            return Err(AppError::config(format!(
+                "purchases.timeout_ms must be between 1 and {}",
+                Self::MAX_TIMEOUT_MS
+            )));
+        }
+        if self.max_retries > 3 {
+            return Err(AppError::config(
+                "purchases.max_retries must be between 0 and 3",
+            ));
+        }
+        if self.allowed_hosts.is_empty() || self.allowed_hosts.len() > 16 {
+            return Err(AppError::config(
+                "purchases.allowed_hosts must contain between 1 and 16 hostnames",
+            ));
+        }
+        for host in &self.allowed_hosts {
+            if !RuntimeConfig::is_valid_outbound_http_hostname(host) {
+                return Err(AppError::config(format!(
+                    "purchases.allowed_hosts contains invalid hostname '{host}'"
+                )));
+            }
+        }
+        for (name, provider) in [
+            ("apple", &self.apple),
+            ("google", &self.google),
+            ("huawei", &self.huawei),
+        ] {
+            if provider.enabled {
+                return Err(AppError::config(format!(
+                    "purchases.{name}.enabled is unavailable until its provider adapter ships",
+                )));
+            }
+            if provider
+                .credential_env
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(AppError::config(format!(
+                    "purchases.{name}.credential_env must not be empty when set",
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Authentication-specific abuse-control configuration.
@@ -838,11 +1071,12 @@ pub struct RuntimeConfig {
     /// Explicit runtime language. `None` means autodetect from `scripts_dir`.
     pub language: Option<RuntimeLanguage>,
     /// Runtime hosting adapter. `embedded` executes game scripts in-process.
-    /// `external-worker` (unix and windows) executes them in a supervised
-    /// worker process instead: matches run in per-match engine contexts over
-    /// the authenticated data plane, while the match-independent surface
-    /// (global messages, RPC, lifecycle hooks) is not routed to the worker
-    /// yet. `wasm` is not implemented.
+    /// `external-worker` (unix and windows) executes its existing per-match
+    /// data-plane dispatch in a supervised worker process. It does **not** yet
+    /// carry native authoritative-match lifecycle frames with their complete
+    /// server-owned context, so Citadel rejects room and matchmaker admission
+    /// before a lifecycle match is created. Native lifecycle callbacks ship only
+    /// for embedded Lua, Python, and JavaScript. `wasm` is not implemented.
     pub adapter: RuntimeAdapter,
     /// Runtime trust tier. Only `trusted` is implemented today.
     pub tier: RuntimeTier,
@@ -959,6 +1193,15 @@ pub struct BridgeConfig {
     pub max_persist_ops: usize,
     /// Max schedule ops per batch.
     pub max_schedule_ops: usize,
+    /// Max bridge batches retained per authoritative match awaiting a script
+    /// answer. New ingress drops fail closed at this bound.
+    pub max_pending_batches: usize,
+    /// Node-wide cap across all matches awaiting a script answer.
+    pub max_pending_batches_total: usize,
+    /// Per-participant accepted V1 match-input messages in one fixed minute.
+    pub max_match_input_messages_per_minute: usize,
+    /// Per-participant accepted V1 match-input opaque bytes in one fixed minute.
+    pub max_match_input_bytes_per_minute: usize,
     /// Permit `Persist` commands (storage writes).
     pub allow_persist: bool,
     /// Permit `Schedule` commands (deferred re-entry).
@@ -977,6 +1220,10 @@ impl Default for BridgeConfig {
             max_recipients: 1_024,
             max_persist_ops: 64,
             max_schedule_ops: 64,
+            max_pending_batches: 64,
+            max_pending_batches_total: 1_024,
+            max_match_input_messages_per_minute: 120,
+            max_match_input_bytes_per_minute: 1 << 20,
             allow_persist: false,
             allow_schedule: false,
             allow_physics: false,
@@ -1481,6 +1728,191 @@ pub struct HttpConfig {
     pub behind_tls_proxy: bool,
 }
 
+/// Server-owned capture/upload policy for opt-in lag diagnostics.
+///
+/// The feature is deliberately disabled by default. Enabling it requires a
+/// private filesystem root and an explicit HMAC keyring; it never falls back to
+/// a process-generated key because that would make restart/replay semantics
+/// ambiguous.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LagDiagnosticsConfig {
+    /// Enables native capture control and its state-gated HTTP ingest route.
+    pub enabled: bool,
+    /// Absolute filesystem root for raw artifacts, manifests, staging, and
+    /// replay markers. It must not be a public static-file directory.
+    pub raw_root: Option<String>,
+    /// Active key id used to sign newly minted one-use upload capabilities.
+    pub active_key_id: Option<String>,
+    /// Base64url-no-padding HMAC-SHA256 keyring. Keys are redacted from Debug.
+    pub upload_hmac_keys: BTreeMap<String, String>,
+    /// Exact browser origins allowed to perform a bearer upload. Empty means
+    /// CORS is disabled; native/same-origin clients may still upload.
+    pub allowed_origins: Vec<String>,
+    /// Global compressed-body cap, also narrowed per grant.
+    pub max_compressed_bytes: u32,
+    /// Maximum decompressed CLAG bytes after gzip validation.
+    pub max_decompressed_bytes: u32,
+    /// Maximum decompressed/compressed expansion ratio.
+    pub max_decompression_ratio: u32,
+    /// Simultaneous uploads admitted by this node.
+    pub max_concurrent_uploads: u16,
+    /// Private raw artifact quota across this node's raw root.
+    pub max_raw_bytes: u64,
+    /// Age after which unreferenced raw artifacts may be removed by maintenance.
+    pub retention_hours: u64,
+    /// Set only when a shared, non-database raw store plus capture control plane
+    /// makes a clustered upload route safe. Node-local raw disk fails closed.
+    pub shared_raw_store: bool,
+}
+
+impl std::fmt::Debug for LagDiagnosticsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LagDiagnosticsConfig")
+            .field("enabled", &self.enabled)
+            .field("raw_root", &self.raw_root)
+            .field("active_key_id", &self.active_key_id)
+            .field("upload_hmac_keys", &"[redacted]")
+            .field("allowed_origins", &self.allowed_origins)
+            .field("max_compressed_bytes", &self.max_compressed_bytes)
+            .field("max_decompressed_bytes", &self.max_decompressed_bytes)
+            .field("max_decompression_ratio", &self.max_decompression_ratio)
+            .field("max_concurrent_uploads", &self.max_concurrent_uploads)
+            .field("max_raw_bytes", &self.max_raw_bytes)
+            .field("retention_hours", &self.retention_hours)
+            .field("shared_raw_store", &self.shared_raw_store)
+            .finish()
+    }
+}
+
+impl Default for LagDiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            raw_root: None,
+            active_key_id: None,
+            upload_hmac_keys: BTreeMap::new(),
+            allowed_origins: Vec::new(),
+            max_compressed_bytes: 4 * 1024 * 1024,
+            max_decompressed_bytes: 64 * 1024 * 1024,
+            max_decompression_ratio: 32,
+            max_concurrent_uploads: 4,
+            max_raw_bytes: 4 * 1024 * 1024 * 1024,
+            retention_hours: 168,
+            shared_raw_store: false,
+        }
+    }
+}
+
+impl LagDiagnosticsConfig {
+    fn validate(&self, cluster_enabled: bool) -> AppResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let raw_root = self
+            .raw_root
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| AppError::config("lag_diagnostics.raw_root is required when enabled"))?;
+        if !Path::new(raw_root).is_absolute() {
+            return Err(AppError::config(
+                "lag_diagnostics.raw_root must be an absolute private filesystem path",
+            ));
+        }
+        let active_key_id = self
+            .active_key_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::config("lag_diagnostics.active_key_id is required when enabled")
+            })?;
+        if !valid_key_id(active_key_id)
+            || !self.upload_hmac_keys.keys().all(|key| valid_key_id(key))
+        {
+            return Err(AppError::config(
+                "lag_diagnostics upload key ids must be 1-64 ASCII alphanumeric, '-' or '_' bytes",
+            ));
+        }
+        let key = self.upload_hmac_keys.get(active_key_id).ok_or_else(|| {
+            AppError::config("lag_diagnostics.active_key_id is absent from upload_hmac_keys")
+        })?;
+        let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(key)
+            .map_err(|_| AppError::config("lag_diagnostics active HMAC key is not base64url"))?;
+        if key_bytes.len() < 32 {
+            return Err(AppError::config(
+                "lag_diagnostics active HMAC key must decode to at least 32 bytes",
+            ));
+        }
+        if self.max_compressed_bytes == 0
+            || self.max_decompressed_bytes == 0
+            || self.max_compressed_bytes > self.max_decompressed_bytes
+            || self.max_decompressed_bytes > 64 * 1024 * 1024
+            || self.max_decompression_ratio == 0
+            || self.max_decompression_ratio > 128
+            || self.max_concurrent_uploads == 0
+            || self.max_concurrent_uploads > 64
+            || self.max_raw_bytes < u64::from(self.max_compressed_bytes)
+            || self.retention_hours == 0
+            || self.retention_hours > 24 * 365
+        {
+            return Err(AppError::config("invalid lag_diagnostics upload limits"));
+        }
+        if self
+            .allowed_origins
+            .iter()
+            .any(|origin| !valid_diagnostics_origin(origin))
+        {
+            return Err(AppError::config(
+                "lag_diagnostics.allowed_origins must contain exact HTTPS origins (or loopback HTTP origins), never wildcards, paths, queries, or fragments",
+            ));
+        }
+        // This implementation owns its pending/consumed leases and raw artifacts on
+        // the local filesystem. Merely declaring a shared root would not make the
+        // one-use token state or recovery protocol cluster-safe, so keep the MVP
+        // fail-closed until a shared store *and* capture control plane exist.
+        if cluster_enabled {
+            return Err(AppError::config(
+                "lag_diagnostics.enabled rejects cluster mode: the current raw ingest implementation is node-local",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_diagnostics_origin(value: &str) -> bool {
+    if value.is_empty()
+        || value.contains('*')
+        || value.contains('/') && !value.starts_with("https://") && !value.starts_with("http://")
+    {
+        return false;
+    }
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    match scheme {
+        "https" => true,
+        "http" => {
+            authority.eq_ignore_ascii_case("localhost")
+                || authority.starts_with("localhost:")
+                || authority.starts_with("127.0.0.1:")
+                || authority.starts_with("[::1]")
+        }
+        _ => false,
+    }
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -1704,6 +2136,219 @@ impl ErrorJournalConfig {
     }
 }
 
+/// Write-behind and retention bounds for the durable log family.
+///
+/// The family is four tables — script logs, the console action trail, closed
+/// telemetry slice reports, and match lifecycle records — written through one
+/// bounded queue per domain and one batched flush, so a hot game tick or a
+/// polling machine credential costs a queue push instead of a database round
+/// trip. This section does not touch the local incident journal, which stays a
+/// file on disk and is configured by `[errors]`.
+///
+/// A backend with no durable log capability (in-memory, MongoDB) ignores every
+/// bound here except `audit.capacity` and keeps its in-process rings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogsConfig {
+    /// Whether validated records are queued for durable persistence at all.
+    pub enabled: bool,
+    /// How often the flush service drains the queues. A commit-triggered wake
+    /// can drain sooner; this is the ceiling on how long a record waits.
+    pub flush_interval_ms: u64,
+    /// Rows taken per domain per flush. Also the queue depth that wakes the
+    /// flush service early.
+    pub flush_batch_items: usize,
+    /// How long shutdown waits for the queues to drain before abandoning what
+    /// is left. Queued records are in memory only, so this is what keeps the
+    /// last flush interval of the trail.
+    pub shutdown_drain_timeout_ms: u64,
+    /// How often retention runs.
+    pub prune_interval_secs: u64,
+    /// Rows deleted per table per prune pass, so a retention backlog never
+    /// becomes one unbounded delete.
+    pub prune_batch_limit: usize,
+    /// Console action trail.
+    pub audit: AuditLogsConfig,
+    /// Game-script log stream.
+    pub match_logs: MatchLogsConfig,
+    /// Closed authoritative-telemetry slice reports.
+    pub telemetry_slices: SliceLogsConfig,
+    /// Match lifecycle records.
+    pub matches: MatchRecordsConfig,
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            flush_interval_ms: 250,
+            flush_batch_items: 128,
+            shutdown_drain_timeout_ms: 5_000,
+            prune_interval_secs: 300,
+            prune_batch_limit: 500,
+            audit: AuditLogsConfig::default(),
+            match_logs: MatchLogsConfig::default(),
+            telemetry_slices: SliceLogsConfig::default(),
+            matches: MatchRecordsConfig::default(),
+        }
+    }
+}
+
+/// Retention for the console action trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditLogsConfig {
+    /// Entries kept in the in-process ring, which every backend has.
+    pub capacity: usize,
+    /// Records held for the durable store before the oldest are dropped.
+    pub max_queue_items: usize,
+    /// How long a trail row is kept. Deliberately the longest retention in the
+    /// family: an operator action's record must not be deleted because the
+    /// match it happened during ended.
+    pub retention_days: u32,
+}
+
+impl Default for AuditLogsConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 1_024,
+            max_queue_items: 16_384,
+            retention_days: 365,
+        }
+    }
+}
+
+/// Retention for the game-script log stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MatchLogsConfig {
+    pub max_queue_items: usize,
+    /// Widest `payload_json` a script may attach to one line. The payload is
+    /// author-supplied and stored verbatim.
+    pub max_payload_bytes: usize,
+    pub retention_days: u32,
+}
+
+impl Default for MatchLogsConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_items: 8_192,
+            max_payload_bytes: 8_192,
+            retention_days: 30,
+        }
+    }
+}
+
+/// Retention for closed authoritative-telemetry slice reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SliceLogsConfig {
+    pub max_queue_items: usize,
+    pub retention_days: u32,
+}
+
+impl Default for SliceLogsConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_items: 2_048,
+            retention_days: 30,
+        }
+    }
+}
+
+/// Retention for match lifecycle records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MatchRecordsConfig {
+    pub max_queue_items: usize,
+    /// Strictly longer than the script-log and slice retentions, so a row is
+    /// never left referencing a match that has already been pruned.
+    pub retention_days: u32,
+}
+
+impl Default for MatchRecordsConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_items: 4_096,
+            retention_days: 90,
+        }
+    }
+}
+
+impl LogsConfig {
+    /// Retention horizon for `days`, measured back from `now_ms`.
+    #[must_use]
+    pub fn retention_horizon_ms(now_ms: u64, days: u32) -> u64 {
+        now_ms.saturating_sub(u64::from(days) * 86_400_000)
+    }
+
+    /// Reject every zero bound.
+    ///
+    /// Checked even when disabled: `audit.capacity` sizes the in-process ring,
+    /// which exists on every backend, and a zero anywhere else is a typo worth
+    /// failing on rather than silently clamping to one.
+    fn validate(&self) -> AppResult<()> {
+        let millis: [(&str, u64); 3] = [
+            ("logs.flush_interval_ms", self.flush_interval_ms),
+            (
+                "logs.shutdown_drain_timeout_ms",
+                self.shutdown_drain_timeout_ms,
+            ),
+            ("logs.prune_interval_secs", self.prune_interval_secs),
+        ];
+        let counts: [(&str, usize); 8] = [
+            ("logs.flush_batch_items", self.flush_batch_items),
+            ("logs.prune_batch_limit", self.prune_batch_limit),
+            ("logs.audit.capacity", self.audit.capacity),
+            ("logs.audit.max_queue_items", self.audit.max_queue_items),
+            (
+                "logs.match_logs.max_queue_items",
+                self.match_logs.max_queue_items,
+            ),
+            (
+                "logs.match_logs.max_payload_bytes",
+                self.match_logs.max_payload_bytes,
+            ),
+            (
+                "logs.telemetry_slices.max_queue_items",
+                self.telemetry_slices.max_queue_items,
+            ),
+            ("logs.matches.max_queue_items", self.matches.max_queue_items),
+        ];
+        let days: [(&str, u32); 4] = [
+            ("logs.audit.retention_days", self.audit.retention_days),
+            (
+                "logs.match_logs.retention_days",
+                self.match_logs.retention_days,
+            ),
+            (
+                "logs.telemetry_slices.retention_days",
+                self.telemetry_slices.retention_days,
+            ),
+            ("logs.matches.retention_days", self.matches.retention_days),
+        ];
+        for (field, zero) in millis
+            .iter()
+            .map(|(field, value)| (*field, *value == 0))
+            .chain(counts.iter().map(|(field, value)| (*field, *value == 0)))
+            .chain(days.iter().map(|(field, value)| (*field, *value == 0)))
+        {
+            if zero {
+                return Err(AppError::config(format!("{field} must be >= 1")));
+            }
+        }
+        if self.matches.retention_days < self.match_logs.retention_days
+            || self.matches.retention_days < self.telemetry_slices.retention_days
+        {
+            return Err(AppError::config(
+                "logs.matches.retention_days must be >= logs.match_logs.retention_days and \
+                 logs.telemetry_slices.retention_days, so no retained row references a pruned match",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Narrow CLI flag overrides applied last in the precedence chain.
 ///
 /// Only high-signal startup options are exposed as flags; most settings belong
@@ -1884,6 +2529,9 @@ impl Config {
             return Err(AppError::config("logging.level must not be empty"));
         }
         self.errors.validate()?;
+        self.logs.validate()?;
+        self.telemetry.validate()?;
+        self.purchases.validate()?;
         self.cluster
             .validate(&self.server.node_id, &self.database)?;
         self.transport.tls.validate()?;
@@ -1982,6 +2630,7 @@ impl Config {
         self.database.validate()?;
         self.console.validate()?;
         self.http.tls.validate()?;
+        self.lag_diagnostics.validate(self.cluster.enabled)?;
         self.validate_console_exposure()?;
         self.validate_http_exposure()?;
         Ok(())
@@ -2415,8 +3064,55 @@ mod tests {
     }
 
     #[test]
+    fn purchase_validation_defaults_disable_real_providers_and_reject_early_enablement() {
+        let config = Config::default();
+        assert!(!config.purchases.apple.enabled);
+        assert!(!config.purchases.google.enabled);
+        assert!(!config.purchases.huawei.enabled);
+        assert_eq!(config.purchases.allowed_hosts.len(), 2);
+        assert_eq!(config.purchases.max_retries, 2);
+        assert!(config.validate().is_ok());
+
+        let mut excessive_retries = config.clone();
+        excessive_retries.purchases.max_retries = 4;
+        let error = excessive_retries
+            .validate()
+            .expect_err("retry budget must remain bounded");
+        assert!(error.message().contains("purchases.max_retries"));
+
+        let mut enabled = config;
+        enabled.purchases.apple.enabled = true;
+        let error = enabled
+            .validate()
+            .expect_err("an unimplemented real-store adapter must not be enabled");
+        assert_eq!(error.category(), crate::error::ErrorCategory::Config);
+        assert!(error.message().contains("purchases.apple.enabled"));
+    }
+
+    #[test]
     fn default_config_validates() {
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_lag_ingest_fails_closed_in_cluster_mode() {
+        use base64::Engine as _;
+
+        let mut config = Config::default();
+        config.cluster.enabled = true;
+        config.lag_diagnostics.enabled = true;
+        config.lag_diagnostics.raw_root = Some(std::env::temp_dir().display().to_string());
+        config.lag_diagnostics.active_key_id = Some("current".to_string());
+        config.lag_diagnostics.upload_hmac_keys.insert(
+            "current".to_string(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9_u8; 32]),
+        );
+
+        let error = config
+            .lag_diagnostics
+            .validate(true)
+            .expect_err("node-local ingest must fail closed");
+        assert!(error.message().contains("node-local"));
     }
 
     #[test]

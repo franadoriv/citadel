@@ -76,6 +76,30 @@ use crate::services::party_directory::StoragePartyDirectory;
 use crate::session::NodeId;
 use crate::time::{Clock, DurationMillis, SystemClock, TimestampMillis};
 
+/// Run one concrete application/control write only while its transport
+/// generation remains current. The asynchronous gate is deliberately held until
+/// `write` resolves, including socket flush: supersession and durable close take
+/// the same gate before publishing cancellation.
+pub(crate) async fn write_if_current<F, Fut, T>(
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    transport_write_gate: &tokio::sync::Mutex<()>,
+    write: F,
+) -> Option<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let _write = transport_write_gate.lock().await;
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    Some(write().await)
+}
+
 /// Typed, best-effort broadcaster for the local channel-presence announcer.
 /// It deliberately discards a transient peer error: the supervised renewer
 /// republishes the lease and durable history is the recovery path.
@@ -394,11 +418,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // install its synchronous `physics_state` read handle. The gateway receives
     // the same shared hub below.
     let transform_hub = build_transform_hub(&cfg.transform_sync);
-    // GameScript readiness gate (`runtime.require_script`): the authority is
-    // created before the runtime loads so a missing entrypoint boots the node
-    // not-ready instead of silently falling back to the relay. `None` keeps
-    // ungated deployments byte-identical.
-    let script_readiness = app.config().runtime.require_script.then(|| {
+    // Script readiness exists for every enabled embedded runtime: strict nodes
+    // gate every room, while ordinary nodes consult it only for a room that
+    // requests authoritative bridge mode.
+    let script_readiness = app.config().runtime.enabled.then(|| {
         Arc::new(
             crate::runtime::GameScriptReadiness::new(SystemClock.now())
                 .with_metrics(Arc::clone(app.metrics())),
@@ -417,6 +440,8 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         transform_hub.as_ref().map(|(hub, _, _)| Arc::clone(hub)),
         Arc::clone(app.runtime_event_bus()),
         Arc::clone(app.runtime_shared_cache()),
+        app.telemetry_slices(),
+        app.match_log_writer(),
         readiness_source.as_ref(),
     )?;
     // Build the realtime authenticator from the node's session service and the
@@ -436,12 +461,24 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         runtime.clone(),
         authenticator,
     );
+    if let Some(recorder) = app.authoritative_decision_recorder() {
+        gateway = gateway.with_authoritative_decision_recorder(recorder);
+    }
+    // Also adopts the node identity into the room registry, so a room's minted
+    // `mt1-` id and the `node_id` its row is written under agree. Without this
+    // no durable match record is ever written.
+    if let Some(recorder) = app.match_recorder() {
+        gateway = gateway.with_match_recorder(recorder);
+    }
     if let Some(readiness) = &script_readiness {
-        gateway = gateway.with_script_readiness(Arc::clone(readiness));
-        // A require_script node runs authoritative matches: enable the gameplay
-        // bridge so a bound match's protected frames route through the per-match
-        // validator. Quotas + capabilities come from `[runtime.bridge]`
-        // (PROVISIONAL measure-first quota defaults; capabilities opt-in).
+        gateway = if app.config().runtime.require_script {
+            gateway.with_script_readiness(Arc::clone(readiness))
+        } else {
+            gateway.with_optional_script_readiness(Arc::clone(readiness))
+        };
+        // Enable the bridge when an embedded runtime is configured. Relay rooms
+        // still bypass it; only room generations explicitly born authoritative
+        // can use this state.
         let bridge_cfg = &app.config().runtime.bridge;
         let quotas = crate::runtime::BridgeQuotas {
             max_commands: bridge_cfg.max_commands,
@@ -450,6 +487,10 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
             max_recipients: bridge_cfg.max_recipients,
             max_persist_ops: bridge_cfg.max_persist_ops,
             max_schedule_ops: bridge_cfg.max_schedule_ops,
+            max_pending_batches: bridge_cfg.max_pending_batches,
+            max_pending_batches_total: bridge_cfg.max_pending_batches_total,
+            max_match_input_messages_per_minute: bridge_cfg.max_match_input_messages_per_minute,
+            max_match_input_bytes_per_minute: bridge_cfg.max_match_input_bytes_per_minute,
         };
         let mut capabilities = std::collections::HashSet::new();
         if bridge_cfg.allow_persist {
@@ -754,6 +795,17 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     // live room state through this seam; ).
     app.attach_realtime_gateway(Arc::clone(&gateway));
 
+    // Durable logging is supervised, never a bare `tokio::spawn`: the shutdown
+    // drain is what keeps the last flush interval of the trail, and a detached
+    // task would not participate in graceful shutdown at all.
+    if let Some(writer) = app.durable_logs() {
+        supervisor.spawn(crate::durable_logs::DurableLogFlushService::new(
+            writer,
+            app.durable_log_repositories(),
+            app.telemetry_slices(),
+        ));
+    }
+
     // The ticket index has a single local leader in this deployment. Keep its
     // 250 ms lifecycle independent from an optional game-script tick so TTL
     // cleanup and formation do not stop when no script registered on_tick.
@@ -765,6 +817,13 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         chat_delivery_interval,
         64,
         64,
+    ));
+    // Identity lifecycle expiry (reconnect grace and durable revocation
+    // tombstones) is not script state: reclaim it even on a relay-only node
+    // with no runtime tick or inbound socket traffic.
+    supervisor.spawn(crate::realtime::ReconnectGraceExpiryService::new(
+        Arc::clone(&gateway),
+        std::time::Duration::from_secs(1),
     ));
     if !app.config().cluster.enabled {
         supervisor.spawn(crate::realtime::MatchmakerTickService::new(
@@ -840,6 +899,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
     maybe_spawn_reload(
         &mut supervisor,
         runtime.as_ref(),
+        &gateway,
         &app.config().runtime,
         readiness_source.as_ref(),
     );
@@ -875,7 +935,7 @@ pub async fn start_enabled(app: &App, cancel: CancellationToken) -> AppResult<Su
         }
         impl crate::runtime::worker_supervisor::WorkerGenerationObserver for CloseMatchesOnGenerationEnd {
             fn worker_generation_ended(&self) {
-                let notified = self.gateway.close_all_matches();
+                let notified = self.gateway.close_all_authoritative_matches();
                 tracing::warn!(
                     notified,
                     "external runtime worker generation ended; dependent matches closed"
@@ -1109,6 +1169,7 @@ fn maybe_spawn_tick(
 fn maybe_spawn_reload(
     supervisor: &mut Supervisor,
     runtime: Option<&Arc<dyn Runtime>>,
+    gateway: &Arc<Gateway>,
     rc: &crate::config::RuntimeConfig,
     readiness: Option<&crate::runtime::InProcessRuntimeSource>,
 ) {
@@ -1137,7 +1198,8 @@ fn maybe_spawn_reload(
         poll_ms = interval.as_millis() as u64,
         "starting embedded script hot-reload watcher"
     );
-    let mut service = crate::realtime::LuaReloadService::new(Arc::clone(runtime), path, interval);
+    let mut service = crate::realtime::LuaReloadService::new(Arc::clone(runtime), path, interval)
+        .with_gateway(Arc::clone(gateway));
     if let Some(source) = readiness {
         // Successful reloads adopt the new content identity and bump the
         // gate generation; rejected reloads keep the serving script Ready.
@@ -1170,6 +1232,8 @@ pub(crate) fn validate_runtime_for_check(config: &Config) -> AppResult<()> {
             ),
             Arc::new(crate::observability::NodeMetrics::new()),
         )),
+        None,
+        None,
     )?;
     Ok(())
 }
@@ -1268,6 +1332,8 @@ fn build_runtime(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<BuiltRuntime> {
     build_runtime_with_readiness(
         config,
@@ -1276,6 +1342,8 @@ fn build_runtime(
         transform_hub,
         event_bus,
         shared_cache,
+        telemetry_slices,
+        match_log,
         None,
     )
 }
@@ -1299,6 +1367,8 @@ fn build_runtime_with_readiness(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
     readiness: Option<&crate::runtime::InProcessRuntimeSource>,
 ) -> AppResult<BuiltRuntime> {
     let rc = &config.runtime;
@@ -1380,6 +1450,14 @@ fn build_runtime_with_readiness(
                     .with_maps(maps)
                     .with_event_bus(Arc::clone(&event_bus))
                     .with_shared_cache(Arc::clone(&shared_cache));
+                    let runtime = match telemetry_slices.clone() {
+                        Some(slices) => runtime.with_telemetry_slices(slices),
+                        None => runtime,
+                    };
+                    let runtime = match match_log.clone() {
+                        Some(writer) => runtime.with_match_log(writer),
+                        None => runtime,
+                    };
                     let runtime = match transform_hub {
                         Some(hub) => runtime.with_transform_hub(hub),
                         None => runtime,
@@ -1397,13 +1475,31 @@ fn build_runtime_with_readiness(
             }
         }
         RuntimeLanguage::Python => Ok(
-            match load_python_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)? {
+            match load_python_runtime(
+                rc,
+                domain,
+                maps,
+                transform_hub,
+                event_bus,
+                shared_cache,
+                telemetry_slices.clone(),
+                match_log.clone(),
+            )? {
                 Some(runtime) => BuiltRuntime::embedded(runtime),
                 None => BuiltRuntime::none(),
             },
         ),
         RuntimeLanguage::Js => Ok(
-            match load_js_runtime(rc, domain, maps, transform_hub, event_bus, shared_cache)? {
+            match load_js_runtime(
+                rc,
+                domain,
+                maps,
+                transform_hub,
+                event_bus,
+                shared_cache,
+                telemetry_slices.clone(),
+                match_log.clone(),
+            )? {
                 Some(runtime) => BuiltRuntime::embedded(runtime),
                 None => BuiltRuntime::none(),
             },
@@ -1437,6 +1533,8 @@ fn load_python_runtime(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     match PythonRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
@@ -1459,6 +1557,14 @@ fn load_python_runtime(
             .with_maps(maps)
             .with_event_bus(event_bus)
             .with_shared_cache(shared_cache);
+            let runtime = match telemetry_slices {
+                Some(slices) => runtime.with_telemetry_slices(slices),
+                None => runtime,
+            };
+            let runtime = match match_log {
+                Some(writer) => runtime.with_match_log(writer),
+                None => runtime,
+            };
             let runtime = match transform_hub {
                 Some(hub) => runtime.with_transform_hub(hub),
                 None => runtime,
@@ -1484,6 +1590,8 @@ fn load_python_runtime(
     _transform_hub: Option<Arc<TransformHub>>,
     _event_bus: Arc<crate::runtime::RuntimeEventBus>,
     _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    _telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    _match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,
@@ -1502,6 +1610,8 @@ fn load_js_runtime(
     transform_hub: Option<Arc<TransformHub>>,
     event_bus: Arc<crate::runtime::RuntimeEventBus>,
     shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     match JsRuntime::load_with_static_data_and_capability_policies(
         Path::new(&rc.scripts_dir),
@@ -1524,6 +1634,14 @@ fn load_js_runtime(
             .with_maps(maps)
             .with_event_bus(event_bus)
             .with_shared_cache(shared_cache);
+            let runtime = match telemetry_slices {
+                Some(slices) => runtime.with_telemetry_slices(slices),
+                None => runtime,
+            };
+            let runtime = match match_log {
+                Some(writer) => runtime.with_match_log(writer),
+                None => runtime,
+            };
             let runtime = match transform_hub {
                 Some(hub) => runtime.with_transform_hub(hub),
                 None => runtime,
@@ -1549,6 +1667,8 @@ fn load_js_runtime(
     _transform_hub: Option<Arc<TransformHub>>,
     _event_bus: Arc<crate::runtime::RuntimeEventBus>,
     _shared_cache: Arc<crate::runtime::RuntimeSharedCache>,
+    _telemetry_slices: Option<Arc<crate::authoritative_telemetry_slices::TelemetrySliceService>>,
+    _match_log: Option<Arc<crate::match_recorder::MatchLogWriter>>,
 ) -> AppResult<Option<Arc<dyn Runtime>>> {
     Err(AppError::new(
         ErrorCategory::Config,

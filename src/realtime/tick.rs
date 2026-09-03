@@ -180,6 +180,14 @@ pub struct MatchmakerTickService {
     period: Duration,
 }
 
+/// Periodically reclaims expired identity lifecycle records independently of
+/// game scripts and socket traffic. This runs on every production transport
+/// node, including relay-only nodes with no runtime.
+pub struct ReconnectGraceExpiryService {
+    gateway: Arc<Gateway>,
+    period: Duration,
+}
+
 /// Periodically renews only channel/node chat leases while local subscribers
 /// exist. It never inspects socket queues or performs remote fan-out.
 pub struct ChatPresenceRenewalService {
@@ -286,6 +294,24 @@ impl MatchmakerTickService {
     }
 }
 
+impl ReconnectGraceExpiryService {
+    /// Build a supervised identity-lifecycle expiry worker.
+    #[must_use]
+    pub fn new(gateway: Arc<Gateway>, period: Duration) -> Self {
+        Self { gateway, period }
+    }
+
+    /// Run one deterministic identity-lifecycle maintenance pass. Keeping this
+    /// seam separate from the interval lets tests prove relay-only behavior
+    /// without depending on scheduler timing.
+    fn reclaim_expired_at(&self, now: crate::time::TimestampMillis) -> (usize, usize) {
+        (
+            self.gateway.expire_reconnect_grace_at(now),
+            self.gateway.expire_revocation_tombstones_at(now),
+        )
+    }
+}
+
 impl LuaTickService {
     /// Build a tick service driving `gateway` at `period` with step `dt` and the
     /// given per-tick `budget`.
@@ -375,6 +401,27 @@ impl AsyncService for MatchmakerTickService {
                 _ = interval.tick() => {
                     let delivered = self.gateway.matchmaker_tick();
                     tracing::trace!(delivered, "completed local matchmaker evaluation");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AsyncService for ReconnectGraceExpiryService {
+    fn name(&self) -> &str {
+        "reconnect-grace-expiry"
+    }
+
+    async fn run(self: Box<Self>, cancel: CancellationToken) -> AppResult<()> {
+        let mut interval = tokio::time::interval(self.period);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let (grace_expired, revocations_expired) = self.reclaim_expired_at(SystemClock.now());
+                    tracing::trace!(grace_expired, revocations_expired, "reclaimed expired identity lifecycle records");
                 }
             }
         }
@@ -509,6 +556,107 @@ mod tests {
             "interval runs independently of an embedded runtime"
         );
         supervisor.shutdown().await.expect("cooperative shutdown");
+    }
+
+    #[tokio::test]
+    async fn reconnect_grace_expiry_runs_without_a_script_tick() {
+        use crate::realtime::{ParticipantIdentity, ResumeSecret, SessionHandle};
+        use crate::session::SessionId;
+        use crate::storage::UserId;
+        use crate::transport::TransportKind;
+        use tokio::sync::mpsc;
+
+        let gateway = Arc::new(Gateway::new());
+        let participant = gateway.next_participant_id();
+        let (outbound, _receiver) = mpsc::channel(1);
+        let now = SystemClock.now();
+        gateway.register_session_at(
+            SessionHandle {
+                id: participant,
+                kind: TransportKind::WebSocket,
+                outbound,
+                identity: Some(ParticipantIdentity {
+                    user_id: UserId::new("grace-worker-user").expect("user"),
+                    session_id: SessionId::new("grace-worker-session").expect("session"),
+                    expires_at: TimestampMillis::from_unix_millis(u64::MAX),
+                }),
+            },
+            now,
+        );
+        assert!(gateway.begin_reconnect_grace_at(
+            participant,
+            ResumeSecret::from_server_bytes(vec![6; 16]).expect("secret"),
+            now,
+            now,
+        ));
+        assert_eq!(gateway.reconnect_grace_count(), 1);
+
+        let mut supervisor = Supervisor::new();
+        supervisor.spawn(ReconnectGraceExpiryService::new(
+            Arc::clone(&gateway),
+            Duration::from_millis(5),
+        ));
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if gateway.reconnect_grace_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent expiry service reclaims grace");
+        supervisor.shutdown().await.expect("cooperative shutdown");
+    }
+
+    #[tokio::test]
+    async fn identity_expiry_maintenance_reclaims_revocations_without_runtime_or_socket_traffic() {
+        use crate::realtime::{ParticipantIdentity, SessionHandle};
+        use crate::session::SessionId;
+        use crate::storage::UserId;
+        use crate::transport::TransportKind;
+        use tokio::sync::mpsc;
+
+        let gateway = Arc::new(Gateway::new());
+        let participant = gateway.next_participant_id();
+        let (outbound, _receiver) = mpsc::channel(1);
+        let expiry = TimestampMillis::from_unix_millis(100);
+        gateway.register_session_at(
+            SessionHandle {
+                id: participant,
+                kind: TransportKind::WebSocket,
+                outbound,
+                identity: Some(ParticipantIdentity {
+                    user_id: UserId::new("relay-only-maintenance-user").expect("user"),
+                    session_id: SessionId::new("relay-only-maintenance-session").expect("session"),
+                    expires_at: expiry,
+                }),
+            },
+            TimestampMillis::from_unix_millis(10),
+        );
+        gateway
+            .registry()
+            .close_session_at(
+                &SessionId::new("relay-only-maintenance-session").expect("session"),
+                "expired-revocation",
+                None,
+                expiry,
+                TimestampMillis::from_unix_millis(10),
+            )
+            .await;
+        assert_eq!(gateway.revocation_tombstone_count(), 1);
+
+        // This is the production supervised maintenance service, with no script
+        // tick or socket traffic involved. Supplying time makes the regression
+        // deterministic rather than relying on interval scheduling.
+        ReconnectGraceExpiryService::new(Arc::clone(&gateway), Duration::from_secs(60))
+            .reclaim_expired_at(expiry);
+
+        assert_eq!(
+            gateway.revocation_tombstone_count(),
+            0,
+            "relay-only maintenance must reclaim expired durable revocations"
+        );
     }
 
     #[tokio::test]

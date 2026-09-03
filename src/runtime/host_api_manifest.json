@@ -34,11 +34,11 @@
     "name": "on_input",
     "category": "realtime_hook",
     "params": [
-      "handler:fn(event)->outcome"
+      "handler:fn(event:normalized_v2)->outcome"
     ],
     "returns": "void",
     "status": "shipped",
-    "since": "unreleased"
+    "since": "IMPL-20260820-AUTH-MATCH-SCOPED-DELIVERY"
   },
   {
     "name": "on_join",
@@ -59,6 +59,66 @@
     "returns": "void",
     "status": "shipped",
     "since": "pre-1.0"
+  },
+  {
+    "name": "on_match_created",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_started",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_ended",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_join",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_leave",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "on_match_tick",
+    "category": "lifecycle_hook",
+    "params": [
+      "handler:fn(context)"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
   },
   {
     "name": "on_tick",
@@ -135,6 +195,17 @@
     "returns": "void",
     "status": "shipped",
     "since": "pre-1.0"
+  },
+  {
+    "name": "match.set_input_ack",
+    "category": "action",
+    "params": [
+      "participant:canonical_u64_string",
+      "last_processed_sequence:canonical_u64_string"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
   },
   {
     "name": "spawn_actor",
@@ -678,6 +749,32 @@
     "since": "TASK-0418"
   },
   {
+    "name": "telemetry.begin",
+    "category": "log",
+    "params": [],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "telemetry.mark",
+    "category": "log",
+    "params": [
+      "marker:string"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "telemetry.finish",
+    "category": "log",
+    "params": [],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
     "name": "cache.cas",
     "category": "storage",
     "params": [
@@ -690,5 +787,28 @@
     "returns": "{value:bytes,version:u64,expires_in_ms:u64}?",
     "status": "shipped",
     "since": "TASK-0418"
+  },
+  {
+    "name": "log.write",
+    "category": "log",
+    "params": [
+      "level:string",
+      "tag:string",
+      "message:string",
+      "payload_json:string?"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
+  },
+  {
+    "name": "match.set_result",
+    "category": "log",
+    "params": [
+      "result_json:string"
+    ],
+    "returns": "void",
+    "status": "shipped",
+    "since": "unreleased"
   }
 ]

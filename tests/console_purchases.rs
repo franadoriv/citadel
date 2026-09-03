@@ -132,11 +132,27 @@ async fn purchases_validate_list_detail_and_subscriptions() {
         "/console/v1/purchases",
         Some(&admin),
         Some(
-            r#"{"user_id":"u-1","store":"apple","receipt":"{\"transaction_id\":\"tx-2\",\"product_id\":\"vip\",\"subscription_expiry_unix_ms\":99999999999999}"}"#,
+            r#"{"user_id":"u-1","store":"custom","receipt":"{\"transaction_id\":\"tx-2\",\"product_id\":\"vip\",\"subscription_expiry_unix_ms\":99999999999999}"}"#,
         ),
     )
     .await;
     assert_eq!(subscription.status, 201);
+
+    // The assembled application uses the composite validator: a JSON-shaped
+    // Apple receipt is not mistaken for production validation before the Apple
+    // provider adapter is implemented and explicitly enabled.
+    let disabled_store = send(
+        addr,
+        "POST",
+        "/console/v1/purchases",
+        Some(&admin),
+        Some(
+            r#"{"user_id":"u-1","store":"apple","receipt":"{\"transaction_id\":\"tx-apple\",\"product_id\":\"vip\"}"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(disabled_store.status, 403);
+    assert_eq!(disabled_store.body.expect("error")["code"], "forbidden");
 
     // Replaying the same receipt is a conflict.
     let replay = send(

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
-use crate::services::{AuditEntry, ConsoleIdentity};
+use crate::services::{AuditEntry, ConsolePrincipal};
 use crate::storage::{
     Accessor, Collection, CollectionSummary, Cursor, Key, ListQuery, ObjectId, Owner, Permissions,
     Precondition, ReadPermission, StorageObject, StorageValue, UserId, Version, WritePermission,
@@ -195,7 +195,7 @@ fn default_write_permission() -> u8 {
 /// `GET /console/v1/storage`: every collection with its object count.
 pub(super) async fn collections_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
 ) -> Result<Json<CollectionsResponse>, ApiError> {
     app.metrics().record_http_request();
     let collections = app
@@ -209,7 +209,7 @@ pub(super) async fn collections_handler(
 /// `GET /console/v1/storage/{collection}`: paged object summaries.
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(collection): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<ObjectsPage>, ApiError> {
@@ -251,7 +251,7 @@ pub(super) async fn list_handler(
 /// `GET /console/v1/storage/{collection}/{key}`: one full object.
 pub(super) async fn get_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path((collection, key)): Path<(String, String)>,
     Query(params): Query<ObjectParams>,
 ) -> Result<Json<ObjectBody>, ApiError> {
@@ -269,7 +269,7 @@ pub(super) async fn get_handler(
 /// `PUT /console/v1/storage/{collection}/{key}`: create/overwrite (admin).
 pub(super) async fn write_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((collection, key)): Path<(String, String)>,
     Query(params): Query<ObjectParams>,
     body: Result<Json<WriteBody>, JsonRejection>,
@@ -302,8 +302,8 @@ pub(super) async fn write_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "storage.write",
         object_target(&id),
         format!("wrote version {}", object.version.as_str()),
@@ -314,7 +314,7 @@ pub(super) async fn write_handler(
 /// `DELETE /console/v1/storage/{collection}/{key}`: delete (admin).
 pub(super) async fn delete_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((collection, key)): Path<(String, String)>,
     Query(params): Query<ObjectParams>,
 ) -> Result<StatusCode, ApiError> {
@@ -331,8 +331,8 @@ pub(super) async fn delete_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "storage.delete",
         object_target(&id),
         "deleted object",

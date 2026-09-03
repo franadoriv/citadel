@@ -297,6 +297,7 @@ fn worker_crash_replacement_never_resumes_matches() {
 /// client's match wedges in a non-yielding loop the client itself receives
 /// the reliable `KIND_MATCH_CLOSED` carrying the requeue hint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "external-worker does not ship native lifecycle; room admission fails closed"]
 async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
     use citadel::observability::NodeMetrics;
     use citadel::realtime::{Authenticator, Gateway};
@@ -498,6 +499,7 @@ async fn members_receive_match_closed_with_requeue_hint_over_live_ipc() {
 /// after that is bound to exactly the worker-reported revision and has its
 /// match executed inside the worker over the real IPC transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "external-worker does not ship native lifecycle; room admission fails closed"]
 async fn require_script_external_worker_boots_not_ready_then_binds_and_executes() {
     use citadel::observability::NodeMetrics;
     use citadel::realtime::{Authenticator, Gateway};

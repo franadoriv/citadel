@@ -99,14 +99,15 @@ and reject a join before the player enters.
 Cross-node authoritative match ownership and failover remain planned. Do not
 store the only copy of durable progression in an in-memory room table.
 
-:::caution[Known limitation: transform snapshots are node-global]
-The transform snapshot that fans out to clients is currently node-global — it is
-not yet scoped per room. Two or more concurrent authoritative matches on one node
-can leak transform state across matches (a client in one match can receive
-another match's objects). This is a known limitation, not a feature: per-room
-snapshot scoping is required before running multiple authoritative matches per
-node. Until then, run a single authoritative match per node.
-:::
+## Transform snapshots stay in their authoritative room
+
+Transform snapshots are scoped to the recipient's current room. Server-owned
+objects carry their authoritative-room binding; client-owned objects derive
+their scope from their owner's current room. Before enqueueing a snapshot,
+Citadel rechecks both the recipient membership and every captured source binding,
+so a concurrent room transition cannot deliver stale cross-room state. Multiple
+authoritative rooms may therefore run on one node without exchanging transform
+state through snapshots.
 
 ## Server physics is optional
 

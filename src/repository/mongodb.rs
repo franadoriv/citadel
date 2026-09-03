@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use mongodb::bson::{Bson, Document, doc};
+use mongodb::bson::{Binary, Bson, Document, doc, spec::BinarySubtype};
 use mongodb::error::{TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT};
 use mongodb::options::{
     ClientOptions, IndexOptions, ReadConcern, ReadPreference, ReturnDocument, SelectionCriteria,
@@ -34,6 +34,7 @@ use crate::leaderboard_scheduler::{
     SchedulerFencingToken, SchedulerLease,
 };
 use crate::repository::UserPage;
+use crate::repository::api_keys::{decode_scope_names, validate_stored_key};
 use crate::repository::backend::{Backend, BackendKind, UnitOfWork};
 use crate::repository::chat::{
     ChannelSummary, ChannelType, ChatChannel, ChatDeliveryOutboxRecord, ChatDeliveryRequest,
@@ -72,9 +73,10 @@ use crate::repository::tournaments::{
 };
 use crate::repository::wallet::{LedgerEntry, apply_delta, ledger_overflow};
 use crate::repository::{
-    AuthIdentityRepository, ChatRepository, FriendRow, FriendState, FriendsRepository,
-    GroupsRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
-    SessionRepository, StorageRepository, UserRepository, WalletRepository, plan_add,
+    ApiKeyId, ApiKeyRepository, ApiKeyVerifier, AuthIdentityRepository, ChatRepository, FriendRow,
+    FriendState, FriendsRepository, GroupsRepository, LeaderboardsRepository,
+    NotificationsRepository, PurchasesRepository, SessionRepository, StorageRepository,
+    StoredApiKey, UserRepository, WalletRepository, plan_add,
 };
 use crate::session::{RevocationReason, Session, SessionId, SessionTokenRef};
 use crate::storage::{
@@ -96,6 +98,7 @@ const NOTIFICATIONS: &str = "notifications";
 const WALLET_BALANCES: &str = "wallet_balances";
 const WALLET_LEDGER: &str = "wallet_ledger";
 const PURCHASES: &str = "purchases";
+const API_KEYS: &str = "api_keys";
 const CHAT_CHANNELS: &str = "chat_channels";
 const CHAT_ACCESS_EPOCHS: &str = "chat_access_epochs";
 const CHAT_MESSAGES: &str = "chat_messages";
@@ -125,7 +128,7 @@ const GAMESCRIPT_COUNTERS: &str = "gamescript_counters";
 
 const SCHEMA_COLLECTION: &str = "citadel_schema";
 const SCHEMA_ID: &str = "mongodb-foundation";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 // MongoDB recommends retrying a whole transaction on
 // `TransientTransactionError`, but retrying *only* the commit when the result
 // is unknown.  A direct `UnitOfWork` has no replayable user closure, so it can
@@ -169,6 +172,26 @@ struct CollectionSpec {
 }
 
 const SCHEMA: &[CollectionSpec] = &[
+    CollectionSpec {
+        name: API_KEYS,
+        indexes: &[
+            IndexSpec {
+                name: "api_keys_id_uq",
+                keys: &[("id", 1)],
+                unique: true,
+            },
+            IndexSpec {
+                name: "api_keys_created",
+                keys: &[("created_at_ms", -1), ("id", 1)],
+                unique: false,
+            },
+            IndexSpec {
+                name: "api_keys_active",
+                keys: &[("revoked_at_ms", 1), ("expires_at_ms", 1)],
+                unique: false,
+            },
+        ],
+    },
     CollectionSpec {
         name: "storage_objects",
         indexes: &[
@@ -7445,6 +7468,17 @@ impl MongoDatabase {
         run_mongo_transaction(&self.client, &self.database, work).await
     }
 
+    /// Clear only API-key credentials in an isolated integration database.
+    #[doc(hidden)]
+    pub async fn clear_api_key_data_for_tests(&self) -> AppResult<()> {
+        self.database
+            .collection::<Document>(API_KEYS)
+            .delete_many(doc! {})
+            .await
+            .map_err(mongo_error)?;
+        Ok(())
+    }
+
     /// Clear the identity/session projections used by hermetic integration
     /// tests. This is deliberately narrow: it never drops the versioned
     /// schema, indexes, or projections belonging to other repository tasks.
@@ -7655,6 +7689,7 @@ impl MongoDatabase {
             }
         }
         self.reconcile_friend_edges_validator().await?;
+        self.reconcile_api_keys_validator().await?;
         let registry = self.database.collection::<Document>(SCHEMA_COLLECTION);
         match registry
             .find_one(doc! { "_id": SCHEMA_ID })
@@ -7698,6 +7733,19 @@ impl MongoDatabase {
             .run_command(doc! {
                 "collMod": FRIEND_EDGES,
                 "validator": friend_edges_validator(),
+                "validationLevel": "strict",
+                "validationAction": "error",
+            })
+            .await
+            .map_err(mongo_error)?;
+        Ok(())
+    }
+
+    async fn reconcile_api_keys_validator(&self) -> AppResult<()> {
+        self.database
+            .run_command(doc! {
+                "collMod": API_KEYS,
+                "validator": api_keys_validator(),
                 "validationLevel": "strict",
                 "validationAction": "error",
             })
@@ -7894,8 +7942,226 @@ async fn transaction_backoff(attempt: usize) {
     tokio::time::sleep(TRANSACTION_RETRY_BACKOFF.saturating_mul(multiplier)).await;
 }
 
+pub struct MongoApiKeyRepository {
+    database: Database,
+}
+impl MongoApiKeyRepository {
+    fn new(database: Database) -> Self {
+        Self { database }
+    }
+    fn collection(&self) -> mongodb::Collection<Document> {
+        self.database.collection(API_KEYS)
+    }
+}
+fn api_key_document(key: StoredApiKey) -> AppResult<Document> {
+    Ok(
+        doc! { "id": key.id.as_str(), "name": key.name, "scopes": key.scopes.iter().map(|scope| scope.as_str()).collect::<Vec<_>>(), "secret_verifier": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: key.verifier.as_bytes().to_vec() }), "generation": i64::try_from(key.generation).map_err(|_| AppError::internal("invalid API key generation"))?, "created_at_ms": i64::try_from(key.created_at.unix_millis()).map_err(|_| AppError::internal("invalid API key timestamp"))?, "expires_at_ms": key.expires_at.map(|at| i64::try_from(at.unix_millis())).transpose().map_err(|_| AppError::internal("invalid API key timestamp"))?, "revoked_at_ms": key.revoked_at.map(|at| i64::try_from(at.unix_millis())).transpose().map_err(|_| AppError::internal("invalid API key timestamp"))?, "last_used_at_ms": key.last_used_at.map(|at| i64::try_from(at.unix_millis())).transpose().map_err(|_| AppError::internal("invalid API key timestamp"))? },
+    )
+}
+fn api_key_from_document(document: Document) -> AppResult<StoredApiKey> {
+    let optional_time = |name| -> AppResult<Option<TimestampMillis>> {
+        match document.get(name) {
+            None | Some(Bson::Null) => Ok(None),
+            Some(Bson::Int64(value)) => u64::try_from(*value)
+                .map(TimestampMillis::from_unix_millis)
+                .map(Some)
+                .map_err(|_| AppError::internal("invalid API key timestamp")),
+            _ => Err(AppError::internal("invalid API key timestamp")),
+        }
+    };
+    let scope_values = document
+        .get_array("scopes")
+        .map_err(|_| AppError::internal("invalid API key scopes"))?;
+    let scope_names = scope_values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| AppError::internal("invalid API key scopes"))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    let scopes = decode_scope_names(scope_names)?;
+    let key = StoredApiKey {
+        id: ApiKeyId::new(
+            document
+                .get_str("id")
+                .map_err(|_| AppError::internal("invalid API key id"))?,
+        )?,
+        name: document
+            .get_str("name")
+            .map_err(|_| AppError::internal("invalid API key name"))?
+            .to_string(),
+        scopes,
+        verifier: ApiKeyVerifier::from_slice(
+            document
+                .get_binary_generic("secret_verifier")
+                .map_err(|_| AppError::internal("invalid API key verifier"))?,
+        )?,
+        generation: u64::try_from(
+            document
+                .get_i64("generation")
+                .map_err(|_| AppError::internal("invalid API key generation"))?,
+        )
+        .map_err(|_| AppError::internal("invalid API key generation"))?,
+        created_at: u64::try_from(
+            document
+                .get_i64("created_at_ms")
+                .map_err(|_| AppError::internal("invalid API key timestamp"))?,
+        )
+        .map(TimestampMillis::from_unix_millis)
+        .map_err(|_| AppError::internal("invalid API key timestamp"))?,
+        expires_at: optional_time("expires_at_ms")?,
+        revoked_at: optional_time("revoked_at_ms")?,
+        last_used_at: optional_time("last_used_at_ms")?,
+    };
+    validate_stored_key(&key)?;
+    Ok(key)
+}
+#[async_trait]
+impl ApiKeyRepository for MongoApiKeyRepository {
+    async fn create(&self, key: StoredApiKey) -> AppResult<()> {
+        validate_stored_key(&key)?;
+        self.collection()
+            .insert_one(api_key_document(key)?)
+            .await
+            .map_err(|error| mongo_write_error(error, "API key already exists"))?;
+        Ok(())
+    }
+    async fn get(&self, id: &ApiKeyId) -> AppResult<Option<StoredApiKey>> {
+        self.collection()
+            .find_one(doc! { "id": id.as_str() })
+            .await
+            .map_err(mongo_error)?
+            .map(api_key_from_document)
+            .transpose()
+    }
+    async fn list(&self) -> AppResult<Vec<StoredApiKey>> {
+        self.collection()
+            .find(doc! {})
+            .sort(doc! { "created_at_ms": -1, "id": 1 })
+            .await
+            .map_err(mongo_error)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(mongo_error)?
+            .into_iter()
+            .map(api_key_from_document)
+            .collect()
+    }
+    async fn rotate(
+        &self,
+        id: &ApiKeyId,
+        expected_generation: u64,
+        verifier: ApiKeyVerifier,
+        at: TimestampMillis,
+    ) -> AppResult<StoredApiKey> {
+        let generation = i64::try_from(expected_generation)
+            .map_err(|_| AppError::conflict("API key state changed"))?;
+        let at = i64::try_from(at.unix_millis())
+            .map_err(|_| AppError::internal("invalid API key timestamp"))?;
+        let document = self
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "id": id.as_str(),
+                    "generation": generation,
+                    "revoked_at_ms": Bson::Null,
+                    "created_at_ms": { "$lte": at },
+                    "$or": [
+                        { "expires_at_ms": Bson::Null },
+                        { "expires_at_ms": { "$gt": at } },
+                    ],
+                },
+                doc! {
+                    "$set": { "secret_verifier": Bson::Binary(Binary {
+                        subtype: BinarySubtype::Generic,
+                        bytes: verifier.as_bytes().to_vec(),
+                    }) },
+                    "$inc": { "generation": 1_i64 },
+                },
+            )
+            .return_document(ReturnDocument::After)
+            .await
+            .map_err(mongo_error)?
+            .ok_or_else(|| AppError::conflict("API key state changed"))?;
+        api_key_from_document(document)
+    }
+    async fn revoke(
+        &self,
+        id: &ApiKeyId,
+        expected_generation: u64,
+        at: TimestampMillis,
+    ) -> AppResult<StoredApiKey> {
+        let at = i64::try_from(at.unix_millis())
+            .map_err(|_| AppError::internal("invalid API key timestamp"))?;
+        let generation = i64::try_from(expected_generation)
+            .map_err(|_| AppError::conflict("API key state changed"))?;
+        let document = self
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "id": id.as_str(),
+                    "generation": generation,
+                    "created_at_ms": { "$lte": at },
+                    "revoked_at_ms": Bson::Null,
+                },
+                doc! { "$set": { "revoked_at_ms": at } },
+            )
+            .return_document(ReturnDocument::After)
+            .await
+            .map_err(mongo_error)?;
+        if let Some(document) = document {
+            return api_key_from_document(document);
+        }
+        let document = self
+            .collection()
+            .find_one(doc! {
+                "id": id.as_str(),
+                "generation": generation,
+                "created_at_ms": { "$lte": at },
+                "revoked_at_ms": { "$ne": Bson::Null },
+            })
+            .await
+            .map_err(mongo_error)?
+            .ok_or_else(|| AppError::conflict("API key state changed"))?;
+        api_key_from_document(document)
+    }
+    async fn update_last_used(
+        &self,
+        id: &ApiKeyId,
+        expected_generation: u64,
+        at: TimestampMillis,
+    ) -> AppResult<()> {
+        let at = i64::try_from(at.unix_millis())
+            .map_err(|_| AppError::internal("invalid API key timestamp"))?;
+        let generation = i64::try_from(expected_generation)
+            .map_err(|_| AppError::internal("invalid API key generation"))?;
+        self.collection()
+            .update_one(
+                doc! {
+                    "id": id.as_str(),
+                    "generation": generation,
+                    "revoked_at_ms": Bson::Null,
+                    "created_at_ms": { "$lte": at },
+                    "$or": [
+                        { "expires_at_ms": Bson::Null },
+                        { "expires_at_ms": { "$gt": at } },
+                    ],
+                },
+                doc! { "$max": { "last_used_at_ms": at } },
+            )
+            .await
+            .map_err(mongo_error)?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Backend for MongoDatabase {
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        Arc::new(MongoApiKeyRepository::new(self.database.clone()))
+    }
+
     fn kind(&self) -> BackendKind {
         BackendKind::MongoDb
     }
@@ -8056,6 +8322,62 @@ fn supports_transactions(hello: &Document) -> bool {
     replica_set || sharded
 }
 
+fn api_keys_validator() -> Document {
+    doc! {
+        "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+                "id", "name", "scopes", "secret_verifier", "generation",
+                "created_at_ms", "expires_at_ms", "revoked_at_ms", "last_used_at_ms",
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "_id": {},
+                "id": { "bsonType": "string", "pattern": "^[0-9a-f]{32}$" },
+                "name": { "bsonType": "string", "minLength": 1_i32, "maxLength": 128_i32 },
+                "scopes": {
+                    "bsonType": "array",
+                    "minItems": 1_i32,
+                    "uniqueItems": true,
+                    "items": { "enum": [
+                        "telemetry:read", "config:read", "audit:read", "errors:read",
+                        "accounts:read", "groups:read", "runtime:read", "matches:read",
+                        "storage:read", "database:read", "chat:read", "notifications:read",
+                        "leaderboards:read", "tournaments:read", "purchases:read",
+                        "subscriptions:read",
+                    ] },
+                },
+                "secret_verifier": { "bsonType": "binData" },
+                "generation": { "bsonType": "long", "minimum": 1_i64 },
+                "created_at_ms": { "bsonType": "long", "minimum": 0_i64 },
+                "expires_at_ms": { "bsonType": ["long", "null"] },
+                "revoked_at_ms": { "bsonType": ["long", "null"] },
+                "last_used_at_ms": { "bsonType": ["long", "null"] },
+            },
+        },
+        "$expr": {
+            "$and": [
+                { "$eq": [
+                    { "$binarySize": "$secret_verifier" },
+                    32_i32,
+                ] },
+                { "$or": [
+                    { "$eq": ["$expires_at_ms", Bson::Null] },
+                    { "$gt": ["$expires_at_ms", "$created_at_ms"] },
+                ] },
+                { "$or": [
+                    { "$eq": ["$revoked_at_ms", Bson::Null] },
+                    { "$gte": ["$revoked_at_ms", "$created_at_ms"] },
+                ] },
+                { "$or": [
+                    { "$eq": ["$last_used_at_ms", Bson::Null] },
+                    { "$gte": ["$last_used_at_ms", "$created_at_ms"] },
+                ] },
+            ],
+        },
+    }
+}
+
 /// MongoDB equivalent of the SQL friend-edge checks: both ids must be
 /// non-empty and distinct, while state stays in the durable enum.
 fn friend_edges_validator() -> Document {
@@ -8098,9 +8420,28 @@ mod tests {
     #[test]
     fn foundation_manifest_covers_every_existing_domain_projection() {
         let plan = MongoSchemaPlan::foundation();
-        assert_eq!(plan.version, 7);
-        assert_eq!(plan.collections, 40);
+        assert_eq!(plan.version, 8);
+        assert_eq!(plan.collections, 41);
         assert!(plan.indexes >= 62);
+    }
+
+    #[test]
+    fn api_key_validator_requires_exactly_32_verifier_bytes() {
+        let validator = api_keys_validator();
+        let conditions = validator
+            .get_document("$expr")
+            .expect("expression validator")
+            .get_array("$and")
+            .expect("combined expression conditions");
+        assert!(conditions.iter().any(|condition| {
+            condition.as_document()
+                == Some(&doc! {
+                    "$eq": [
+                        { "$binarySize": "$secret_verifier" },
+                        32_i32,
+                    ]
+                })
+        }));
     }
 
     #[test]

@@ -56,12 +56,17 @@ use crate::database_explorer::{DatabaseExplorer, SqliteMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
-    GroupsRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
-    SessionRepository, StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, DurableAuditRepository,
+    DurableLagReportRepository, DurableMatchLogRepository, DurableMatchRepository,
+    DurableTelemetrySliceRepository, FriendsRepository, GameScriptRepository, GroupsRepository,
+    LeaderboardsRepository, NotificationsRepository, PurchasesRepository, SessionRepository,
+    SqliteAuditRepository, SqliteLagReportRepository, SqliteMatchLogRepository,
+    SqliteMatchRepository, SqliteTelemetrySliceRepository, StorageRepository,
+    TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
+mod api_keys;
 mod chat;
 mod friends;
 mod gamescript;
@@ -76,6 +81,7 @@ mod storage;
 mod tournaments;
 mod wallet;
 
+pub use api_keys::SqliteApiKeyRepository;
 pub use chat::SqliteChatRepository;
 pub use friends::SqliteFriendsRepository;
 pub use gamescript::SqliteGameScriptRepository;
@@ -223,6 +229,11 @@ pub struct SqliteDatabase {
 }
 
 impl SqliteDatabase {
+    #[must_use]
+    pub fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        Arc::new(SqliteApiKeyRepository::new(self.pool.clone()))
+    }
+
     /// Connect to SQLite (opening or creating the file / in-memory database) and
     /// apply migrations.
     ///
@@ -435,6 +446,11 @@ impl SqliteDatabase {
     #[doc(hidden)]
     pub async fn reset_storage_for_tests(&self) -> AppResult<()> {
         for table in [
+            "match_logs",
+            "telemetry_slice_reports",
+            "console_audit_entries",
+            "matches",
+            "api_keys",
             "gamescript_outbox",
             "gamescript_audit",
             "gamescript_activations",
@@ -557,6 +573,10 @@ impl SqliteUnitOfWork {
 
 #[async_trait]
 impl BackendTrait for SqliteDatabase {
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        SqliteDatabase::api_key_repository(self)
+    }
+
     fn kind(&self) -> BackendKind {
         BackendKind::Sqlite
     }
@@ -617,6 +637,28 @@ impl BackendTrait for SqliteDatabase {
 
     fn purchases_repository(&self) -> Arc<dyn PurchasesRepository> {
         SqliteDatabase::purchases_repository(self)
+    }
+
+    fn lag_report_repository(&self) -> Option<Arc<dyn DurableLagReportRepository>> {
+        Some(Arc::new(SqliteLagReportRepository::new(self.pool.clone())))
+    }
+
+    fn audit_repository(&self) -> Option<Arc<dyn DurableAuditRepository>> {
+        Some(Arc::new(SqliteAuditRepository::new(self.pool.clone())))
+    }
+
+    fn telemetry_slice_repository(&self) -> Option<Arc<dyn DurableTelemetrySliceRepository>> {
+        Some(Arc::new(SqliteTelemetrySliceRepository::new(
+            self.pool.clone(),
+        )))
+    }
+
+    fn match_log_repository(&self) -> Option<Arc<dyn DurableMatchLogRepository>> {
+        Some(Arc::new(SqliteMatchLogRepository::new(self.pool.clone())))
+    }
+
+    fn match_repository(&self) -> Option<Arc<dyn DurableMatchRepository>> {
+        Some(Arc::new(SqliteMatchRepository::new(self.pool.clone())))
     }
 
     fn database_explorer(&self) -> Option<Arc<dyn DatabaseExplorer>> {

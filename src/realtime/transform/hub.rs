@@ -520,6 +520,16 @@ impl TransformHub {
         }
     }
 
+    /// Return an existing object's authoritative server-room binding. An
+    /// unknown or unbound object has no binding and must not be treated as
+    /// match-scoped by authoritative callers.
+    #[must_use]
+    pub fn object_room(&self, id: ObjectId) -> Option<u64> {
+        let g = self.inner.lock().ok()?;
+        g.world.get_transform(id)?;
+        g.object_rooms.get(&id).copied()
+    }
+
     /// Set where a client observes the world from (its avatar/camera). Defaults
     /// to the origin until set.
     pub fn set_viewer(&self, participant: u64, pos: [f32; 3]) {
@@ -623,6 +633,7 @@ impl TransformHub {
             && let Some(id) = g.assigned_slots.remove(&participant)
         {
             g.world.despawn(id);
+            g.object_rooms.remove(&id);
         }
     }
 
@@ -816,6 +827,7 @@ impl TransformHub {
         let mut g = self.inner.lock().ok()?;
         let entry = g.na_presence.remove(&participant)?;
         g.world.despawn(entry.object_id);
+        g.object_rooms.remove(&entry.object_id);
         Some(entry.object_id)
     }
 
@@ -1443,19 +1455,40 @@ mod tests {
             "no free slot once the pool is full"
         );
 
-        // Releasing frees the id for reuse by the next join.
+        // Releasing clears a room binding before the id can be reused by the
+        // next join.
+        hub.set_object_room(id1, Some(71));
         hub.release_player_slot(100);
+        assert_eq!(hub.object_room(id1), None);
         let (reused, _) = hub.assign_player_slot(300).expect("freed slot reused");
         assert_eq!(
             reused, 1,
             "the released id is handed to the next participant"
         );
+        assert_eq!(hub.object_room(reused), None);
     }
 
     #[test]
     fn player_slot_mode_off_by_default() {
         // Default config has player_slots == 0, so no assignment happens.
         assert!(hub().assign_player_slot(1).is_none());
+    }
+
+    #[test]
+    fn despawn_removes_the_object_room_binding() {
+        let hub = hub();
+        hub.spawn_server_simulated(71, TransformState::default());
+        hub.set_object_room(71, Some(9));
+
+        hub.despawn(71);
+        assert_eq!(hub.object_room(71), None);
+
+        hub.spawn_server_simulated(71, TransformState::default());
+        assert_eq!(
+            hub.object_room(71),
+            None,
+            "a reused server object id cannot inherit a despawned binding"
+        );
     }
 
     #[test]
@@ -1621,11 +1654,13 @@ mod tests {
         let hub = hub();
         let t = NaTransform::identity();
         let r1 = hub.register_presence(1, 0, t).expect("p1");
+        hub.set_object_room(r1.object_id, Some(71));
         assert!(hub.get_transform(r1.object_id).is_some());
 
         let freed = hub.release_presence(1).expect("released");
         assert_eq!(freed, r1.object_id);
         assert!(hub.get_transform(freed).is_none(), "object despawned");
+        assert_eq!(hub.object_room(freed), None);
         assert!(
             hub.release_presence(1).is_none(),
             "second release is a no-op"
@@ -1634,6 +1669,7 @@ mod tests {
         // The freed id is reused by the next joiner.
         let r2 = hub.register_presence(2, 0, t).expect("p2");
         assert_eq!(r2.object_id, freed, "lowest free id reused");
+        assert_eq!(hub.object_room(r2.object_id), None);
     }
 
     #[test]

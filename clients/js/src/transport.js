@@ -3,6 +3,11 @@
 
 import { FrameDecoder, decodeDatagram } from "./envelope.js";
 
+// `lag-recorder.js` owns the public meaning. Keep these packed primitives here
+// so an inbound hook does not allocate a direction/delivery metadata object.
+const DIAGNOSTIC_RELIABLE = 1 << 1;
+const DIAGNOSTIC_DATAGRAM = 1 << 2;
+
 /** @param {ArrayBuffer | ArrayBufferView} value */
 function bytes(value) {
   if (value instanceof Uint8Array) return value;
@@ -53,12 +58,14 @@ export class WebSocketTransport {
     this._closeError = null;
     this._decoder = new FrameDecoder();
     this._onEnvelope = null;
+    this._onDiagnosticEnvelope = null;
     this._onClose = null;
 
     ws.binaryType = "arraybuffer";
     ws.addEventListener("message", (event) => {
       try {
         for (const envelope of this._decoder.push(bytes(event.data))) {
+          this._onDiagnosticEnvelope?.(envelope, DIAGNOSTIC_RELIABLE);
           this._onEnvelope?.(envelope);
         }
       } catch (error) {
@@ -68,9 +75,10 @@ export class WebSocketTransport {
     ws.addEventListener("close", () => this._finish(new Error("connection closed")));
   }
 
-  /** @param {{ onEnvelope: (env: import("./envelope.js").Envelope) => void, onClose: (error: Error) => void }} handlers */
+  /** @param {{ onEnvelope: (env: import("./envelope.js").Envelope) => void, onDiagnosticEnvelope?: (env: import("./envelope.js").Envelope, flags: number) => void, onClose: (error: Error) => void }} handlers */
   setHandlers(handlers) {
     this._onEnvelope = handlers.onEnvelope;
+    this._onDiagnosticEnvelope = handlers.onDiagnosticEnvelope || null;
     this._onClose = handlers.onClose;
     if (this._closed) this._onClose(this._closeError || new Error("connection closed"));
   }
@@ -114,6 +122,7 @@ export class WebTransportTransport {
     this._closed = false;
     this._closeError = null;
     this._onEnvelope = null;
+    this._onDiagnosticEnvelope = null;
     this._onClose = null;
 
     if (!webTransport.incomingUnidirectionalStreams || !webTransport.datagrams?.readable
@@ -129,9 +138,10 @@ export class WebTransportTransport {
     );
   }
 
-  /** @param {{ onEnvelope: (env: import("./envelope.js").Envelope) => void, onClose: (error: Error) => void }} handlers */
+  /** @param {{ onEnvelope: (env: import("./envelope.js").Envelope) => void, onDiagnosticEnvelope?: (env: import("./envelope.js").Envelope, flags: number) => void, onClose: (error: Error) => void }} handlers */
   setHandlers(handlers) {
     this._onEnvelope = handlers.onEnvelope;
+    this._onDiagnosticEnvelope = handlers.onDiagnosticEnvelope || null;
     this._onClose = handlers.onClose;
     if (this._closed) this._onClose(this._closeError || new Error("connection closed"));
   }
@@ -209,7 +219,10 @@ export class WebTransportTransport {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) return;
-        for (const envelope of decoder.push(bytes(value))) this._onEnvelope?.(envelope);
+        for (const envelope of decoder.push(bytes(value))) {
+          this._onDiagnosticEnvelope?.(envelope, DIAGNOSTIC_RELIABLE);
+          this._onEnvelope?.(envelope);
+        }
       }
     } finally {
       reader.releaseLock?.();
@@ -222,7 +235,9 @@ export class WebTransportTransport {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) return;
-        this._onEnvelope?.(decodeDatagram(bytes(value)));
+        const envelope = decodeDatagram(bytes(value));
+        this._onDiagnosticEnvelope?.(envelope, DIAGNOSTIC_DATAGRAM);
+        this._onEnvelope?.(envelope);
       }
     } finally {
       reader.releaseLock?.();

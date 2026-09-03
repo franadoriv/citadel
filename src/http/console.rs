@@ -50,6 +50,7 @@ pub const NAV_LABELS: &[&str] = &[
     "Leaderboards",
     "Matches",
     "Purchases & Subscriptions",
+    "Lag Diagnostics",
     "Configuration",
     "API Explorer / Runtime",
     "Audit Logs",

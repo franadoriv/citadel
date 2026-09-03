@@ -1018,6 +1018,84 @@ citadel.log("player disconnected unexpectedly", "warn")
 
 ---
 
+## citadel.log.write
+
+Append one **durable** log line to the node's match-log table. `citadel.log`
+only emits a tracing event; this line is stored and stays readable from the
+operator console after the match is over.
+
+```
+citadel.log.write(level, tag, message [, payload_json])
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `level` | string | yes | One of `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`; ASCII case is ignored. Unlike `citadel.log`, an unrecognized level is an **error**, never a silent fallback to `info` — a stored row that says `info` when the author wrote `eror` is a lie no operator can detect later. |
+| `tag` | string | yes | 1–64 bytes of `[a-z0-9_.-]`, with no leading, trailing, or repeated `.`. The console filters by tag prefix, so `combat.hit` and `combat.miss` both match `combat`. |
+| `message` | string | yes | Free text. Trimmed first, then required to be 1–1024 bytes with no ASCII control characters (newlines and tabs included). |
+| `payload_json` | string | no | A JSON **object or array**, at most 8192 bytes (`logs.match_logs.max_payload_bytes`). Stored verbatim and never inspected. |
+
+:::caution[`payload_json` is stored verbatim]
+`payload_json` is persisted to the database exactly as written and is visible to
+console operators and to the read-only database explorer. **Do not write
+secrets, credentials, tokens, or personal data into it.**
+:::
+
+**Match scope:** optional. A line written from a match-scoped callback is
+attributed to that match; a line written anywhere else — a global tick, a
+scheduled job, or a game with no match concept at all — is stored with no match.
+That is a supported case, not a failure.
+
+**Returns:** nothing.
+
+**Errors:** a level, tag, message, or payload that fails the rules above, or
+`"durable logs are unavailable"` on a node with no durable log tables.
+
+```lua
+citadel.log.write("info", "combat.hit", "kitsune scored")
+citadel.log.write("warn", "economy", "refund issued", '{"amount":250}')
+```
+
+---
+
+## citadel.match.set_result
+
+Stamp a script-authored result document on the match this callback belongs to.
+
+```
+citadel.match.set_result(result_json)
+```
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `result_json` | string | yes | A JSON **object**, at most 4096 bytes. Stored verbatim on the match record. |
+
+**Match scope:** required. There is deliberately no `citadel.match.open` and no
+`citadel.match.close`. The server opens a match record when the room is created
+and closes it when the room ends; the match id, membership, clock, and close
+reason are chosen by the gateway and cannot be supplied or replaced by game
+code. `set_result` is the only script influence on that record, and it writes
+one nullable column.
+
+The document is held until the server closes the match, so it lands in the same
+write that ends it and can never resurrect a closed match. Calling this more
+than once keeps the last document.
+
+**Returns:** nothing.
+
+**Errors:** `"match results require a match-scoped context"` outside a
+match-scoped callback, `"match result exceeds the maximum size"` past 4096
+bytes, a document that is not a JSON object, or `"durable logs are unavailable"`
+on a node with no durable log tables.
+
+```lua
+citadel.on_match_ended(function(ctx)
+  citadel.match.set_result('{"winner":"kitsune","rounds":3}')
+end)
+```
+
+---
+
 ## require — scoped module loading
 
 A restricted, sandboxed `require` is installed as a Lua global (not under

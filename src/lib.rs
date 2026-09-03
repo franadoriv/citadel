@@ -8,20 +8,27 @@
 //! contracts (`identity`, `session`, `time`) landed in .
 
 pub mod app;
+pub mod authoritative_decision_telemetry;
+pub mod authoritative_telemetry_slices;
 pub mod chat_cluster;
 pub mod cli;
 pub mod config;
 pub mod database_explorer;
 pub mod deferred_storage;
+pub mod durable_logs;
 pub mod error;
 pub mod error_journal;
 pub mod error_reporting;
 pub mod host_telemetry;
 pub mod http;
 pub mod identity;
+pub mod ids;
+pub mod lag_analysis;
+pub mod lag_diagnostics;
 pub mod leaderboard_scheduler;
 pub mod lifecycle;
 pub mod maps;
+pub mod match_recorder;
 pub mod matchmaker;
 pub mod matchmaker_cluster;
 pub mod matchmaker_live;
@@ -36,6 +43,7 @@ pub mod services;
 pub mod session;
 pub mod startup;
 pub mod storage;
+pub mod telemetry_slice_persistence;
 pub mod time;
 pub mod transport;
 

@@ -13,6 +13,7 @@
 //! concrete storage or transport. [`ServiceLifecycle`] stays synchronous: it
 //! reports name/health without touching a backend.
 
+pub mod api_keys;
 pub mod audit;
 pub mod auth_rate_limit;
 pub mod authentication;
@@ -38,7 +39,11 @@ pub mod token;
 pub mod tournaments;
 pub mod wallet;
 
-pub use audit::{AuditEntry, AuditFilter, AuditLog, DEFAULT_AUDIT_CAPACITY};
+pub use crate::repository::ApiKeyScope;
+pub use api_keys::{
+    ApiKeyMetadata, ApiKeyPrincipal, ApiKeySecretResponse, ApiKeyService, CreateApiKeyRequest,
+};
+pub use audit::{AuditEntry, AuditFilter, AuditLog, AuditSink, DEFAULT_AUDIT_CAPACITY};
 pub use chat::{
     ChannelSummary, ChannelType, ChatDeliveryRequest, ChatMessage, ChatService,
     DEFAULT_AUTHOR_DELETE_WINDOW_MS, DEFAULT_AUTHOR_EDIT_WINDOW_MS, DEFAULT_CHANNEL_HISTORY_CAP,
@@ -49,7 +54,9 @@ pub use chat_authorization::{
     AuthorizedChatChannel, AuthorizedChatLease, ChatChannelAuthorizer, ChatTarget,
 };
 pub use chat_rate_limit::ChatRateLimitPolicy;
-pub use console::{ConsoleIdentity, ConsoleRole, ConsoleTokenStore, verify_login};
+pub use console::{
+    ConsoleIdentity, ConsolePrincipal, ConsoleRole, ConsoleTokenStore, verify_login,
+};
 pub use friends::{FriendRow, FriendState, FriendsService};
 pub use groups::{
     AdmissionKind, AdmissionOutcome, CreateGroupRequest, Group, GroupFilter, GroupId, GroupRole,
@@ -67,8 +74,9 @@ pub use player_notifications::{
     PlayerNotificationService, SendPlayerNotification, SendPlayerNotificationOutcome,
 };
 pub use purchases::{
-    DevReceiptValidator, Purchase, PurchaseService, PurchaseStore, ReceiptValidator,
-    SubscriptionRow, ValidatedReceipt,
+    CompositeReceiptValidator, DevReceiptValidator, Purchase, PurchaseService, PurchaseStore,
+    ReceiptValidationErrorCode, ReceiptValidationHttpClient, ReceiptValidator, SubscriptionRow,
+    ValidatedReceipt,
 };
 pub use wallet::{LedgerEntry, WalletService};
 

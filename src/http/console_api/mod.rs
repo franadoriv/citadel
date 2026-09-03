@@ -25,14 +25,19 @@
 //! no token or password ever logged.
 
 pub mod accounts;
+pub mod api_keys;
 pub mod audit;
+pub mod authoritative_telemetry_slices;
 pub mod chat;
 pub mod config;
 pub mod database;
 pub mod errors;
 pub mod groups;
+pub mod lag_diagnostics;
 pub mod leaderboards;
+pub mod logs;
 pub mod matches;
+pub mod matchlogs;
 pub mod notifications;
 pub mod purchases;
 pub mod runtime;
@@ -43,20 +48,25 @@ pub mod tournaments;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
 use crate::error::{AppError, ErrorCategory};
-use crate::services::{AuditEntry, ConsoleIdentity, verify_login};
+use crate::repository::ApiKeyScope;
+use crate::services::{AuditEntry, ConsoleIdentity, ConsolePrincipal, verify_login};
+use crate::session::token::MAX_TOKEN_SECRET_LEN;
 use crate::time::{Clock, SystemClock};
 
 use super::error::{ApiError, ErrorBody};
 
 pub use accounts::ACCOUNTS_PATH;
 pub use audit::AUDIT_PATH;
+pub use authoritative_telemetry_slices::{
+    AUTHORITATIVE_TELEMETRY_SLICE_DETAIL_PATH, AUTHORITATIVE_TELEMETRY_SLICES_PATH,
+};
 pub use chat::CHAT_PATH;
 pub use config::CONFIG_PATH;
 pub use database::DATABASE_PATH;
@@ -87,6 +97,7 @@ pub const ME_PATH: &str = "/console/v1/me";
 pub const SECTION_PATHS: &[&str] = &[
     "/console/v1/config",
     "/console/v1/audit",
+    authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICES_PATH,
     "/console/v1/errors",
     "/console/v1/storage",
     "/console/v1/database",
@@ -110,6 +121,7 @@ pub const SECTION_PATHS: &[&str] = &[
 /// router build (duplicate route), which is the desired failure mode.
 pub const IMPLEMENTED_SECTION_PATHS: &[&str] = &[
     audit::AUDIT_PATH,
+    authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICES_PATH,
     errors::ERRORS_PATH,
     config::CONFIG_PATH,
     storage::STORAGE_PATH,
@@ -180,34 +192,143 @@ impl std::fmt::Debug for LoginResponse {
 
 /// The JSON response for [`ME_PATH`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct MeResponse {
-    /// Operator username the token was issued to.
-    pub username: String,
-    /// Operator role: `admin` or `viewer`.
-    pub role: &'static str,
+#[serde(untagged)]
+pub enum MeResponse {
+    /// Backward-compatible human session identity.
+    Human {
+        username: String,
+        role: &'static str,
+    },
+    /// Machine identity; deliberately has no human username field.
+    ApiKey {
+        actor_type: &'static str,
+        credential_id: String,
+        key_name: String,
+        scopes: Vec<ApiKeyScope>,
+        generation: u64,
+    },
 }
 
-/// Bearer-token extractor: any handler taking [`ConsoleIdentity`] is an
-/// authenticated console route.
+/// Bearer-token extractor for human sessions and V1 API keys.
 ///
-/// Every failure mode (missing header, malformed header, unknown token,
-/// expired token) collapses to the uniform `401` via
-/// [`ApiError`](super::error::ApiError), so the boundary leaks nothing about
-/// which part was wrong.
+/// A credential beginning with the API-key prefix is only ever processed as an
+/// API key. Malformed, unknown, expired, and revoked keys share one uniform 401
+/// and can never fall back to the opaque human-session store. Every authorized
+/// machine read is audited here before handler execution, including attempts
+/// whose handler later returns an error.
 #[async_trait::async_trait]
-impl FromRequestParts<App> for ConsoleIdentity {
+impl FromRequestParts<App> for ConsolePrincipal {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .ok_or_else(unauthorized)?;
-        app.console_tokens()
-            .validate(token)
-            .ok_or_else(unauthorized)
+        let mut authorization = parts.headers.get_all(header::AUTHORIZATION).iter();
+        let value = authorization.next().ok_or_else(unauthorized)?;
+        if authorization.next().is_some()
+            || value.as_bytes().len() > "Bearer ".len() + MAX_TOKEN_SECRET_LEN
+        {
+            return Err(unauthorized());
+        }
+        let value = value.to_str().map_err(|_| unauthorized())?;
+        // The scheme and credential namespaces are deliberately case-sensitive.
+        // Reject every whitespace/control-bearing credential before either
+        // verifier sees it, and never reinterpret an API-key namespace as a
+        // human session when API-key parsing or verification fails.
+        let token = value.strip_prefix("Bearer ").ok_or_else(unauthorized)?;
+        if token.is_empty()
+            || token
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err(unauthorized());
+        }
+
+        if token.starts_with("ctdl_") {
+            let key = app
+                .api_keys()
+                .authenticate(token, SystemClock.now())
+                .await
+                .map_err(|_| unauthorized())?;
+            authorize_api_key(&parts.method, parts.uri.path(), &key.scopes)?;
+            let principal = ConsolePrincipal::ApiKey(key);
+            let path = parts.uri.path();
+            // Every authorized machine read is recorded here, reads of the log
+            // surfaces included. That is unbounded self-amplification in a
+            // table but not in the ring, so the durable writer drops exactly
+            // those entries (`durable_logs::RING_ONLY_AUDIT_TARGETS`) instead
+            // of this call site branching on the path.
+            app.audit_log().record(AuditEntry::for_principal(
+                SystemClock.now(),
+                &principal,
+                "console.read",
+                path,
+                format!("method={} path={path}", parts.method),
+            ));
+            Ok(principal)
+        } else {
+            app.console_tokens()
+                .validate(token)
+                .map(ConsolePrincipal::Human)
+                .ok_or_else(unauthorized)
+        }
+    }
+}
+
+fn authorize_api_key(method: &Method, path: &str, scopes: &[ApiKeyScope]) -> Result<(), ApiError> {
+    let semantic_database_read = *method == Method::POST
+        && matches!(
+            path,
+            database::DATABASE_ROWS_PATH | database::DATABASE_ROW_PATH
+        );
+    if (!matches!(*method, Method::GET | Method::HEAD) && !semantic_database_read)
+        || path.ends_with('/')
+        || path.contains('%')
+    {
+        return Err(AppError::permission("API key is not authorized for this route").into());
+    }
+    let segments: Vec<_> = path
+        .strip_prefix("/console/v1/")
+        .filter(|rest| !rest.is_empty())
+        .map(|rest| rest.split('/').collect())
+        .ok_or_else(|| AppError::permission("API key is not authorized for this route"))?;
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err(AppError::permission("API key is not authorized for this route").into());
+    }
+
+    let required = match segments.as_slice() {
+        ["me"] => return Ok(()),
+        ["telemetry"] => ApiKeyScope::TelemetryRead,
+        ["config"] => ApiKeyScope::ConfigRead,
+        ["audit"] => ApiKeyScope::AuditRead,
+        ["errors"] => ApiKeyScope::ErrorsRead,
+        ["runtime"] => ApiKeyScope::RuntimeRead,
+        ["accounts"] | ["accounts", _] => ApiKeyScope::AccountsRead,
+        ["accounts", _, "export" | "wallet" | "friends"] => ApiKeyScope::AccountsRead,
+        ["groups"] | ["groups", _] => ApiKeyScope::GroupsRead,
+        ["matches"] | ["matches", _] => ApiKeyScope::MatchesRead,
+        // Durable match records answer the same question as the live registry,
+        // one match later, so they reuse its scope.
+        ["matchlogs"] | ["matchlogs", _] | ["matchlogs", _, "entries"] => ApiKeyScope::MatchesRead,
+        ["logs"] | ["logs", _] => ApiKeyScope::LogsRead,
+        ["storage"] | ["storage", _] | ["storage", _, _] => ApiKeyScope::StorageRead,
+        ["database"] | ["database", "rows" | "row"] | ["database", _, _] => {
+            ApiKeyScope::DatabaseRead
+        }
+        ["chat"] | ["chat", _, "messages"] => ApiKeyScope::ChatRead,
+        ["notifications"] => ApiKeyScope::NotificationsRead,
+        ["leaderboards"] | ["leaderboards", _, "records"] => ApiKeyScope::LeaderboardsRead,
+        ["tournaments"] | ["tournaments", _] | ["tournaments", _, "entries" | "results"] => {
+            ApiKeyScope::TournamentsRead
+        }
+        ["purchases"] | ["purchases", _] => ApiKeyScope::PurchasesRead,
+        ["subscriptions"] => ApiKeyScope::SubscriptionsRead,
+        _ => {
+            return Err(AppError::permission("API key is not authorized for this route").into());
+        }
+    };
+    if scopes.contains(&required) {
+        Ok(())
+    } else {
+        Err(AppError::permission("API key is not authorized for this route").into())
     }
 }
 
@@ -221,7 +342,67 @@ pub(super) fn routes() -> Router<App> {
     let mut router = Router::new()
         .route(LOGIN_PATH, post(login_handler))
         .route(ME_PATH, get(me_handler))
+        .route(
+            api_keys::API_KEYS_PATH,
+            get(api_keys::list_handler).post(api_keys::create_handler),
+        )
+        .route(api_keys::API_KEY_DETAIL_PATH, get(api_keys::detail_handler))
+        .route(
+            api_keys::API_KEY_ROTATE_PATH,
+            post(api_keys::rotate_handler),
+        )
+        .route(
+            api_keys::API_KEY_REVOKE_PATH,
+            post(api_keys::revoke_handler),
+        )
         .route(audit::AUDIT_PATH, get(audit::list_handler))
+        .route(
+            authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICES_PATH,
+            get(authoritative_telemetry_slices::list_handler),
+        )
+        .route(
+            authoritative_telemetry_slices::AUTHORITATIVE_TELEMETRY_SLICE_DETAIL_PATH,
+            get(authoritative_telemetry_slices::detail_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_REPORTS_PATH,
+            get(lag_diagnostics::list_reports_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_REPORT_DETAIL_PATH,
+            get(lag_diagnostics::report_detail_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_REPORT_WINDOWS_PATH,
+            get(lag_diagnostics::windows_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURES_PATH,
+            get(lag_diagnostics::list_captures_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURE_RAW_PATH,
+            get(lag_diagnostics::list_raw_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURE_RAW_HANDLE_PATH,
+            get(lag_diagnostics::download_raw_handler).delete(lag_diagnostics::delete_raw_handler),
+        )
+        .route(
+            lag_diagnostics::LAG_CAPTURE_REGENERATE_PATH,
+            post(lag_diagnostics::regenerate_handler),
+        )
+        .route(logs::LOGS_PATH, get(logs::list_handler))
+        .route(logs::LOG_DETAIL_PATH, get(logs::detail_handler))
+        .route(matchlogs::MATCHLOGS_PATH, get(matchlogs::list_handler))
+        .route(
+            matchlogs::MATCHLOG_DETAIL_PATH,
+            get(matchlogs::detail_handler),
+        )
+        .route(
+            matchlogs::MATCHLOG_ENTRIES_PATH,
+            get(matchlogs::entries_handler),
+        )
         .route(errors::ERRORS_PATH, get(errors::list_handler))
         .route(telemetry::TELEMETRY_PATH, get(telemetry::get_handler))
         .route(config::CONFIG_PATH, get(config::get_handler))
@@ -453,11 +634,20 @@ async fn admit_console_login(app: &App, source: &str, username: &str) -> Result<
 }
 
 /// `GET /console/v1/me`: the authenticated operator identity.
-async fn me_handler(State(app): State<App>, operator: ConsoleIdentity) -> Json<MeResponse> {
+async fn me_handler(State(app): State<App>, principal: ConsolePrincipal) -> Json<MeResponse> {
     app.metrics().record_http_request();
-    Json(MeResponse {
-        username: operator.username,
-        role: operator.role.as_str(),
+    Json(match principal {
+        ConsolePrincipal::Human(operator) => MeResponse::Human {
+            username: operator.username,
+            role: operator.role.as_str(),
+        },
+        ConsolePrincipal::ApiKey(key) => MeResponse::ApiKey {
+            actor_type: "api_key",
+            credential_id: key.id.as_str().to_string(),
+            key_name: key.name,
+            scopes: key.scopes,
+            generation: key.generation,
+        },
     })
 }
 
@@ -467,7 +657,7 @@ async fn me_handler(State(app): State<App>, operator: ConsoleIdentity) -> Json<M
 /// the same auth path regardless of section maturity.
 async fn stub_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
 ) -> (StatusCode, Json<ErrorBody>) {
     app.metrics().record_http_request();
     (
@@ -501,7 +691,7 @@ mod tests {
         assert_eq!(unique.len(), SECTION_PATHS.len());
         // One route per placeholder sidebar section (purchases splits into
         // purchases + subscriptions, and Status stays on the public /status).
-        assert_eq!(SECTION_PATHS.len(), 15);
+        assert_eq!(SECTION_PATHS.len(), 16);
     }
 
     #[test]

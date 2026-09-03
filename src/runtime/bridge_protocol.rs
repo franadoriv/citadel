@@ -41,7 +41,13 @@ use super::worker_protocol::ProtocolError;
 /// contract evolve separately. A new version is a new top-level payload, never
 /// an in-place field reinterpretation (the reserved-kind precedent,
 /// `crates/citadel-wire/src/protocol.rs`).
-pub const GS_BRIDGE_PROTOCOL_VERSION: u16 = 1;
+pub const GS_BRIDGE_PROTOCOL_VERSION: u16 = 2;
+
+/// Maximum opaque-body size accepted for one generic custom client-message
+/// event. This is intentionally the same per-message limit exposed by the
+/// embedded host APIs; a transport frame may be larger, but no custom frame can
+/// consume an entire bridge payload or reach a runtime unbounded.
+pub const MAX_MATCH_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 
 /// Symmetric fail-closed encode/decode cap for one bridge payload. Reuses the
 /// data-plane frame cap ([`MAX_DATA_FRAME_BYTES`](super::worker_data_protocol::MAX_DATA_FRAME_BYTES),
@@ -325,13 +331,19 @@ pub enum NormalizedPayload {
         /// Requested initial transform (finite, normalized rotation).
         transform: BridgeTransform,
     },
-    /// Any unreserved kind (replaces the raw `on_message` dispatch inside a
-    /// match).
+    /// A version-2 generic custom client message (replaces raw `on_message`
+    /// dispatch inside an authoritative match). Rust preserves the body as
+    /// bounded opaque bytes; it never gives scripts a client-selected scope.
     MatchMessage {
         /// Wire kind of the inbound envelope.
         kind: u16,
         /// Opaque envelope body (bounded by the structural stage).
         body: Vec<u8>,
+        /// Whether the native ingress path provided reliable ordered delivery.
+        reliable: bool,
+        /// Native ingress sequence when that path exposes one. `None` means no
+        /// sequence is available; scripts must not infer one from event ids.
+        sequence: Option<u64>,
     },
     /// A participant joined the match (replaces `dispatch_lifecycle` join in the
     /// match scope).
@@ -388,12 +400,18 @@ impl NormalizedEventBatch {
     }
 
     /// Decode a batch, rejecting oversized payloads before parsing (fail-closed
-    /// decode order, the same contract as the data frame itself).
+    /// decode order, the same contract as the data frame itself) and rejecting
+    /// every bridge protocol revision except the exact supported revision.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() > MAX_BRIDGE_PAYLOAD_BYTES {
             return Err(ProtocolError::FrameTooLarge);
         }
-        serde_json::from_slice(bytes).map_err(|_| ProtocolError::MalformedFrame)
+        let batch: Self =
+            serde_json::from_slice(bytes).map_err(|_| ProtocolError::MalformedFrame)?;
+        if batch.protocol_version != GS_BRIDGE_PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(batch.protocol_version));
+        }
+        Ok(batch)
     }
 }
 
@@ -527,6 +545,15 @@ pub enum ScriptCommand {
         /// Best-effort delivery.
         unreliable: bool,
     },
+    /// Internal, room-scoped acknowledgement of processed V1 match input.
+    /// The gateway owns the wire kind and sends it only after validated bridge
+    /// membership checks; scripts cannot construct an arbitrary reserved frame.
+    SetInputAck {
+        /// Current match participant that receives the acknowledgement.
+        participant: u64,
+        /// Exact input sequence processed by the authoritative script.
+        sequence: u64,
+    },
     /// Multicast to an explicit recipient list (all must be match members).
     SendToMany {
         /// Recipients (every one must be a current member of the match).
@@ -614,12 +641,18 @@ impl ScriptCommandBatch {
         Ok(bytes)
     }
 
-    /// Decode a batch, rejecting oversized payloads before parsing.
+    /// Decode a batch, rejecting oversized payloads before parsing and every
+    /// bridge protocol revision except the exact supported revision.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() > MAX_BRIDGE_PAYLOAD_BYTES {
             return Err(ProtocolError::FrameTooLarge);
         }
-        serde_json::from_slice(bytes).map_err(|_| ProtocolError::MalformedFrame)
+        let batch: Self =
+            serde_json::from_slice(bytes).map_err(|_| ProtocolError::MalformedFrame)?;
+        if batch.protocol_version != GS_BRIDGE_PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(batch.protocol_version));
+        }
+        Ok(batch)
     }
 }
 
@@ -708,8 +741,28 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_one() {
-        assert_eq!(GS_BRIDGE_PROTOCOL_VERSION, 1);
+    fn protocol_version_is_two_for_generic_message_events() {
+        assert_eq!(GS_BRIDGE_PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn generic_message_round_trips_with_native_delivery_metadata() {
+        let mut batch = NormalizedEventBatch::new(7, 42, 9, 100, 1);
+        batch.events.push(NormalizedEvent {
+            event_id: 1,
+            participant: 99,
+            user_id: None,
+            payload: NormalizedPayload::MatchMessage {
+                kind: 401,
+                body: b"opaque\0body".to_vec(),
+                reliable: false,
+                sequence: Some(7),
+            },
+        });
+
+        let decoded =
+            NormalizedEventBatch::decode(&batch.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded, batch);
     }
 
     #[test]
@@ -838,6 +891,36 @@ mod tests {
         let bytes = answer.encode().expect("encode");
         let decoded = ScriptCommandBatch::decode(&bytes).expect("decode");
         assert_eq!(answer, decoded);
+    }
+
+    #[test]
+    fn bridge_batch_decode_requires_the_exact_protocol_version() {
+        let event_batch = NormalizedEventBatch::new(2, 5, 11, 250, 4);
+        let command_batch = ScriptCommandBatch::answering(&event_batch);
+
+        for version in [
+            GS_BRIDGE_PROTOCOL_VERSION - 1,
+            GS_BRIDGE_PROTOCOL_VERSION + 1,
+        ] {
+            let mut incompatible_event = event_batch.clone();
+            incompatible_event.protocol_version = version;
+            let event_bytes = serde_json::to_vec(&incompatible_event).expect("serialize event");
+            assert_eq!(
+                NormalizedEventBatch::decode(&event_bytes),
+                Err(ProtocolError::UnsupportedVersion(version)),
+                "event batches from another bridge protocol revision are never accepted"
+            );
+
+            let mut incompatible_command = command_batch.clone();
+            incompatible_command.protocol_version = version;
+            let command_bytes =
+                serde_json::to_vec(&incompatible_command).expect("serialize command");
+            assert_eq!(
+                ScriptCommandBatch::decode(&command_bytes),
+                Err(ProtocolError::UnsupportedVersion(version)),
+                "command batches from another bridge protocol revision are never accepted"
+            );
+        }
     }
 
     #[test]

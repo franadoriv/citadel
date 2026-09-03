@@ -5,6 +5,74 @@ All notable changes to Citadel are documented here. Version numbers follow
 
 ## Unreleased
 
+## [0.11.0] - 2026-08-25
+
+### Added
+
+- **Scoped machine credentials.** Human administrators can create, rotate, and
+  revoke durable, hash-only `ctdl_k1_` API keys with explicit read scopes. Keys
+  are header-only, return their secret exactly once, and cannot mutate data or
+  manage credentials.
+- **Opt-in lag diagnostics.** The JavaScript SDK can record bounded movement
+  metadata only when application source enables it and a trusted server issues
+  a capture lifecycle. Citadel uses one-use upload grants, private raw retention,
+  and redacted derived reports; it does not claim RTT, one-way latency, or packet
+  loss. SQLite, PostgreSQL, and CockroachDB persist reports; MongoDB supports
+  raw collection only with analysis disabled.
+- **Authoritative match lifecycle, input, and telemetry.** Embedded Lua, Python,
+  and JavaScript runtimes receive server-owned match lifecycle callbacks and
+  protocol-v2 custom match messages through the fenced `citadel.on_input`
+  bridge. Trusted scripts can create bounded context-derived telemetry slices;
+  report identifiers and payload/identity retention remain server controlled.
+- **Receipt-validation foundation.** The console can persist validated purchase
+  records without storing raw receipts. Only deterministic custom development
+  receipts are enabled today; Apple, Google, and Huawei validators remain
+  disabled pending verified provider adapters.
+- **Durable logging, telemetry persistence, and match records.** The console
+  action trail, authoritative telemetry slice reports, and a new game-script log
+  stream are persisted through a bounded write-behind queue instead of living
+  only in process-local rings. Four new tables (`matches`, `match_logs`,
+  `console_audit_entries`, `telemetry_slice_reports`) ship for SQLite,
+  PostgreSQL, and CockroachDB; the in-memory and MongoDB backends keep their
+  rings and every read endpoint still answers `200` with `durable: false`.
+- **Server-owned match records.** The realtime gateway mints a durable `mt1-`
+  match identity at room birth and records open, close, peak participants, join
+  total, and termination reason. Game code can neither open nor close a match;
+  `citadel.match.set_result(json)` stamps a result on the row the server closes.
+- **`citadel.log.write(level, tag, message, payload_json?)`** in Lua, Python,
+  and JavaScript. Log lines written inside a match-scoped callback are attributed
+  to that match; anything else is stored with a `NULL` match reference.
+  `payload_json` is author-supplied and is persisted verbatim — it is visible to
+  console operators and the database explorer, so secrets must not be written
+  into it.
+- **New console pages and routes.** `GET /console/v1/logs`,
+  `/console/v1/logs/{log_id}`, `/console/v1/matchlogs`,
+  `/console/v1/matchlogs/{match_id}`, and
+  `/console/v1/matchlogs/{match_id}/entries`, plus a Logs page and a Match
+  Records drill-down in the console. `/console/v1/audit` and
+  `/console/v1/telemetry/slices` gain `match_id` and `after` filters and keyset
+  paging. A new `logs:read` API-key scope gates the log routes.
+
+### Changed
+
+- Telemetry slice report ids are now salted per node and per boot
+  (`ats1-` plus 29 hex, 34 bytes total), so two nodes or two runs can no longer
+  mint the same id. Closed slices are reaped on the flush service's own tick
+  rather than on an operator's page load, which keeps `closed_at_ms` and
+  `duration_ms` from being observer-dependent.
+- The console action trail's ring capacity is configurable through
+  `logs.audit.capacity` instead of being hardcoded.
+- Reads of the audit and log routes are recorded to the ring only, so a machine
+  credential polling them can no longer self-amplify into unbounded durable
+  writes.
+
+### Known limitations
+
+- `lag_diagnostic_reports.match_id` ships as a nullable column with a working
+  read filter, but nothing populates it yet: the write path needs a production
+  lag-capture flush caller and per-match capture scoping. The lag-to-match link
+  does not work today.
+
 ## [0.10.0] - 2026-08-09
 
 ### Added

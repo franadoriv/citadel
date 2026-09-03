@@ -11,6 +11,7 @@ pub mod console_api;
 pub mod dashboard;
 pub mod error;
 mod headers;
+pub mod lag_diagnostics;
 pub mod player;
 mod runtime_endpoint;
 pub mod tls;
@@ -34,7 +35,10 @@ pub use auth::{
     AuthRequest, AuthResponse, CUSTOM_AUTH_PATH, DEVICE_AUTH_PATH, EMAIL_AUTH_PATH,
     EmailAuthRequest,
 };
-pub use console_api::{CONSOLE_API_PREFIX, LOGIN_PATH, ME_PATH, SECTION_PATHS};
+pub use console_api::{
+    AUTHORITATIVE_TELEMETRY_SLICE_DETAIL_PATH, AUTHORITATIVE_TELEMETRY_SLICES_PATH,
+    CONSOLE_API_PREFIX, LOGIN_PATH, ME_PATH, SECTION_PATHS,
+};
 pub use dashboard::{DASHBOARD_PATH, NodeStatus, STATUS_PATH};
 pub use error::{ApiError, ErrorBody};
 pub use player::{ACCOUNT_PATH, PLAYER_LOOKUP_PATH, SESSION_LOGOUT_PATH, SESSION_REFRESH_PATH};
@@ -90,6 +94,7 @@ pub fn router(app: App) -> Router {
         .merge(auth::routes())
         .merge(player::routes())
         .merge(console_api::routes())
+        .merge(lag_diagnostics::routes())
         .merge(runtime_endpoint::routes())
         // Applied last so it wraps every route above, including the console SPA
         // and the 404 fallback.
@@ -134,7 +139,8 @@ pub async fn serve<F>(listener: TcpListener, app: App, shutdown: F) -> AppResult
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    axum::serve(
+    let api_keys = Arc::clone(app.api_keys());
+    let serve_result = axum::serve(
         listener,
         router(app).into_make_service_with_connect_info::<SocketAddr>(),
     )
@@ -146,7 +152,10 @@ where
             "HTTP server terminated with an error",
         )
         .with_detail(e.to_string())
-    })
+    });
+    let flush_result = api_keys.flush_last_used().await;
+    serve_result?;
+    flush_result
 }
 
 /// Serve on `listener` using whichever scheme the configuration selects.

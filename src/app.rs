@@ -11,22 +11,35 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder;
+use crate::authoritative_telemetry_slices::TelemetrySliceService;
 use crate::config::{Config, RuntimeConfig};
 use crate::deferred_storage::DeferredStorageWriter;
+use crate::durable_logs::{DurableLogRepositories, DurableLogWriter};
 use crate::error::{AppError, AppResult};
 use crate::error_journal::ErrorJournal;
 use crate::error_reporting;
 use crate::host_telemetry::{HostTelemetryService, HostTelemetrySnapshot};
-use crate::observability::NodeMetrics;
-use crate::repository::{Backend, BackendKind, InMemoryBackend, select_backend};
-use crate::services::{
-    AuditLog, AuthenticationRateLimitPolicy, AuthenticationService, AuthenticationServiceImpl,
-    ChatAccessCoordinator, ChatRateLimitPolicy, ChatService, ConsoleTokenStore,
-    DatabaseExplorerRateLimiter, FriendsService, GroupsService, Health, InMemorySessionService,
-    LeaderboardService, NotificationService, PlayerNotificationService, PurchaseService,
-    SharedSessionService, WalletService,
+use crate::ids::NodeIdentity;
+use crate::lag_analysis::{
+    AnalysisIdentity, AnalysisWorkResult, InMemoryLagReportRepository, LagAnalysisWorker,
+    LagReport, LagReportCaptureOverview, LagReportRepository,
 };
-use crate::time::{Clock, SystemClock};
+use crate::match_recorder::{MatchLogWriter, MatchRecorder};
+use crate::observability::NodeMetrics;
+use crate::repository::{
+    Backend, BackendKind, DurableAuditFilter, DurableAuditRepository, DurableAuditRow,
+    DurableLagReportRepository, DurableSliceRow, InMemoryBackend, MatchLogEntry, MatchLogFilter,
+    MatchRecord, select_backend,
+};
+use crate::services::{
+    ApiKeyService, AuditFilter, AuditLog, AuthenticationRateLimitPolicy, AuthenticationService,
+    AuthenticationServiceImpl, ChatAccessCoordinator, ChatRateLimitPolicy, ChatService,
+    CompositeReceiptValidator, ConsoleTokenStore, DatabaseExplorerRateLimiter, FriendsService,
+    GroupsService, Health, InMemorySessionService, LeaderboardService, NotificationService,
+    PlayerNotificationService, PurchaseService, SharedSessionService, WalletService,
+};
+use crate::time::{Clock, SystemClock, TimestampMillis};
 
 /// Crate version, surfaced for `--version` and health responses.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -51,11 +64,14 @@ pub struct App {
     config: Config,
     started_at: Instant,
     metrics: Arc<NodeMetrics>,
+    authoritative_decision_recorder: Option<Arc<AuthoritativeDecisionRecorder>>,
+    telemetry_slices: Option<Arc<TelemetrySliceService>>,
     host_telemetry: Arc<HostTelemetryService>,
     backend: Arc<dyn Backend>,
     auth: Arc<dyn AuthenticationService>,
     sessions: SharedSessionService,
     console_tokens: Arc<ConsoleTokenStore>,
+    api_keys: Arc<ApiKeyService>,
     audit: Arc<AuditLog>,
     error_journal: Arc<ErrorJournal>,
     chat_access: Arc<ChatAccessCoordinator>,
@@ -76,6 +92,26 @@ pub struct App {
     wallet: Arc<WalletService>,
     friends: Arc<FriendsService>,
     deferred_storage: Option<Arc<DeferredStorageWriter>>,
+    lag_diagnostics: Arc<crate::lag_diagnostics::LagDiagnosticsService>,
+    /// Fast local cache for analysis deduplication and the in-memory backend.
+    lag_reports: Arc<InMemoryLagReportRepository>,
+    /// Selected database-backed report store. It contains only bounded derived
+    /// reports; raw CLAG and filesystem locators stay in `lag_diagnostics`.
+    durable_lag_reports: Option<Arc<dyn DurableLagReportRepository>>,
+    lag_analysis_worker: Arc<LagAnalysisWorker>,
+    /// Node and boot identity every durable log id is minted under.
+    identity: Arc<NodeIdentity>,
+    /// Bounded write-behind front of the durable log family. `None` when
+    /// `logs.enabled` is off or the backend exposes no durable log table.
+    durable_logs: Option<Arc<DurableLogWriter>>,
+    /// Process-local room to match-id directory, plus the lifecycle emitter.
+    match_recorder: Option<Arc<MatchRecorder>>,
+    /// The narrow handle the script runtimes write log lines through.
+    match_log_writer: Option<Arc<MatchLogWriter>>,
+    /// Selected durable log stores. Each is `None` on a backend without the
+    /// capability, and the console reports `durable: false` rather than
+    /// presenting a process-local ring as history.
+    durable_log_repositories: DurableLogRepositories,
 }
 
 impl std::fmt::Debug for App {
@@ -122,6 +158,51 @@ impl App {
             None
         };
         let metrics = Arc::new(NodeMetrics::new());
+        let identity = Arc::new(NodeIdentity::new(config.server.node_id.clone()));
+        let durable_log_repositories = DurableLogRepositories {
+            matches: backend.match_repository(),
+            match_logs: backend.match_log_repository(),
+            telemetry_slices: backend.telemetry_slice_repository(),
+            audit: backend.audit_repository(),
+        };
+        // No durable store means nothing to flush: the in-process rings stay
+        // the whole history rather than a queue that never drains.
+        let durable_logs = (config.logs.enabled && durable_log_repositories.any()).then(|| {
+            Arc::new(DurableLogWriter::new(
+                Arc::clone(&identity),
+                config.logs.clone(),
+            ))
+        });
+        let match_recorder = durable_logs
+            .as_ref()
+            .map(|writer| Arc::new(MatchRecorder::new(Arc::clone(writer))));
+        let match_log_writer = match_recorder
+            .as_ref()
+            .map(|recorder| Arc::new(MatchLogWriter::new(Arc::clone(recorder))));
+        let authoritative_decision_recorder =
+            config.telemetry.authoritative_decisions.enabled.then(|| {
+                Arc::new(AuthoritativeDecisionRecorder::new(
+                    config.telemetry.authoritative_decisions.capacity,
+                ))
+            });
+        let telemetry_slices = authoritative_decision_recorder.as_ref().map(|recorder| {
+            crate::durable_logs::build_telemetry_slices(
+                Arc::clone(recorder),
+                config
+                    .telemetry
+                    .slices
+                    .policy()
+                    .expect("validated telemetry slice configuration"),
+                &identity,
+                durable_logs.as_ref(),
+                // Without the directory a persisted slice can never carry a
+                // match scope, which would leave the console's match filter
+                // hollow. `match_recorder` is built above, so this is in order.
+                match_recorder.as_ref(),
+            )
+        });
+        let audit =
+            crate::durable_logs::build_audit_log(config.logs.audit.capacity, durable_logs.as_ref());
         let sessions: SharedSessionService = Arc::new(InMemorySessionService::with_secure_issuer(
             backend.session_repository(),
         ));
@@ -130,6 +211,7 @@ impl App {
             Arc::clone(&sessions),
         ));
         let console_tokens = Arc::new(ConsoleTokenStore::from_config(&config.console));
+        let api_keys = Arc::new(ApiKeyService::new(backend.api_key_repository()));
         let error_journal = error_reporting::journal_for_config(&config.errors);
         let chat = Arc::new(ChatService::new(backend.chat_repository()));
         let chat_rate_limits = Arc::new(ChatRateLimitPolicy::new(config.chat.limits.clone()));
@@ -164,17 +246,47 @@ impl App {
         let notifications = Arc::new(NotificationService::new(backend.notifications_repository()));
         let player_notifications = Arc::new(PlayerNotificationService::new(Arc::clone(&backend)));
         let wallet = Arc::new(WalletService::new(backend.wallet_repository()));
-        let purchases = Arc::new(PurchaseService::new(backend.purchases_repository()));
+        let purchases = Arc::new(PurchaseService::with_validator(
+            backend.purchases_repository(),
+            Arc::new(CompositeReceiptValidator::from_config(
+                &config.purchases,
+                Arc::clone(&metrics),
+            )),
+        ));
+        let lag_diagnostics = Arc::new(
+            crate::lag_diagnostics::LagDiagnosticsService::new(
+                config.lag_diagnostics.clone(),
+                config.server.node_id.clone(),
+            )
+            .expect("validated lag-diagnostics configuration"),
+        );
+        let lag_reports = Arc::new(InMemoryLagReportRepository::default());
+        let durable_lag_reports = backend.lag_report_repository();
+        let lag_analysis_worker = Arc::new(LagAnalysisWorker::new(
+            lag_reports.clone(),
+            usize::from(config.lag_diagnostics.max_concurrent_uploads),
+        ));
+        // Raw capture state is deliberately outside the database. Reconcile
+        // interrupted leases before exposing the permanent ingest route.
+        // Retention is asynchronous because every exact report projection must
+        // be marked unavailable durably before the corresponding bytes vanish.
+        let lag_diagnostics_now = SystemClock.now();
+        lag_diagnostics
+            .recover(lag_diagnostics_now)
+            .expect("private lag-diagnostics recovery");
         Self {
             config,
             started_at: Instant::now(),
             metrics,
+            authoritative_decision_recorder,
+            telemetry_slices,
             host_telemetry: Arc::new(HostTelemetryService::new()),
             backend,
             auth,
             sessions,
             console_tokens,
-            audit: Arc::new(AuditLog::default()),
+            api_keys,
+            audit,
             error_journal,
             chat_access,
             groups,
@@ -194,6 +306,15 @@ impl App {
             wallet,
             friends,
             deferred_storage,
+            lag_diagnostics,
+            lag_reports,
+            durable_lag_reports,
+            lag_analysis_worker,
+            identity,
+            durable_logs,
+            match_recorder,
+            match_log_writer,
+            durable_log_repositories,
         }
     }
 
@@ -247,7 +368,12 @@ impl App {
             node_id = %config.server.node_id,
             "selected persistence backend"
         );
-        Ok(Self::with_backend(config, backend))
+        let app = Self::with_backend(config, backend);
+        // Reconcile retention before any listener is exposed. The public upload
+        // route repeats this lightweight maintenance pass so deployments that
+        // stay up longer than the retention window keep the same invariant.
+        app.reconcile_lag_raw_retention(SystemClock.now()).await?;
+        Ok(app)
     }
 
     /// Borrow the resolved configuration.
@@ -301,6 +427,21 @@ impl App {
         &self.metrics
     }
 
+    /// The optional bounded recorder for already-validated authoritative decisions.
+    ///
+    /// This is process-local telemetry only. It has no public endpoint and stores
+    /// no payload, reply, command, corrected value, participant, or account data.
+    #[must_use]
+    pub fn authoritative_decision_recorder(&self) -> Option<Arc<AuthoritativeDecisionRecorder>> {
+        self.authoritative_decision_recorder.clone()
+    }
+
+    /// The optional bounded service that derives closed redacted telemetry reports.
+    #[must_use]
+    pub fn telemetry_slices(&self) -> Option<Arc<TelemetrySliceService>> {
+        self.telemetry_slices.clone()
+    }
+
     /// Return host CPU, memory, and filesystem capacity telemetry.
     ///
     /// The collector is shared across [`App`] clones so CPU usage is calculated
@@ -317,10 +458,373 @@ impl App {
         &self.console_tokens
     }
 
+    #[must_use]
+    pub fn api_keys(&self) -> &Arc<ApiKeyService> {
+        &self.api_keys
+    }
+
     /// The console action audit trail.
     #[must_use]
     pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit
+    }
+
+    /// The node and boot identity durable log ids are minted under.
+    #[must_use]
+    pub fn identity(&self) -> &Arc<NodeIdentity> {
+        &self.identity
+    }
+
+    /// The bounded write-behind front of the durable log family, or `None` when
+    /// durable logging is off or unsupported by the selected backend.
+    #[must_use]
+    pub fn durable_logs(&self) -> Option<Arc<DurableLogWriter>> {
+        self.durable_logs.clone()
+    }
+
+    /// The room-to-match directory and lifecycle record emitter.
+    #[must_use]
+    pub fn match_recorder(&self) -> Option<Arc<MatchRecorder>> {
+        self.match_recorder.clone()
+    }
+
+    /// The narrow handle the script runtimes write log lines through.
+    #[must_use]
+    pub fn match_log_writer(&self) -> Option<Arc<MatchLogWriter>> {
+        self.match_log_writer.clone()
+    }
+
+    /// The selected durable log stores, for the flush service.
+    #[must_use]
+    pub fn durable_log_repositories(&self) -> DurableLogRepositories {
+        self.durable_log_repositories.clone()
+    }
+
+    /// Whether the console trail is backed by a table rather than only by the
+    /// in-process ring. The console reports it so an operator is never shown a
+    /// process-local cache as durable history.
+    #[must_use]
+    pub fn audit_is_durable(&self) -> bool {
+        self.durable_log_repositories.audit.is_some()
+    }
+
+    /// Read a bounded newest-first page of the console action trail.
+    ///
+    /// Durable store when one is configured, otherwise the in-process ring,
+    /// which answers `actor` and `action` but has no cursor and no match scope:
+    /// a ring-sourced row carries an empty `audit_id`, and a match filter over
+    /// the ring matches nothing because a ring entry records no match.
+    pub async fn list_audit(&self, filter: &DurableAuditFilter) -> AppResult<Vec<DurableAuditRow>> {
+        if let Some(repository) = &self.durable_log_repositories.audit {
+            self.settle_audit_trail(repository).await;
+            // The ring reads `0` as "capacity"; a literal `LIMIT 0` would
+            // silently return nothing, so the translation happens here.
+            let bounded = DurableAuditFilter {
+                limit: filter.limit.max(1),
+                ..filter.clone()
+            };
+            return repository.list(&bounded).await;
+        }
+        if filter.match_id.is_some() || filter.after_audit_id.is_some() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .audit
+            .list(&AuditFilter {
+                actor: filter.actor.clone(),
+                action: filter.action_prefix.clone(),
+                // Always `None` in practice: the early return above rejects a
+                // match-scoped read of the ring, which records no match.
+                match_id: filter.match_id.clone(),
+                limit: filter.limit,
+            })
+            .into_iter()
+            .map(|entry| DurableAuditRow {
+                audit_id: String::new(),
+                node_id: self.node_id().to_string(),
+                match_id: None,
+                entry,
+            })
+            .collect())
+    }
+
+    /// Settle the write-behind trail queue so a durable read is current.
+    ///
+    /// A failure here is never fatal to the read: the rows stay queued for the
+    /// flush service to retry, and the operator sees a page that lags rather
+    /// than an error.
+    async fn settle_audit_trail(&self, repository: &Arc<dyn DurableAuditRepository>) {
+        let Some(writer) = &self.durable_logs else {
+            return;
+        };
+        if let Err(error) = writer.flush_audit_into(repository).await {
+            tracing::warn!(
+                error = %error,
+                "durable audit flush before read failed; trail page may lag its ring"
+            );
+        }
+    }
+
+    /// Trail rows matching `filter`, ignoring its cursor and limit.
+    pub async fn count_audit(&self, filter: &DurableAuditFilter) -> AppResult<u64> {
+        if let Some(repository) = &self.durable_log_repositories.audit {
+            self.settle_audit_trail(repository).await;
+            return repository.count(filter).await;
+        }
+        let retained = self.list_audit(filter).await?.len();
+        Ok(u64::try_from(retained).unwrap_or(u64::MAX))
+    }
+
+    /// Whether script logs are persisted rather than discarded.
+    #[must_use]
+    pub fn match_logs_are_durable(&self) -> bool {
+        self.durable_log_repositories.match_logs.is_some()
+    }
+
+    /// Read a bounded newest-first page of the script log stream.
+    ///
+    /// Without a durable store there is no history at all — script logs have no
+    /// in-process ring — so this answers an empty page rather than an error.
+    pub async fn list_match_logs(&self, filter: &MatchLogFilter) -> AppResult<Vec<MatchLogEntry>> {
+        match &self.durable_log_repositories.match_logs {
+            Some(repository) => repository.list(filter).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Read one stored log line, payload included.
+    pub async fn match_log_by_id(&self, log_id: &str) -> AppResult<Option<MatchLogEntry>> {
+        match &self.durable_log_repositories.match_logs {
+            Some(repository) => repository.get(log_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// How many log lines one match wrote.
+    pub async fn count_match_logs(&self, match_id: &str) -> AppResult<u64> {
+        match &self.durable_log_repositories.match_logs {
+            Some(repository) => repository.count_for_match(match_id).await,
+            None => Ok(0),
+        }
+    }
+
+    /// Whether match lifecycle records are persisted.
+    #[must_use]
+    pub fn matches_are_durable(&self) -> bool {
+        self.durable_log_repositories.matches.is_some()
+    }
+
+    /// Read a bounded newest-first page of durable match records.
+    ///
+    /// This is the historical record table, not the live room registry — that
+    /// one is reached through [`App::realtime_gateway`] and answers a different
+    /// question: what is happening right now.
+    pub async fn list_matches(
+        &self,
+        after_match_id: Option<&str>,
+        limit: usize,
+        open_only: bool,
+    ) -> AppResult<Vec<MatchRecord>> {
+        match &self.durable_log_repositories.matches {
+            Some(repository) => repository.list(after_match_id, limit, open_only).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Read one durable match record.
+    pub async fn match_record_by_id(&self, match_id: &str) -> AppResult<Option<MatchRecord>> {
+        match &self.durable_log_repositories.matches {
+            Some(repository) => repository.get(match_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Whether closed telemetry slice reports outlive this process.
+    #[must_use]
+    pub fn slices_are_durable(&self) -> bool {
+        self.durable_log_repositories.telemetry_slices.is_some()
+    }
+
+    /// Read a bounded newest-first page of stored slice reports.
+    ///
+    /// The bounded in-process report list stays reachable through
+    /// [`App::telemetry_slices`]; this is the durable aggregate table, which
+    /// carries the resolved match scope the in-process report deliberately
+    /// does not.
+    pub async fn list_slices(
+        &self,
+        match_id: Option<&str>,
+        after_report_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<DurableSliceRow>> {
+        match &self.durable_log_repositories.telemetry_slices {
+            Some(repository) => repository.list(match_id, after_report_id, limit).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Stored slice reports matching `match_id`, or all of them for `None`.
+    pub async fn count_slices(&self, match_id: Option<&str>) -> AppResult<u64> {
+        match &self.durable_log_repositories.telemetry_slices {
+            Some(repository) => repository.count(match_id).await,
+            None => Ok(0),
+        }
+    }
+
+    /// In-process report store used for local deduplication and by the
+    /// explicitly non-durable in-memory backend.
+    #[must_use]
+    pub fn lag_reports(&self) -> &Arc<InMemoryLagReportRepository> {
+        &self.lag_reports
+    }
+
+    /// Read a bounded keyset page from the selected durable report store when
+    /// one is configured, otherwise from the in-memory reference store.
+    pub async fn list_lag_reports(
+        &self,
+        after_report_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<LagReport>> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository.list(after_report_id, limit).await
+        } else if self.backend.kind() == BackendKind::InMemory {
+            Ok(self.lag_reports.list(after_report_id, limit))
+        } else {
+            // MongoDB deliberately has no report-only adapter yet. Do not
+            // present its process-local worker cache as a durable history.
+            Ok(Vec::new())
+        }
+    }
+
+    /// Read one redacted-report source row by its opaque report id.
+    pub async fn lag_report_by_id(&self, report_id: &str) -> AppResult<Option<LagReport>> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository.get_by_report_id(report_id).await
+        } else if self.backend.kind() == BackendKind::InMemory {
+            Ok(self.lag_reports.find_by_report_id(report_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List capture-level report aggregates using the durable store when
+    /// available. Raw-retention metadata is merged separately by the Console.
+    pub async fn list_lag_capture_overviews(
+        &self,
+        after_capture_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<LagReportCaptureOverview>> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository
+                .list_capture_overviews(after_capture_id, limit)
+                .await
+        } else if self.backend.kind() == BackendKind::InMemory {
+            Ok(self
+                .lag_reports
+                .list_capture_overviews(after_capture_id, limit))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Persist a completed or pre-existing derived report before returning it
+    /// to a caller. The cache is updated only with the durable row, so a
+    /// database failure cannot be presented as a durable analysis success.
+    pub async fn persist_lag_analysis(&self, result: AnalysisWorkResult) -> AnalysisWorkResult {
+        let Some(repository) = &self.durable_lag_reports else {
+            return if self.backend.kind() == BackendKind::InMemory {
+                result
+            } else {
+                AnalysisWorkResult::Failed
+            };
+        };
+        let (completed, mut report) = match result {
+            AnalysisWorkResult::Completed(report) => (true, report),
+            AnalysisWorkResult::Existing(report) => (false, report),
+            other => return other,
+        };
+        // The bounded worker cache is intentionally process-local. Consult the
+        // durable source before a new insert so changing analysis options after
+        // a restart still links the immutable successor to its predecessor.
+        if completed && report.supersedes_report_id.is_none() {
+            report.supersedes_report_id = match repository
+                .latest_for_artifact(
+                    &report.capture_id,
+                    report.generation,
+                    &report.artifact_digest_sha256,
+                )
+                .await
+            {
+                Ok(previous) => previous.map(|previous| previous.report_id),
+                Err(_) => return AnalysisWorkResult::Failed,
+            };
+        }
+        let identity = analysis_identity(&report);
+        let stored = match repository.insert_immutable(&identity, &report).await {
+            Ok(stored) => stored,
+            Err(_) => return AnalysisWorkResult::Failed,
+        };
+        self.lag_reports.insert_immutable(identity, stored.clone());
+        if completed {
+            AnalysisWorkResult::Completed(stored)
+        } else {
+            AnalysisWorkResult::Existing(stored)
+        }
+    }
+
+    /// Project current raw-retention availability without changing immutable
+    /// report metrics or status.
+    pub async fn mark_lag_raw_unavailable(
+        &self,
+        capture_id: &str,
+        generation: u64,
+        artifact_digest_sha256: &str,
+    ) -> AppResult<()> {
+        if let Some(repository) = &self.durable_lag_reports {
+            repository
+                .mark_raw_unavailable(capture_id, generation, artifact_digest_sha256)
+                .await?;
+        }
+        self.lag_reports
+            .mark_raw_unavailable(capture_id, generation, artifact_digest_sha256);
+        Ok(())
+    }
+
+    /// Reconcile expired private raw artifacts without ever leaving a report
+    /// that advertises an artifact after its bytes have been removed. Each
+    /// `(capture, generation, digest)` projection is durably set to unavailable
+    /// before its private file/manifest deletion is attempted; a deletion race
+    /// or storage failure therefore remains conservatively unavailable.
+    pub async fn reconcile_lag_raw_retention(&self, now: TimestampMillis) -> AppResult<usize> {
+        let service = Arc::clone(&self.lag_diagnostics);
+        let candidates =
+            tokio::task::spawn_blocking(move || service.expired_retention_candidates(now))
+                .await
+                .map_err(|_| AppError::internal("lag raw retention scan failed"))?
+                .map_err(|_| AppError::internal("lag raw retention scan failed"))?;
+        let mut removed = 0;
+        for candidate in candidates {
+            self.mark_lag_raw_unavailable(
+                &candidate.capture_id,
+                candidate.generation,
+                &candidate.digest_sha256,
+            )
+            .await?;
+            let service = Arc::clone(&self.lag_diagnostics);
+            let removed_candidate =
+                tokio::task::spawn_blocking(move || service.remove_retention_candidate(&candidate))
+                    .await
+                    .map_err(|_| AppError::internal("lag raw retention removal failed"))?
+                    .map_err(|_| AppError::internal("lag raw retention removal failed"))?;
+            removed += usize::from(removed_candidate);
+        }
+        Ok(removed)
+    }
+
+    /// Bounded lag analysis worker associated with this application.
+    #[must_use]
+    pub fn lag_analysis_worker(&self) -> &Arc<LagAnalysisWorker> {
+        &self.lag_analysis_worker
     }
 
     /// The local, redacted process incident journal shown in the console.
@@ -479,6 +983,13 @@ impl App {
         self.realtime.get().cloned()
     }
 
+    /// Server-owned, filesystem-backed lag-diagnostics capture service. Raw
+    /// artifacts and grants never pass through the selected database backend.
+    #[must_use]
+    pub fn lag_diagnostics(&self) -> &Arc<crate::lag_diagnostics::LagDiagnosticsService> {
+        &self.lag_diagnostics
+    }
+
     /// Compose durable session revocation with exact local live-session
     /// fencing. The gateway is optional only for HTTP-only nodes, where no
     /// connection can be live; callers always use this coordinator rather than
@@ -541,6 +1052,16 @@ impl App {
     #[must_use]
     pub fn health(&self) -> Health {
         Health::Healthy
+    }
+}
+
+fn analysis_identity(report: &LagReport) -> AnalysisIdentity {
+    AnalysisIdentity {
+        capture_id: report.capture_id.clone(),
+        generation: report.generation,
+        artifact_digest_sha256: report.artifact_digest_sha256.clone(),
+        analyzer_version: report.analyzer_version,
+        options_hash: report.options_hash.clone(),
     }
 }
 

@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod chat_presence;
+pub mod diagnostics;
 pub mod gateway;
 pub mod identity;
 pub mod netpeer;
@@ -23,9 +24,13 @@ pub mod transform;
 
 pub use auth::{AuthOutcome, Authenticator, PresentedCredential, RejectReason};
 pub use chat_presence::{ChatJoin, ChatLeave, ChatPresenceRegistry, ChatSubscription};
+pub use diagnostics::{
+    LagCaptureError, LagCaptureFlush, LagCaptureManager, LagCaptureParticipantState,
+    LagCaptureParticipantStatus, LagCaptureStart, LagCaptureStatus,
+};
 pub use gateway::{
-    DomainRpcServices, Gateway, Handshake, KIND_AUTH, KIND_AUTH_RESULT, KIND_PEER_POSITION,
-    KIND_POSITION, shared,
+    DomainRpcServices, Gateway, Handshake, InboundMessageMetadata, KIND_AUTH, KIND_AUTH_RESULT,
+    KIND_PEER_POSITION, KIND_POSITION, shared,
 };
 pub use identity::{IdentityLifecycle, Presence, PresenceState, ResumeResult, ResumeSecret};
 pub use registry::{
@@ -33,9 +38,9 @@ pub use registry::{
     SessionHandle, SessionRegistry,
 };
 pub use reload::LuaReloadService;
-pub use rooms::{JoinError, RoomId, RoomLabel, RoomRegistry, RoomSnapshot};
+pub use rooms::{BridgeMode, JoinError, RoomId, RoomLabel, RoomRegistry, RoomSnapshot};
 pub use tick::{
     ChatDeliveryDispatchService, ChatPresenceRenewalService, GameplayClock, GameplayClockSnapshot,
-    LuaTickService, MatchmakerTickService, TransformTickService,
+    LuaTickService, MatchmakerTickService, ReconnectGraceExpiryService, TransformTickService,
 };
 pub use transform::{TransformHub, TransformHubConfig};

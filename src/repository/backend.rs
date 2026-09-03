@@ -51,14 +51,14 @@ use super::groups::GroupsState;
 use super::pg::PgDatabase;
 use super::sqlite::SqliteDatabase;
 use super::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
-    GroupsRepository, InMemoryAuthIdentityRepository, InMemoryChatRepository,
-    InMemoryFriendsRepository, InMemoryGameScriptRepository, InMemoryGroupsRepository,
-    InMemoryLeaderboardsRepository, InMemoryNotificationsRepository, InMemoryPurchasesRepository,
-    InMemorySessionRepository, InMemoryStorageRepository, InMemoryTournamentsRepository,
-    InMemoryUserRepository, InMemoryWalletRepository, LeaderboardsRepository,
-    NotificationsRepository, PurchasesRepository, SessionRepository, StorageRepository,
-    TournamentsRepository, UserRepository, WalletRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, FriendsRepository,
+    GameScriptRepository, GroupsRepository, InMemoryApiKeyRepository,
+    InMemoryAuthIdentityRepository, InMemoryChatRepository, InMemoryFriendsRepository,
+    InMemoryGameScriptRepository, InMemoryGroupsRepository, InMemoryLeaderboardsRepository,
+    InMemoryNotificationsRepository, InMemoryPurchasesRepository, InMemorySessionRepository,
+    InMemoryStorageRepository, InMemoryTournamentsRepository, InMemoryUserRepository,
+    InMemoryWalletRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
+    SessionRepository, StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 
 /// Which persistence backend a node is running on.
@@ -145,6 +145,8 @@ pub trait UnitOfWork: Send {
 /// `Debug` with a redacted representation (no connection string).
 #[async_trait]
 pub trait Backend: Send + Sync + fmt::Debug {
+    /// Dedicated machine-credential repository (never generic object storage).
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository>;
     /// Which backend this is.
     fn kind(&self) -> BackendKind;
     /// A pooled (autocommit) storage repository.
@@ -226,6 +228,50 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// [`UnitOfWork`].
     fn purchases_repository(&self) -> Arc<dyn PurchasesRepository>;
 
+    /// Optional durable, report-only lag-diagnostics repository. Raw capture
+    /// bytes and their filesystem locators never cross this backend boundary.
+    /// SQLite, PostgreSQL, and CockroachDB expose this capability; the
+    /// in-memory and MongoDB backends deliberately return `None`.
+    fn lag_report_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::repository::DurableLagReportRepository>> {
+        None
+    }
+
+    /// Optional durable console audit trail. SQLite, PostgreSQL, and CockroachDB
+    /// expose this capability; the in-memory and MongoDB backends deliberately
+    /// return `None` and keep the bounded in-process ring as their only trail.
+    fn audit_repository(&self) -> Option<Arc<dyn crate::repository::DurableAuditRepository>> {
+        None
+    }
+
+    /// Optional durable, aggregate-only authoritative-telemetry slice store.
+    /// Marker text never crosses this boundary. SQLite, PostgreSQL, and
+    /// CockroachDB expose this capability; the in-memory and MongoDB backends
+    /// deliberately return `None` and keep the process-local ring.
+    fn telemetry_slice_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::repository::DurableTelemetrySliceRepository>> {
+        None
+    }
+
+    /// Optional durable game-script log stream. SQLite, PostgreSQL, and
+    /// CockroachDB expose this capability; the in-memory and MongoDB backends
+    /// deliberately return `None`, and the console reports `durable: false`
+    /// rather than presenting a process-local cache as history.
+    fn match_log_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::repository::DurableMatchLogRepository>> {
+        None
+    }
+
+    /// Optional durable match lifecycle records. SQLite, PostgreSQL, and
+    /// CockroachDB expose this capability; the in-memory and MongoDB backends
+    /// deliberately return `None` and create no match rows at all.
+    fn match_repository(&self) -> Option<Arc<dyn crate::repository::DurableMatchRepository>> {
+        None
+    }
+
     /// Optional read-only administrative database explorer.
     ///
     /// This is deliberately a capability accessor, not a domain repository:
@@ -286,6 +332,7 @@ pub async fn select_backend(config: &DatabaseConfig) -> AppResult<Arc<dyn Backen
 /// dropped transaction leaves no partial state.
 #[derive(Debug)]
 pub struct InMemoryBackend {
+    api_keys: Arc<InMemoryApiKeyRepository>,
     users: Arc<InMemoryUserRepository>,
     identities: Arc<InMemoryAuthIdentityRepository>,
     sessions: Arc<InMemorySessionRepository>,
@@ -310,6 +357,7 @@ impl InMemoryBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            api_keys: Arc::new(InMemoryApiKeyRepository::new()),
             users: Arc::new(InMemoryUserRepository::new()),
             identities: Arc::new(InMemoryAuthIdentityRepository::new()),
             sessions: Arc::new(InMemorySessionRepository::new()),
@@ -337,6 +385,10 @@ impl Default for InMemoryBackend {
 
 #[async_trait]
 impl Backend for InMemoryBackend {
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        Arc::clone(&self.api_keys) as Arc<dyn ApiKeyRepository>
+    }
+
     fn kind(&self) -> BackendKind {
         BackendKind::InMemory
     }

@@ -18,7 +18,7 @@
 //! handled by its own task that reads inbound and concurrently writes outbound.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
@@ -29,12 +29,13 @@ use tokio_tungstenite::tungstenite::Message;
 use std::time::Duration;
 
 use citadel_wire::Envelope;
-use citadel_wire::protocol::KIND_AUTH_RESULT;
+use citadel_wire::protocol::{KIND_AUTH_RESULT, KIND_DIAG_SERVER_TIME};
 
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::error_reporting;
 use crate::lifecycle::{AsyncService, CancellationToken};
 use crate::realtime::{Gateway, Outbound, SessionHandle};
+use crate::time::{Clock, SystemClock};
 use crate::transport::codec::decode_framed;
 use crate::transport::metrics::TransportMetrics;
 use crate::transport::{
@@ -306,22 +307,53 @@ async fn handle_connection(
     // Seed the accepted auth result through the registry-owned fence before
     // publishing this session. A revocation racing the writer can therefore
     // invalidate it just like every later outbound envelope.
-    let initial = (!handshake.replay_first).then(|| {
-        Outbound::reliable(Envelope::new(
+    let mut initials = Vec::with_capacity(2);
+    if !handshake.replay_first {
+        initials.push(Outbound::reliable(Envelope::new(
             KIND_AUTH_RESULT,
             handshake.outcome.result_body(),
-        ))
-    });
-    let unreliable = gateway.register_session_with_initial(
+        )));
+    }
+    match gateway.issue_diagnostics_server_time(session_id, SystemClock.now()) {
+        Ok(server_time) => match server_time.encode() {
+            Ok(body) => initials.push(Outbound::reliable(Envelope::new(
+                KIND_DIAG_SERVER_TIME,
+                body,
+            ))),
+            Err(error) => {
+                tracing::error!(conn = %id, %session_id, error = %error, "failed to encode diagnostics server-time offer")
+            }
+        },
+        Err(error) => {
+            tracing::error!(conn = %id, %session_id, error = %error, "failed to issue diagnostics server-time offer")
+        }
+    }
+    let registration = gateway.register_session_with_initials_at(
         SessionHandle {
             id: session_id,
             kind: TransportKind::WebSocket,
             outbound: tx,
             identity,
         },
-        initial,
+        initials,
+        SystemClock.now(),
     );
+    let unreliable = registration.unreliable;
+    let superseded = registration.superseded;
+    let supersession_gate = registration.supersession_gate;
+    let transport_write_gate = registration.transport_write_gate;
+    let superseding = registration.superseding;
+    let replaced_cleanup = registration.replaced_cleanup;
+    let inbound_supersession_drained = registration.inbound_supersession_drained;
+    if let Some(cleanup) = replaced_cleanup {
+        let cleanup_gateway = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            cleanup.wait_for_inbound_drain().await;
+            cleanup_gateway.unregister_session(cleanup.participant_id());
+        });
+    }
     if !gateway.accepts_work(session_id) {
+        gateway.abandon_diagnostics_session(session_id);
         metrics.connection_closed();
         gateway.connection_closed();
         return Ok(());
@@ -335,12 +367,28 @@ async fn handle_connection(
         // Replay the first frame for a pre-handshake (legacy) client, then any
         // frames batched behind it, so nothing sent before registration is lost.
         if handshake.replay_first {
-            metrics.envelope_received();
-            gateway.handle_inbound(session_id, first);
+            if !route_envelope(
+                session_id,
+                first,
+                &metrics,
+                &gateway,
+                &superseded,
+                &supersession_gate,
+            ) {
+                return Ok(());
+            }
         }
         for env in queued {
-            metrics.envelope_received();
-            gateway.handle_inbound(session_id, env);
+            if !route_envelope(
+                session_id,
+                env,
+                &metrics,
+                &gateway,
+                &superseded,
+                &supersession_gate,
+            ) {
+                return Ok(());
+            }
         }
 
         let mut heartbeat = heartbeat_interval.map(tokio::time::interval);
@@ -353,14 +401,21 @@ async fn handle_connection(
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
+                () = superseded.cancelled() => break,
                 () = async {
                     match pong_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    metrics.liveness_timeout();
-                    gateway.node_metrics().record_websocket_liveness_timeout();
+                    if !route_heartbeat_timeout(
+                        &metrics,
+                        &gateway,
+                        &superseded,
+                        &supersession_gate,
+                    ) {
+                        break;
+                    }
                     error_reporting::report_app_error(
                         "transport.websocket.liveness",
                         &AppError::new(ErrorCategory::Transport, "WebSocket liveness timeout"),
@@ -379,7 +434,16 @@ async fn handle_connection(
                     // At most one probe is outstanding. The deadline branch
                     // above owns failure, so no probe queue can accumulate.
                     if pong_deadline.is_none() {
-                        writer.send(Message::Ping(Vec::new())).await.map_err(send_err)?;
+                        if !send_heartbeat_ping(
+                            &mut writer,
+                            &superseded,
+                            &superseding,
+                            &transport_write_gate,
+                        )
+                        .await?
+                        {
+                            break;
+                        }
                         metrics.ping_sent();
                         gateway.node_metrics().record_websocket_ping_sent();
                         pong_deadline = Some(tokio::time::Instant::now() + heartbeat_timeout);
@@ -390,11 +454,17 @@ async fn handle_connection(
                     let Some(out) = out else { break };
                     let Some(_delivery) = out.acquire_delivery().await else { continue };
                     let frame = out.envelope.encode_framed();
-                    writer
-                        .send(Message::Binary(frame.to_vec()))
-                        .await
-                        .map_err(send_err)?;
-                    metrics.envelope_sent();
+                    if let Some(result) = crate::transport::write_if_current(
+                        &superseded,
+                        &superseding,
+                        &transport_write_gate,
+                        || async { writer.send(Message::Binary(frame.to_vec())).await },
+                    )
+                    .await
+                    {
+                        result.map_err(send_err)?;
+                        metrics.envelope_sent();
+                    }
                 }
                 // Unreliable state is coalesced by its state key. Peer
                 // positions include their sender ID in that key, so a browser
@@ -403,11 +473,17 @@ async fn handle_connection(
                 out = unreliable.recv() => {
                     let Some(_delivery) = out.acquire_delivery().await else { continue };
                     let frame = out.envelope.encode_framed();
-                    writer
-                        .send(Message::Binary(frame.to_vec()))
-                        .await
-                        .map_err(send_err)?;
-                    metrics.envelope_sent();
+                    if let Some(result) = crate::transport::write_if_current(
+                        &superseded,
+                        &superseding,
+                        &transport_write_gate,
+                        || async { writer.send(Message::Binary(frame.to_vec())).await },
+                    )
+                    .await
+                    {
+                        result.map_err(send_err)?;
+                        metrics.envelope_sent();
+                    }
                 }
                 // Inbound: decode framed envelopes and route to the gateway.
                 msg = reader.next() => {
@@ -419,27 +495,41 @@ async fn handle_connection(
                     match msg {
                         Message::Binary(data) => {
                             let mut buf = BytesMut::from(&data[..]);
-                            loop {
-                                match decode_framed(&mut buf) {
-                                    Ok(Some(env)) => {
-                                        metrics.envelope_received();
-                                        gateway.handle_inbound(session_id, &env);
-                                    }
-                                    Ok(None) => break,
-                                    Err(e) => {
-                                        metrics.decode_error();
-                                        return Err(e);
-                                    }
-                                }
+                            while route_framed_envelope(
+                                session_id,
+                                &mut buf,
+                                &metrics,
+                                &gateway,
+                                &superseded,
+                                &supersession_gate,
+                            )? {
                             }
                         }
                         Message::Close(_) => break,
                         Message::Ping(payload) => {
-                            writer.send(Message::Pong(payload)).await.map_err(send_err)?;
+                            if !reply_to_ping(
+                                &mut writer,
+                                payload,
+                                &superseded,
+                                &superseding,
+                                &transport_write_gate,
+                            )
+                            .await?
+                            {
+                                break;
+                            }
                         }
-                        Message::Pong(_) if pong_deadline.take().is_some() => {
-                            metrics.pong_received();
-                            gateway.node_metrics().record_websocket_pong_received();
+                        Message::Pong(_) => {
+                            if pong_deadline.is_some()
+                                && route_pong_received(
+                                    &metrics,
+                                    &gateway,
+                                    &superseded,
+                                    &supersession_gate,
+                                )
+                            {
+                                pong_deadline = None;
+                            }
                         }
                         // Text and other frames are ignored in the binary-only MVP.
                         _ => {}
@@ -451,12 +541,175 @@ async fn handle_connection(
     }
     .await;
 
+    if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+        inbound_supersession_drained.cancelled().await;
+    }
     gateway.unregister_session(session_id);
     let _ = writer.close().await;
     metrics.connection_closed();
     gateway.connection_closed();
     tracing::debug!(conn = %id, %session_id, "WebSocket connection closed");
     result
+}
+
+/// Route one post-handshake envelope only while this exact transport generation
+/// remains current. The supersession gate is the decode/metric/gateway
+/// linearization point shared with replacement and durable revocation.
+fn route_envelope(
+    session_id: crate::realtime::ParticipantId,
+    env: &Envelope,
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    supersession_gate: &Arc<Mutex<()>>,
+) -> bool {
+    let Ok(_gate) = supersession_gate.lock() else {
+        return false;
+    };
+    if superseded.is_cancelled() || !gateway.accepts_work(session_id) {
+        return false;
+    }
+    metrics.envelope_received();
+    gateway.handle_inbound_with_metadata(
+        session_id,
+        env,
+        crate::realtime::InboundMessageMetadata::reliable(),
+    );
+    true
+}
+
+/// Decode and route one WebSocket frame only while its transport remains
+/// current. The gate covers decode, metrics, and gateway handoff, not merely a
+/// speculative cancellation check before decoding client-controlled bytes.
+fn route_framed_envelope(
+    session_id: crate::realtime::ParticipantId,
+    buf: &mut BytesMut,
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    supersession_gate: &Arc<Mutex<()>>,
+) -> AppResult<bool> {
+    let Ok(_gate) = supersession_gate.lock() else {
+        return Ok(false);
+    };
+    if superseded.is_cancelled() || !gateway.accepts_work(session_id) {
+        return Ok(false);
+    }
+    let Some(env) = (match decode_framed(buf) {
+        Ok(env) => env,
+        Err(error) => {
+            metrics.decode_error();
+            return Err(error);
+        }
+    }) else {
+        return Ok(false);
+    };
+    metrics.envelope_received();
+    gateway.handle_inbound_with_metadata(
+        session_id,
+        &env,
+        crate::realtime::InboundMessageMetadata::reliable(),
+    );
+    Ok(true)
+}
+
+/// Reply to a Ping only while the transport remains current. The shared async
+/// write gate stays held through `poll_ready`, `start_send`, and `flush`; a
+/// supersession or close cannot publish in the gap after queue admission.
+async fn reply_to_ping<S>(
+    writer: &mut S,
+    payload: Vec<u8>,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    transport_write_gate: &tokio::sync::Mutex<()>,
+) -> AppResult<bool>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let Some(result) = crate::transport::write_if_current(
+        superseded,
+        superseding,
+        transport_write_gate,
+        || async {
+            futures_util::future::poll_fn(|cx| writer.poll_ready_unpin(cx)).await?;
+            writer.start_send_unpin(Message::Pong(payload))?;
+            writer.flush().await
+        },
+    )
+    .await
+    else {
+        return Ok(false);
+    };
+    result.map_err(send_err)?;
+    Ok(true)
+}
+
+/// Send a server heartbeat probe only while the transport remains current. A
+/// heartbeat Ping is a control write just like a Pong reply, so its queueing and
+/// flush share the cancellation/write linearization gate with application frames.
+async fn send_heartbeat_ping<S>(
+    writer: &mut S,
+    superseded: &CancellationToken,
+    superseding: &std::sync::atomic::AtomicBool,
+    transport_write_gate: &tokio::sync::Mutex<()>,
+) -> AppResult<bool>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let Some(result) = crate::transport::write_if_current(
+        superseded,
+        superseding,
+        transport_write_gate,
+        || async { writer.send(Message::Ping(Vec::new())).await },
+    )
+    .await
+    else {
+        return Ok(false);
+    };
+    result.map_err(send_err)?;
+    Ok(true)
+}
+
+/// Record a liveness timeout only while this exact transport generation remains
+/// current. A `select!` can pick a ready deadline after supersession, so this
+/// check is adjacent to the metrics rather than relying on branch order.
+fn route_heartbeat_timeout(
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    supersession_gate: &Arc<Mutex<()>>,
+) -> bool {
+    let Ok(_gate) = supersession_gate.lock() else {
+        return false;
+    };
+    if superseded.is_cancelled() {
+        return false;
+    }
+    metrics.liveness_timeout();
+    gateway.node_metrics().record_websocket_liveness_timeout();
+    true
+}
+
+/// Record a WebSocket Pong only while this exact transport generation remains
+/// current. Keep both transport and node metrics beneath the cancellation gate
+/// so a revocation cannot count a concurrently ready control frame.
+fn route_pong_received(
+    metrics: &TransportMetrics,
+    gateway: &Gateway,
+    superseded: &CancellationToken,
+    supersession_gate: &Arc<Mutex<()>>,
+) -> bool {
+    let Ok(_gate) = supersession_gate.lock() else {
+        return false;
+    };
+    if superseded.is_cancelled() {
+        return false;
+    }
+    metrics.pong_received();
+    gateway.node_metrics().record_websocket_pong_received();
+    true
 }
 
 /// Read from the socket until a binary message yields at least one decoded
@@ -516,7 +769,54 @@ fn send_err(e: impl std::fmt::Display) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct FlushBlockingSink {
+        flush_started: Option<tokio::sync::oneshot::Sender<()>>,
+        flush_release: tokio::sync::oneshot::Receiver<()>,
+        expect_ping: bool,
+    }
+
+    impl futures_util::Sink<Message> for FlushBlockingSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+            assert_eq!(
+                matches!(message, Message::Ping(_)),
+                self.expect_ping,
+                "control write has the expected frame kind"
+            );
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if let Some(started) = self.flush_started.take() {
+                started.send(()).expect("flush observer alive");
+            }
+            match Pin::new(&mut self.flush_release).poll(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::other("flush cancelled"))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.poll_flush(cx)
+        }
+    }
 
     #[tokio::test]
     async fn server_binds_and_reports_local_addr() {
@@ -524,5 +824,219 @@ mod tests {
         let server = WebSocketServer::bind(bind).await.expect("bind");
         assert_eq!(server.transport_kind(), TransportKind::WebSocket);
         assert_ne!(server.local_addr().port(), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_outbound_write_waits_before_supersession_is_published() {
+        let superseded = CancellationToken::new();
+        let superseding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let writer_token = superseded.clone();
+        let writer_superseding = Arc::clone(&superseding);
+        let writer_gate = Arc::clone(&gate);
+        let writer = tokio::spawn(async move {
+            crate::transport::write_if_current(
+                &writer_token,
+                &writer_superseding,
+                &writer_gate,
+                || async {
+                    entered_tx.send(()).expect("write entered");
+                    release_rx.await.expect("write released");
+                },
+            )
+            .await
+        });
+        entered_rx.await.expect("application write admitted");
+        superseding.store(true, std::sync::atomic::Ordering::Release);
+        let cancellation_gate = Arc::clone(&gate);
+        let cancellation_token = superseded.clone();
+        let cancellation = tokio::spawn(async move {
+            let _write = cancellation_gate.lock().await;
+            cancellation_token.cancel();
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !superseded.is_cancelled(),
+            "WebSocket supersession cannot publish while an admitted application frame writes"
+        );
+        release_tx.send(()).expect("release application write");
+        assert!(writer.await.expect("writer task").is_some());
+        cancellation.await.expect("cancellation task");
+        assert!(superseded.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn ping_reply_flush_is_linearized_with_same_session_replacement() {
+        let superseded = CancellationToken::new();
+        let superseding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport_write_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (flush_started_tx, flush_started_rx) = tokio::sync::oneshot::channel();
+        let (flush_release_tx, flush_release_rx) = tokio::sync::oneshot::channel();
+        let mut sink = FlushBlockingSink {
+            flush_started: Some(flush_started_tx),
+            flush_release: flush_release_rx,
+            expect_ping: false,
+        };
+        let pong_token = superseded.clone();
+        let pong_superseding = Arc::clone(&superseding);
+        let pong_gate = Arc::clone(&transport_write_gate);
+        let pong = tokio::spawn(async move {
+            reply_to_ping(
+                &mut sink,
+                b"ping".to_vec(),
+                &pong_token,
+                &pong_superseding,
+                &pong_gate,
+            )
+            .await
+        });
+        flush_started_rx.await.expect("Pong reached async flush");
+        superseding.store(true, std::sync::atomic::Ordering::Release);
+        let cancellation_gate = Arc::clone(&transport_write_gate);
+        let cancellation_token = superseded.clone();
+        let cancellation = tokio::spawn(async move {
+            let _write = cancellation_gate.lock().await;
+            cancellation_token.cancel();
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !superseded.is_cancelled(),
+            "replacement must wait for the admitted Pong's asynchronous flush"
+        );
+        flush_release_tx.send(()).expect("release flush");
+        assert!(pong.await.expect("Pong task").expect("Pong reply"));
+        cancellation.await.expect("cancellation task");
+        assert!(superseded.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ping_flush_is_linearized_with_same_session_replacement() {
+        let superseded = CancellationToken::new();
+        let superseding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport_write_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (flush_started_tx, flush_started_rx) = tokio::sync::oneshot::channel();
+        let (flush_release_tx, flush_release_rx) = tokio::sync::oneshot::channel();
+        let mut sink = FlushBlockingSink {
+            flush_started: Some(flush_started_tx),
+            flush_release: flush_release_rx,
+            expect_ping: true,
+        };
+        let ping_token = superseded.clone();
+        let ping_superseding = Arc::clone(&superseding);
+        let ping_gate = Arc::clone(&transport_write_gate);
+        let ping = tokio::spawn(async move {
+            send_heartbeat_ping(&mut sink, &ping_token, &ping_superseding, &ping_gate).await
+        });
+        flush_started_rx
+            .await
+            .expect("Ping reached asynchronous flush");
+        superseding.store(true, std::sync::atomic::Ordering::Release);
+        let cancellation_gate = Arc::clone(&transport_write_gate);
+        let cancellation_token = superseded.clone();
+        let cancellation = tokio::spawn(async move {
+            let _write = cancellation_gate.lock().await;
+            cancellation_token.cancel();
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !superseded.is_cancelled(),
+            "replacement must wait for the admitted heartbeat Ping's flush"
+        );
+        flush_release_tx.send(()).expect("release flush");
+        assert!(ping.await.expect("Ping task").expect("heartbeat Ping"));
+        cancellation.await.expect("cancellation task");
+        assert!(superseded.is_cancelled());
+    }
+
+    #[test]
+    fn superseded_heartbeat_does_not_update_liveness_metrics() {
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+        let gate = Arc::new(Mutex::new(()));
+
+        assert!(
+            !route_heartbeat_timeout(&metrics, &gateway, &superseded, &gate),
+            "a timeout branch selected after replacement must not record liveness"
+        );
+        assert!(
+            !route_pong_received(&metrics, &gateway, &superseded, &gate),
+            "a Pong branch selected after replacement must not record liveness"
+        );
+        assert_eq!(metrics.snapshot(), Default::default());
+    }
+
+    #[test]
+    fn superseded_websocket_frame_and_queued_replay_are_not_counted() {
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+        let gate = Arc::new(Mutex::new(()));
+        let queued = Envelope::new(citadel_wire::protocol::KIND_POSITION, b"queued".to_vec());
+        let framed = queued.encode_framed();
+        let mut buf = BytesMut::from(&framed[..]);
+
+        assert!(!route_envelope(
+            crate::realtime::ParticipantId::from_raw(1),
+            &queued,
+            &metrics,
+            &gateway,
+            &superseded,
+            &gate,
+        ));
+        assert!(
+            !route_framed_envelope(
+                crate::realtime::ParticipantId::from_raw(1),
+                &mut buf,
+                &metrics,
+                &gateway,
+                &superseded,
+                &gate,
+            )
+            .expect("cancellation is an orderly stop")
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            Default::default(),
+            "neither queued nor framed WebSocket work may decode or count after replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_websocket_control_frames_are_neither_replied_to_nor_counted() {
+        let superseded = CancellationToken::new();
+        superseded.cancel();
+        let metrics = TransportMetrics::new();
+        let gateway = Gateway::new();
+        let gate = Arc::new(Mutex::new(()));
+        let transport_write_gate = tokio::sync::Mutex::new(());
+        let superseding = std::sync::atomic::AtomicBool::new(false);
+
+        let mut wrote = false;
+        assert!(
+            crate::transport::write_if_current(
+                &superseded,
+                &superseding,
+                &transport_write_gate,
+                || async { wrote = true },
+            )
+            .await
+            .is_none(),
+            "a superseded WebSocket Ping must not produce a Pong write"
+        );
+        assert!(!wrote, "the superseded Pong write callback must not run");
+        assert!(
+            !route_pong_received(&metrics, &gateway, &superseded, &gate),
+            "a superseded WebSocket Pong must not mutate liveness metrics"
+        );
+        assert_eq!(
+            metrics.snapshot(),
+            Default::default(),
+            "a superseded control frame must not be replied to or counted"
+        );
     }
 }

@@ -45,12 +45,16 @@ use crate::database_explorer::{DatabaseExplorer, PgMetadataExplorer};
 use crate::error::{AppError, AppResult};
 use crate::repository::backend::{Backend as BackendTrait, BackendKind, UnitOfWork};
 use crate::repository::{
-    AuthIdentityRepository, ChatRepository, FriendsRepository, GameScriptRepository,
-    GroupsRepository, LeaderboardsRepository, NotificationsRepository, PurchasesRepository,
+    ApiKeyRepository, AuthIdentityRepository, ChatRepository, DurableAuditRepository,
+    DurableLagReportRepository, DurableMatchLogRepository, DurableMatchRepository,
+    DurableTelemetrySliceRepository, FriendsRepository, GameScriptRepository, GroupsRepository,
+    LeaderboardsRepository, NotificationsRepository, PgAuditRepository, PgLagReportRepository,
+    PgMatchLogRepository, PgMatchRepository, PgTelemetrySliceRepository, PurchasesRepository,
     SessionRepository, StorageRepository, TournamentsRepository, UserRepository, WalletRepository,
 };
 use crate::time::TimestampMillis;
 
+mod api_keys;
 mod chat;
 mod friends;
 mod gamescript;
@@ -65,6 +69,7 @@ mod storage;
 mod tournaments;
 mod wallet;
 
+pub use api_keys::PgApiKeyRepository;
 pub use chat::PgChatRepository;
 pub use friends::PgFriendsRepository;
 pub use gamescript::PgGameScriptRepository;
@@ -189,6 +194,12 @@ pub struct PgDatabase {
 /// coverage test below makes a new entry fail fast unless its table is also
 /// present in the CRDB migration set.
 const TEST_RESET_TABLES: &[&str] = &[
+    "match_logs",
+    "telemetry_slice_reports",
+    "console_audit_entries",
+    "matches",
+    "lag_diagnostic_reports",
+    "api_keys",
     "gamescript_outbox",
     "gamescript_audit",
     "gamescript_activations",
@@ -244,6 +255,11 @@ fn normalize_pg_scheme(url: &str) -> std::borrow::Cow<'_, str> {
 }
 
 impl PgDatabase {
+    #[must_use]
+    pub fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        Arc::new(PgApiKeyRepository::new(self.pool.clone()))
+    }
+
     /// Connect to PostgreSQL (or a CockroachDB cluster over the PostgreSQL wire
     /// protocol) and apply migrations.
     ///
@@ -587,6 +603,10 @@ impl PgUnitOfWork {
 
 #[async_trait]
 impl BackendTrait for PgDatabase {
+    fn api_key_repository(&self) -> Arc<dyn ApiKeyRepository> {
+        PgDatabase::api_key_repository(self)
+    }
+
     fn kind(&self) -> BackendKind {
         match self.flavor {
             PgFlavor::Postgres => BackendKind::Postgres,
@@ -652,6 +672,26 @@ impl BackendTrait for PgDatabase {
         PgDatabase::purchases_repository(self)
     }
 
+    fn lag_report_repository(&self) -> Option<Arc<dyn DurableLagReportRepository>> {
+        Some(Arc::new(PgLagReportRepository::new(self.pool.clone())))
+    }
+
+    fn audit_repository(&self) -> Option<Arc<dyn DurableAuditRepository>> {
+        Some(Arc::new(PgAuditRepository::new(self.pool.clone())))
+    }
+
+    fn telemetry_slice_repository(&self) -> Option<Arc<dyn DurableTelemetrySliceRepository>> {
+        Some(Arc::new(PgTelemetrySliceRepository::new(self.pool.clone())))
+    }
+
+    fn match_log_repository(&self) -> Option<Arc<dyn DurableMatchLogRepository>> {
+        Some(Arc::new(PgMatchLogRepository::new(self.pool.clone())))
+    }
+
+    fn match_repository(&self) -> Option<Arc<dyn DurableMatchRepository>> {
+        Some(Arc::new(PgMatchRepository::new(self.pool.clone())))
+    }
+
     fn database_explorer(&self) -> Option<Arc<dyn DatabaseExplorer>> {
         Some(Arc::clone(&self.explorer) as Arc<dyn DatabaseExplorer>)
     }
@@ -712,6 +752,8 @@ impl UnitOfWork for PgUnitOfWork {
 mod tests {
     use super::*;
 
+    const CRDB_API_KEYS: &str =
+        include_str!("../../../migrations-crdb/20260811120000_create_api_keys.sql");
     const CRDB_STORAGE: &str =
         include_str!("../../../migrations-crdb/20260702090000_create_storage_objects.sql");
     const CRDB_IDENTITY_SESSION: &str =
@@ -756,6 +798,22 @@ mod tests {
         include_str!("../../../migrations-crdb/20260803142000_add_leaderboard_reset_snapshots.sql");
     const CRDB_GAMESCRIPT: &str =
         include_str!("../../../migrations-crdb/20260805100000_create_gamescript_revisions.sql");
+    const CRDB_LAG_DIAGNOSTIC_REPORTS: &str =
+        include_str!("../../../migrations-crdb/20260819130000_create_lag_diagnostic_reports.sql");
+    const PG_LAG_DIAGNOSTIC_REPORTS: &str =
+        include_str!("../../../migrations/20260819130000_create_lag_diagnostic_reports.sql");
+    const CRDB_MATCHES: &str =
+        include_str!("../../../migrations-crdb/20260824090000_create_matches.sql");
+    const CRDB_MATCH_LOGS: &str =
+        include_str!("../../../migrations-crdb/20260824091000_create_match_logs.sql");
+    const CRDB_CONSOLE_AUDIT: &str =
+        include_str!("../../../migrations-crdb/20260824092000_create_console_audit_entries.sql");
+    const CRDB_TELEMETRY_SLICES: &str =
+        include_str!("../../../migrations-crdb/20260824093000_create_telemetry_slice_reports.sql");
+    const PG_MATCH_LOGS: &str =
+        include_str!("../../../migrations/20260824091000_create_match_logs.sql");
+    const PG_CONSOLE_AUDIT: &str =
+        include_str!("../../../migrations/20260824092000_create_console_audit_entries.sql");
 
     #[test]
     fn timestamp_round_trips_through_millis() {
@@ -785,6 +843,12 @@ mod tests {
     #[test]
     fn cockroach_migrations_cover_every_contract_reset_table() {
         let coverage = [
+            ("match_logs", CRDB_MATCH_LOGS),
+            ("telemetry_slice_reports", CRDB_TELEMETRY_SLICES),
+            ("console_audit_entries", CRDB_CONSOLE_AUDIT),
+            ("matches", CRDB_MATCHES),
+            ("lag_diagnostic_reports", CRDB_LAG_DIAGNOSTIC_REPORTS),
+            ("api_keys", CRDB_API_KEYS),
             ("gamescript_outbox", CRDB_GAMESCRIPT),
             ("gamescript_audit", CRDB_GAMESCRIPT),
             ("gamescript_activations", CRDB_GAMESCRIPT),
@@ -890,5 +954,90 @@ mod tests {
             assert!(migration.contains("DELETE FROM chat_delivery_outbox"));
             assert!(migration.contains("chat_delivery_outbox_origin_active_idx"));
         }
+    }
+
+    #[test]
+    fn lag_diagnostic_report_migrations_store_only_report_projections() {
+        for migration in [CRDB_LAG_DIAGNOSTIC_REPORTS, PG_LAG_DIAGNOSTIC_REPORTS] {
+            assert!(migration.contains("CREATE TABLE IF NOT EXISTS lag_diagnostic_reports"));
+            assert!(migration.contains("report_json"));
+            assert!(migration.contains("raw_available"));
+            for forbidden in [
+                "raw_path",
+                "filename",
+                "mime",
+                "upload_token",
+                "jti",
+                "payload",
+                "ip_address",
+                "user_agent",
+            ] {
+                assert!(
+                    !migration.lines().any(|line| {
+                        let line = line.trim_start();
+                        !line.starts_with("--") && line.starts_with(&format!("{forbidden} "))
+                    }),
+                    "report persistence must not retain {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit_and_telemetry_migrations_never_declare_secret_columns() {
+        for migration in [CRDB_CONSOLE_AUDIT, PG_CONSOLE_AUDIT, CRDB_TELEMETRY_SLICES] {
+            for forbidden in [
+                "password",
+                "secret",
+                "token",
+                "session_token",
+                "marker_text",
+                "marker",
+                "payload",
+                "raw",
+                "sequence",
+            ] {
+                assert!(
+                    !migration.lines().any(|line| {
+                        let line = line.trim_start();
+                        !line.starts_with("--") && line.starts_with(&format!("{forbidden} "))
+                    }),
+                    "durable log persistence must not retain {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn match_log_migrations_store_the_authors_payload_and_no_server_identity() {
+        for migration in [CRDB_MATCH_LOGS, PG_MATCH_LOGS] {
+            assert!(migration.contains("CREATE TABLE IF NOT EXISTS match_logs"));
+            // `match_id` is nullable on purpose: a game with no match concept
+            // still writes logs, and such a row is stored, never rejected.
+            assert!(!migration.contains("match_id      TEXT COLLATE \"C\" NOT NULL"));
+            assert!(!migration.contains("match_id      STRING NOT NULL"));
+            for forbidden in [
+                "credential_id",
+                "session_id",
+                "participant_id",
+                "ip_address",
+            ] {
+                assert!(
+                    !migration.contains(forbidden),
+                    "script log persistence must not retain {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_match_table_keys_a_room_by_the_boot_that_minted_it() {
+        // `room_id` is a per-process counter starting at 1, so it is unique only
+        // together with the node and the boot.
+        assert!(CRDB_MATCHES.contains("UNIQUE (node_id, boot_id, room_id)"));
+        assert!(CRDB_MATCHES.contains("CREATE TABLE IF NOT EXISTS matches"));
+        // The server owns open and close; a script can only stamp a result.
+        assert!(CRDB_MATCHES.contains("termination_reason"));
+        assert!(CRDB_MATCHES.contains("'final_departure'"));
     }
 }

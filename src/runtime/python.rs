@@ -17,9 +17,18 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule, PyTuple};
 
+use crate::authoritative_telemetry_slices::{
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, active_runtime_scope,
+    set_active_runtime_scope,
+};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
+use crate::match_recorder::MatchLogWriter;
 use crate::realtime::TransformHub;
+use crate::runtime::host_api_spec::{
+    validate_log_level, validate_log_message, validate_log_payload, validate_log_tag,
+    validate_match_result,
+};
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
 use crate::runtime::outbound_http::{
     AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
@@ -28,8 +37,9 @@ use crate::runtime::outbound_http::{
 use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
-    BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEventBatch,
-    OutboundCommand, PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome,
+    BridgeCommandSink, LifecycleHook, MAX_RUNTIME_EVENTS_PER_INVOCATION, NativeMatchContext,
+    NativeMatchLifecycleHook, NormalizedEventBatch, NormalizedPayload, OutboundCommand,
+    PhysicsOptions, RealtimeAfterOutcome, RealtimeInterception, ReloadOutcome, RoomBridgeMode,
     RoomSpec, RpcOutcome, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
     RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
     RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
@@ -40,6 +50,7 @@ use crate::runtime::{
     set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
+use crate::time::{Clock, SystemClock};
 use citadel_physics::{PhysicsConfig, Shape};
 
 static PYTHON_BUILD_LOCK: Mutex<()> = Mutex::new(());
@@ -77,6 +88,12 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "on_message",
     "on_join",
     "on_leave",
+    "on_match_created",
+    "on_match_started",
+    "on_match_ended",
+    "on_match_join",
+    "on_match_leave",
+    "on_match_tick",
     "on_tick",
     "on_leaderboard_reset",
     "on_rpc",
@@ -87,6 +104,7 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "on_input",
     "broadcast",
     "send",
+    "match.set_input_ack",
     "spawn_actor",
     "move_actor",
     "despawn_actor",
@@ -135,6 +153,11 @@ const PYTHON_HOST_API_NAMES: &[&str] = &[
     "cache.set",
     "cache.delete",
     "cache.cas",
+    "telemetry.begin",
+    "telemetry.mark",
+    "telemetry.finish",
+    "log.write",
+    "match.set_result",
 ];
 
 /// The Python-side `citadel` module. Keeping this in Python avoids Rust-side
@@ -154,6 +177,12 @@ _MAX_EVENT_SUBSCRIBERS = 64
 _storage_index_filters = {}
 _on_join = None
 _on_leave = None
+_on_match_created = None
+_on_match_started = None
+_on_match_ended = None
+_on_match_join = None
+_on_match_leave = None
+_on_match_tick = None
 _on_tick = None
 _on_leaderboard_reset = None
 _on_room_create = None
@@ -162,6 +191,7 @@ _on_before_realtime = None
 _on_after_realtime = None
 _on_input = None
 _commands = []
+_match_input_active = False
 _total_bytes = 0
 _overflowed = False
 _next_npc_id = 0x40000000
@@ -252,6 +282,24 @@ def on_join(handler=None):
 def on_leave(handler=None):
     return _single("_on_leave", handler)
 
+def on_match_created(handler=None):
+    return _single("_on_match_created", handler)
+
+def on_match_started(handler=None):
+    return _single("_on_match_started", handler)
+
+def on_match_ended(handler=None):
+    return _single("_on_match_ended", handler)
+
+def on_match_join(handler=None):
+    return _single("_on_match_join", handler)
+
+def on_match_leave(handler=None):
+    return _single("_on_match_leave", handler)
+
+def on_match_tick(handler=None):
+    return _single("_on_match_tick", handler)
+
 def on_tick(handler=None):
     return _single("_on_tick", handler)
 
@@ -286,6 +334,34 @@ def log(message, level="info"):
         logger.error(str(message))
     else:
         logger.info(str(message))
+
+def _log_write(level, tag, message, payload_json=None):
+    """Persist one durable log line, match-scoped when the caller is."""
+    if "_match_log_bridge" not in globals():
+        raise RuntimeError("durable logs are unavailable")
+    _match_log_bridge.write(
+        str(level), str(tag), str(message),
+        None if payload_json is None else str(payload_json))
+
+# `citadel.log` keeps its volatile behaviour; `citadel.log.write` is the durable
+# stream, hung off the same name because a Python function is already an object.
+log.write = _log_write
+
+class _Match:
+    """The server owns match open and close; a script may only stamp a result."""
+    def set_result(self, result_json):
+        if "_match_log_bridge" not in globals():
+            raise RuntimeError("durable logs are unavailable")
+        return _match_log_bridge.set_result(str(result_json))
+
+    def set_input_ack(self, participant, last_processed_sequence):
+        if not _match_input_active:
+            raise RuntimeError("match.set_input_ack requires a V1 match-input callback")
+        participant = _canonical_u64_string(participant, "participant")
+        sequence = _canonical_u64_string(last_processed_sequence, "last_processed_sequence")
+        _push(("set_input_ack", participant, sequence))
+
+match = _Match()
 
 class _Http:
     def fetch(self, url, opts=None):
@@ -372,6 +448,30 @@ class _Cache:
             str(namespace), str(key), version, _bytes(value), int(ttl_ms)))
 
 cache = _Cache()
+
+class _Telemetry:
+    def _bridge(self):
+        if "_telemetry_slices_bridge" not in globals():
+            raise RuntimeError("telemetry slices are unavailable")
+        return _telemetry_slices_bridge
+
+    def begin(self):
+        return self._bridge().begin()
+
+    def mark(self, marker):
+        return self._bridge().mark(str(marker))
+
+    def finish(self):
+        return self._bridge().finish()
+
+telemetry = _Telemetry()
+
+def _canonical_u64_string(value, name):
+    if not isinstance(value, str) or not value or (len(value) > 1 and value[0] == "0") or not value.isascii() or not value.isdecimal():
+        raise TypeError(f"{name} must be a canonical decimal u64 string")
+    if int(value) > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(f"{name} must be a canonical decimal u64 string")
+    return value
 
 def _push(command, body_len=0):
     global _total_bytes, _overflowed
@@ -480,8 +580,9 @@ def ground_height(origin, max_distance):
     return _transform_hub_bridge.ground_height(tuple(origin), float(max_distance))
 
 def _reset_commands():
-    global _total_bytes, _overflowed
+    global _total_bytes, _overflowed, _match_input_active
     _commands.clear()
+    _match_input_active = False
     _total_bytes = 0
     _overflowed = False
 
@@ -553,6 +654,13 @@ def _dispatch_lifecycle(hook, ctx):
     handler(ctx)
     return True
 
+def _dispatch_match_lifecycle(hook, context):
+    handler = globals().get("_" + str(hook))
+    if handler is None:
+        return False
+    handler(dict(context))
+    return True
+
 def _dispatch_tick(dt):
     if _on_tick is None:
         return False
@@ -575,13 +683,17 @@ def _call_room_create(ctx, params):
     if spec is None:
         return None
     if isinstance(spec, str):
-        return (spec, "", 0, True)
+        return (spec, "", 0, True, "relay")
     data = dict(spec)
+    bridge_mode = str(data.get("bridge_mode", "relay"))
+    if bridge_mode not in ("relay", "authoritative"):
+        raise ValueError("bridge_mode must be 'relay' or 'authoritative'")
     return (
         str(data.get("map", "")),
         str(data.get("mode", "")),
         int(data.get("max_players", 0)),
         bool(data.get("open", True)),
+        bridge_mode,
     )
 
 def _call_room_join(ctx, room_id):
@@ -634,6 +746,12 @@ def _has_any_handler():
         or bool(_rpc_handlers)
         or _on_join is not None
         or _on_leave is not None
+        or _on_match_created is not None
+        or _on_match_started is not None
+        or _on_match_ended is not None
+        or _on_match_join is not None
+        or _on_match_leave is not None
+        or _on_match_tick is not None
         or _on_tick is not None
         or _on_leaderboard_reset is not None
         or _on_room_create is not None
@@ -651,6 +769,18 @@ def _introspect():
         hooks.append("on_join")
     if _on_leave is not None:
         hooks.append("on_leave")
+    if _on_match_created is not None:
+        hooks.append("on_match_created")
+    if _on_match_started is not None:
+        hooks.append("on_match_started")
+    if _on_match_ended is not None:
+        hooks.append("on_match_ended")
+    if _on_match_join is not None:
+        hooks.append("on_match_join")
+    if _on_match_leave is not None:
+        hooks.append("on_match_leave")
+    if _on_match_tick is not None:
+        hooks.append("on_match_tick")
     if _on_tick is not None:
         hooks.append("on_tick")
     if _on_leaderboard_reset is not None:
@@ -841,7 +971,82 @@ struct DomainHostBridge {
     interceptor_mode: Arc<AtomicBool>,
 }
 
-/// PyO3 wrapper exposing the read-only loaded-map catalog to Python scripts.
+/// PyO3 wrapper exposing context-derived telemetry slices to Python scripts.
+#[pyclass]
+struct TelemetrySlicesHandle {
+    slices: Arc<TelemetrySliceService>,
+}
+
+#[pymethods]
+impl TelemetrySlicesHandle {
+    fn begin(&self) -> PyResult<()> {
+        let context = active_runtime_context().ok_or_else(|| {
+            PyRuntimeError::new_err("telemetry slices require a match-scoped context")
+        })?;
+        self.slices
+            .begin(context, SystemClock.now().unix_millis())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    fn mark(&self, marker: String) -> PyResult<()> {
+        let context = active_runtime_context().ok_or_else(|| {
+            PyRuntimeError::new_err("telemetry slices require a match-scoped context")
+        })?;
+        self.slices
+            .mark(context, &marker, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+    fn finish(&self) -> PyResult<()> {
+        let context = active_runtime_context().ok_or_else(|| {
+            PyRuntimeError::new_err("telemetry slices require a match-scoped context")
+        })?;
+        self.slices
+            .finish(context, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+/// PyO3 wrapper exposing the durable log/result writer to Python scripts.
+///
+/// It carries no match lifecycle: the server opens and closes a match, and a
+/// script can only append a line or stamp a result on the one it is playing.
+#[pyclass]
+struct MatchLogHandle {
+    writer: Arc<MatchLogWriter>,
+}
+
+#[pymethods]
+impl MatchLogHandle {
+    fn write(
+        &self,
+        level: &str,
+        tag: &str,
+        message: &str,
+        payload_json: Option<&str>,
+    ) -> PyResult<()> {
+        let level = validate_log_level(level).map_err(PyRuntimeError::new_err)?;
+        let tag = validate_log_tag(tag).map_err(PyRuntimeError::new_err)?;
+        let message = validate_log_message(message).map_err(PyRuntimeError::new_err)?;
+        let payload = payload_json
+            .map(validate_log_payload)
+            .transpose()
+            .map_err(PyRuntimeError::new_err)?;
+        // Match scope is optional: a line written outside a match-scoped
+        // callback is stored with no match, never refused.
+        self.writer
+            .write(active_runtime_scope(), level, tag, message, payload);
+        Ok(())
+    }
+
+    fn set_result(&self, result_json: &str) -> PyResult<()> {
+        let result_json = validate_match_result(result_json).map_err(PyRuntimeError::new_err)?;
+        self.writer
+            .set_result(active_runtime_scope(), result_json.to_owned())
+            .map_err(|error| PyRuntimeError::new_err(error.message()))
+    }
+}
+
 #[pyclass]
 struct MapCatalogBridge {
     maps: Arc<MapCatalog>,
@@ -1652,6 +1857,9 @@ pub struct PythonRuntime {
     domain: Option<Arc<dyn DomainHost>>,
     maps: Option<Arc<MapCatalog>>,
     transform_hub: Option<Arc<TransformHub>>,
+    telemetry_slices: Option<Arc<TelemetrySliceService>>,
+    /// Durable log/result write handle retained across hot reload.
+    match_log: Option<Arc<MatchLogWriter>>,
     /// Where this runtime's authoritative-bridge answers land (the gateway),
     /// held weakly. Lives on the runtime so it survives a hot-reload swap.
     bridge_sink: Mutex<Option<Weak<dyn BridgeCommandSink>>>,
@@ -1764,6 +1972,8 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         }))
     }
@@ -1809,6 +2019,8 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1855,6 +2067,8 @@ impl PythonRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
+            match_log: None,
             bridge_sink: Mutex::new(None),
         })
     }
@@ -1875,6 +2089,29 @@ impl PythonRuntime {
                 &self.domain,
                 Arc::clone(&guard.interceptor_mode),
             );
+        }
+        self
+    }
+
+    /// Attach private context-derived telemetry slices to trusted script calls.
+    #[must_use]
+    pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
+        self.telemetry_slices = Some(slices);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_telemetry_slices(&guard.citadel, &self.telemetry_slices);
+        }
+        self
+    }
+
+    /// Attach the durable log/result write handle behind `citadel.log.write`
+    /// and `citadel.match.set_result`.
+    #[must_use]
+    pub fn with_match_log(mut self, writer: Arc<MatchLogWriter>) -> Self {
+        self.match_log = Some(writer);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_match_log(&guard.citadel, &self.match_log);
         }
         self
     }
@@ -1985,6 +2222,8 @@ impl PythonRuntime {
                 return ReloadOutcome::Rejected;
             }
         };
+        apply_telemetry_slices(&fresh.citadel, &self.telemetry_slices);
+        apply_match_log(&fresh.citadel, &self.match_log);
         if !vm_has_any_handler(&fresh) {
             tracing::warn!(
                 script = %label,
@@ -2098,6 +2337,7 @@ impl PythonRuntime {
     /// `on_input` handler is registered or the invocation errors, times out, or
     /// panics.
     pub fn evaluate_event_batch(&self, batch: &NormalizedEventBatch) -> Option<ScriptCommandBatch> {
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(batch.match_id));
         let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Python::attach(
@@ -2114,6 +2354,16 @@ impl PythonRuntime {
                         let dispatch = module.getattr("_dispatch_input")?;
                         let mut outcomes = Vec::with_capacity(batch.events.len());
                         for event in &batch.events {
+                            module.setattr(
+                                "_match_input_active",
+                                matches!(
+                                    event.payload,
+                                    NormalizedPayload::MatchMessage {
+                                        kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                                        ..
+                                    }
+                                ),
+                            )?;
                             let event_json = bridge_event_json(batch, event);
                             let decision = dispatch.call1((event_json,))?;
                             if decision.is_none() {
@@ -2259,8 +2509,28 @@ impl PythonRuntime {
         })
     }
 
+    /// Dispatch a server-owned authoritative-match lifecycle callback.
+    pub fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        // Match lifecycle telemetry must use this server-owned context, never a
+        // previous invocation's thread-local scope.
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(context.match_id));
+        self.run_commands(hook.name(), budget, |py, module| {
+            let callback_context = native_match_context_dict(py, &context)?;
+            module
+                .getattr("_dispatch_match_lifecycle")?
+                .call1((hook.name(), callback_context))?
+                .extract::<bool>()
+        })
+    }
+
     /// Dispatch the periodic tick handler with `dt` in seconds.
     pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        set_active_runtime_scope(None);
         let dt_secs = dt.as_secs_f64();
         self.run_commands("on_tick", budget, |_, module| {
             module
@@ -2692,6 +2962,37 @@ fn apply_map_catalog(citadel: &Py<PyModule>, maps: &Option<Arc<MapCatalog>>) {
 }
 
 /// Apply the synchronous transform-physics read bridge to a freshly-built VM.
+fn apply_telemetry_slices(citadel: &Py<PyModule>, slices: &Option<Arc<TelemetrySliceService>>) {
+    if let Some(slices) = slices {
+        Python::attach(|py| {
+            if let Err(e) = citadel.bind(py).setattr(
+                "_telemetry_slices_bridge",
+                TelemetrySlicesHandle {
+                    slices: Arc::clone(slices),
+                },
+            ) {
+                tracing::warn!(error = %e, "failed to set telemetry slices bridge on python module");
+            }
+        });
+    }
+}
+
+/// Apply the durable log/result write bridge to a freshly-built VM.
+fn apply_match_log(citadel: &Py<PyModule>, writer: &Option<Arc<MatchLogWriter>>) {
+    if let Some(writer) = writer {
+        Python::attach(|py| {
+            if let Err(e) = citadel.bind(py).setattr(
+                "_match_log_bridge",
+                MatchLogHandle {
+                    writer: Arc::clone(writer),
+                },
+            ) {
+                tracing::warn!(error = %e, "failed to set match log bridge on python module");
+            }
+        });
+    }
+}
+
 fn apply_transform_hub(citadel: &Py<PyModule>, hub: &Option<Arc<TransformHub>>) {
     if let Some(hub) = hub {
         Python::attach(|py| {
@@ -2705,6 +3006,21 @@ fn apply_transform_hub(citadel: &Py<PyModule>, hub: &Option<Arc<TransformHub>>) 
             }
         });
     }
+}
+
+fn native_match_context_dict(py: Python<'_>, context: &NativeMatchContext) -> PyResult<Py<PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("match_id", context.match_id)?;
+    result.set_item("lifecycle_generation", context.lifecycle_generation)?;
+    result.set_item("clock_epoch", context.clock_epoch)?;
+    result.set_item("tick", context.tick)?;
+    result.set_item("participants", &context.participants)?;
+    result.set_item("map", &context.map)?;
+    result.set_item("mode", &context.mode)?;
+    result.set_item("max_players", context.max_players)?;
+    result.set_item("open", context.open)?;
+    result.set_item("termination_reason", &context.termination_reason)?;
+    Ok(result.unbind())
 }
 
 impl Runtime for PythonRuntime {
@@ -2767,6 +3083,23 @@ impl Runtime for PythonRuntime {
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand> {
         PythonRuntime::dispatch_lifecycle(self, hook, sender, user_id)
+    }
+
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        PythonRuntime::dispatch_match_lifecycle(self, hook, context, budget)
+    }
+
+    fn supports_native_match_lifecycle(&self) -> bool {
+        true
+    }
+
+    fn supports_match_input_v1(&self) -> bool {
+        true
     }
 
     fn on_leaderboard_reset(
@@ -3118,6 +3451,7 @@ fn make_ctx<'py>(
     method: Option<&str>,
     room_id: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    set_active_runtime_scope(room_id);
     module
         .getattr("_make_ctx")?
         .call1((sender, user_id, kind, method, room_id))
@@ -3259,6 +3593,18 @@ fn dispatch_pending_runtime_events(
     commands
 }
 
+fn parse_canonical_u64(value: &str, name: &str) -> Result<u64, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{name} must be a canonical decimal u64 string"));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a canonical decimal u64 string"))
+}
+
 fn parse_commands(commands: Bound<'_, PyAny>) -> PyResult<Vec<OutboundCommand>> {
     let list: Bound<'_, PyList> = commands.cast_into()?;
     let mut out = Vec::with_capacity(list.len());
@@ -3277,6 +3623,16 @@ fn parse_commands(commands: Bound<'_, PyAny>) -> PyResult<Vec<OutboundCommand>> 
                 body: tuple.get_item(3)?.extract()?,
                 unreliable: tuple.get_item(4)?.extract()?,
             },
+            "set_input_ack" => {
+                let participant: String = tuple.get_item(1)?.extract()?;
+                let sequence: String = tuple.get_item(2)?.extract()?;
+                OutboundCommand::SetInputAck {
+                    participant: parse_canonical_u64(&participant, "participant")
+                        .map_err(PyRuntimeError::new_err)?,
+                    sequence: parse_canonical_u64(&sequence, "last_processed_sequence")
+                        .map_err(PyRuntimeError::new_err)?,
+                }
+            }
             "spawn_actor" => OutboundCommand::SpawnActor {
                 object_id: tuple.get_item(1)?.extract()?,
                 archetype: tuple.get_item(2)?.extract()?,
@@ -3405,12 +3761,22 @@ fn parse_room_spec(spec: Bound<'_, PyAny>) -> PyResult<Option<RoomSpec>> {
         return Ok(None);
     }
     let tuple: Bound<'_, PyTuple> = spec.cast_into()?;
+    let bridge_mode: String = tuple.get_item(4)?.extract()?;
     Ok(Some(RoomSpec {
         map: tuple.get_item(0)?.extract()?,
         mode: tuple.get_item(1)?.extract()?,
         max_players: tuple.get_item(2)?.extract()?,
         open: tuple.get_item(3)?.extract()?,
+        bridge_mode: parse_room_bridge_mode(&bridge_mode).map_err(PyRuntimeError::new_err)?,
     }))
+}
+
+fn parse_room_bridge_mode(value: &str) -> Result<RoomBridgeMode, String> {
+    match value {
+        "relay" => Ok(RoomBridgeMode::Relay),
+        "authoritative" => Ok(RoomBridgeMode::Authoritative),
+        _ => Err("bridge_mode must be 'relay' or 'authoritative'".to_owned()),
+    }
 }
 
 fn vm_has_any_handler(vm: &PythonVm) -> bool {
@@ -3563,6 +3929,145 @@ mod tests {
         PythonRuntime::from_source(src, "test.py", 100).expect("python runtime loads")
     }
 
+    fn match_log_writer(
+        capacity: usize,
+    ) -> (
+        Arc<crate::match_recorder::MatchRecorder>,
+        Arc<MatchLogWriter>,
+    ) {
+        let writer = Arc::new(crate::durable_logs::DurableLogWriter::new(
+            Arc::new(crate::ids::NodeIdentity::new("node-python")),
+            crate::config::LogsConfig::default(),
+        ));
+        let recorder = Arc::new(crate::match_recorder::MatchRecorder::with_capacity(
+            writer, capacity,
+        ));
+        let log = Arc::new(MatchLogWriter::new(Arc::clone(&recorder)));
+        (recorder, log)
+    }
+
+    #[test]
+    fn log_write_persists_a_line_and_leaves_the_plain_log_callable() {
+        let (recorder, log) = match_log_writer(8);
+        recorder.bind(7, "mt1-py".to_owned());
+        let runtime = runtime(
+            r#"
+import citadel
+import json
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    citadel.log("still a plain logging call")
+    citadel.log.write("WARN", "combat.hit", "  round over  ", json.dumps({"dmg": 3}))
+    citadel.log.write("info", "world", "no payload")
+"#,
+        )
+        .with_match_log(log);
+
+        assert!(
+            runtime
+                .dispatch_in_room(7, Some("user-7"), 7, 1, b"")
+                .is_empty()
+        );
+        assert_eq!(recorder.writer().queued_total(), 2);
+    }
+
+    #[test]
+    fn log_write_refuses_a_malformed_argument_and_set_result_needs_a_match() {
+        let (_recorder, log) = match_log_writer(8);
+        let runtime = runtime(
+            r#"
+import citadel
+
+@citadel.on_message(1)
+def handle(ctx, body):
+    failures = []
+
+    def refuse(fn):
+        try:
+            fn()
+            failures.append("accepted")
+        except RuntimeError as error:
+            failures.append("false:" + str(error))
+
+    refuse(lambda: citadel.log.write("nope", "world", "hi"))
+    refuse(lambda: citadel.log.write("info", "Bad Tag", "hi"))
+    refuse(lambda: citadel.log.write("info", "world", "   "))
+    refuse(lambda: citadel.log.write("info", "world", "hi", "not json"))
+    refuse(lambda: citadel.match.set_result('{"winner":"a"}'))
+    citadel.broadcast(2, "\n".join(failures).encode("utf-8"), True)
+"#,
+        )
+        .with_match_log(log);
+
+        let commands = runtime.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            panic!("expected a broadcast command");
+        };
+        let report = String::from_utf8_lossy(body);
+        assert_eq!(report.matches("false:").count(), 5, "{report}");
+        assert!(!report.contains("accepted"), "{report}");
+        assert!(report.contains("log level must be one of"));
+        assert!(report.contains("log tag must be"));
+        assert!(report.contains("log message must be 1-1024 bytes"));
+        assert!(report.contains("payload_json must be a JSON object or array"));
+        assert!(report.contains("match results require a match-scoped context"));
+    }
+
+    #[test]
+    fn native_match_lifecycle_telemetry_uses_its_context_and_restores_prior_scope() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"
+import citadel
+
+@citadel.on_match_tick
+def lifecycle(context):
+    citadel.telemetry.begin()
+    citadel.telemetry.mark("match.lifecycle")
+    citadel.telemetry.finish()
+"#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+
+        set_active_runtime_scope(Some(41));
+        assert!(
+            runtime
+                .dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Tick,
+                    NativeMatchContext {
+                        match_id: 42,
+                        lifecycle_generation: 1,
+                        clock_epoch: 0,
+                        tick: 7,
+                        participants: Vec::new(),
+                        map: "arena".to_owned(),
+                        mode: "duel".to_owned(),
+                        max_players: 2,
+                        open: true,
+                        termination_reason: None,
+                    },
+                    Duration::from_millis(100),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        set_active_runtime_scope(None);
+
+        let reports = slices.list_closed(1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].context_kind, "match");
+        assert_eq!(reports[0].marker_total, 1);
+    }
+
     // ---- authoritative bridge: citadel.on_input parity ----
 
     #[derive(Default)]
@@ -3596,6 +4101,113 @@ mod tests {
         let mut batch = NormalizedEventBatch::new(5, 42, 9, 100, 1);
         batch.events = events;
         batch
+    }
+
+    #[test]
+    fn on_input_telemetry_uses_batch_match_and_restores_prior_scope_after_error() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            "import citadel\ndef h(e):\n    citadel.telemetry.begin()\n    citadel.telemetry.mark(\"match.input\")\n    citadel.telemetry.finish()\n    raise RuntimeError(\"boom\")\ncitadel.on_input(h)\n",
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+        slices
+            .begin(
+                crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41),
+                SystemClock.now().unix_millis(),
+            )
+            .expect("prior match slice begins");
+        let _prior_scope = RuntimeScopeGuard::enter(Some(41));
+
+        assert!(
+            runtime
+                .evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        assert!(
+            slices
+                .finish(
+                    crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41),
+                    SystemClock.now().unix_millis(),
+                )
+                .is_ok(),
+            "the batch must not close the pre-existing match's telemetry slice"
+        );
+        assert!(
+            slices
+                .list_closed(2)
+                .iter()
+                .any(|report| report.marker_total == 1),
+            "the failing batch still closes its own telemetry slice"
+        );
+    }
+
+    #[test]
+    fn match_input_callback_preserves_exact_strings_and_queues_typed_ack() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    assert e['message_kind'] == 41\n    assert e['participant_id'] == '1001'\n    assert e['sequence'] == '18446744073709551615'\n    assert e['body'] == [0, 255, 7]\n    citadel.match.set_input_ack(e['participant_id'], e['sequence'])\n    return None\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![crate::runtime::NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: Some("authenticated-user".to_owned()),
+            payload: crate::runtime::NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: vec![0, 255, 7],
+                reliable: true,
+                sequence: Some(u64::MAX),
+            },
+        }]);
+        let answer = rt.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(
+            answer.commands,
+            vec![crate::runtime::ScriptCommand::SetInputAck {
+                participant: 1001,
+                sequence: u64::MAX,
+            }]
+        );
+    }
+
+    #[test]
+    fn match_input_ack_rejects_non_string_python_values() {
+        let rt = runtime(
+            "import citadel\ndef h(event):\n    citadel.match.set_input_ack(event['participant_id'], 77)\ncitadel.on_input(h)\n",
+        );
+        let batch = batch_with(vec![crate::runtime::NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: None,
+            payload: crate::runtime::NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: Vec::new(),
+                reliable: true,
+                sequence: Some(1),
+            },
+        }]);
+        assert!(
+            rt.evaluate_event_batch(&batch).is_none(),
+            "Python values outside the canonical decimal-string contract must fail closed"
+        );
+    }
+
+    #[test]
+    fn match_input_ack_fails_closed_outside_explicit_match_input_event() {
+        let rt = runtime(
+            "import citadel\ndef h(e):\n    citadel.match.set_input_ack('1001', '77')\n    return None\ncitadel.on_input(h)\n",
+        );
+        assert!(
+            rt.evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none(),
+            "a generic normalized event may not manufacture a match-input acknowledgement"
+        );
     }
 
     #[test]
@@ -4664,7 +5276,7 @@ import citadel
 
 @citadel.on_room_create
 def create(ctx, params):
-    return {"map": "Arena", "mode": "duel", "max_players": 2, "open": True}
+    return {"map": "Arena", "mode": "duel", "max_players": 2, "open": True, "bridge_mode": "authoritative"}
 
 @citadel.on_room_join
 def join(ctx, room_id):
@@ -4676,6 +5288,7 @@ def join(ctx, room_id):
         assert_eq!(spec.mode, "duel");
         assert_eq!(spec.max_players, 2);
         assert!(spec.open);
+        assert_eq!(spec.bridge_mode, RoomBridgeMode::Authoritative);
         assert!(rt.call_room_join(1, None, 7));
         assert!(!rt.call_room_join(1, None, 8));
 

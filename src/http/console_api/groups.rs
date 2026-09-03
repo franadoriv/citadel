@@ -27,7 +27,7 @@ use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
 use crate::services::{
-    AuditEntry, ConsoleIdentity, CreateGroupRequest, Group, GroupFilter, GroupId,
+    AuditEntry, ConsolePrincipal, CreateGroupRequest, Group, GroupFilter, GroupId,
     UpdateGroupRequest,
 };
 use crate::time::{Clock, SystemClock};
@@ -194,7 +194,7 @@ pub struct AddMemberBody {
 /// `GET /console/v1/groups`: paged group summaries.
 pub(super) async fn list_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(params): Query<ListParams>,
 ) -> Result<Json<GroupsPageBody>, ApiError> {
     app.metrics().record_http_request();
@@ -213,7 +213,7 @@ pub(super) async fn list_handler(
 /// `POST /console/v1/groups`: create a group (admin, audited).
 pub(super) async fn create_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     body: Result<Json<CreateGroupBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<GroupDetailBody>), ApiError> {
     app.metrics().record_http_request();
@@ -227,9 +227,7 @@ pub(super) async fn create_handler(
         }
     };
     let now = SystemClock.now();
-    let creator_user_id = body
-        .creator_user_id
-        .unwrap_or_else(|| operator.username.clone());
+    let creator_user_id = body.creator_user_id.unwrap_or_else(|| operator.actor_id());
     let group = app
         .groups()
         .create(CreateGroupRequest {
@@ -243,8 +241,8 @@ pub(super) async fn create_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "groups.create",
         group.id.to_string(),
         format!("created group '{}'", group.name),
@@ -258,7 +256,7 @@ pub(super) async fn create_handler(
 /// `GET /console/v1/groups/{id}`: one group with its member roll.
 pub(super) async fn detail_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(id): Path<GroupId>,
 ) -> Result<Json<GroupDetailBody>, ApiError> {
     app.metrics().record_http_request();
@@ -270,7 +268,7 @@ pub(super) async fn detail_handler(
 /// audited).
 pub(super) async fn update_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(id): Path<GroupId>,
     body: Result<Json<UpdateGroupBody>, JsonRejection>,
 ) -> Result<Json<GroupDetailBody>, ApiError> {
@@ -297,8 +295,8 @@ pub(super) async fn update_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "groups.update",
         id.to_string(),
         "updated group settings",
@@ -309,7 +307,7 @@ pub(super) async fn update_handler(
 /// `DELETE /console/v1/groups/{id}`: delete a group (admin, audited).
 pub(super) async fn delete_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(id): Path<GroupId>,
 ) -> Result<StatusCode, ApiError> {
     app.metrics().record_http_request();
@@ -317,8 +315,8 @@ pub(super) async fn delete_handler(
     app.groups().delete(id).await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "groups.delete",
         id.to_string(),
         "deleted group",
@@ -329,7 +327,7 @@ pub(super) async fn delete_handler(
 /// `POST /console/v1/groups/{id}/members`: add a member (admin, audited).
 pub(super) async fn add_member_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(id): Path<GroupId>,
     body: Result<Json<AddMemberBody>, JsonRejection>,
 ) -> Result<Json<GroupDetailBody>, ApiError> {
@@ -350,8 +348,8 @@ pub(super) async fn add_member_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "groups.member.add",
         format!("{id}/{}", body.user_id),
         "added member",
@@ -362,7 +360,7 @@ pub(super) async fn add_member_handler(
 /// `POST /console/v1/groups/{id}/members/{user_id}/promote` (admin, audited).
 pub(super) async fn promote_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((id, user_id)): Path<(GroupId, String)>,
 ) -> Result<Json<GroupDetailBody>, ApiError> {
     app.metrics().record_http_request();
@@ -370,8 +368,8 @@ pub(super) async fn promote_handler(
     let group = app.groups().promote(id, &user_id).await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "groups.member.promote",
         format!("{id}/{user_id}"),
         "promoted member",
@@ -382,7 +380,7 @@ pub(super) async fn promote_handler(
 /// `POST /console/v1/groups/{id}/members/{user_id}/demote` (admin, audited).
 pub(super) async fn demote_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((id, user_id)): Path<(GroupId, String)>,
 ) -> Result<Json<GroupDetailBody>, ApiError> {
     app.metrics().record_http_request();
@@ -390,8 +388,8 @@ pub(super) async fn demote_handler(
     let group = app.groups().demote(id, &user_id).await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "groups.member.demote",
         format!("{id}/{user_id}"),
         "demoted member",
@@ -402,7 +400,7 @@ pub(super) async fn demote_handler(
 /// `POST /console/v1/groups/{id}/members/{user_id}/kick` (admin, audited).
 pub(super) async fn kick_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((id, user_id)): Path<(GroupId, String)>,
 ) -> Result<Json<GroupDetailBody>, ApiError> {
     app.metrics().record_http_request();
@@ -410,8 +408,8 @@ pub(super) async fn kick_handler(
     let group = app.groups().kick_member(id, &user_id).await?;
     app.audit_log().record(AuditEntry::new(
         SystemClock.now(),
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "groups.member.kick",
         format!("{id}/{user_id}"),
         "kicked member",

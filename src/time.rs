@@ -107,14 +107,25 @@ pub trait Clock {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
+impl SystemClock {
+    /// Current UTC Unix epoch microseconds for correlation protocols that need
+    /// finer granularity than the domain's millisecond timestamps. This remains
+    /// wall-clock correlation metadata; gameplay time uses `GameplayClock` and
+    /// never calls this source.
+    #[must_use]
+    pub fn now_utc_micros() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+}
+
 impl Clock for SystemClock {
     fn now(&self) -> TimestampMillis {
         // A clock set before the Unix epoch is treated as the epoch rather than
         // panicking; this seam is intentionally infallible for callers.
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+        let millis = Self::now_utc_micros() / 1_000;
         TimestampMillis::from_unix_millis(millis)
     }
 }

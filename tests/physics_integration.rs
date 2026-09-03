@@ -98,7 +98,9 @@ fn server_simulated_bot_falls_jumps_and_replicates_from_a_loaded_map() {
         Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(Arc::new(runtime)))
             .with_maps(maps)
             .with_transform_hub(Arc::clone(&hub));
-    let room_id = gateway.create_room(RoomLabel::with_map("physics-floor"));
+    let room_id = gateway
+        .create_room(RoomLabel::with_map("physics-floor"))
+        .expect("Lua runtime supports native match lifecycle");
     let participant = gateway.next_participant_id();
     let (outbound, mut reliable) = mpsc::channel(1);
     let unreliable = gateway.register_session(SessionHandle {

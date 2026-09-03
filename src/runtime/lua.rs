@@ -13,10 +13,19 @@ use std::time::{Duration, Instant};
 use citadel_physics::{PhysicsConfig, Shape};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
+use crate::authoritative_telemetry_slices::{
+    RuntimeScopeGuard, TelemetrySliceService, active_runtime_context, active_runtime_scope,
+    set_active_runtime_scope,
+};
 use crate::config::LuaExecutionMode;
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::maps::MapCatalog;
+use crate::match_recorder::MatchLogWriter;
 use crate::realtime::TransformHub;
+use crate::runtime::host_api_spec::{
+    validate_log_level, validate_log_message, validate_log_payload, validate_log_tag,
+    validate_match_result,
+};
 use crate::runtime::host_services::{DomainHost, StorageWriteInput};
 use crate::runtime::outbound_http::{
     AsyncOutboundHttp, OutboundHttpPolicy, OutboundHttpRequest, OutboundHttpRequestState,
@@ -26,17 +35,19 @@ use crate::runtime::static_data::StaticDataCatalog;
 use crate::runtime::text_policy::TextPolicyCatalog;
 use crate::runtime::{
     BridgeCommandSink, BridgeTransform, Correction, Decision, InputOutcome,
-    MAX_RUNTIME_EVENTS_PER_INVOCATION, NormalizedEvent, NormalizedEventBatch, NormalizedPayload,
-    RealtimeAfterOutcome, RealtimeInterception, Runtime, RuntimeEvent, RuntimeEventBus,
-    RuntimeEventBusHandle, RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint,
-    RuntimeHttpEndpointPolicy, RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest,
-    RuntimeHttpResponse, RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
+    MAX_RUNTIME_EVENTS_PER_INVOCATION, NativeMatchContext, NativeMatchLifecycleHook,
+    NormalizedEvent, NormalizedEventBatch, NormalizedPayload, RealtimeAfterOutcome,
+    RealtimeInterception, Runtime, RuntimeEvent, RuntimeEventBus, RuntimeEventBusHandle,
+    RuntimeEventEmitOutcome, RuntimeHttpAuth, RuntimeHttpEndpoint, RuntimeHttpEndpointPolicy,
+    RuntimeHttpMethod, RuntimeHttpOutcome, RuntimeHttpRequest, RuntimeHttpResponse,
+    RuntimeSharedCache, RuntimeSharedCacheHandle, ScriptCommandBatch,
     append_runtime_event_commands, disabled_runtime_event_bus_handle,
     disabled_runtime_shared_cache_handle, runtime_event_bus, runtime_shared_cache,
     script_command_from_outbound, set_runtime_event_bus, set_runtime_shared_cache,
 };
 use crate::services::PlayerNotification;
 use crate::storage::StorageIndexName;
+use crate::time::{Clock, SystemClock};
 
 /// Default per-invocation time budget for a script handler, in milliseconds.
 pub const DEFAULT_DEADLINE_MS: u64 = 100;
@@ -135,6 +146,14 @@ const ON_JOIN_KEY: &str = "citadel.on_join";
 
 /// Registry key holding the `on_leave` lifecycle handler (a single function).
 const ON_LEAVE_KEY: &str = "citadel.on_leave";
+
+/// Registry keys for the server-owned authoritative-match lifecycle callbacks.
+const ON_MATCH_CREATED_KEY: &str = "citadel.on_match_created";
+const ON_MATCH_STARTED_KEY: &str = "citadel.on_match_started";
+const ON_MATCH_ENDED_KEY: &str = "citadel.on_match_ended";
+const ON_MATCH_JOIN_KEY: &str = "citadel.on_match_join";
+const ON_MATCH_LEAVE_KEY: &str = "citadel.on_match_leave";
+const ON_MATCH_TICK_KEY: &str = "citadel.on_match_tick";
 
 /// Registry key holding the `on_tick` game-loop handler (a single function).
 const ON_TICK_KEY: &str = "citadel.on_tick";
@@ -240,6 +259,14 @@ pub enum OutboundCommand {
         /// Whether best-effort delivery was requested.
         unreliable: bool,
     },
+    /// Internal match-input acknowledgement request. Generic command execution
+    /// must never materialize this; only a validated bridge batch may do so.
+    SetInputAck {
+        /// Target participant in the current authoritative match.
+        participant: u64,
+        /// Exact last processed input sequence.
+        sequence: u64,
+    },
     /// Spawn a server-owned networked actor (an NPC) with a script-assigned
     /// `object_id`. The gateway places it in the transform world and fans out an
     /// `NA_SPAWN` so every client instantiates the proxy for `archetype`. Movement
@@ -323,6 +350,7 @@ struct Deadline(Option<Instant>);
 enum InvocationMode {
     Normal,
     RealtimeInterceptor,
+    MatchInput,
 }
 
 /// Base object id for server-owned actors (NPCs). Player/presence ids grow from 1,
@@ -360,6 +388,14 @@ struct MapCatalogHandle(Arc<MapCatalog>);
 /// Authoritative transform hub made available to synchronous physics reads.
 struct TransformHubHandle(Arc<TransformHub>);
 
+/// Private trusted-runtime bridge; scripts receive no recorder or report handles.
+struct TelemetrySlicesHandle(Arc<TelemetrySliceService>);
+
+/// Durable log/result write handle. Scripts reach it only through
+/// `citadel.log.write` and `citadel.match.set_result`; it can neither open nor
+/// close a match, which stays the server's alone.
+struct MatchLogHandle(Arc<MatchLogWriter>);
+
 /// Install (or refresh) the domain-host seam on a VM's app-data.
 ///
 /// Called after each VM build (initial + hot-reload) so `citadel.friends_*` can
@@ -379,6 +415,18 @@ fn apply_map_catalog(lua: &Lua, maps: &Option<Arc<MapCatalog>>) {
 fn apply_transform_hub(lua: &Lua, hub: &Option<Arc<TransformHub>>) {
     if let Some(hub) = hub {
         lua.set_app_data(TransformHubHandle(Arc::clone(hub)));
+    }
+}
+
+fn apply_telemetry_slices(lua: &Lua, slices: &Option<Arc<TelemetrySliceService>>) {
+    if let Some(slices) = slices {
+        lua.set_app_data(TelemetrySlicesHandle(Arc::clone(slices)));
+    }
+}
+
+fn apply_match_log(lua: &Lua, writer: &Option<Arc<MatchLogWriter>>) {
+    if let Some(writer) = writer {
+        lua.set_app_data(MatchLogHandle(Arc::clone(writer)));
     }
 }
 
@@ -421,6 +469,14 @@ enum RpcInner {
     NoHandler,
 }
 
+/// Server-owned per-room bridge choice requested by an embedded room-create
+/// callback and validated by the gateway before the room is born.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomBridgeMode {
+    Relay,
+    Authoritative,
+}
+
 /// A room label produced by the Lua `on_room_create` handler. The
 /// gateway maps this onto its own `RoomLabel`; keeping it here avoids a runtime →
 /// realtime dependency. A handler may return a bare string (the map name) or a
@@ -435,6 +491,8 @@ pub struct RoomSpec {
     pub max_players: u16,
     /// Whether new joins are accepted.
     pub open: bool,
+    /// Server-owned mode requested at creation; relay is the compatibility default.
+    pub bridge_mode: RoomBridgeMode,
 }
 
 impl Default for RoomSpec {
@@ -444,6 +502,7 @@ impl Default for RoomSpec {
             mode: String::new(),
             max_players: 0,
             open: true,
+            bridge_mode: RoomBridgeMode::Relay,
         }
     }
 }
@@ -507,6 +566,10 @@ pub struct LuaRuntime {
     maps: Option<Arc<MapCatalog>>,
     /// Authoritative transform hub retained for synchronous physics reads.
     transform_hub: Option<Arc<TransformHub>>,
+    /// Private trusted host bridge for context-derived telemetry slices.
+    telemetry_slices: Option<Arc<TelemetrySliceService>>,
+    /// Durable log/result write handle, retained so a hot-reload re-applies it.
+    match_log: Option<Arc<MatchLogWriter>>,
     /// The capability mode used when constructing this VM. Retained so a reload
     /// cannot accidentally change the script's authority.
     execution_mode: LuaExecutionMode,
@@ -656,6 +719,8 @@ impl LuaRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
+            match_log: None,
             execution_mode,
             outbound_http_policy,
             http_endpoint_policy,
@@ -707,6 +772,8 @@ impl LuaRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
+            match_log: None,
             execution_mode: LuaExecutionMode::Sandboxed,
             outbound_http_policy: OutboundHttpPolicy::default(),
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
@@ -757,6 +824,8 @@ impl LuaRuntime {
             domain: None,
             maps: None,
             transform_hub: None,
+            telemetry_slices: None,
+            match_log: None,
             execution_mode: LuaExecutionMode::Sandboxed,
             outbound_http_policy: OutboundHttpPolicy::default(),
             http_endpoint_policy: RuntimeHttpEndpointPolicy::default(),
@@ -778,6 +847,29 @@ impl LuaRuntime {
         {
             let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
             apply_domain_host(&guard.lua, &self.domain);
+        }
+        self
+    }
+
+    /// Attach private context-derived telemetry slices to trusted script calls.
+    #[must_use]
+    pub fn with_telemetry_slices(mut self, slices: Arc<TelemetrySliceService>) -> Self {
+        self.telemetry_slices = Some(slices);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_telemetry_slices(&guard.lua, &self.telemetry_slices);
+        }
+        self
+    }
+
+    /// Attach the durable log/result write handle behind `citadel.log.write`
+    /// and `citadel.match.set_result`.
+    #[must_use]
+    pub fn with_match_log(mut self, writer: Arc<MatchLogWriter>) -> Self {
+        self.match_log = Some(writer);
+        {
+            let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
+            apply_match_log(&guard.lua, &self.match_log);
         }
         self
     }
@@ -859,6 +951,12 @@ impl LuaRuntime {
         let hooks = [
             ("on_join", ON_JOIN_KEY),
             ("on_leave", ON_LEAVE_KEY),
+            ("on_match_created", ON_MATCH_CREATED_KEY),
+            ("on_match_started", ON_MATCH_STARTED_KEY),
+            ("on_match_ended", ON_MATCH_ENDED_KEY),
+            ("on_match_join", ON_MATCH_JOIN_KEY),
+            ("on_match_leave", ON_MATCH_LEAVE_KEY),
+            ("on_match_tick", ON_MATCH_TICK_KEY),
             ("on_tick", ON_TICK_KEY),
             ("on_leaderboard_reset", ON_LEADERBOARD_RESET_KEY),
             ("on_room_create", ON_ROOM_CREATE_KEY),
@@ -1036,6 +1134,8 @@ impl LuaRuntime {
         apply_domain_host(&fresh, &self.domain);
         apply_map_catalog(&fresh, &self.maps);
         apply_transform_hub(&fresh, &self.transform_hub);
+        apply_telemetry_slices(&fresh, &self.telemetry_slices);
+        apply_match_log(&fresh, &self.match_log);
         // Guard against an accidental empty/handlerless save (e.g. an editor's
         // transient zero-byte write caught mid-save): swapping it in would leave
         // the node with no handlers. Reject and keep the working script.
@@ -1165,6 +1265,7 @@ impl LuaRuntime {
     /// panics. The validator is the sole authority on whether the returned
     /// answer materializes; this method only builds it.
     pub fn evaluate_event_batch(&self, batch: &NormalizedEventBatch) -> Option<ScriptCommandBatch> {
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(batch.match_id));
         let guard = self.vm.lock().unwrap_or_else(|e| e.into_inner());
         let lua = &guard.lua;
         let budget = self.budget;
@@ -1179,6 +1280,20 @@ impl LuaRuntime {
                 };
                 let mut outcomes = Vec::with_capacity(batch.events.len());
                 for event in &batch.events {
+                    set_invocation_mode(
+                        lua,
+                        if matches!(
+                            event.payload,
+                            NormalizedPayload::MatchMessage {
+                                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                                ..
+                            }
+                        ) {
+                            InvocationMode::MatchInput
+                        } else {
+                            InvocationMode::Normal
+                        },
+                    );
                     let ev = build_event_table(lua, batch, event)?;
                     let ret: Value = handler.call(ev)?;
                     let (decision, reply) = parse_input_decision(ret)?;
@@ -1366,6 +1481,30 @@ impl LuaRuntime {
         })
     }
 
+    /// Run a server-owned authoritative-match lifecycle callback. Scripts receive
+    /// only a copied context table built by the gateway; its match identity and
+    /// membership cannot be selected by game code.
+    pub fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        // Native lifecycle callbacks own their telemetry correlation. Restore any
+        // surrounding scope (including one left by a different runtime surface)
+        // once the callback returns or panics.
+        let _runtime_scope = RuntimeScopeGuard::enter(Some(context.match_id));
+        self.run_locked(hook.name(), budget, |lua| {
+            let Some(handler) =
+                lua.named_registry_value::<Option<Function>>(native_match_registry_key(hook))?
+            else {
+                return Ok(false);
+            };
+            handler.call::<()>(build_native_match_ctx(lua, &context)?)?;
+            Ok(true)
+        })
+    }
+
     /// Run the `on_tick` game-loop handler with elapsed `dt` and return commands.
     ///
     /// `dt` is passed to the script in seconds. Runs under the same serialized
@@ -1373,6 +1512,7 @@ impl LuaRuntime {
     /// error isolation: a hung or erroring tick yields no commands and never
     /// wedges inbound dispatch. A no-op when no `on_tick` handler is registered.
     pub fn tick(&self, dt: Duration, budget: Duration) -> Vec<OutboundCommand> {
+        set_active_runtime_scope(None);
         let dt_secs = dt.as_secs_f64();
         self.run_locked("on_tick", budget, |lua| {
             if let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_TICK_KEY)? {
@@ -1392,6 +1532,7 @@ impl LuaRuntime {
         dt: Duration,
         budget: Duration,
     ) -> Vec<OutboundCommand> {
+        set_active_runtime_scope(Some(room_id));
         let dt_secs = dt.as_secs_f64();
         self.run_locked("match_tick", budget, |lua| {
             if let Some(handler) = lua.named_registry_value::<Option<Function>>(ON_TICK_KEY)? {
@@ -1771,6 +1912,23 @@ impl Runtime for LuaRuntime {
         LuaRuntime::dispatch_lifecycle(self, hook, sender, user_id)
     }
 
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        LuaRuntime::dispatch_match_lifecycle(self, hook, context, budget)
+    }
+
+    fn supports_native_match_lifecycle(&self) -> bool {
+        true
+    }
+
+    fn supports_match_input_v1(&self) -> bool {
+        true
+    }
+
     fn on_leaderboard_reset(
         &self,
         epoch: &crate::leaderboard_scheduler::ResetEpoch,
@@ -1905,6 +2063,7 @@ fn build_ctx(
     kind: u16,
     room_id: Option<u64>,
 ) -> mlua::Result<Table> {
+    set_active_runtime_scope(room_id);
     let ctx = lua.create_table()?;
     ctx.set("sender", sender)?;
     ctx.set("kind", kind)?;
@@ -2014,10 +2173,26 @@ fn build_event_table(
             t.set("archetype_id", *archetype_id)?;
             t.set("transform", transform_table(lua, *transform)?)?;
         }
-        NormalizedPayload::MatchMessage { kind, body } => {
+        NormalizedPayload::MatchMessage {
+            kind,
+            body,
+            reliable,
+            sequence,
+        } => {
             t.set("kind", "message")?;
             t.set("message_kind", *kind)?;
+            if *kind == crate::realtime::gateway::KIND_MATCH_INPUT {
+                t.set("participant_id", event.participant.to_string())?;
+            }
             t.set("body", lua.create_string(body)?)?;
+            t.set("reliable", *reliable)?;
+            if let Some(sequence) = sequence {
+                if *kind == crate::realtime::gateway::KIND_MATCH_INPUT {
+                    t.set("sequence", sequence.to_string())?;
+                } else {
+                    t.set("sequence", *sequence)?;
+                }
+            }
         }
         NormalizedPayload::ParticipantJoined => {
             t.set("kind", "join")?;
@@ -2115,6 +2290,38 @@ fn parse_transform(t: &Table) -> mlua::Result<BridgeTransform> {
     })
 }
 
+fn native_match_registry_key(hook: NativeMatchLifecycleHook) -> &'static str {
+    match hook {
+        NativeMatchLifecycleHook::Created => ON_MATCH_CREATED_KEY,
+        NativeMatchLifecycleHook::Started => ON_MATCH_STARTED_KEY,
+        NativeMatchLifecycleHook::Ended => ON_MATCH_ENDED_KEY,
+        NativeMatchLifecycleHook::Join => ON_MATCH_JOIN_KEY,
+        NativeMatchLifecycleHook::Leave => ON_MATCH_LEAVE_KEY,
+        NativeMatchLifecycleHook::Tick => ON_MATCH_TICK_KEY,
+    }
+}
+
+fn build_native_match_ctx(lua: &Lua, context: &NativeMatchContext) -> mlua::Result<Table> {
+    let ctx = lua.create_table()?;
+    ctx.set("match_id", context.match_id)?;
+    ctx.set("lifecycle_generation", context.lifecycle_generation)?;
+    ctx.set("clock_epoch", context.clock_epoch)?;
+    ctx.set("tick", context.tick)?;
+    ctx.set(
+        "participants",
+        lua.create_sequence_from(context.participants.iter().copied())?,
+    )?;
+    ctx.set("map", context.map.as_str())?;
+    ctx.set("mode", context.mode.as_str())?;
+    ctx.set("max_players", context.max_players)?;
+    ctx.set("open", context.open)?;
+    match context.termination_reason.as_deref() {
+        Some(reason) => ctx.set("termination_reason", reason)?,
+        None => ctx.set("termination_reason", mlua::Value::Nil)?,
+    }
+    Ok(ctx)
+}
+
 /// Build the `ctx` table handed to a lifecycle handler: `sender` plus `user_id`.
 fn build_lifecycle_ctx(lua: &Lua, sender: u64, user_id: Option<&str>) -> mlua::Result<Table> {
     let ctx = lua.create_table()?;
@@ -2187,11 +2394,22 @@ fn call_room_create_handler(
             mode: t.get::<Option<String>>("mode")?.unwrap_or_default(),
             max_players: t.get::<Option<u16>>("max_players")?.unwrap_or(0),
             open: t.get::<Option<bool>>("open")?.unwrap_or(true),
+            bridge_mode: parse_room_bridge_mode(t.get::<Option<String>>("bridge_mode")?)?,
         },
         // A nil/other return means "use the default label" (empty map).
         _ => RoomSpec::default(),
     };
     Ok(Some(spec))
+}
+
+fn parse_room_bridge_mode(value: Option<String>) -> mlua::Result<RoomBridgeMode> {
+    match value.as_deref().unwrap_or("relay") {
+        "relay" => Ok(RoomBridgeMode::Relay),
+        "authoritative" => Ok(RoomBridgeMode::Authoritative),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "bridge_mode must be 'relay' or 'authoritative', got {other:?}"
+        ))),
+    }
 }
 
 /// Invoke `on_room_join` (if registered), returning its admission decision.
@@ -2448,6 +2666,52 @@ fn install_host_api(
     events.set("emit", emit)?;
     citadel.set("events", events)?;
 
+    // Scope comes only from the server-owned active runtime invocation. Scripts
+    // cannot provide a match/session/account/report correlation to this API.
+    let telemetry = lua.create_table()?;
+    let begin = lua.create_function(|lua, ()| {
+        let context = active_runtime_context().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices require a match-scoped context".to_string())
+        })?;
+        let handle = lua.app_data_ref::<TelemetrySlicesHandle>().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices are unavailable".to_string())
+        })?;
+        handle
+            .0
+            .begin(context, SystemClock.now().unix_millis())
+            .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
+    })?;
+    telemetry.set("begin", begin)?;
+    let mark = lua.create_function(|lua, marker: String| {
+        let context = active_runtime_context().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices require a match-scoped context".to_string())
+        })?;
+        let handle = lua.app_data_ref::<TelemetrySlicesHandle>().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices are unavailable".to_string())
+        })?;
+        handle
+            .0
+            .mark(context, &marker, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
+    })?;
+    telemetry.set("mark", mark)?;
+    let finish = lua.create_function(|lua, ()| {
+        let context = active_runtime_context().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices require a match-scoped context".to_string())
+        })?;
+        let handle = lua.app_data_ref::<TelemetrySlicesHandle>().ok_or_else(|| {
+            mlua::Error::RuntimeError("telemetry slices are unavailable".to_string())
+        })?;
+        handle
+            .0
+            .finish(context, SystemClock.now().unix_millis())
+            .map(|_| ())
+            .map_err(|e| mlua::Error::RuntimeError(e.to_string()))
+    })?;
+    telemetry.set("finish", finish)?;
+    citadel.set("telemetry", telemetry)?;
+
     let cache = lua.create_table()?;
     let get = lua.create_function(|lua, (namespace, key): (String, String)| {
         ensure_realtime_effects_allowed(lua)?;
@@ -2531,6 +2795,12 @@ fn install_host_api(
     for (name, key) in [
         ("on_join", ON_JOIN_KEY),
         ("on_leave", ON_LEAVE_KEY),
+        ("on_match_created", ON_MATCH_CREATED_KEY),
+        ("on_match_started", ON_MATCH_STARTED_KEY),
+        ("on_match_ended", ON_MATCH_ENDED_KEY),
+        ("on_match_join", ON_MATCH_JOIN_KEY),
+        ("on_match_leave", ON_MATCH_LEAVE_KEY),
+        ("on_match_tick", ON_MATCH_TICK_KEY),
         ("on_tick", ON_TICK_KEY),
         ("on_room_create", ON_ROOM_CREATE_KEY),
         ("on_room_join", ON_ROOM_JOIN_KEY),
@@ -2548,9 +2818,13 @@ fn install_host_api(
     // `citadel.log(message [, level])`: structured logging tagged as script
     // output. `level` is an optional case-insensitive string
     // (trace/debug/info/warn/error); anything else falls back to info.
+    //
+    // The name is a callable table rather than a plain function so it can also
+    // carry `citadel.log.write` — Lua values have no properties, and the call
+    // behaviour above is unchanged. `__call` receives the table itself first.
     let label = source_label.to_string();
     let log = lua.create_function(
-        move |_, (message, level): (mlua::String, Option<mlua::String>)| {
+        move |_, (_self, message, level): (Table, mlua::String, Option<mlua::String>)| {
             let message = message.to_string_lossy();
             let level = level.map(|l| l.to_string_lossy().to_ascii_lowercase());
             match level.as_deref() {
@@ -2571,7 +2845,84 @@ fn install_host_api(
             Ok(())
         },
     )?;
-    citadel.set("log", log)?;
+
+    let log_ns = lua.create_table()?;
+    let write = lua.create_function(
+        |lua,
+         (level, tag, message, payload_json): (
+            mlua::String,
+            mlua::String,
+            mlua::String,
+            Option<mlua::String>,
+        )| {
+            let level =
+                validate_log_level(&level.to_string_lossy()).map_err(mlua::Error::RuntimeError)?;
+            let tag = tag.to_string_lossy();
+            let tag = validate_log_tag(&tag).map_err(mlua::Error::RuntimeError)?;
+            let message = message.to_string_lossy();
+            let message = validate_log_message(&message).map_err(mlua::Error::RuntimeError)?;
+            let payload = payload_json.map(|value| value.to_string_lossy());
+            let payload = payload
+                .as_deref()
+                .map(validate_log_payload)
+                .transpose()
+                .map_err(mlua::Error::RuntimeError)?;
+            let handle = lua.app_data_ref::<MatchLogHandle>().ok_or_else(|| {
+                mlua::Error::RuntimeError("durable logs are unavailable".to_string())
+            })?;
+            // Match scope is optional: a line written outside a match-scoped
+            // callback is stored with no match, never refused.
+            handle
+                .0
+                .write(active_runtime_scope(), level, tag, message, payload);
+            Ok(())
+        },
+    )?;
+    log_ns.set("write", write)?;
+    let log_meta = lua.create_table()?;
+    log_meta.set("__call", log)?;
+    log_ns.set_metatable(Some(log_meta));
+    citadel.set("log", log_ns)?;
+
+    // `citadel.match.set_result(result_json)`: the only script influence over a
+    // match record. The server still owns open and close, so there is
+    // deliberately no `match.open` or `match.close` beside it.
+    let match_ns = lua.create_table()?;
+    let set_result = lua.create_function(|lua, result_json: mlua::String| {
+        let result_json = result_json.to_string_lossy();
+        let result_json = validate_match_result(&result_json).map_err(mlua::Error::RuntimeError)?;
+        let handle = lua
+            .app_data_ref::<MatchLogHandle>()
+            .ok_or_else(|| mlua::Error::RuntimeError("durable logs are unavailable".to_string()))?;
+        handle
+            .0
+            .set_result(active_runtime_scope(), result_json.to_string())
+            .map_err(|error| mlua::Error::RuntimeError(error.message().to_string()))
+    })?;
+    match_ns.set("set_result", set_result)?;
+    let set_input_ack = lua.create_function(
+        |lua, (participant, sequence): (mlua::String, mlua::String)| {
+            if !lua
+                .app_data_ref::<InvocationMode>()
+                .is_some_and(|mode| *mode == InvocationMode::MatchInput)
+            {
+                return Err(mlua::Error::RuntimeError(
+                    "match.set_input_ack requires a V1 match-input callback".to_string(),
+                ));
+            }
+            let participant = parse_canonical_u64(&participant, "participant")?;
+            let sequence = parse_canonical_u64(&sequence, "last_processed_sequence")?;
+            push_internal_command(
+                lua,
+                OutboundCommand::SetInputAck {
+                    participant,
+                    sequence,
+                },
+            )
+        },
+    )?;
+    match_ns.set("set_input_ack", set_input_ack)?;
+    citadel.set("match", match_ns)?;
 
     let http_api = lua.create_table()?;
     if http_endpoint_policy.enabled {
@@ -3720,6 +4071,35 @@ fn advance_patrols(lua: &Lua, dt: f32) -> mlua::Result<()> {
     Ok(())
 }
 
+fn parse_canonical_u64(value: &mlua::String, name: &str) -> mlua::Result<u64> {
+    let value = value.to_str()?;
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{name} must be a canonical decimal u64 string"
+        )));
+    }
+    value.parse::<u64>().map_err(|_| {
+        mlua::Error::RuntimeError(format!("{name} must be a canonical decimal u64 string"))
+    })
+}
+
+/// Queue an internal command with no opaque body allocation. These commands are
+/// still subject to the invocation command-count cap and are later converted to
+/// typed bridge commands; generic gateway execution drops them fail closed.
+fn push_internal_command(lua: &Lua, command: OutboundCommand) -> mlua::Result<()> {
+    if let Some(mut sink) = lua.app_data_mut::<CommandSink>() {
+        if sink.commands.len() >= MAX_OUTBOUND_COMMANDS {
+            sink.overflowed = true;
+        } else {
+            sink.commands.push(command);
+        }
+    }
+    Ok(())
+}
+
 /// Validate `body`, build a command via `make`, and push it into the sink.
 ///
 /// Borrows the command sink only for the push and drops the guard immediately,
@@ -4017,7 +4397,19 @@ fn has_any_handler(lua: &Lua) -> bool {
     if has_event_subscriber {
         return true;
     }
-    [ON_JOIN_KEY, ON_LEAVE_KEY, ON_TICK_KEY].iter().any(|key| {
+    [
+        ON_JOIN_KEY,
+        ON_LEAVE_KEY,
+        ON_MATCH_CREATED_KEY,
+        ON_MATCH_STARTED_KEY,
+        ON_MATCH_ENDED_KEY,
+        ON_MATCH_JOIN_KEY,
+        ON_MATCH_LEAVE_KEY,
+        ON_MATCH_TICK_KEY,
+        ON_TICK_KEY,
+    ]
+    .iter()
+    .any(|key| {
         lua.named_registry_value::<Option<Function>>(key)
             .map(|h| h.is_some())
             .unwrap_or(false)
@@ -4061,6 +4453,169 @@ mod tests {
         LuaRuntime::from_source(src, "test", DEFAULT_DEADLINE_MS).expect("runtime loads")
     }
 
+    #[test]
+    fn telemetry_slice_builder_enables_match_scoped_lua_reports() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"
+                citadel.on_message(1, function()
+                    citadel.telemetry.begin()
+                    citadel.telemetry.mark("match.round")
+                    citadel.telemetry.finish()
+                end)
+            "#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+
+        assert!(
+            runtime
+                .dispatch_in_room(7, Some("user-7"), 42, 1, b"")
+                .is_empty()
+        );
+        let reports = slices.list_closed(1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].context_kind, "match");
+        assert_eq!(reports[0].close_reason, "finished");
+        assert_eq!(reports[0].marker_total, 1);
+    }
+
+    fn match_log_writer(
+        capacity: usize,
+    ) -> (
+        Arc<crate::match_recorder::MatchRecorder>,
+        Arc<MatchLogWriter>,
+    ) {
+        let writer = Arc::new(crate::durable_logs::DurableLogWriter::new(
+            Arc::new(crate::ids::NodeIdentity::new("node-lua")),
+            crate::config::LogsConfig::default(),
+        ));
+        let recorder = Arc::new(crate::match_recorder::MatchRecorder::with_capacity(
+            writer, capacity,
+        ));
+        let log = Arc::new(MatchLogWriter::new(Arc::clone(&recorder)));
+        (recorder, log)
+    }
+
+    #[test]
+    fn log_write_persists_a_line_and_leaves_the_plain_log_callable() {
+        let (recorder, log) = match_log_writer(8);
+        recorder.bind(7, "mt1-lua".to_string());
+        let runtime = runtime(
+            r#"
+                citadel.on_message(1, function()
+                    citadel.log("still a plain tracing call")
+                    citadel.log.write("WARN", "combat.hit", "  round over  ", '{"dmg":3}')
+                    citadel.log.write("info", "world", "no payload")
+                end)
+            "#,
+        )
+        .with_match_log(log);
+
+        assert!(
+            runtime
+                .dispatch_in_room(7, Some("user-7"), 7, 1, b"")
+                .is_empty()
+        );
+        assert_eq!(recorder.writer().queued_total(), 2);
+    }
+
+    #[test]
+    fn log_write_refuses_a_malformed_argument_and_set_result_needs_a_match() {
+        let (_recorder, log) = match_log_writer(8);
+        let runtime = runtime(
+            r#"
+                citadel.on_message(1, function()
+                    local failures = {}
+                    local function refused(...)
+                        local ok, err = pcall(citadel.log.write, ...)
+                        failures[#failures + 1] = tostring(ok) .. ":" .. tostring(err)
+                    end
+                    refused("nope", "world", "hi")
+                    refused("info", "Bad Tag", "hi")
+                    refused("info", "world", "   ")
+                    refused("info", "world", "hi", "not json")
+                    local ok, err = pcall(citadel.match.set_result, '{"winner":"a"}')
+                    failures[#failures + 1] = tostring(ok) .. ":" .. tostring(err)
+                    citadel.broadcast(2, table.concat(failures, "\n"), true)
+                end)
+            "#,
+        )
+        .with_match_log(log);
+
+        let commands = runtime.dispatch(1, None, 1, b"");
+        let OutboundCommand::Broadcast { body, .. } = &commands[0] else {
+            unreachable!("expected a broadcast command");
+        };
+        let report = String::from_utf8_lossy(body);
+        // Every one of the five calls must have been refused. An mlua error
+        // string may carry position information, so count refusals rather than
+        // lines.
+        assert_eq!(report.matches("false:").count(), 5, "{report}");
+        assert!(!report.contains("true:"), "{report}");
+        assert!(report.contains("log level must be one of"));
+        assert!(report.contains("log tag must be"));
+        assert!(report.contains("log message must be 1-1024 bytes"));
+        assert!(report.contains("payload_json must be a JSON object or array"));
+        assert!(report.contains("match results require a match-scoped context"));
+    }
+
+    #[test]
+    fn native_match_lifecycle_telemetry_uses_its_context_and_restores_prior_scope() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"
+                citadel.on_match_tick(function()
+                    citadel.telemetry.begin()
+                    citadel.telemetry.mark("match.lifecycle")
+                    citadel.telemetry.finish()
+                end)
+            "#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+
+        set_active_runtime_scope(Some(41));
+        assert!(
+            runtime
+                .dispatch_match_lifecycle(
+                    NativeMatchLifecycleHook::Tick,
+                    NativeMatchContext {
+                        match_id: 42,
+                        lifecycle_generation: 1,
+                        clock_epoch: 0,
+                        tick: 7,
+                        participants: Vec::new(),
+                        map: "arena".to_owned(),
+                        mode: "duel".to_owned(),
+                        max_players: 2,
+                        open: true,
+                        termination_reason: None,
+                    },
+                    Duration::from_millis(100),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        set_active_runtime_scope(None);
+
+        let reports = slices.list_closed(1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].context_kind, "match");
+        assert_eq!(reports[0].marker_total, 1);
+    }
+
     // ---- authoritative bridge: citadel.on_input ----
 
     #[derive(Default)]
@@ -4094,6 +4649,109 @@ mod tests {
         let mut batch = NormalizedEventBatch::new(5, 42, 9, 100, 1);
         batch.events = events;
         batch
+    }
+
+    #[test]
+    fn on_input_telemetry_uses_batch_match_and_restores_prior_scope_after_error() {
+        let slices = Arc::new(TelemetrySliceService::new(
+            Arc::new(
+                crate::authoritative_decision_telemetry::AuthoritativeDecisionRecorder::new(16),
+            ),
+            crate::authoritative_telemetry_slices::TelemetrySlicePolicy::default(),
+        ));
+        let runtime = runtime(
+            r#"citadel.on_input(function()
+                citadel.telemetry.begin()
+                citadel.telemetry.mark("match.input")
+                citadel.telemetry.finish()
+                error("boom")
+            end)"#,
+        )
+        .with_telemetry_slices(Arc::clone(&slices));
+        slices
+            .begin(
+                crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41),
+                SystemClock.now().unix_millis(),
+            )
+            .expect("prior match slice begins");
+        let _prior_scope = RuntimeScopeGuard::enter(Some(41));
+
+        assert!(
+            runtime
+                .evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none()
+        );
+        assert_eq!(
+            active_runtime_context(),
+            Some(crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41))
+        );
+        assert!(
+            slices
+                .finish(
+                    crate::authoritative_telemetry_slices::TelemetrySliceContext::match_context(41),
+                    SystemClock.now().unix_millis(),
+                )
+                .is_ok(),
+            "the batch must not close the pre-existing match's telemetry slice"
+        );
+        assert!(
+            slices
+                .list_closed(2)
+                .iter()
+                .any(|report| report.marker_total == 1),
+            "the failing batch still closes its own telemetry slice"
+        );
+    }
+
+    #[test]
+    fn match_input_callback_preserves_authenticated_participant_sequence_body_and_ack() {
+        let runtime = runtime(
+            r#"citadel.on_input(function(event)
+                assert(event.kind == "message")
+                assert(event.message_kind == 41)
+                assert(event.participant_id == "1001")
+                assert(event.sequence == "18446744073709551615")
+                assert(event.body == string.char(0, 255, 7))
+                citadel.match.set_input_ack(event.participant_id, event.sequence)
+                return nil
+            end)"#,
+        );
+        let batch = batch_with(vec![NormalizedEvent {
+            event_id: 1,
+            participant: 1001,
+            user_id: Some("authenticated-user".to_owned()),
+            payload: NormalizedPayload::MatchMessage {
+                kind: crate::realtime::gateway::KIND_MATCH_INPUT,
+                body: vec![0, 255, 7],
+                reliable: true,
+                sequence: Some(u64::MAX),
+            },
+        }]);
+        let answer = runtime.evaluate_event_batch(&batch).expect("answer built");
+        assert_eq!(answer.input_outcomes[0].decision, Decision::Accept);
+        assert_eq!(
+            answer.commands,
+            vec![crate::runtime::ScriptCommand::SetInputAck {
+                participant: 1001,
+                sequence: u64::MAX,
+            }]
+        );
+    }
+
+    #[test]
+    fn match_input_ack_fails_closed_outside_explicit_match_input_event() {
+        let runtime = runtime(
+            r#"citadel.on_input(function()
+                citadel.match.set_input_ack("1001", "77")
+                return nil
+            end)"#,
+        );
+        assert!(
+            runtime
+                .evaluate_event_batch(&batch_with(vec![input_event(1, 7)]))
+                .is_none(),
+            "a generic normalized event may not manufacture a match-input acknowledgement"
+        );
     }
 
     #[test]
@@ -4965,6 +5623,12 @@ mod tests {
             "on_message",
             "on_join",
             "on_leave",
+            "on_match_created",
+            "on_match_started",
+            "on_match_ended",
+            "on_match_join",
+            "on_match_leave",
+            "on_match_tick",
             "on_tick",
             "on_leaderboard_reset",
             "on_rpc",
@@ -4975,6 +5639,7 @@ mod tests {
             "on_input",
             "broadcast",
             "send",
+            "match.set_input_ack",
             "spawn_actor",
             "move_actor",
             "despawn_actor",
@@ -5023,6 +5688,11 @@ mod tests {
             "cache.set",
             "cache.delete",
             "cache.cas",
+            "telemetry.begin",
+            "telemetry.mark",
+            "telemetry.finish",
+            "log.write",
+            "match.set_result",
         ]
         .into_iter()
         .collect();
@@ -5237,6 +5907,17 @@ mod tests {
             panic!("storage index host must return a reply");
         };
         assert_eq!(reply, b"false|true|1|alice|main");
+    }
+
+    #[test]
+    fn on_room_create_can_request_authoritative_bridge_mode() {
+        let runtime = runtime(
+            r#"citadel.on_room_create(function()
+                return { map = "Arena", bridge_mode = "authoritative" }
+            end)"#,
+        );
+        let spec = runtime.call_room_create(1, None, b"").expect("room spec");
+        assert_eq!(spec.bridge_mode, RoomBridgeMode::Authoritative);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::App;
 use crate::error::AppError;
 use crate::http::error::ApiError;
-use crate::services::{AuditEntry, ChannelType, ChatMessage, ConsoleIdentity};
+use crate::services::{AuditEntry, ChannelType, ChatMessage, ConsolePrincipal};
 use crate::time::{Clock, SystemClock};
 
 /// The Chat section route (channel listing).
@@ -168,7 +168,7 @@ pub struct MessagesPage {
 /// activity, most-recently-active first. Answers `200` with no query params.
 pub(super) async fn channels_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Query(query): Query<ChannelsQuery>,
 ) -> Result<Json<ChannelsResponse>, ApiError> {
     app.metrics().record_http_request();
@@ -193,7 +193,7 @@ pub(super) async fn channels_handler(
 /// audited). Creates the channel on first use.
 pub(super) async fn append_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path(channel): Path<String>,
     body: Result<Json<AppendBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<MessageRow>), ApiError> {
@@ -224,8 +224,8 @@ pub(super) async fn append_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "chat.message.append",
         format!("{channel}#{id}"),
         format!("appended message from {}", body.sender),
@@ -243,7 +243,7 @@ pub(super) async fn append_handler(
 /// `GET /console/v1/chat/{channel}/messages`: paged history, newest first.
 pub(super) async fn messages_handler(
     State(app): State<App>,
-    _operator: ConsoleIdentity,
+    _operator: ConsolePrincipal,
     Path(channel): Path<String>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesPage>, ApiError> {
@@ -273,7 +273,7 @@ pub(super) async fn messages_handler(
 /// (admin, audited). Idempotent; unknown channel or id is `404`.
 pub(super) async fn delete_message_handler(
     State(app): State<App>,
-    operator: ConsoleIdentity,
+    operator: ConsolePrincipal,
     Path((channel, id)): Path<(String, u64)>,
 ) -> Result<StatusCode, ApiError> {
     app.metrics().record_http_request();
@@ -282,7 +282,7 @@ pub(super) async fn delete_message_handler(
     app.chat()
         .consume_rate_limits(
             &app.chat_rate_limits()
-                .moderation(&operator.username, &channel),
+                .moderation(&operator.actor_id(), &channel),
             now,
         )
         .await?;
@@ -291,7 +291,7 @@ pub(super) async fn delete_message_handler(
             &channel,
             id,
             "operator",
-            &operator.username,
+            &operator.actor_id(),
             "operator_remove",
             0,
             "",
@@ -301,8 +301,8 @@ pub(super) async fn delete_message_handler(
         .await?;
     app.audit_log().record(AuditEntry::new(
         now,
-        operator.username,
-        operator.role.as_str(),
+        operator.actor_id(),
+        operator.role_label(),
         "chat.message.delete",
         format!("{channel}#{id}"),
         "deleted (tombstoned) message",

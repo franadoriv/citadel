@@ -8,7 +8,8 @@ HTML document served by the node itself (no build step, no CDN, works
 offline). **Every sidebar section is live**: the SPA signs in against
 `/console/v1/login`, drives the operator-only **console API** under
 **`/console/v1`** for accounts, groups, chat, notifications, storage,
-leaderboards, matches, purchases, configuration, runtime, audit logs, the error
+leaderboards, matches, purchases, API keys, configuration, runtime, audit logs,
+script logs, match records, the error
 journal, and the read-only Database Explorer, and
 its **Status** section renders live node gauges from the public `/status`
 endpoint (no login required for that data source).
@@ -47,6 +48,11 @@ Two roles exist:
 | `admin` | `console.password` | Read everything, perform mutations. |
 | `viewer` | `console.viewer_password` (optional) | Read-only; mutations return `403 forbidden`. |
 
+These human sessions are short-lived opaque bearer tokens, not JWTs. Durable
+machine credentials are separate principals with explicit read scopes; see
+[API keys and service accounts](/reference/admin-api/api-keys/). Only a human
+`admin` session can manage them.
+
 Failure behavior is deliberately uniform: a wrong username, wrong password,
 missing header, malformed header, unknown token, and expired token all return
 the same `401 authentication_failed` — the boundary is not a credential
@@ -83,11 +89,239 @@ exposing a node beyond localhost.
 | `/console/v1/leaderboards` | GET | bearer | Leaderboard administration (live — see below). |
 | `/console/v1/purchases` | GET | bearer | Validated purchase records (live — see below). |
 | `/console/v1/subscriptions` | GET | bearer | Subscription records (live — see below). |
+| `/console/v1/api-keys` | GET, POST | human admin bearer | List metadata or create a machine credential; see [API keys](/reference/admin-api/api-keys/). |
+| `/console/v1/api-keys/{id}` | GET | human admin bearer | Read API-key metadata (never a secret). |
+| `/console/v1/api-keys/{id}/rotate` | POST | human admin bearer | Rotate and reveal a replacement secret once. |
+| `/console/v1/api-keys/{id}/revoke` | POST | human admin bearer | Revoke the current generation. |
+| `/console/v1/lag/reports` | GET | bearer | Redacted, keyset-paged derived lag reports. |
+| `/console/v1/lag/reports/{report_id}` | GET | bearer | One redacted derived report. |
+| `/console/v1/lag/reports/{report_id}/windows` | GET | bearer | Bounded aggregate timeline windows, never packet rows. |
+| `/console/v1/lag/captures` | GET | bearer | Redacted, keyset-paged capture overview. |
+| `/console/v1/lag/captures/{capture_id}/raw` | GET | admin | Paged opaque raw-artifact handles. |
+| `/console/v1/lag/captures/{capture_id}/raw/{handle}` | GET, DELETE | admin | Download a private attachment or delete it while retaining reports. |
+| `/console/v1/lag/captures/{capture_id}/regenerate` | POST | admin | Regenerate from a currently retained opaque raw handle. |
+| `/console/v1/logs` | GET | bearer | Durable game-script log stream, keyset-paged (live — see below). |
+| `/console/v1/logs/{log_id}` | GET | bearer | One stored log line including its author-supplied payload. |
+| `/console/v1/matchlogs` | GET | bearer | Durable match records, keyset-paged — history, not live rooms. |
+| `/console/v1/matchlogs/{match_id}` | GET | bearer | One match record plus exact per-domain counts. |
+| `/console/v1/matchlogs/{match_id}/entries` | GET | bearer | The match drill-down: logs, telemetry slices, lag reports, audit. |
 
 A section whose backend has not landed yet answers
 `501 { "code": "not_implemented" }` — authenticated and routed, never a `404` —
 so the SPA treats every section uniformly. Section documentation is added to
 this page as each backend ships.
+
+## Lag diagnostics
+
+**Logs & Diagnostics > Lag Diagnostics** shows compact derived reports and capture
+overviews. Both `viewer` and `admin` can read report lists, a report detail,
+bounded histogram/timeline windows, and redacted capture summaries. The report
+surface has no raw paths, artifact digest, token, MIME grant, packet body,
+packet row, player/session identity, or raw availability state for viewers.
+Pages use opaque keyset cursors: pass `after` from `next_after` with a bounded
+`limit`, rather than treating cursors as filesystem paths or database ids.
+
+The report surface requires SQLite, PostgreSQL, or CockroachDB durable report
+storage. MongoDB deployments can expose the admin raw-artifact lifecycle but
+reject `analyze = true`; they never substitute a process-local report cache for
+an empty or durable report list.
+
+Only `admin` can list raw handles, download an artifact, delete retained raw
+evidence, or request regeneration. A raw download is an
+`application/octet-stream` attachment with `Cache-Control: no-store`, not a
+JSON endpoint and not a static URL. Handles are opaque (`lc1-...`) and do not
+reveal a disk path. `viewer` gets `403 forbidden` for every raw or regeneration
+operation, including an attempted request.
+
+Deleting raw bytes preserves existing derived reports and marks their raw
+availability unavailable; regeneration then returns a conflict until a new
+capture is collected. Raw lifecycle attempts, including failed or denied
+operations, are audited without recording paths, raw bytes, upload grants, or
+tokens. A report’s `raw_available` field is admin-only and means only that
+retained material is currently usable; the API does not expose whether it was
+expired or manually deleted.
+
+Interpret charts as diagnostic correlation, not a latency verdict. The UI
+shows samples, exclusions, overflows/truncation, percentiles, decoder/analyzer
+versions, and UTC-clock uncertainty. `no_analysis`, `pending`, `no_data`,
+`partial`, `complete`, and `failed` are explicit report outcomes. Raw
+unavailability is a separate admin-only retention projection, deliberately
+without an expiry-versus-deletion reason. None should silently turn into a
+healthy-network result. Lag reports do not claim RTT, one-way latency,
+asymmetric latency, or packet loss.
+
+For the private-root, quota, and cluster restrictions, see
+[Lag diagnostics operations](/reference/operations/lag-diagnostics/).
+
+## Logs (game script)
+
+**Logs & Diagnostics > Script Logs** is the durable stream your *game script* writes
+through `citadel.log.write`. Nothing else writes to it: the server contributes
+no line of its own, and it attaches no credential, bearer token, session id,
+participant id, or transport identifier to any field. Server-side failures live
+in the [Error Journal](#error-journal) instead, and operator actions in the
+[Audit Logs](#audit-logs).
+
+```
+GET /console/v1/logs?level=warn&tag=combat&limit=50
+Authorization: Bearer <token>
+
+200 OK
+{
+  "items": [
+    { "log_id": "ml1-0198f2c1a40b33c7d000000000007",
+      "match_id": "mt1-0198f2c19e2a33c7d000000000000",
+      "node_id": "citadel-1", "created_at_unix_ms": 1751791000000,
+      "level": "warn", "tag": "combat.round",
+      "message": "round ended early", "has_payload": true }
+  ],
+  "next_after": "ml1-0198f2c1a40b33c7d000000000007",
+  "durable": true,
+  "dropped_total": 0
+}
+```
+
+| Query param | Meaning |
+| --- | --- |
+| `match_id` | Exact durable match id (`mt1-…`). Absent lists every line, **including the ones written outside any match**. |
+| `level` | Exact severity: `trace`, `debug`, `info`, `warn`, or `error`. An unrecognized name is a `400`, never a silent widening. |
+| `tag` | Tag **prefix** match — `combat` matches `combat.round`. Max 64 bytes. |
+| `after` | Opaque keyset cursor: the previous page's `next_after`. |
+| `limit` | Page size, newest-first. Default `50`, capped at `200`. |
+
+`GET /console/v1/logs/{log_id}` returns one line with the `payload_json` field
+the listing omits — a page of 200 author-supplied payloads is a large response
+for rows the operator has not opened yet. A malformed or unknown `log_id` is a
+`404`; a malformed cursor, match id, level, or tag is a `400`. Unknown query
+parameters are rejected.
+
+Two response fields describe the pipeline rather than the rows:
+
+- `durable` — whether these rows came from a table. There is **no in-process
+  ring behind this surface**: script logs are either persisted or discarded, so
+  `false` means this backend keeps no script-log history at all and the empty
+  page is the whole truth. The in-memory and MongoDB backends answer
+  `200 { "items": [], "durable": false }`, never a `503`, because durable
+  history must stay readable in exactly the node states where operators need it.
+- `dropped_total` — lines the bounded write-behind queue dropped since boot. A
+  non-zero value means the node produced logs faster than it could flush them.
+
+:::caution[Payloads are stored verbatim]
+`message` and `payload_json` are author-supplied. The server does not inspect,
+reformat, or redact them, and re-serializing would reorder keys and renormalize
+numbers, so what you read is exactly what the script wrote. A script that writes
+a secret into a payload has published it to every console operator.
+:::
+
+`match_id` is nullable by design and is not a gate. A game with no match concept
+at all — an MMORPG world tick, a global scheduled job — still writes logs; the
+row simply carries no match. A log outside a match is stored, never rejected.
+
+Machine credentials need the `logs:read` scope (see
+[API keys](/reference/admin-api/api-keys/)). Reads are recorded in the audit
+trail as `logs.list` and `logs.detail` with **counts and ids only** — never a
+log message or payload text.
+
+## Match records (durable history)
+
+**Logs & Diagnostics > Match Records** answers "what happened", from the
+`matches` table, after the fact. [Matches (live rooms)](#matches-live-rooms)
+answers "what is happening right now", from the realtime gateway. They are
+separate routes because they are separate questions, and because a durable
+record outlives the process that produced it.
+
+The namespace is `/console/v1/matchlogs`, deliberately not
+`/console/v1/matches/history`: axum routes through matchit, which rejects a
+static segment sharing a position with a path parameter, and
+`/console/v1/matches/{id}` already claims that position.
+
+A match record is **server-owned**. Its id, membership shape, clock, and
+termination reason are selected by the gateway; game code can neither open nor
+close a match. The one author-supplied column is `result_json`, stamped through
+`citadel.match.set_result` and returned verbatim. The record stores no
+participant identity, account id, session id, or transport identifier — that
+detail lives in the child domains the drill-down joins.
+
+```
+GET /console/v1/matchlogs?open=false&limit=50
+Authorization: Bearer <token>
+
+200 OK
+{
+  "items": [
+    { "match_id": "mt1-0198f2c19e2a33c7d000000000000",
+      "node_id": "citadel-1", "boot_id": "bt1-…", "room_id": 7,
+      "name": "arena", "map": "corneria", "mode": "versus",
+      "max_players": 8, "clock_epoch": 1751790000000,
+      "opened_at_unix_ms": 1751791000000,
+      "closed_at_unix_ms": 1751791900000,
+      "termination_reason": "final_departure",
+      "peak_participants": 6, "join_total": 11, "open": false }
+  ],
+  "next_after": "mt1-0198f2c19e2a33c7d000000000000",
+  "durable": true,
+  "dropped_total": 0
+}
+```
+
+| Query param | Meaning |
+| --- | --- |
+| `open` | `true` restricts the page to matches that have not been closed yet. |
+| `after` | Opaque keyset cursor: the previous page's `next_after`. |
+| `limit` | Page size, newest-first. Default `50`, capped at `200`. |
+
+`termination_reason` is one of `final_departure`, `server_closed`, or
+`formation_abandoned`, and is absent while a match is still open. `boot_id`
+names the run of the node that opened the match: `room_id` is a per-process
+counter, so the pair is what makes a room identifiable across restarts.
+`durable` and `dropped_total` mean exactly what they mean for script logs above.
+
+`GET /console/v1/matchlogs/{match_id}` adds `result_json` and an exact
+`counts` object — `logs`, `telemetry_slices`, `lag_reports`, `audit`.
+
+### The drill-down
+
+`GET /console/v1/matchlogs/{match_id}/entries?after&limit` returns one match
+with its children:
+
+```
+{
+  "record": { "match_id": "mt1-…", "result_json": "{\"winner\":\"kitsune\"}", ... },
+  "logs": [...],
+  "logs_next_after": "ml1-…",
+  "telemetry_slices": [...],
+  "lag_reports": [],
+  "audit": [],
+  "counts": { "logs": 1284, "telemetry_slices": 3, "lag_reports": 0, "audit": 0 }
+}
+```
+
+`logs` is the only paged child — it is the only one that grows without a natural
+bound — and it keysets on `log_id` through `after`/`logs_next_after`. The other
+domains are inlined up to 50 rows each **beside their exact count**, so a
+truncated view never hides the real total.
+
+Three of those fields are routinely empty, each for its own reason:
+
+- `audit` is empty by design. Operator actions are not match-scoped, and this
+  layer deliberately never forces one into a match.
+- `telemetry_slices` are aggregate-only projections of closed authoritative
+  slices: report id, context, close reason, duration, marker **count**, and
+  accepted/rejected/corrected totals. Marker text is validated, used, and
+  discarded — there is no column for it and there never will be.
+- `lag_reports` is a bounded scan filtered by match scope. The durable column
+  and its index shipped ahead of their write path, so this list is **always
+  empty today**: a capture is node-scoped, and nothing yet constructs a capture
+  participant carrying a match. It becomes correct with no API change once that
+  write path lands. Each entry, when populated, carries only `report_id`,
+  `capture_id`, `status`, and `created_at_unix_ms` — open it on
+  [Lag diagnostics](#lag-diagnostics), which owns its own admin gate and its own
+  redaction.
+
+A malformed or unknown `match_id` is a `404`; a malformed cursor is a `400`.
+Machine credentials need the existing `matches:read` scope. Reads are recorded
+as `matchlog.list`, `matchlog.detail`, and `matchlog.entries`, carrying counts
+and ids only.
 
 ## Configuration browser
 
@@ -520,9 +754,13 @@ verb per mutation as sections land (e.g. `storage.write`, `accounts.ban`).
 Both roles may read the trail; unknown query parameters are rejected with
 `400`.
 
-The trail is a bounded in-process ring (1024 entries): older entries are
-evicted, and a **node restart clears it**. Durable audit persistence is a
-known limitation tracked in the technical-debt log.
+A bounded in-process ring (1024 entries) always fronts the trail, so the
+newest history is readable with no database at all. On the SQLite, PostgreSQL,
+and CockroachDB backends the ring is also written behind to a
+`console_audit_entries` table and survives a restart; on the in-memory and
+MongoDB backends it does not, and the ring is the whole history. See
+[Audit log](/reference/admin-api/audit/) for retention, the durability flag,
+and the full parameter set.
 
 ## Errors
 

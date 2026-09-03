@@ -81,8 +81,9 @@ use crate::leaderboard_scheduler::{ResetEpoch, SchedulerFencingToken};
 pub use bridge_protocol::{
     BridgeCommandSink, BridgePhysicsOptions, BridgeRepField, BridgeRepValue, BridgeShape,
     BridgeTransform, Correction, Decision, FireIntent, GS_BRIDGE_PROTOCOL_VERSION, InputOutcome,
-    MAX_BRIDGE_PAYLOAD_BYTES, NormalizedEvent, NormalizedEventBatch, NormalizedPayload, PersistOp,
-    RewindHit, RewindQuery, RewindResult, ScriptCommand, ScriptCommandBatch,
+    MAX_BRIDGE_PAYLOAD_BYTES, MAX_MATCH_MESSAGE_BODY_BYTES, NormalizedEvent, NormalizedEventBatch,
+    NormalizedPayload, PersistOp, RewindHit, RewindQuery, RewindResult, ScriptCommand,
+    ScriptCommandBatch,
 };
 pub use bridge_validator::{
     BatchRejection, BridgeMatchContext, BridgeQuotas, Capability, EventDraft, MAX_RESERVED_KIND,
@@ -108,7 +109,7 @@ pub use http_endpoint::{
 pub use js::{JS_ENTRYPOINT, JsRuntime};
 pub use lua::{
     DEFAULT_DEADLINE_MS, LifecycleHook, LuaRuntime, OutboundCommand, PhysicsOptions, ReloadOutcome,
-    RoomSpec, RpcOutcome, RuntimeIntrospection,
+    RoomBridgeMode, RoomSpec, RpcOutcome, RuntimeIntrospection,
 };
 #[cfg(feature = "runtime-python")]
 pub use python::PythonRuntime;
@@ -257,10 +258,31 @@ pub(crate) fn bridge_event_json(batch: &NormalizedEventBatch, event: &Normalized
             map.insert("archetype_id".into(), json!(*archetype_id));
             map.insert("transform".into(), bridge_transform_json(transform));
         }
-        NormalizedPayload::MatchMessage { kind, body } => {
+        NormalizedPayload::MatchMessage {
+            kind,
+            body,
+            reliable,
+            sequence,
+        } => {
             map.insert("kind".into(), json!("message"));
             map.insert("message_kind".into(), json!(*kind));
+            if *kind == crate::realtime::gateway::KIND_MATCH_INPUT {
+                map.insert(
+                    "participant_id".into(),
+                    json!(event.participant.to_string()),
+                );
+            }
             map.insert("body".into(), json!(body));
+            map.insert("reliable".into(), json!(*reliable));
+            map.insert(
+                "sequence".into(),
+                match sequence {
+                    Some(sequence) if *kind == crate::realtime::gateway::KIND_MATCH_INPUT => {
+                        json!(sequence.to_string())
+                    }
+                    _ => json!(sequence),
+                },
+            );
         }
         NormalizedPayload::ParticipantJoined => {
             map.insert("kind".into(), json!("join"));
@@ -363,6 +385,13 @@ pub(crate) fn script_command_from_outbound(command: OutboundCommand) -> ScriptCo
             body,
             unreliable,
         },
+        OutboundCommand::SetInputAck {
+            participant,
+            sequence,
+        } => ScriptCommand::SetInputAck {
+            participant,
+            sequence,
+        },
         OutboundCommand::SpawnActor {
             object_id,
             archetype,
@@ -420,6 +449,66 @@ pub struct RealtimeAfterOutcome {
     /// Number of local outbound deliveries synchronously queued by the gateway.
     pub delivered: usize,
 }
+
+/// A server-owned snapshot installed for a native authoritative-match callback.
+///
+/// Scripts only receive a copy of this value; a match id, membership list, clock,
+/// generation, and close reason are selected by the gateway and cannot be supplied
+/// or replaced by game code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMatchContext {
+    pub match_id: u64,
+    pub lifecycle_generation: u64,
+    pub clock_epoch: u64,
+    pub tick: u64,
+    pub participants: Vec<u64>,
+    pub map: String,
+    pub mode: String,
+    pub max_players: u16,
+    pub open: bool,
+    pub termination_reason: Option<String>,
+}
+
+/// A native authoritative-match lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeMatchLifecycleHook {
+    Created,
+    Started,
+    Ended,
+    Join,
+    Leave,
+    Tick,
+}
+
+impl NativeMatchLifecycleHook {
+    /// Stable host registration name for this lifecycle transition.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Created => "on_match_created",
+            Self::Started => "on_match_started",
+            Self::Ended => "on_match_ended",
+            Self::Join => "on_match_join",
+            Self::Leave => "on_match_leave",
+            Self::Tick => "on_match_tick",
+        }
+    }
+}
+
+/// Client-safe refusal used when the selected runtime cannot run the shipped
+/// native authoritative-match lifecycle surface.
+pub const NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE: &str =
+    "native match lifecycle is unavailable for the selected runtime";
+
+/// Typed refusal returned before a room can be created or a member admitted
+/// when the selected runtime cannot execute the complete native lifecycle.
+///
+/// This is intentionally separate from script readiness: an otherwise-ready
+/// external worker still cannot host a match until its protocol carries every
+/// server-owned lifecycle context frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE}")]
+pub struct NativeMatchLifecycleUnavailable;
 
 /// A language runtime that turns inbound game events into outbound commands.
 ///
@@ -517,6 +606,39 @@ pub trait Runtime: Send + Sync + 'static {
         sender: u64,
         user_id: Option<&str>,
     ) -> Vec<OutboundCommand>;
+
+    /// Run one native authoritative-match lifecycle callback.
+    ///
+    /// The gateway builds `context` from its own room registry and clock; runtimes
+    /// must never accept a script-selected match id. The default is intentionally
+    /// inert so existing global lifecycle implementations remain compatible.
+    fn dispatch_match_lifecycle(
+        &self,
+        hook: NativeMatchLifecycleHook,
+        context: NativeMatchContext,
+        budget: Duration,
+    ) -> Vec<OutboundCommand> {
+        let _ = (hook, context, budget);
+        Vec::new()
+    }
+
+    /// Whether this runtime can execute every native authoritative-match
+    /// lifecycle callback with its complete server-owned context. Embedded Lua,
+    /// Python, and JavaScript support this shipped surface. An adapter that
+    /// cannot transport it must return `false`; the gateway then refuses
+    /// admission before creating a native lifecycle match. The default is
+    /// fail-closed so an adapter cannot silently opt into callbacks it drops.
+    fn supports_native_match_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Whether this runtime can execute the full native-match V1 input and
+    /// private acknowledgement surface. The default is fail-closed so an
+    /// adapter cannot receive reserved match input until its host API and typed
+    /// command encoder are implemented with parity.
+    fn supports_match_input_v1(&self) -> bool {
+        false
+    }
 
     /// Invoke the registered leaderboard-reset hook for one durable epoch.
     ///
@@ -684,5 +806,36 @@ mod bridge_seam_tests {
             sink.0.lock().expect("sink lock").is_empty(),
             "the default bridge surface must never answer"
         );
+    }
+
+    #[cfg(any(feature = "runtime-js", feature = "runtime-python"))]
+    #[test]
+    fn json_bridge_exposes_generic_message_metadata_to_each_json_adapter() {
+        let mut batch = NormalizedEventBatch::new(7, 42, 9, 100, 1);
+        let event = NormalizedEvent {
+            event_id: 3,
+            participant: 99,
+            user_id: Some("account".to_owned()),
+            payload: NormalizedPayload::MatchMessage {
+                kind: 401,
+                body: b"opaque\0body".to_vec(),
+                reliable: false,
+                sequence: Some(12),
+            },
+        };
+        batch.events.push(event.clone());
+
+        let event: serde_json::Value =
+            serde_json::from_str(&bridge_event_json(&batch, &event)).expect("event JSON");
+        assert_eq!(event["kind"], "message");
+        assert_eq!(event["message_kind"], 401);
+        assert_eq!(
+            event["body"],
+            serde_json::json!([111, 112, 97, 113, 117, 101, 0, 98, 111, 100, 121])
+        );
+        assert_eq!(event["reliable"], false);
+        assert_eq!(event["sequence"], 12);
+        assert_eq!(event["match_id"], 42);
+        assert_eq!(event["tick"], 100);
     }
 }

@@ -289,6 +289,7 @@ table.tbl tr.deleted td { color: var(--text-dim); font-style: italic; }
   background: var(--navy-750); color: var(--text-muted); border: 1px solid var(--border);
 }
 .tag-soft.on { color: var(--ok); background: var(--ok-soft); border-color: rgba(53,200,143,0.3); }
+.tag-soft.warn { color: var(--warn); background: var(--warn-soft); border-color: rgba(224,166,58,0.35); }
 .tag-soft.off { color: var(--text-dim); }
 .tag-soft.bad { color: var(--bad); background: var(--bad-soft); border-color: rgba(229,96,95,0.3); }
 
@@ -336,6 +337,15 @@ select.form-in {
 .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
 .form-row .field { flex: 1; min-width: 130px; margin-bottom: 0; }
 .form-row .field.fixed { flex: 0 0 auto; }
+.scope-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+.scope-option {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--navy-900);
+  color: var(--text-muted); font-family: var(--mono); font-size: 12px;
+}
+.scope-option input { accent-color: var(--accent-400); }
+.inline-error { color: var(--bad); font-size: 12.5px; margin: 0 0 12px; }
+.secret-value { user-select: all; overflow-wrap: anywhere; }
 
 pre.code {
   margin: 0; background: var(--navy-900); border: 1px solid var(--border);
@@ -348,6 +358,22 @@ pre.code {
   border-top: 1px solid var(--border); color: var(--text-dim); font-size: 12px;
 }
 .pager .grow { flex: 1; }
+
+/* ---- Lag diagnostics ------------------------------------------------------- */
+.lag-note { color: var(--text-dim); font-size: 12px; line-height: 1.55; margin: 0; }
+.lag-status { text-transform: none; }
+.lag-bars { display: flex; align-items: end; gap: 3px; height: 96px; padding: 8px 0 3px; border-bottom: 1px solid var(--border); }
+.lag-bars i { display: block; min-width: 5px; flex: 1 1 8px; max-width: 28px; background: linear-gradient(180deg, var(--accent-300), var(--accent-600)); border-radius: 3px 3px 0 0; }
+.lag-axis { display: flex; justify-content: space-between; gap: 8px; margin-top: 5px; color: var(--text-dim); font-size: 10.5px; font-family: var(--mono); }
+.lag-spark { display: flex; align-items: end; gap: 2px; height: 74px; padding-top: 6px; border-bottom: 1px solid var(--border); }
+.lag-spark i { display: block; min-width: 4px; flex: 1 1 5px; max-width: 14px; background: var(--ok); border-radius: 2px 2px 0 0; }
+.lag-spark i.warn { background: var(--warn); }
+.lag-spark i.bad { background: var(--bad); }
+.lag-cohort { display: grid; grid-template-columns: minmax(190px, 1.5fr) repeat(4, minmax(82px, .7fr)); gap: 8px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+.lag-cohort:last-child { border-bottom: 0; }
+.lag-cohort .cohort-key { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+.lag-muted { color: var(--text-dim); }
+@media (max-width: 720px) { .lag-cohort { grid-template-columns: 1fr 1fr; } }
 
 .updated { color: var(--text-dim); font-size: 12px; }
 .updated .dot-live { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-right: 6px; animation: pulse 2s infinite; vertical-align: middle; }
@@ -403,8 +429,24 @@ pre.code {
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
 
 @media (max-width: 820px) {
-  .app { grid-template-columns: 1fr; grid-template-areas: "brand" "topbar" "content"; }
-  .sidebar { display: none; }
+  .app {
+    grid-template-columns: 1fr;
+    grid-template-rows: var(--topbar-h) var(--topbar-h) auto 1fr;
+    grid-template-areas: "brand" "topbar" "sidebar" "content";
+  }
+  .topbar { overflow-x: auto; padding: 0 14px; }
+  .topbar .meta { min-width: max-content; }
+  .sidebar {
+    display: flex; align-items: center; gap: 4px; padding: 6px 8px;
+    overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  .nav-group { display: flex; gap: 4px; padding: 0; flex: 0 0 auto; }
+  .nav-group .label { display: none; }
+  .nav-item { margin: 0; white-space: nowrap; }
+  .content { padding: 18px 14px 32px; }
+  .page-head { flex-direction: column; }
+  .page-head .btn { width: 100%; justify-content: center; }
+  .scope-grid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -458,7 +500,7 @@ pre.code {
 </div>
 
 <div id="modal-root"></div>
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast" aria-live="polite"></div>
 
 <script>
 "use strict";
@@ -471,6 +513,7 @@ pre.code {
     database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
     trophy: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0V4z"/><path d="M7 4H4v2a3 3 0 0 0 3 3M17 4h3v2a3 3 0 0 1-3 3"/>',
     grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+    layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
     chat: '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
     group: '<path d="M9 21v-2a4 4 0 0 1 4-4h0a4 4 0 0 1 4 4v2"/><circle cx="13" cy="7" r="3"/><path d="M3 21v-1.5A3.5 3.5 0 0 1 6.5 16"/>',
     bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
@@ -491,7 +534,8 @@ pre.code {
     trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
     download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
     send: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
-    plug: '<path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0V8zM12 17v5"/>'
+    plug: '<path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0V8zM12 17v5"/>',
+    key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="M11 12l9-9M17 6l3 3M14 9l2 2"/>'
   };
   function svg(name) { return '<svg viewBox="0 0 24 24">' + (I[name] || '') + '</svg>'; }
 
@@ -535,15 +579,20 @@ pre.code {
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
     return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
   }
+  function fmtUtc(ms) {
+    if (!ms || !isFinite(Number(ms))) return '—';
+    try { return new Date(Number(ms)).toISOString(); } catch (e) { return '—'; }
+  }
 
   // ---- Auth state + API helper ---------------------------------------------
   var TOKEN_KEY = 'citadel.console.token';
   var ROLE_KEY = 'citadel.console.role';
-  var state = { user: null };
+  var state = { user: null, sessionGeneration: 0, viewGeneration: 0 };
   var ACT = {};   // per-view click actions: data-act -> fn(dataset, el)
   var FORM = {};  // per-view form actions: data-form -> fn(values, formEl)
 
   function token() { return sessionStorage.getItem(TOKEN_KEY) || ''; }
+  function isAdmin() { return !!(state.user && state.user.role === 'admin'); }
   function isViewer() { return !!(state.user && state.user.role === 'viewer'); }
   function adminDis() { return isViewer() ? ' disabled title="admin role required"' : ''; }
 
@@ -571,6 +620,22 @@ pre.code {
     });
   }
 
+  function captureApiKeyRequestContext() {
+    return {
+      route: currentRoute(),
+      sessionGeneration: state.sessionGeneration,
+      viewGeneration: state.viewGeneration,
+      token: token()
+    };
+  }
+  function apiKeyRequestContextIsCurrent(context) {
+    return !!state.user
+      && context.route === currentRoute()
+      && context.sessionGeneration === state.sessionGeneration
+      && context.viewGeneration === state.viewGeneration
+      && context.token === token();
+  }
+
   // ---- Toast ----------------------------------------------------------------
   var toastTimer = null;
   function toast(msg, kind) {
@@ -583,17 +648,53 @@ pre.code {
   function fail(e) { if (e && e.message !== 'session expired') toast(e.message || 'request failed', 'err'); }
 
   // ---- Modal (inline dialog; native dialogs are never used) -----------------
+  var modalReturnFocus = null;
+  var modalGeneration = 0;
   function openModal(title, bodyHtml) {
-    qs('modal-root').innerHTML =
-      '<div class="modal-back"><div class="panel modal">'
-      + '<div class="panel-head"><h2>' + esc(title) + '</h2><div class="spacer"></div>'
+    modalGeneration += 1;
+    var modalRoot = qs('modal-root');
+    if (!modalRoot.firstChild) modalReturnFocus = document.activeElement;
+    modalRoot.innerHTML =
+      '<div class="modal-back"><div class="panel modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">'
+      + '<div class="panel-head"><h2 id="modal-title">' + esc(title) + '</h2><div class="spacer"></div>'
       + '<button class="btn small" data-act="modal-close">Close</button></div>'
       + '<div class="panel-body">' + bodyHtml + '</div></div></div>';
+    var dialog = modalRoot.querySelector('[role="dialog"]');
+    var focusableSelector = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+    var modalFocusTarget = dialog.querySelector('.panel-body input:not([disabled]), .panel-body select:not([disabled]), .panel-body textarea:not([disabled]), .panel-body [tabindex]:not([tabindex="-1"]), .panel-body button:not([disabled])')
+      || dialog.querySelector(focusableSelector);
+    if (modalFocusTarget) modalFocusTarget.focus();
+    dialog.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeModal();
+        return;
+      }
+      if (ev.key !== 'Tab') return;
+      var focusable = dialog.querySelectorAll(focusableSelector);
+      if (!focusable.length) { ev.preventDefault(); return; }
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (ev.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        ev.preventDefault();
+        last.focus();
+      } else if (!ev.shiftKey && document.activeElement === last) {
+        ev.preventDefault();
+        first.focus();
+      }
+    });
+    return modalGeneration;
   }
-  function closeModal() { qs('modal-root').innerHTML = ''; }
+  function closeModal() {
+    modalGeneration += 1;
+    qs('modal-root').replaceChildren();
+    if (modalReturnFocus && document.contains(modalReturnFocus)) modalReturnFocus.focus();
+    modalReturnFocus = null;
+  }
 
   // ---- Inline confirm: swap the button for a "Confirm? Yes / No" pair -------
   function armConfirm(btn) {
+    var confirmReturnFocus = document.activeElement;
     var wrap = document.createElement('span');
     wrap.className = 'confirm-inline';
     var q = document.createElement('span');
@@ -614,7 +715,19 @@ pre.code {
     no.setAttribute('data-act', '__cancel');
     wrap.appendChild(q); wrap.appendChild(yes); wrap.appendChild(no);
     wrap.__orig = btn;
+    wrap.__restore = function () {
+      wrap.replaceWith(btn);
+      if (confirmReturnFocus && document.contains(confirmReturnFocus)) confirmReturnFocus.focus();
+      else btn.focus();
+    };
+    wrap.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') { ev.preventDefault(); wrap.__restore(); return; }
+      if (ev.key !== 'Tab') return;
+      if (ev.shiftKey && document.activeElement === yes) { ev.preventDefault(); no.focus(); }
+      else if (!ev.shiftKey && document.activeElement === no) { ev.preventDefault(); yes.focus(); }
+    });
     btn.replaceWith(wrap);
+    yes.focus();
   }
 
   // ---- Event delegation (clicks + form submits, whole document) --------------
@@ -626,12 +739,14 @@ pre.code {
       if (act === '__cancel') {
         ev.preventDefault();
         var w = btn.closest('.confirm-inline');
-        if (w && w.__orig) w.replaceWith(w.__orig);
+        if (w && w.__restore) w.__restore();
         return;
       }
       if (btn.hasAttribute('data-confirm')) { ev.preventDefault(); armConfirm(btn); return; }
       if (act === 'logout') { ev.preventDefault(); logout(false); return; }
       if (act === 'modal-close') { ev.preventDefault(); closeModal(); return; }
+      var confirmation = btn.closest('.confirm-inline');
+      if (confirmation && confirmation.__restore) confirmation.__restore();
       var fn = ACT[act];
       if (fn) { ev.preventDefault(); fn(btn.dataset, btn); }
     });
@@ -750,11 +865,18 @@ pre.code {
     { label: 'Commerce', items: [
       { id: 'purchases', title: 'Purchases & Subscriptions', icon: 'cart' }
     ]},
-    { label: 'System', items: [
-      { id: 'configuration', title: 'Configuration', icon: 'settings' },
-      { id: 'api', title: 'API Explorer / Runtime', icon: 'terminal' },
+    { label: 'Logs & Diagnostics', items: [
+      { id: 'logs', title: 'Script Logs', icon: 'scroll' },
+      { id: 'match-records', title: 'Match Records', icon: 'layers' },
+      { id: 'telemetry-slices', title: 'Telemetry Slices', icon: 'activity' },
+      { id: 'lag-diagnostics', title: 'Lag Diagnostics', icon: 'activity' },
       { id: 'audit', title: 'Audit Logs', icon: 'scroll' },
       { id: 'errors', title: 'Error Journal', icon: 'alert' }
+    ]},
+    { label: 'System', items: [
+      { id: 'configuration', title: 'Configuration', icon: 'settings' },
+      { id: 'api-keys', title: 'API Keys', icon: 'key', adminOnly: true },
+      { id: 'api', title: 'API Explorer / Runtime', icon: 'terminal' }
     ]}
   ];
 
@@ -766,6 +888,7 @@ pre.code {
     NAV.forEach(function (g) {
       html += '<div class="nav-group"><div class="label">' + esc(g.label) + '</div>';
       g.items.forEach(function (it) {
+        if (it.adminOnly && !isAdmin()) return;
         var cls = 'nav-item' + (it.id === active ? ' active' : '');
         html += '<a class="' + cls + '" href="#/' + it.id + '">'
           + '<span class="ico">' + svg(it.icon) + '</span>'
@@ -785,9 +908,10 @@ pre.code {
   }
   function currentRoute() {
     var h = (location.hash || '').replace(/^#\/?/, '').trim();
-    return ROUTES[h] ? h : 'status';
+    return ROUTES[h] && (!ROUTES[h].adminOnly || isAdmin()) ? h : 'status';
   }
   function render() {
+    state.viewGeneration += 1;
     if (!state.user) return;
     var id = currentRoute();
     var route = ROUTES[id];
@@ -2003,6 +2127,168 @@ pre.code {
     };
   }
 
+  // ==== API Keys (human admin only) ============================================
+  var API_KEY_SCOPES = [
+    'telemetry:read', 'config:read', 'audit:read', 'errors:read',
+    'accounts:read', 'groups:read', 'runtime:read', 'matches:read',
+    'storage:read', 'database:read', 'chat:read', 'notifications:read',
+    'leaderboards:read', 'tournaments:read', 'purchases:read', 'subscriptions:read',
+    'logs:read'
+  ];
+
+  function apiKeyStateTag(status) {
+    if (status === 'active') return '<span class="pill ok"><span class="dot"></span>active</span>';
+    if (status === 'expired') return '<span class="pill warn"><span class="dot"></span>expired</span>';
+    return '<span class="pill bad"><span class="dot"></span>revoked</span>';
+  }
+
+  function setApiKeyError(message) {
+    var error = qs('api-key-error');
+    if (!error) return;
+    error.textContent = message || '';
+    if (message) error.removeAttribute('hidden'); else error.setAttribute('hidden', '');
+  }
+
+  function renderApiKeys() {
+    ACT = {}; FORM = {};
+    if (!isAdmin()) {
+      location.replace('#/status');
+      return;
+    }
+    setPage(pageHead('API Keys', 'Read-only machine credentials. Metadata is listed here; secrets are never returned after issuance.',
+      '<button class="btn primary" data-act="api-key-new">' + svg('plus') + 'Create API key</button>')
+      + '<div id="api-key-error" class="inline-error" role="alert" aria-live="polite" hidden></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Keys</h2><span class="sub" id="api-key-count"></span>'
+      + '<div class="spacer"></div><button class="btn small" data-act="api-key-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div id="api-key-table">' + loadingRows(8) + '</div></div>');
+    ACT['api-key-new'] = openApiKeyCreate;
+    ACT['api-key-refresh'] = loadApiKeys;
+    ACT['api-key-rotate'] = rotateApiKey;
+    ACT['api-key-revoke'] = revokeApiKey;
+    loadApiKeys();
+  }
+
+  function loadApiKeys() {
+    setApiKeyError('');
+    api('GET', '/console/v1/api-keys').then(function (d) {
+      var keys = d.keys || [];
+      var rows = '';
+      keys.forEach(function (key) {
+        var usable = key.status === 'active';
+        var disabled = usable ? '' : ' disabled title="only active keys can be changed"';
+        var actions = '<span class="form-row">'
+          + '<button class="btn small" data-act="api-key-rotate" data-id="' + esc(key.id)
+          + '" data-generation="' + esc(key.generation) + '" data-confirm' + disabled + '>Rotate</button>'
+          + '<button class="btn small danger" data-act="api-key-revoke" data-id="' + esc(key.id)
+          + '" data-generation="' + esc(key.generation) + '" data-confirm' + disabled + '>Revoke</button></span>';
+        rows += '<tr><td><b>' + esc(key.name) + '</b><br><span class="mono">' + esc(key.id) + '</span></td>'
+          + '<td>' + apiKeyStateTag(key.status) + '</td>'
+          + '<td>' + (key.scopes || []).map(function (scope) { return '<span class="tag-soft">' + esc(scope) + '</span>'; }).join(' ') + '</td>'
+          + '<td>' + esc(fmtTime(key.created_at)) + '</td>'
+          + '<td>' + esc(key.expires_at == null ? 'never' : fmtTime(key.expires_at)) + '</td>'
+          + '<td>' + esc(fmtTime(key.last_used_at)) + '</td>'
+          + '<td>' + esc(key.generation) + '</td><td>' + actions + '</td></tr>';
+      });
+      if (!keys.length) rows = emptyRowHtml(8, 'No API keys have been created.');
+      setHtml('api-key-table', tableHtml(['Name / public ID', 'Status', 'Scopes', 'Created', 'Expires', 'Last used', 'Generation', 'Actions'], rows));
+      setText('api-key-count', fmtNum(keys.length) + ' key(s)');
+    }).catch(function (error) {
+      setHtml('api-key-table', emptyBlock('key', 'Could not load API keys', 'Try again or inspect the server error journal.'));
+      setApiKeyError(error.message || 'request failed');
+    });
+  }
+
+  function openApiKeyCreate() {
+    var scopeOptions = API_KEY_SCOPES.map(function (scope) {
+      return '<label class="scope-option"><input type="checkbox" name="scopes" value="' + esc(scope) + '">'
+        + esc(scope) + '</label>';
+    }).join('');
+    openModal('Create API key',
+      '<form data-form="api-key-create">'
+      + '<div id="api-key-form-error" class="inline-error" role="alert" aria-live="polite" hidden></div>'
+      + field('Name', '<input class="form-in" name="name" maxlength="128" autocomplete="off" required placeholder="metrics collector">')
+      + '<fieldset class="field" style="border:0;padding:0;margin:0 0 12px"><legend style="color:var(--text-muted);font-size:12px;font-weight:600;margin-bottom:6px">Read scopes (choose at least one)</legend>'
+      + '<div class="scope-grid">' + scopeOptions + '</div></fieldset>'
+      + field('Expiration (optional)', '<input class="form-in" type="datetime-local" name="expires_at">')
+      + '<button class="btn primary" type="submit">' + svg('key') + 'Create and reveal secret</button>'
+      + '</form>');
+    FORM['api-key-create'] = function (values, form) {
+      var selected = Array.prototype.map.call(form.querySelectorAll('input[name="scopes"]:checked'), function (input) { return input.value; });
+      var error = qs('api-key-form-error');
+      function formError(message) {
+        if (!error) return;
+        error.textContent = message || '';
+        if (message) error.removeAttribute('hidden'); else error.setAttribute('hidden', '');
+      }
+      var name = (values.name || '').trim();
+      if (!name) { formError('Name is required.'); return; }
+      if (!selected.length) { formError('Choose at least one read scope.'); return; }
+      var expiresAt = null;
+      if (values.expires_at) {
+        expiresAt = Date.parse(values.expires_at);
+        if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+          formError('Expiration must be a valid future date and time.');
+          return;
+        }
+      }
+      formError('');
+      var requestContext = captureApiKeyRequestContext();
+      api('POST', '/console/v1/api-keys', { name: name, scopes: selected, expires_at: expiresAt })
+        .then(function (issued) {
+          if (!apiKeyRequestContextIsCurrent(requestContext)) return;
+          loadApiKeys();
+          showApiKeySecret('API key created', issued);
+        })
+        .catch(function (apiError) { formError(apiError.message || 'request failed'); });
+    };
+  }
+
+  function showApiKeySecret(title, issued) {
+    openModal(title,
+      '<div class="notice">' + svg('alert') + '<div><b>Copy this secret now.</b> It is shown only once. '
+      + 'Closing this dialog or navigating away permanently removes it from the console.</div></div>'
+      + '<pre class="code secret-value" id="api-key-secret" tabindex="0">' + esc(issued.secret) + '</pre>'
+      + '<div id="api-key-secret-error" class="inline-error" role="alert" aria-live="polite" hidden style="margin-top:12px"></div>'
+      + '<div class="toolbar" style="margin-top:14px;margin-bottom:0"><button class="btn primary" data-act="api-key-copy">Copy secret</button></div>');
+    ACT['api-key-copy'] = function () {
+      var secretNode = qs('api-key-secret');
+      var error = qs('api-key-secret-error');
+      if (!secretNode) return;
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        error.textContent = 'Clipboard access is unavailable. Select and copy the secret manually.';
+        error.removeAttribute('hidden');
+        secretNode.focus();
+        return;
+      }
+      navigator.clipboard.writeText(secretNode.textContent)
+        .then(function () { toast('API key secret copied', 'ok'); })
+        .catch(function () {
+          error.textContent = 'Copy failed. Select and copy the secret manually.';
+          error.removeAttribute('hidden');
+          secretNode.focus();
+        });
+    };
+  }
+
+  function rotateApiKey(data) {
+    setApiKeyError('');
+    var requestContext = captureApiKeyRequestContext();
+    api('POST', '/console/v1/api-keys/' + encodeURIComponent(data.id) + '/rotate', { generation: Number(data.generation) })
+      .then(function (issued) {
+        if (!apiKeyRequestContextIsCurrent(requestContext)) return;
+        loadApiKeys();
+        showApiKeySecret('API key rotated', issued);
+      })
+      .catch(function (error) { setApiKeyError(error.message || 'request failed'); });
+  }
+
+  function revokeApiKey(data) {
+    setApiKeyError('');
+    api('POST', '/console/v1/api-keys/' + encodeURIComponent(data.id) + '/revoke', { generation: Number(data.generation) })
+      .then(function () { toast('API key revoked', 'ok'); loadApiKeys(); })
+      .catch(function (error) { setApiKeyError(error.message || 'request failed'); });
+  }
+
   // ==== Configuration ==========================================================
   var cfgData = null;
 
@@ -2114,46 +2400,164 @@ pre.code {
     };
   }
 
+
+  // ==== Telemetry Slices =======================================================
+  // Aggregate-only closed reports. On a backend with the durable table this is
+  // history rather than a process-local cache, so it pages by cursor and says
+  // which of the two it is reading.
+  var slices = { match_id: '', limit: 100, items: [], next: null, loading: false, page: null };
+
+  function slicesAreCurrent() { return currentRoute() === 'telemetry-slices'; }
+
+  function slicePath(after) {
+    var q = '/console/v1/telemetry/slices?limit=' + slices.limit;
+    if (slices.match_id) q += '&match_id=' + encodeURIComponent(slices.match_id);
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
+  }
+
+  function renderTelemetrySlices() {
+    ACT = {}; FORM = {};
+    slices.items = []; slices.next = null; slices.loading = false; slices.page = null;
+    setPage(pageHead('Telemetry Slices', 'Closed, bounded authoritative-decision reports. No packet payloads or player identity are retained.')
+      + '<div class="toolbar">' + searchBox('ts-match', 'Filter by match id', slices.match_id)
+      + '<div class="grow"></div><button class="btn" data-act="ts-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Closed reports</h2><span class="sub" id="ts-meta"></span></div>'
+      + '<div id="ts-table">' + loadingRows(9) + '</div>'
+      + '<div class="pager" id="ts-pager"></div></div>');
+    bindSearch('ts-match', function (v) { slices.match_id = v; loadTelemetrySlices(true); });
+    ACT['ts-refresh'] = function () { loadTelemetrySlices(true); };
+    ACT['ts-more'] = function () { loadTelemetrySlices(false); };
+    ACT['ts-detail'] = function (data) { openTelemetrySlice(data.id); };
+    loadTelemetrySlices(true);
+  }
+
+  function loadTelemetrySlices(reset) {
+    if (slices.loading || (!reset && !slices.next)) return;
+    var after = reset ? null : slices.next;
+    var viewGeneration = state.viewGeneration;
+    slices.loading = true;
+    api('GET', slicePath(after)).then(function (page) {
+      if (!slicesAreCurrent() || viewGeneration !== state.viewGeneration) return;
+      slices.items = reset ? (page.items || []) : slices.items.concat(page.items || []);
+      slices.next = page.next_after || null;
+      slices.page = page;
+      slices.loading = false;
+      renderTelemetrySlicesTable();
+    }).catch(function (error) {
+      if (!slicesAreCurrent() || viewGeneration !== state.viewGeneration) return;
+      slices.loading = false;
+      renderTelemetrySlicesTable();
+      fail(error);
+    });
+  }
+
+  function renderTelemetrySlicesTable() {
+    var page = slices.page || {};
+    var rows = '';
+    slices.items.forEach(function (r) {
+      var totals = fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total);
+      rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(r.closed_at_ms)) + '</td>'
+        + '<td class="mono">' + esc(r.report_id) + '</td>'
+        + '<td class="mono">' + esc(r.match_id || '—') + '</td>'
+        + '<td>' + esc(r.context_kind) + '</td><td>' + esc(r.close_reason) + '</td>'
+        + '<td>' + esc(fmtNum(r.duration_ms)) + ' ms</td><td>' + esc(totals) + '</td>'
+        + '<td>' + (r.truncated ? '<span class="tag-soft off">truncated</span>' : '<span class="tag-soft on">complete</span>') + '</td>'
+        + '<td><button class="btn small" data-act="ts-detail" data-id="' + esc(r.report_id) + '">View</button></td></tr>';
+    });
+    if (!rows) rows = emptyRowHtml(9, 'No closed telemetry slices are retained.');
+    setHtml('ts-table', tableHtml(['Closed', 'Report', 'Match', 'Context', 'Close reason', 'Duration', 'Accept / Reject / Correct', 'Completeness', ''], rows));
+    setText('ts-meta', fmtNum(slices.items.length) + ' loaded');
+    setHtml('ts-pager', durabilityNote(page) + '<div class="grow"></div>'
+      + (slices.next ? '<button class="btn small" data-act="ts-more">Load more</button>' : ''));
+  }
+
+  function openTelemetrySlice(reportId) {
+    if (!reportId) return;
+    var viewGeneration = state.viewGeneration;
+    api('GET', '/console/v1/telemetry/slices/' + encodeURIComponent(reportId)).then(function (r) {
+      if (!state.user || viewGeneration !== state.viewGeneration) return;
+      openModal('Telemetry slice ' + r.report_id,
+        '<div class="panel-body"><p><b>Match:</b> ' + esc(r.match_id || 'no match scope') + '</p><p><b>Context:</b> ' + esc(r.context_kind) + '</p><p><b>Close reason:</b> ' + esc(r.close_reason) + '</p><p><b>Duration:</b> ' + esc(fmtNum(r.duration_ms)) + ' ms</p><p><b>Markers:</b> ' + esc(fmtNum(r.marker_total || 0)) + '</p><p><b>Accepted / rejected / corrected:</b> ' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</p><p><b>Completeness:</b> ' + esc(r.truncated ? 'truncated by bounded retention' : 'complete within retained window') + '</p></div>');
+    }).catch(fail);
+  }
+
   // ==== Audit Logs =============================================================
-  var aud = { actor: '', action: '', limit: 100 };
+  // Operator actions are deliberately not match-scoped: the match filter exists
+  // to answer "what did an operator do to this match", and almost every entry
+  // carries no match at all.
+  var aud = { actor: '', action: '', match_id: '', limit: 100, entries: [], next: null, loading: false };
+
+  function auditIsCurrent() { return currentRoute() === 'audit'; }
+
+  function auditPath(after) {
+    var q = '/console/v1/audit?limit=' + aud.limit;
+    if (aud.actor) q += '&actor=' + encodeURIComponent(aud.actor);
+    if (aud.action) q += '&action=' + encodeURIComponent(aud.action);
+    if (aud.match_id) q += '&match_id=' + encodeURIComponent(aud.match_id);
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
+  }
 
   function renderAudit() {
     ACT = {}; FORM = {};
+    aud.entries = []; aud.next = null; aud.loading = false;
     setPage(pageHead('Audit Logs', 'Every console mutation and login attempt: who did what, when.')
       + '<div class="toolbar">'
       + searchBox('aud-actor', 'Filter by actor', aud.actor)
       + searchBox('aud-action', 'Filter by action prefix', aud.action)
+      + searchBox('aud-match', 'Filter by match id', aud.match_id)
       + '<input class="form-in" id="aud-limit" type="number" min="1" max="500" value="' + aud.limit + '" style="width:90px" title="page size">'
       + '<div class="grow"></div>'
       + '<button class="btn" data-act="aud-refresh">' + svg('refresh') + 'Refresh</button></div>'
       + '<div class="panel"><div class="panel-head"><h2>Trail</h2><span class="sub" id="aud-meta"></span></div>'
-      + '<div id="aud-table">' + loadingRows(6) + '</div></div>');
-    bindSearch('aud-actor', function (v) { aud.actor = v; loadAudit(); });
-    bindSearch('aud-action', function (v) { aud.action = v; loadAudit(); });
-    ACT['aud-refresh'] = loadAudit;
-    loadAudit();
+      + '<div id="aud-table">' + loadingRows(7) + '</div>'
+      + '<div class="pager" id="aud-pager"></div></div>');
+    bindSearch('aud-actor', function (v) { aud.actor = v; loadAudit(true); });
+    bindSearch('aud-action', function (v) { aud.action = v; loadAudit(true); });
+    bindSearch('aud-match', function (v) { aud.match_id = v; loadAudit(true); });
+    ACT['aud-refresh'] = function () { loadAudit(true); };
+    ACT['aud-more'] = function () { loadAudit(false); };
+    loadAudit(true);
   }
 
-  function loadAudit() {
+  function loadAudit(reset) {
+    if (aud.loading || (!reset && !aud.next)) return;
     var limitEl = qs('aud-limit');
     if (limitEl) aud.limit = Math.max(1, Math.min(500, Number(limitEl.value) || 100));
-    var q = '/console/v1/audit?limit=' + aud.limit;
-    if (aud.actor) q += '&actor=' + encodeURIComponent(aud.actor);
-    if (aud.action) q += '&action=' + encodeURIComponent(aud.action);
-    api('GET', q).then(function (d) {
-      var rows = '';
-      d.entries.forEach(function (e) {
-        rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(e.time_unix_ms)) + '</td>'
-          + '<td><b>' + esc(e.actor) + '</b></td>'
-          + '<td><span class="tag-soft' + (e.role === 'admin' ? ' on' : '') + '">' + esc(e.role) + '</span></td>'
-          + '<td class="mono">' + esc(e.action) + '</td>'
-          + '<td>' + esc(e.target) + '</td>'
-          + '<td>' + esc(e.details) + '</td></tr>';
-      });
-      if (!d.entries.length) rows = emptyRowHtml(6, 'No audit entries match.');
-      setHtml('aud-table', tableHtml(['Time', 'Actor', 'Role', 'Action', 'Target', 'Details'], rows));
-      setText('aud-meta', fmtNum(d.retained) + ' retained of ' + fmtNum(d.capacity) + ' capacity');
-    }).catch(fail);
+    var after = reset ? null : aud.next;
+    var viewGeneration = state.viewGeneration;
+    aud.loading = true;
+    api('GET', auditPath(after)).then(function (d) {
+      if (!auditIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      aud.entries = reset ? (d.entries || []) : aud.entries.concat(d.entries || []);
+      aud.next = d.next_after || null;
+      aud.loading = false;
+      renderAuditTable(d);
+    }).catch(function (error) {
+      if (!auditIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      aud.loading = false;
+      fail(error);
+    });
+  }
+
+  function renderAuditTable(page) {
+    var rows = '';
+    aud.entries.forEach(function (e) {
+      rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(e.time_unix_ms)) + '</td>'
+        + '<td><b>' + esc(e.actor) + '</b></td>'
+        + '<td><span class="tag-soft' + (e.role === 'admin' ? ' on' : '') + '">' + esc(e.role) + '</span></td>'
+        + '<td class="mono">' + esc(e.action) + '</td>'
+        + '<td>' + esc(e.target) + '</td>'
+        + '<td class="mono">' + esc(e.match_id || '—') + '</td>'
+        + '<td>' + esc(e.details) + '</td></tr>';
+    });
+    if (!aud.entries.length) rows = emptyRowHtml(7, 'No audit entries match.');
+    setHtml('aud-table', tableHtml(['Time', 'Actor', 'Role', 'Action', 'Target', 'Match', 'Details'], rows));
+    setText('aud-meta', fmtNum(page.retained) + ' retained of ' + fmtNum(page.capacity) + ' capacity');
+    setHtml('aud-pager', '<span>' + esc(fmtNum(aud.entries.length)) + ' loaded</span>'
+      + durabilityNote(page) + '<div class="grow"></div>'
+      + (aud.next ? '<button class="btn small" data-act="aud-more">Load more</button>' : ''));
   }
 
   // ==== Error Journal ==========================================================
@@ -2197,6 +2601,790 @@ pre.code {
     }).catch(fail);
   }
 
+  // ==== Logs ===================================================================
+  // The durable stream a game script writes with citadel.log.write. Every value
+  // on this page is author-supplied: the server stores `message` and
+  // `payload_json` exactly as the script wrote them and redacts neither, so the
+  // page escapes everything and warns before showing a payload.
+  var LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
+  var logs = {
+    match_id: '', level: '', tag: '', limit: 50,
+    items: [], next: null, loading: false, page: null
+  };
+
+  // A backend without durable log tables answers 200 with an empty page and
+  // `durable: false` rather than an error, so the page says which it got instead
+  // of implying a process-local cache is history.
+  function durabilityNote(page) {
+    if (!page || page.durable === undefined || page.durable === null) return '';
+    if (!page.durable) return '<span class="tag-soft off">not durable on this backend</span>';
+    var dropped = page.dropped_total || 0;
+    return '<span class="tag-soft on">durable</span>'
+      + (dropped ? '<span class="tag-soft warn">' + esc(fmtNum(dropped)) + ' dropped before flush</span>' : '');
+  }
+
+  function jsonText(raw) {
+    if (raw == null || raw === '') return 'none';
+    try { return jsonPretty(JSON.parse(raw)); } catch (e) { return String(raw); }
+  }
+
+  function logLevelTag(level) {
+    var value = String(level || 'info');
+    var cls = value === 'error' ? 'bad' : (value === 'warn' ? 'warn' : (value === 'info' ? 'on' : 'off'));
+    return '<span class="tag-soft ' + cls + '">' + esc(value) + '</span>';
+  }
+
+  // A listing never carries payload text, only has_payload: a page of 200
+  // author-supplied payloads is a large response for rows nobody opened yet.
+  function logRowsHtml(items, showMatch) {
+    var rows = '';
+    (items || []).forEach(function (entry) {
+      rows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(entry.created_at_unix_ms)) + '</td>'
+        + '<td>' + logLevelTag(entry.level) + '</td>'
+        + '<td class="mono">' + esc(entry.tag) + '</td>'
+        + (showMatch ? '<td class="mono">' + esc(entry.match_id || '—') + '</td>' : '')
+        + '<td>' + esc(entry.message) + '</td>'
+        + '<td>' + (entry.has_payload ? '<span class="tag-soft">payload</span>' : '<span class="lag-muted">—</span>') + '</td>'
+        + '<td><button class="btn small" data-act="log-open" data-log="' + esc(entry.log_id) + '">View</button></td></tr>';
+    });
+    return rows;
+  }
+
+  function logsIsCurrent() { return currentRoute() === 'logs'; }
+
+  function logPath(after) {
+    var q = '/console/v1/logs?limit=' + logs.limit;
+    if (logs.match_id) q += '&match_id=' + encodeURIComponent(logs.match_id);
+    if (logs.level) q += '&level=' + encodeURIComponent(logs.level);
+    if (logs.tag) q += '&tag=' + encodeURIComponent(logs.tag);
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
+  }
+
+  function renderLogs() {
+    ACT = {}; FORM = {};
+    logs.items = []; logs.next = null; logs.loading = false; logs.page = null;
+    var levelOptions = '<option value="">All levels</option>';
+    LOG_LEVELS.forEach(function (level) {
+      levelOptions += '<option value="' + esc(level) + '"' + (logs.level === level ? ' selected' : '') + '>' + esc(level) + '</option>';
+    });
+    setPage(pageHead('Script Logs', 'The durable log stream your game script writes. Messages and payloads are stored verbatim and are never redacted.')
+      + '<div class="toolbar">' + searchBox('log-tag', 'Filter by tag prefix', logs.tag)
+      + searchBox('log-match', 'Filter by match id', logs.match_id)
+      + '<select class="form-in" id="log-level" style="width:140px" title="level">' + levelOptions + '</select>'
+      + '<div class="grow"></div>'
+      + '<button class="btn" data-act="log-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Stream</h2><span class="sub" id="log-meta"></span></div>'
+      + '<div id="log-table">' + loadingRows(7) + '</div>'
+      + '<div class="pager" id="log-pager"></div></div>');
+    bindSearch('log-tag', function (v) { logs.tag = v; loadLogs(true); });
+    bindSearch('log-match', function (v) { logs.match_id = v; loadLogs(true); });
+    var levelEl = qs('log-level');
+    if (levelEl) levelEl.addEventListener('change', function () { logs.level = levelEl.value; loadLogs(true); });
+    ACT['log-refresh'] = function () { loadLogs(true); };
+    ACT['log-more'] = function () { loadLogs(false); };
+    ACT['log-open'] = function (data) { openLog(data.log); };
+    loadLogs(true);
+  }
+
+  function loadLogs(reset) {
+    if (logs.loading || (!reset && !logs.next)) return;
+    var after = reset ? null : logs.next;
+    var viewGeneration = state.viewGeneration;
+    logs.loading = true;
+    api('GET', logPath(after)).then(function (page) {
+      if (!logsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      logs.items = reset ? (page.items || []) : logs.items.concat(page.items || []);
+      logs.next = page.next_after || null;
+      logs.page = page;
+      logs.loading = false;
+      renderLogsTable();
+    }).catch(function (error) {
+      if (!logsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      logs.loading = false;
+      renderLogsTable();
+      fail(error);
+    });
+  }
+
+  function renderLogsTable() {
+    var page = logs.page || {};
+    var rows = logRowsHtml(logs.items, true);
+    if (!rows) {
+      rows = emptyRowHtml(7, page.durable === false
+        ? 'This backend keeps no durable log storage, so script logs are not retained.'
+        : 'No script log lines match.');
+    }
+    setHtml('log-table', tableHtml(['Written', 'Level', 'Tag', 'Match', 'Message', 'Payload', ''], rows));
+    setText('log-meta', fmtNum(logs.items.length) + ' loaded');
+    setHtml('log-pager', durabilityNote(page) + '<div class="grow"></div>'
+      + (logs.next ? '<button class="btn small" data-act="log-more">Load more</button>' : ''));
+  }
+
+  function openLog(logId) {
+    if (!logId) return;
+    var viewGeneration = state.viewGeneration;
+    api('GET', '/console/v1/logs/' + encodeURIComponent(logId)).then(function (entry) {
+      if (!state.user || viewGeneration !== state.viewGeneration) return;
+      openModal('Log ' + entry.log_id,
+        '<table class="kv">'
+        + kv('Written', fmtTime(entry.created_at_unix_ms))
+        + kv('UTC', fmtUtc(entry.created_at_unix_ms))
+        + kvRaw('Level', logLevelTag(entry.level))
+        + kv('Tag', entry.tag)
+        + kv('Match', entry.match_id || 'no match scope')
+        + kv('Node', entry.node_id)
+        + '</table>'
+        + '<pre class="code">' + esc(entry.message) + '</pre>'
+        + '<p class="lag-note">Payload is written by your game script and is stored verbatim. Do not write secrets into it.</p>'
+        + '<pre class="code">' + esc(jsonText(entry.payload_json)) + '</pre>');
+    }).catch(fail);
+  }
+
+  // ==== Match Records ==========================================================
+  // The durable, server-owned record of a match. Distinct from Matches, which is
+  // the live room registry: a record outlives its room, its node and its boot,
+  // and only the server ever opens or closes one.
+  var matchRecords = {
+    open_only: false, limit: 50, items: [], next: null, loading: false, page: null,
+    view: 'list', detail: null, entries: [], entriesNext: null, entriesLoading: false
+  };
+
+  function matchRecordsIsCurrent() { return currentRoute() === 'match-records'; }
+
+  function matchRecordPath(after) {
+    var q = '/console/v1/matchlogs?limit=' + matchRecords.limit;
+    if (matchRecords.open_only) q += '&open=true';
+    if (after) q += '&after=' + encodeURIComponent(after);
+    return q;
+  }
+
+  function matchStateTag(record) {
+    if (record.open) return '<span class="tag-soft on">open</span>';
+    return '<span class="tag-soft off">' + esc(record.termination_reason || 'closed') + '</span>';
+  }
+
+  function renderMatchRecords() {
+    ACT = {}; FORM = {};
+    matchRecords.view = 'list';
+    matchRecords.items = []; matchRecords.next = null; matchRecords.loading = false; matchRecords.page = null;
+    matchRecords.detail = null; matchRecords.entries = []; matchRecords.entriesNext = null; matchRecords.entriesLoading = false;
+    setPage(pageHead('Match Records', 'Durable records of the matches this node ran, and everything it retained about each one.')
+      + '<div class="toolbar"><select class="form-in" id="mr-open" style="width:170px" title="lifecycle filter">'
+      + '<option value="all">All matches</option>'
+      + '<option value="open"' + (matchRecords.open_only ? ' selected' : '') + '>Still open only</option></select>'
+      + '<div class="grow"></div>'
+      + '<button class="btn" data-act="mr-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="panel"><div class="panel-head"><h2>Records</h2><span class="sub" id="mr-meta"></span></div>'
+      + '<div id="mr-table">' + loadingRows(7) + '</div>'
+      + '<div class="pager" id="mr-pager"></div></div>');
+    var openEl = qs('mr-open');
+    if (openEl) {
+      openEl.addEventListener('change', function () {
+        matchRecords.open_only = openEl.value === 'open';
+        loadMatchRecords(true);
+      });
+    }
+    ACT['mr-refresh'] = function () { loadMatchRecords(true); };
+    ACT['mr-more'] = function () { loadMatchRecords(false); };
+    ACT['mr-open-record'] = function (data) { openMatchRecord(data.match); };
+    loadMatchRecords(true);
+  }
+
+  function loadMatchRecords(reset) {
+    if (matchRecords.loading || (!reset && !matchRecords.next)) return;
+    var after = reset ? null : matchRecords.next;
+    var viewGeneration = state.viewGeneration;
+    matchRecords.loading = true;
+    api('GET', matchRecordPath(after)).then(function (page) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.view !== 'list') return;
+      matchRecords.items = reset ? (page.items || []) : matchRecords.items.concat(page.items || []);
+      matchRecords.next = page.next_after || null;
+      matchRecords.page = page;
+      matchRecords.loading = false;
+      renderMatchRecordsTable();
+    }).catch(function (error) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.view !== 'list') return;
+      matchRecords.loading = false;
+      renderMatchRecordsTable();
+      fail(error);
+    });
+  }
+
+  function renderMatchRecordsTable() {
+    var page = matchRecords.page || {};
+    var rows = '';
+    matchRecords.items.forEach(function (record) {
+      rows += '<tr class="rowlink" data-act="mr-open-record" data-match="' + esc(record.match_id) + '">'
+        + '<td style="white-space:nowrap">' + esc(fmtTime(record.opened_at_unix_ms)) + '</td>'
+        + '<td class="mono">' + esc(record.match_id) + '</td>'
+        + '<td><b>' + esc(record.name || '—') + '</b></td>'
+        + '<td>' + esc((record.map || '—') + ' / ' + (record.mode || '—')) + '</td>'
+        + '<td>' + esc(fmtNum(record.peak_participants || 0) + ' peak · ' + fmtNum(record.join_total || 0) + ' joins') + '</td>'
+        + '<td>' + matchStateTag(record) + '</td>'
+        + '<td style="white-space:nowrap">' + esc(record.closed_at_unix_ms ? fmtTime(record.closed_at_unix_ms) : '—') + '</td></tr>';
+    });
+    if (!rows) {
+      rows = emptyRowHtml(7, page.durable === false
+        ? 'This backend keeps no durable match records.'
+        : 'No matches have been recorded yet.');
+    }
+    setHtml('mr-table', tableHtml(['Opened', 'Match', 'Name', 'Map / Mode', 'Participants', 'State', 'Closed'], rows));
+    setText('mr-meta', fmtNum(matchRecords.items.length) + ' loaded');
+    setHtml('mr-pager', durabilityNote(page) + '<div class="grow"></div>'
+      + (matchRecords.next ? '<button class="btn small" data-act="mr-more">Load more</button>' : ''));
+  }
+
+  // The drill-down is one request: the entries route returns the record, the
+  // first page of logs and every other retained domain together.
+  function openMatchRecord(matchId) {
+    if (!matchId) return;
+    matchRecords.view = 'detail';
+    var viewGeneration = state.viewGeneration;
+    setPage(pageHead('Match record', 'Loading the durable record and everything retained for it…') + loadingRows(6));
+    api('GET', '/console/v1/matchlogs/' + encodeURIComponent(matchId) + '/entries?limit=' + matchRecords.limit).then(function (detail) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      matchRecords.detail = detail;
+      matchRecords.entries = detail.logs || [];
+      matchRecords.entriesNext = detail.logs_next_after || null;
+      matchRecords.entriesLoading = false;
+      renderMatchDrillDown();
+    }).catch(function (error) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      ACT = {}; FORM = {};
+      setPage(pageHead('Match record', 'The record is unavailable.')
+        + '<div class="toolbar">' + backBtn('mr-back') + '</div><div class="panel">'
+        + emptyBlock('layers', 'Could not load the match record',
+          error && error.message ? error.message : 'Request failed. Refresh and try again.')
+        + '</div>');
+      ACT['mr-back'] = renderMatchRecords;
+    });
+  }
+
+  // Later pages leave the drill-down route for the match-filtered log stream:
+  // both keyset on log_id, and re-running four domain queries and their counts
+  // for every page of one of them is work nobody asked for.
+  function loadMatchEntries(reset) {
+    var detail = matchRecords.detail;
+    if (!detail || matchRecords.entriesLoading || (!reset && !matchRecords.entriesNext)) return;
+    var record = detail.record || {};
+    if (!record.match_id) return;
+    var after = reset ? null : matchRecords.entriesNext;
+    var viewGeneration = state.viewGeneration;
+    matchRecords.entriesLoading = true;
+    api('GET', '/console/v1/logs?limit=' + matchRecords.limit + '&match_id=' + encodeURIComponent(record.match_id)
+      + (after ? '&after=' + encodeURIComponent(after) : '')).then(function (page) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.detail !== detail) return;
+      matchRecords.entries = reset ? (page.items || []) : matchRecords.entries.concat(page.items || []);
+      matchRecords.entriesNext = page.next_after || null;
+      matchRecords.entriesLoading = false;
+      renderMatchEntries();
+    }).catch(function (error) {
+      if (!matchRecordsIsCurrent() || viewGeneration !== state.viewGeneration || matchRecords.detail !== detail) return;
+      matchRecords.entriesLoading = false;
+      renderMatchEntries();
+      fail(error);
+    });
+  }
+
+  function renderMatchEntries() {
+    var rows = logRowsHtml(matchRecords.entries, false);
+    if (!rows) rows = emptyRowHtml(6, 'This match wrote no script logs.');
+    setHtml('mr-entries', tableHtml(['Written', 'Level', 'Tag', 'Message', 'Payload', ''], rows));
+    setHtml('mr-entries-pager', '<span>' + esc(fmtNum(matchRecords.entries.length)) + ' loaded</span><div class="grow"></div>'
+      + (matchRecords.entriesNext ? '<button class="btn small" data-act="mr-more-entries">Load more</button>' : ''));
+  }
+
+  function renderMatchDrillDown() {
+    var detail = matchRecords.detail;
+    if (!detail) return;
+    ACT = {}; FORM = {};
+    var record = detail.record || {};
+    var counts = detail.counts || {};
+    var html = pageHead('Match ' + (record.match_id || ''),
+      'One durable record and everything the node retained under it: script logs, telemetry slices, lag reports and operator actions.')
+      + '<div class="toolbar">' + backBtn('mr-back') + '<div class="grow"></div>'
+      + '<button class="btn" data-act="mr-reload">' + svg('refresh') + 'Refresh</button></div>'
+      // No gauge key: these are exact per-match totals, and a bar scaled to the
+      // largest match an operator happened to open earlier would invent a
+      // comparison the numbers do not make.
+      + '<div class="stat-grid">'
+      + statCard('Log lines', 'scroll', counts.logs || 0, 'written by the game script')
+      + statCard('Telemetry slices', 'activity', counts.telemetry_slices || 0, 'closed authoritative reports')
+      + statCard('Lag reports', 'zap', counts.lag_reports || 0, 'derived arrival observations')
+      + statCard('Audit entries', 'key', counts.audit || 0, 'operator actions are match-exempt')
+      + '</div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Record</h2><div class="spacer"></div>' + matchStateTag(record) + '</div>'
+      + '<div class="panel-body"><table class="kv">'
+      + kv('Match ID', record.match_id || '—')
+      + kv('Node', record.node_id || '—')
+      + kv('Boot', record.boot_id || '—')
+      + kv('Room ID', record.room_id == null ? '—' : fmtNum(record.room_id))
+      + kv('Name', record.name || '—')
+      + kv('Map', record.map || '—')
+      + kv('Mode', record.mode || '—')
+      + kv('Max players', record.max_players ? fmtNum(record.max_players) : 'unlimited')
+      + kv('Peak participants', fmtNum(record.peak_participants || 0))
+      + kv('Joins', fmtNum(record.join_total || 0))
+      + kv('Opened', fmtTime(record.opened_at_unix_ms) + ' · ' + fmtUtc(record.opened_at_unix_ms))
+      + kv('Closed', record.closed_at_unix_ms ? (fmtTime(record.closed_at_unix_ms) + ' · ' + fmtUtc(record.closed_at_unix_ms)) : 'still open')
+      + kv('Termination reason', record.termination_reason || '—')
+      + (record.script_revision_id
+        ? kv('Script revision', record.script_revision_id + ' (generation ' + (record.script_generation == null ? '—' : record.script_generation) + ')')
+        : '')
+      + kv('Clock epoch', record.clock_epoch == null ? '—' : fmtNum(record.clock_epoch))
+      + '</table>'
+      + '<p class="lag-note">The result below is written by your game script and is stored verbatim. Do not write secrets into it.</p>'
+      + '<pre class="code">' + esc(jsonText(record.result_json)) + '</pre></div></div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Script logs</h2><span class="sub">newest first · keyset paged</span></div>'
+      + '<div id="mr-entries">' + loadingRows(6) + '</div>'
+      + '<div class="pager" id="mr-entries-pager"></div></div>';
+
+    var sliceRows = '';
+    (detail.telemetry_slices || []).forEach(function (r) {
+      sliceRows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(r.closed_at_unix_ms)) + '</td>'
+        + '<td class="mono">' + esc(r.report_id) + '</td>'
+        + '<td>' + esc(r.context_kind) + '</td><td>' + esc(r.close_reason) + '</td>'
+        + '<td>' + esc(fmtNum(r.duration_ms)) + ' ms</td>'
+        + '<td>' + esc(fmtNum(r.accepted_total) + ' / ' + fmtNum(r.rejected_total) + ' / ' + fmtNum(r.corrected_total)) + '</td>'
+        + '<td>' + (r.truncated ? '<span class="tag-soft off">truncated</span>' : '<span class="tag-soft on">complete</span>') + '</td></tr>';
+    });
+    if (!sliceRows) sliceRows = emptyRowHtml(7, 'No telemetry slices closed under this match.');
+    html += '<div class="panel"><div class="panel-head"><h2>Telemetry slices</h2><span class="sub">aggregate counts only · no marker text is ever retained</span></div>'
+      + tableHtml(['Closed', 'Report', 'Context', 'Close reason', 'Duration', 'Accept / Reject / Correct', 'Completeness'], sliceRows) + '</div>';
+
+    var lagRows = '';
+    (detail.lag_reports || []).forEach(function (r) {
+      lagRows += '<tr><td class="mono">' + esc(r.report_id) + '</td>'
+        + '<td class="mono">' + esc(r.capture_id || '—') + '</td>'
+        + '<td>' + lagStatusTag(r.status) + '</td>'
+        + '<td>' + esc(fmtUtc(r.created_at_unix_ms)) + '</td></tr>';
+    });
+    if (!lagRows) lagRows = emptyRowHtml(4, 'No lag reports are linked to this match.');
+    html += '<div class="panel"><div class="panel-head"><h2>Lag reports</h2><span class="sub">derived arrival observations · not RTT or packet-loss measurements</span></div>'
+      + tableHtml(['Report', 'Capture', 'Status', 'Created UTC'], lagRows) + '</div>';
+
+    var auditRows = '';
+    (detail.audit || []).forEach(function (e) {
+      auditRows += '<tr><td style="white-space:nowrap">' + esc(fmtTime(e.time_unix_ms)) + '</td>'
+        + '<td><b>' + esc(e.actor) + '</b></td>'
+        + '<td class="mono">' + esc(e.action) + '</td>'
+        + '<td>' + esc(e.target) + '</td>'
+        + '<td>' + esc(e.details) + '</td></tr>';
+    });
+    if (!auditRows) auditRows = emptyRowHtml(5, 'No operator action was recorded against this match.');
+    html += '<div class="panel"><div class="panel-head"><h2>Operator actions</h2><span class="sub">operator actions are deliberately never forced into a match, so this is usually empty</span></div>'
+      + tableHtml(['Time', 'Actor', 'Action', 'Target', 'Details'], auditRows) + '</div>';
+
+    setPage(html);
+    ACT['mr-back'] = renderMatchRecords;
+    ACT['mr-reload'] = function () { openMatchRecord(record.match_id); };
+    ACT['mr-more-entries'] = function () { loadMatchEntries(false); };
+    ACT['log-open'] = function (data) { openLog(data.log); };
+    renderMatchEntries();
+  }
+
+  // ==== Lag Diagnostics ========================================================
+  // This view intentionally renders derived arrival observations only. It never
+  // calls a raw path or treats inter-arrival spacing as RTT, loss, or a client
+  // network diagnosis. The server retains the raw CLAG lifecycle behind opaque
+  // handles for administrators only.
+  var lag = {
+    reports: [], reportsNext: null, reportsLoading: false,
+    captures: [], capturesNext: null, capturesLoading: false,
+    raw: { capture: null, items: [], next: null, loading: false }
+  };
+
+  function lagIsCurrent() { return currentRoute() === 'lag-diagnostics'; }
+  function beginLagKeysetGeneration() {
+    // Existing requests retain their captured generation. Clearing only these
+    // admission flags lets the new generation start immediately; stale
+    // completions cannot mutate them because every completion compares its
+    // captured generation first.
+    state.viewGeneration += 1;
+    lag.reportsLoading = false;
+    lag.capturesLoading = false;
+  }
+  function lagOperationContext(rawSession, capturedModalGeneration) {
+    return {
+      token: token(), sessionGeneration: state.sessionGeneration,
+      viewGeneration: state.viewGeneration, rawSession: rawSession,
+      modalGeneration: capturedModalGeneration
+    };
+  }
+  function lagOperationIsCurrent(context) {
+    return !!state.user && isAdmin()
+      && context.token === token()
+      && context.sessionGeneration === state.sessionGeneration
+      && context.viewGeneration === state.viewGeneration
+      && context.rawSession === lag.raw
+      && context.modalGeneration === modalGeneration;
+  }
+  function lagNum(value) { value = Number(value); return isFinite(value) && value >= 0 ? value : 0; }
+  function fmtMicros(value) {
+    if (value == null || !isFinite(Number(value))) return '—';
+    return fmtNum(Math.round(Number(value))) + ' µs';
+  }
+  function lagStatusTag(status) {
+    var value = String(status || 'Unknown');
+    var normalized = value.toLowerCase();
+    var cls = normalized === 'complete' ? 'on'
+      : (normalized === 'pending' || normalized === 'no_analysis' || normalized === 'no_data' ? 'off'
+        : (normalized === 'partial' || normalized === 'insufficient_samples' || normalized === 'raw_expired' || normalized === 'raw_deleted' ? 'warn' : 'bad'));
+    return '<span class="tag-soft lag-status ' + cls + '">' + esc(value) + '</span>';
+  }
+  function lagQualityTag(quality) {
+    var value = String((quality && quality.status) || 'unknown');
+    var cls = value === 'complete' ? 'on' : (value === 'partial' ? 'warn' : 'off');
+    return '<span class="tag-soft lag-status ' + cls + '">' + esc(value) + '</span>';
+  }
+  function lagRawState(item) {
+    if (!isAdmin()) return 'redacted for viewer';
+    if (item.raw_available === true) return 'retained';
+    // The v1 response deliberately exposes availability, not the private
+    // retention cause. Do not invent an expired/deleted cause from a boolean.
+    return item.raw_available === false ? 'raw unavailable (reason not provided)' : 'not retained';
+  }
+  function lagSafeError(error) {
+    if (!error) return 'Request failed. Refresh and try again.';
+    if (error.status === 403) return 'This action requires an administrator role.';
+    if (error.status === 404 || error.status === 409) return 'This artifact is no longer available. Refresh the capture list.';
+    return 'Request failed. Refresh and try again.';
+  }
+  function lagReportPath(after) {
+    return '/console/v1/lag/reports?limit=20' + (after ? '&after=' + encodeURIComponent(after) : '');
+  }
+  function lagCapturePath(after) {
+    return '/console/v1/lag/captures?limit=20' + (after ? '&after=' + encodeURIComponent(after) : '');
+  }
+
+  function renderLagDiagnostics() {
+    beginLagKeysetGeneration();
+    ACT = {}; FORM = {};
+    lag.reports = []; lag.reportsNext = null; lag.reportsLoading = false;
+    lag.captures = []; lag.capturesNext = null; lag.capturesLoading = false;
+    lag.raw = { capture: null, items: [], next: null, loading: false };
+    renderLagDashboard();
+    loadLagReports(true);
+    loadLagCaptures(true);
+  }
+
+  function loadLagReports(reset) {
+    if (lag.reportsLoading || (!reset && !lag.reportsNext)) return;
+    var after = reset ? null : lag.reportsNext;
+    var viewGeneration = state.viewGeneration;
+    lag.reportsLoading = true;
+    api('GET', lagReportPath(after)).then(function (page) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.reports = reset ? (page.items || []) : lag.reports.concat(page.items || []);
+      lag.reportsNext = page.next_after || null;
+      lag.reportsLoading = false;
+      renderLagDashboard();
+    }).catch(function (error) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.reportsLoading = false;
+      renderLagDashboard(); toast(lagSafeError(error), 'err');
+    });
+  }
+
+  function loadLagCaptures(reset) {
+    if (lag.capturesLoading || (!reset && !lag.capturesNext)) return;
+    var after = reset ? null : lag.capturesNext;
+    var viewGeneration = state.viewGeneration;
+    lag.capturesLoading = true;
+    api('GET', lagCapturePath(after)).then(function (page) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.captures = reset ? (page.items || []) : lag.captures.concat(page.items || []);
+      lag.capturesNext = page.next_after || null;
+      lag.capturesLoading = false;
+      renderLagDashboard();
+    }).catch(function (error) {
+      if (!lagIsCurrent() || viewGeneration !== state.viewGeneration) return;
+      lag.capturesLoading = false;
+      renderLagDashboard(); toast(lagSafeError(error), 'err');
+    });
+  }
+
+  function renderLagDashboard() {
+    ACT = {}; FORM = {};
+    var reports = lag.reports || [];
+    var captures = lag.captures || [];
+    var partial = reports.filter(function (report) { return String(report.status).toLowerCase() === 'partial'; }).length;
+    var unavailable = reports.filter(function (report) { return report.raw_available === false; }).length;
+    var utcLabel = reports.some(function (report) { return report.quality && report.quality.clock_uncertain; })
+      ? 'UTC correlation metadata · uncertainty present' : 'UTC correlation metadata';
+    var html = pageHead('Lag Diagnostics', 'Derived packet-arrival observations for diagnosing jitter. These metrics are not RTT or packet-loss measurements.')
+      + '<div class="toolbar"><span class="tag-soft">' + esc(utcLabel) + '</span><span class="tag-soft">derived data only</span><div class="grow"></div>'
+      + '<button class="btn" data-act="lag-refresh">' + svg('refresh') + 'Refresh</button></div>'
+      + '<div class="stat-grid">'
+      + statCard('Reports loaded', 'activity', reports.length, 'keyset page', 'lag-reports')
+      + statCard('Captures loaded', 'database', captures.length, 'keyset page', 'lag-captures')
+      + statCard('Partial reports', 'alert', partial, 'quality exclusions or recorder overflow', 'lag-partial')
+      + statCard('Raw unavailable', 'inbox', isAdmin() ? unavailable : '—', isAdmin() ? 'retention unavailable; reports remain' : 'retention is redacted', 'lag-raw')
+      + '</div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Reports</h2><span class="sub">immutable analysis output · 20 per keyset page</span></div>';
+    var reportRows = '';
+    reports.forEach(function (report) {
+      var quality = report.quality || {};
+      reportRows += '<tr class="rowlink" data-act="lag-open-report" data-report="' + esc(report.report_id) + '">'
+        + '<td class="mono">' + esc(report.report_id) + '</td>'
+        + '<td class="mono">' + esc(report.capture_id) + '</td>'
+        + '<td>' + lagStatusTag(report.status) + '</td>'
+        + '<td>' + lagQualityTag(quality) + '</td>'
+        + '<td>' + esc(fmtNum(quality.sample_count || 0)) + ' / ' + esc(fmtNum(quality.excluded_count || 0)) + '</td>'
+        + '<td>' + esc(fmtUtc(report.created_at_unix_ms)) + '</td>'
+        + '<td>' + esc(lagRawState(report)) + '</td></tr>';
+    });
+    if (!reportRows && !lag.reportsLoading) reportRows = emptyRowHtml(7, 'No derived reports are retained for this keyset.');
+    if (!reportRows) reportRows = emptyRowHtml(7, 'Loading report keyset…');
+    html += tableHtml(['Report', 'Capture', 'Status', 'Quality', 'Samples / excluded', 'Created UTC', 'Raw lifecycle'], reportRows);
+    html += '<div class="pager"><span>' + esc(fmtNum(reports.length)) + ' loaded</span><div class="grow"></div>'
+      + (lag.reportsNext ? '<button class="btn small" data-act="lag-more-reports">Load more</button>' : '') + '</div></div>';
+
+    html += '<div class="panel"><div class="panel-head"><h2>Capture overview</h2><span class="sub">report rows remain visible after raw retention ends</span></div>';
+    var captureRows = '';
+    captures.forEach(function (capture) {
+      var action = isAdmin()
+        ? '<button class="btn small" data-act="lag-open-raw" data-capture="' + esc(capture.capture_id) + '">Raw artifacts</button>'
+        : '<span class="lag-muted">viewer: no raw access</span>';
+      captureRows += '<tr><td class="mono">' + esc(capture.capture_id) + '</td>'
+        + '<td>' + esc(fmtNum(capture.generation || 0)) + '</td>'
+        + '<td>' + esc(fmtNum(capture.report_count || 0)) + '</td>'
+        + '<td>' + (capture.latest_report_status ? lagStatusTag(capture.latest_report_status) : '—') + '</td>'
+        + '<td>' + esc(lagRawState(capture)) + '</td>'
+        + '<td>' + (isAdmin() ? esc(fmtNum(capture.raw_artifact_count || 0)) + ' · ' + esc(fmtBytes(capture.raw_compressed_bytes || 0)) : 'redacted') + '</td>'
+        + '<td>' + action + '</td></tr>';
+    });
+    if (!captureRows && !lag.capturesLoading) captureRows = emptyRowHtml(7, 'No captures are retained for this keyset.');
+    if (!captureRows) captureRows = emptyRowHtml(7, 'Loading capture keyset…');
+    html += tableHtml(['Capture', 'Generation', 'Reports', 'Latest status', 'Raw lifecycle', 'Artifacts / compressed', 'Actions'], captureRows);
+    html += '<div class="pager"><span>' + esc(fmtNum(captures.length)) + ' loaded</span><div class="grow"></div>'
+      + (lag.capturesNext ? '<button class="btn small" data-act="lag-more-captures">Load more</button>' : '') + '</div></div>';
+    html += '<p class="lag-note">Report states include <span class="mono">pending</span>, <span class="mono">no_analysis</span>, <span class="mono">no_data</span>, <span class="mono">partial</span>, and <span class="mono">failed</span>; cohort quality can be <span class="mono">insufficient_samples</span>. The protocol names <span class="mono">raw_expired</span> and <span class="mono">raw_deleted</span>, while this API version exposes only raw availability and therefore does not infer either reason. Inter-arrival and identifier observations describe what the recorder accepted; none imply a network RTT or loss estimate.</p>';
+    setPage(html);
+    ACT['lag-refresh'] = function () { beginLagKeysetGeneration(); loadLagReports(true); loadLagCaptures(true); };
+    ACT['lag-more-reports'] = function () { loadLagReports(false); };
+    ACT['lag-more-captures'] = function () { loadLagCaptures(false); };
+    ACT['lag-open-report'] = function (data) { openLagReport(data.report); };
+    ACT['lag-open-raw'] = function (data) { openLagRaw(data.capture); };
+  }
+
+  function openLagReport(reportId) {
+    if (!reportId) return;
+    beginLagKeysetGeneration();
+    var generation = state.viewGeneration;
+    setPage(pageHead('Lag report', 'Loading bounded derived report details…') + loadingRows(5));
+    var base = '/console/v1/lag/reports/' + encodeURIComponent(reportId);
+    Promise.all([api('GET', base), api('GET', base + '/windows')]).then(function (responses) {
+      if (!lagIsCurrent() || generation !== state.viewGeneration) return;
+      renderLagReportDetail(responses[0], responses[1]);
+    }).catch(function (error) {
+      if (lagIsCurrent() && generation === state.viewGeneration) {
+        setPage(pageHead('Lag report', 'The report is unavailable.') + '<div class="panel">' + emptyBlock('alert', 'Could not load report', lagSafeError(error)) + '</div>');
+      }
+    });
+  }
+
+  function lagHistogram(summary) {
+    var histogram = summary.histogram || {};
+    var counts = histogram.counts || [];
+    var max = 1;
+    counts.forEach(function (count) { max = Math.max(max, lagNum(count)); });
+    var bars = '';
+    counts.forEach(function (count, index) {
+      var height = Math.max(3, Math.round((lagNum(count) / max) * 100));
+      var edge = histogram.edges_us && histogram.edges_us[index];
+      bars += '<i style="height:' + height + '%" title="≤ ' + esc(fmtMicros(edge)) + ': ' + esc(fmtNum(count)) + '"></i>';
+    });
+    if (!bars) bars = '<span class="lag-muted">No histogram samples</span>';
+    var last = histogram.edges_us && histogram.edges_us.length ? fmtMicros(histogram.edges_us[histogram.edges_us.length - 1]) : '—';
+    return '<div class="lag-bars" aria-label="Inter-arrival histogram in microseconds">' + bars + '</div>'
+      + '<div class="lag-axis"><span>0 µs</span><span>≤ ' + esc(last) + '</span><span>overflow ' + esc(fmtNum(histogram.overflow_count || 0)) + '</span></div>';
+  }
+
+  function lagCohortLabel(key) {
+    key = key || {};
+    return String(key.participant || 'participant') + ' · packet ' + String(key.packet_kind == null ? '—' : key.packet_kind)
+      + ' · ' + String(key.direction || '—') + '/' + String(key.delivery || '—') + ' · epoch ' + String(key.gameplay_epoch == null ? '—' : key.gameplay_epoch);
+  }
+
+  function lagWindowChart(windows) {
+    var max = 1;
+    windows.forEach(function (window) { max = Math.max(max, lagNum(window.mean_interarrival_us)); });
+    var html = '';
+    windows.forEach(function (window) {
+      var mean = lagNum(window.mean_interarrival_us);
+      var cls = window.arrival_reorder ? ' bad' : (window.observed_id_gap ? ' warn' : '');
+      var height = Math.max(3, Math.round((mean / max) * 100));
+      html += '<i class="' + cls + '" style="height:' + height + '%" title="'
+        + esc(fmtMicros(mean)) + ' mean inter-arrival · ' + esc(fmtNum(window.sample_count || 0)) + ' samples"></i>';
+    });
+    return html || '<span class="lag-muted">No bounded timeline windows.</span>';
+  }
+
+  function renderLagReportDetail(report, windowResponse) {
+    ACT = {}; FORM = {};
+    var quality = report.quality || {};
+    var summaries = report.summaries || [];
+    var windows = (windowResponse && windowResponse.windows) || [];
+    var html = pageHead('Lag report', 'Derived packet-arrival analysis. Values are microseconds (µs); they are not RTT or loss.')
+      + '<div class="toolbar">' + backBtn('lag-back') + '<div class="grow"></div>' + lagStatusTag(report.status) + '</div>'
+      + '<div class="stat-grid">'
+      + statCard('Accepted samples', 'activity', quality.sample_count || 0, 'derived records in this report', 'lag-samples')
+      + statCard('Excluded rows', 'alert', quality.excluded_count || 0, 'bounded decoder/analyzer exclusions', 'lag-excluded')
+      + statCard('Recorder overflow', 'inbox', quality.overwritten_count || 0, 'overwritten accepted rows', 'lag-overflow')
+      + statCard('Clock uncertainty', 'clock', quality.clock_uncertain ? 'present' : 'known', 'server UTC alignment quality', 'lag-clock')
+      + '</div>';
+    html += '<div class="panel"><div class="panel-head"><h2>Report provenance</h2><span class="sub">versioned derived result</span></div><div class="panel-body"><table class="kv">'
+      + kv('Report', report.report_id)
+      + kv('Capture', report.capture_id)
+      + kv('Generation', fmtNum(report.generation || 0))
+      + kvRaw('Analysis status', lagStatusTag(report.status))
+      + kvRaw('Metric quality', lagQualityTag(quality))
+      + kv('Decoder / analyzer', 'v' + (report.decoder_version || '—') + ' / v' + (report.analyzer_version || '—'))
+      + kv('Report created (UTC)', fmtUtc(report.created_at_unix_ms))
+      + kv('Clock uncertainty', quality.clock_uncertain ? 'UTC alignment uncertain; compare trends cautiously' : 'No initial UTC-clock uncertainty reported')
+      + kv('Malformed / overwritten', fmtNum(quality.malformed_count || 0) + ' / ' + fmtNum(quality.overwritten_count || 0))
+      + kv('Raw lifecycle', lagRawState(report))
+      + '</table></div></div>';
+    html += '<div class="panel"><div class="panel-head"><h2>Cohorts and histogram</h2><span class="sub">packet kind · direction · delivery · epoch</span></div><div class="panel-body">';
+    if (!summaries.length) html += emptyBlock('activity', 'No analysis samples', 'The report contains no bounded derived cohorts.');
+    summaries.forEach(function (summary) {
+      var cohort = summary.key || {};
+      html += '<div class="lag-cohort"><div class="cohort-key mono" title="' + esc(lagCohortLabel(cohort)) + '">' + esc(lagCohortLabel(cohort)) + '</div>'
+        + '<div><b>' + esc(fmtMicros(summary.p50_interarrival_us)) + '</b><br><span class="lag-muted">p50</span></div>'
+        + '<div><b>' + esc(fmtMicros(summary.p95_interarrival_us)) + '</b><br><span class="lag-muted">p95</span></div>'
+        + '<div><b>' + esc(fmtMicros(summary.p99_interarrival_us)) + '</b><br><span class="lag-muted">p99</span></div>'
+        + '<div><b>' + esc(fmtNum((summary.quality || {}).sample_count || 0)) + '</b><br><span class="lag-muted">samples</span></div></div>'
+        + lagHistogram(summary);
+    });
+    html += '</div></div>';
+    html += '<div class="panel"><div class="panel-head"><h2>Bounded arrival timeline</h2><span class="sub">mean inter-arrival per aggregate window</span></div><div class="panel-body">'
+      + '<div class="lag-spark" aria-label="Arrival timeline in microseconds">' + lagWindowChart(windows) + '</div>'
+      + '<div class="lag-axis"><span>first window</span><span>' + esc(fmtNum(windows.length)) + ' bounded windows' + (windowResponse && windowResponse.truncated ? ' · truncated' : '') + '</span><span>last window</span></div>'
+      + '<p class="lag-note" style="margin-top:12px">Orange bars contain observed identifier gaps; red bars contain arrival reordering. They are recorder observations, not packet-loss claims.</p></div></div>';
+    if (report.truncated) html += '<div class="notice">' + svg('alert') + '<div><b>Response projection bounded.</b> Additional cohorts were excluded from this Console response and the report quality is partial.</div></div>';
+    setPage(html);
+    ACT['lag-back'] = renderLagDiagnostics;
+  }
+
+  function rawBasePath(captureId) {
+    return '/console/v1/lag/captures/' + encodeURIComponent(captureId) + '/raw';
+  }
+  function openLagRaw(captureId) {
+    if (!isAdmin()) { toast('This action requires an administrator role.', 'err'); return; }
+    // Do not allow an in-flight report/capture list to replace this modal's
+    // action registry after it has been opened.
+    beginLagKeysetGeneration();
+    lag.raw = { capture: captureId, items: [], next: null, loading: false, modalGeneration: null };
+    lag.raw.modalGeneration = openModal('Raw diagnostic artifacts', '<p class="lag-note">Opaque handles only. Raw capture data is never embedded in this page.</p><div id="lag-raw-body">' + loadingRows(4) + '</div>');
+    loadLagRaw(true);
+  }
+  function loadLagRaw(reset) {
+    var rawSession = lag.raw;
+    if (!isAdmin() || !rawSession.capture || rawSession.loading || (!reset && !rawSession.next)) return;
+    var context = lagOperationContext(rawSession, rawSession.modalGeneration);
+    var after = reset ? null : rawSession.next;
+    rawSession.loading = true;
+    var path = rawBasePath(rawSession.capture) + '?limit=20' + (after ? '&after=' + encodeURIComponent(after) : '');
+    api('GET', path).then(function (page) {
+      if (!lagOperationIsCurrent(context) || !qs('lag-raw-body')) return;
+      rawSession.items = reset ? (page.items || []) : rawSession.items.concat(page.items || []);
+      rawSession.next = page.next_after || null;
+      rawSession.loading = false;
+      renderLagRawList();
+    }).catch(function (error) {
+      if (!lagOperationIsCurrent(context) || !qs('lag-raw-body')) return;
+      rawSession.loading = false;
+      setHtml('lag-raw-body', '<div class="inline-error" role="alert">' + esc(lagSafeError(error)) + '</div>');
+    });
+  }
+  function renderLagRawList() {
+    var rows = '';
+    lag.raw.items.forEach(function (artifact) {
+      rows += '<tr><td class="mono">' + esc(artifact.handle) + '</td><td>' + esc(fmtNum(artifact.generation || 0)) + '</td>'
+        + '<td>' + esc(fmtUtc(artifact.received_at_unix_ms)) + '</td><td>' + esc(fmtBytes(artifact.compressed_bytes || 0)) + '</td>'
+        + '<td>' + esc(fmtNum(artifact.record_count || 0)) + '</td><td><button class="btn small" data-act="lag-raw-download" data-handle="' + esc(artifact.handle) + '">' + svg('download') + 'Download</button> '
+        + '<button class="btn small" data-act="lag-raw-regenerate" data-handle="' + esc(artifact.handle) + '">' + svg('refresh') + 'Regenerate</button> '
+        + '<button class="btn small danger" data-act="lag-raw-delete" data-handle="' + esc(artifact.handle) + '" data-confirm>' + svg('trash') + 'Delete</button></td></tr>';
+    });
+    if (!rows) rows = emptyRowHtml(6, 'No retained raw artifacts for this capture.');
+    setHtml('lag-raw-body', tableHtml(['Opaque handle', 'Generation', 'Received UTC', 'Compressed', 'Records', 'Actions'], rows)
+      + '<div class="pager"><span>' + esc(fmtNum(lag.raw.items.length)) + ' loaded</span><div class="grow"></div>'
+      + (lag.raw.next ? '<button class="btn small" data-act="lag-raw-more">Load more</button>' : '') + '</div>');
+    ACT['lag-raw-more'] = function () { loadLagRaw(false); };
+    ACT['lag-raw-download'] = function (data) { downloadLagRaw(lag.raw.capture, data.handle); };
+    ACT['lag-raw-delete'] = function (data) { deleteLagRaw(lag.raw.capture, data.handle); };
+    ACT['lag-raw-regenerate'] = function (data) { openLagRegenerate(lag.raw.capture, data.handle); };
+  }
+  function downloadLagRaw(captureId, handle) {
+    if (!isAdmin()) return;
+    var context = lagOperationContext(lag.raw, lag.raw.modalGeneration);
+    var headers = { 'Accept': 'application/octet-stream', 'Authorization': 'Bearer ' + token() };
+    fetch(rawBasePath(captureId) + '/' + encodeURIComponent(handle), { headers: headers, cache: 'no-store' })
+      .then(function (response) {
+        if (!response.ok) { var error = new Error('download failed'); error.status = response.status; throw error; }
+        if (!lagOperationIsCurrent(context)) return null;
+        return response.blob();
+      }).then(function (blob) {
+        // A logout, role downgrade, route transition, or replacement modal
+        // may occur while the browser buffers the attachment. Never mint an
+        // object URL or trigger a download after that context becomes stale.
+        if (!blob || !lagOperationIsCurrent(context)) return;
+        var url = URL.createObjectURL(blob); var anchor = document.createElement('a');
+        anchor.href = url; anchor.download = 'lag-diagnostic.clag'; document.body.appendChild(anchor); anchor.click(); anchor.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        toast('Raw diagnostic download started.', 'ok');
+      }).catch(function (error) { toast(lagSafeError(error), 'err'); });
+  }
+  function deleteLagRaw(captureId, handle) {
+    if (!isAdmin()) return;
+    var context = lagOperationContext(lag.raw, lag.raw.modalGeneration);
+    api('DELETE', rawBasePath(captureId) + '/' + encodeURIComponent(handle)).then(function () {
+      if (!lagOperationIsCurrent(context)) return;
+      toast('Raw artifact deleted. Derived reports were preserved.', 'ok');
+      closeModal();
+      beginLagKeysetGeneration();
+      loadLagReports(true); loadLagCaptures(true);
+    }).catch(function (error) { if (lagOperationIsCurrent(context)) toast(lagSafeError(error), 'err'); });
+  }
+  function openLagRegenerate(captureId, handle) {
+    if (!isAdmin()) return;
+    var rawSession = lag.raw;
+    var regenerationModalGeneration = openModal('Regenerate derived report', '<p class="lag-note">This submits only an opaque handle and bounded analysis options. It does not place raw bytes or capture paths in the Console.</p>'
+      + '<form data-form="lag-regenerate"><div id="lag-regenerate-error" class="inline-error" role="alert" aria-live="polite" hidden></div>'
+      + '<input type="hidden" name="capture" value="' + esc(captureId) + '"><input type="hidden" name="handle" value="' + esc(handle) + '">'
+      + field('Send cadence (Hz, optional)', textIn('send_rate_hz', '', 'server-known only', 'number'))
+      + field('Maximum windows (1–64)', textIn('max_windows', '64', '64', 'number'))
+      + '<div class="toolbar" style="margin:0"><button class="btn primary" type="submit">' + svg('refresh') + 'Regenerate</button><button class="btn" type="button" data-act="modal-close">Cancel</button></div></form>');
+    FORM['lag-regenerate'] = function (values) {
+      var context = lagOperationContext(rawSession, regenerationModalGeneration);
+      if (!lagOperationIsCurrent(context)) return;
+      var error = qs('lag-regenerate-error');
+      var rate = values.send_rate_hz ? Number(values.send_rate_hz) : null;
+      var maxWindows = Number(values.max_windows || 64);
+      if ((rate != null && (!Number.isInteger(rate) || rate < 1 || rate > 65535)) || !Number.isInteger(maxWindows) || maxWindows < 1 || maxWindows > 64) {
+        error.textContent = 'Use a whole send cadence from 1–65535 Hz and 1–64 windows.'; error.removeAttribute('hidden'); return;
+      }
+      error.setAttribute('hidden', '');
+      api('POST', '/console/v1/lag/captures/' + encodeURIComponent(values.capture) + '/regenerate', {
+        handle: values.handle,
+        options: { send_rate_hz: rate, max_windows: maxWindows }
+      }).then(function (result) {
+        if (!lagOperationIsCurrent(context)) return;
+        closeModal(); beginLagKeysetGeneration();
+        toast(result && result.report_id ? 'Derived report regenerated.' : 'Regeneration request accepted.', 'ok');
+        loadLagReports(true); loadLagCaptures(true);
+      }).catch(function (apiError) {
+        if (!lagOperationIsCurrent(context)) return;
+        error.textContent = lagSafeError(apiError); error.removeAttribute('hidden');
+      });
+    };
+  }
+
   // ---- Section dispatch -------------------------------------------------------
   var SECTIONS = {
     status: renderStatusShell,
@@ -2209,7 +3397,12 @@ pre.code {
     leaderboards: renderLeaderboards,
     matches: renderMatches,
     purchases: renderPurchases,
+    logs: renderLogs,
+    'match-records': renderMatchRecords,
+    'lag-diagnostics': renderLagDiagnostics,
+    'telemetry-slices': renderTelemetrySlices,
     configuration: renderConfiguration,
+    'api-keys': renderApiKeys,
     api: renderApi,
     audit: renderAudit,
     errors: renderErrors
@@ -2226,6 +3419,7 @@ pre.code {
   }
 
   function logout(expired) {
+    state.sessionGeneration += 1;
     sessionStorage.removeItem(TOKEN_KEY);
     sessionStorage.removeItem(ROLE_KEY);
     state.user = null;
@@ -2260,6 +3454,7 @@ pre.code {
         }
         sessionStorage.setItem(TOKEN_KEY, x.d.token);
         sessionStorage.setItem(ROLE_KEY, x.d.role);
+        state.sessionGeneration += 1;
         state.user = { username: u, role: x.d.role };
         qs('login-pass').value = '';
         setText('login-err', '');

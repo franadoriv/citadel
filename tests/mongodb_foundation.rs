@@ -1697,6 +1697,47 @@ async fn friend_edge_validator_rejects_invalid_rows_and_is_idempotent() {
     .expect("validator reconciliation remains idempotent");
 }
 
+#[tokio::test]
+async fn api_key_validator_rejects_non_32_byte_verifiers() {
+    let Some(db) = connect_for_retry_test().await else {
+        eprintln!("skipping MongoDB API-key validator test: CITADEL_TEST_MONGODB_URL is unset");
+        return;
+    };
+    let keys = db
+        .database_for_tests()
+        .collection::<mongodb::bson::Document>("api_keys");
+    keys.delete_many(doc! { "id": { "$in": [
+        "11111111111111111111111111111111",
+        "22222222222222222222222222222222",
+    ]}})
+    .await
+    .expect("clear validator fixtures");
+
+    for (id, length) in [
+        ("11111111111111111111111111111111", 31_usize),
+        ("22222222222222222222222222222222", 33_usize),
+    ] {
+        let invalid = doc! {
+            "id": id,
+            "name": "invalid verifier fixture",
+            "scopes": ["telemetry:read"],
+            "secret_verifier": mongodb::bson::Binary {
+                subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                bytes: vec![0_u8; length],
+            },
+            "generation": 1_i64,
+            "created_at_ms": 1_i64,
+            "expires_at_ms": mongodb::bson::Bson::Null,
+            "revoked_at_ms": mongodb::bson::Bson::Null,
+            "last_used_at_ms": mongodb::bson::Bson::Null,
+        };
+        assert!(
+            keys.insert_one(invalid).await.is_err(),
+            "validator must reject a {length}-byte verifier"
+        );
+    }
+}
+
 /// Exercises the four social projections together through the public Mongo
 /// repositories.  The individual contract suites own the exhaustive domain
 /// matrices; this test guards their integration boundary: collections do not

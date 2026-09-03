@@ -43,6 +43,12 @@ format = "pretty"
 max_bytes = 8388608
 max_entries = 2000
 
+[telemetry.authoritative_decisions]
+# Process-local recorder for already-validated authoritative decisions.
+# It retains no payloads, replies, commands, corrected values, or identities.
+enabled = true
+capacity = 1024
+
 [transport.quic]
 # QUIC is the primary realtime transport (datagrams + reliable streams, TLS 1.3).
 enabled = false
@@ -128,6 +134,30 @@ allowed_hosts = []
 allowed_ports = [80, 443]
 # Only enable for an operator-controlled private integration.
 allow_private_networks = false
+
+# Server-owned receipt-validation egress. The only enabled validator is custom
+# development receipts; Apple, Google, and Huawei remain disabled until their
+# dedicated verified adapters ship. credential_env names an environment variable
+# but never places its secret value in TOML or configuration output.
+[purchases]
+max_receipt_bytes = 65536
+max_concurrent_requests = 16
+max_requests_per_minute = 120
+timeout_ms = 5000
+max_retries = 2
+allowed_hosts = ["api.storekit.itunes.apple.com", "androidpublisher.googleapis.com"]
+
+[purchases.apple]
+enabled = false
+# credential_env = "CITADEL_APPLE_PRIVATE_KEY"
+
+[purchases.google]
+enabled = false
+# credential_env = "CITADEL_GOOGLE_SERVICE_ACCOUNT_JSON"
+
+[purchases.huawei]
+enabled = false
+# credential_env = "CITADEL_HUAWEI_CLIENT_SECRET"
 
 # Secure chat fixed-window policies. Every value must be positive; limits are
 # shared by nodes that use the same durable database.
@@ -218,6 +248,86 @@ fields = ["score", "region"]
 | --- | --- | --- | --- |
 | `level` | string | `"info"` | Tracing directive. Must not be empty. |
 | `format` | enum | `"pretty"` | `"pretty"` or `"json"`. |
+
+### `[telemetry.authoritative_decisions]`
+
+This node-local recorder observes only decisions that have already passed the
+authoritative bridge validator at the gateway. It retains a bounded FIFO of
+opaque numeric match/batch/event correlations, generic `accepted`/`rejected`/
+`corrected` outcomes, and an opaque numeric rejection code when supplied. It
+never retains client payloads, replies, script commands, corrected values,
+participant IDs, or account IDs. Trusted runtime-controlled slices can derive
+private bounded reports from this recorder; the reports are visible only through
+the authenticated operator console and never through a public endpoint.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Composes the process-local recorder at application startup. |
+| `capacity` | integer | `1024` | Retained records; must be `1..=100000` when enabled. On overflow, the oldest record is deterministically evicted first. |
+
+
+### `[telemetry.slices]`
+
+Trusted embedded runtime logic can open, mark, and finish a telemetry slice for
+the server-owned room context of its active invocation. The lifecycle APIs take
+no room or match identifier. This allows a game to choose diagnostic windows without
+making Citadel assume that a room is a short-lived match. The API receives the
+Citadel-created runtime context rather than a client-provided match, session,
+account, report, or payload identifier. Like the other runtime host APIs, this
+is a trusted server-script boundary; it is not a sandbox for malicious scripts.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `max_active` | `32` | Maximum active process-local slices; the oldest is closed when the bound is reached. |
+| `max_markers` | `32` | Maximum namespaced marker names retained per slice. |
+| `ttl_ms` | `300000` | Maximum slice duration, `1..=86400000` ms. Expired slices close during normal service maintenance or an operator report read. |
+| `max_closed_reports` | `128` | FIFO retention limit for redacted closed reports. |
+
+Closed reports are available only to authenticated console operators at
+`/console/v1/telemetry/slices`; each read is audited. They contain generic
+decision totals, marker counts, close reason, duration, and a truncation
+indicator. Marker text is never retained. They never contain raw payloads, player identity, account data,
+replies, commands, or corrected values.
+
+
+### Durable log tables
+
+SQLite, PostgreSQL, and CockroachDB carry four tables for durable server
+history, plus a nullable `match_id` column on `lag_diagnostic_reports`:
+
+| Table | Holds | Never holds |
+| --- | --- | --- |
+| `matches` | The server-owned shape of a match: room, map, mode, player cap, open and close time, termination reason, and a script-supplied `result_json`. | Participant identities, account ids, session or transport identifiers. |
+| `match_logs` | Your game script's own log lines — level, tag, message, and a verbatim `payload_json`. | Credentials, bearer tokens, session ids, participant ids. |
+| `console_audit_entries` | The console action trail: who acted, with which role and credential id, what they did, on what, and when. | Passwords, bearer tokens, API-key secrets, console session tokens, raw request or response payloads. |
+| `telemetry_slice_reports` | Aggregate slice outcomes: close reason, duration, marker count, truncation flag, and accepted/rejected/corrected totals. | Marker text, event payloads, participant or account identity, replies, commands, corrected values. |
+
+Three facts about these tables are deliberate and worth knowing before you plan
+around them:
+
+- **The server owns match open and close.** A game script can never open or
+  close a match record; its only influence is stamping `result_json` on a match
+  that is still open. That is what makes the record trustworthy as evidence.
+- **`match_id` is nullable everywhere.** A game with no match concept — an
+  MMORPG world, a global scheduled job — still writes logs; the row simply
+  carries no match. A log outside a match is stored, never rejected.
+- **Operator actions are not match-scoped.** `console_audit_entries.match_id`
+  exists but is almost always empty, and nothing forces an operator action into
+  a match.
+
+`credential_id` is a public machine-credential identifier, but the database
+explorer auto-redacts any column whose name contains `credential`, so it appears
+redacted there. That is expected, not a defect.
+
+**On the in-memory and MongoDB backends none of this is persisted.** Those
+backends expose no durable log capability: audit entries and telemetry slices
+stay in their bounded in-process rings, script log writes are dropped at the
+sink with a counter, and no match rows are created.
+
+`lag_diagnostic_reports.match_id` ships as a working read filter over a column
+nothing populates yet: a lag capture is node-scoped, so associating one with a
+match is separate work. Treat it as always empty for now.
+
 
 ### `[errors]`
 
@@ -577,6 +687,30 @@ outstanding async handles per runtime. Network/runtime results returned by
 `poll` use stable, redacted `error_code` values. Local language argument or
 option validation can instead raise a language-visible validation message.
 
+### `[purchases]`
+
+Server-owned receipt-validation policy. This foundation never gives a game
+runtime a provider credential, a raw socket, or a way to bypass the configured
+HTTPS hosts. It applies a receipt-size cap before provider dispatch, blocks
+redirects/proxies/private-network targets through the shared client, records
+aggregate-only validation metrics, and exposes only sanitized failures.
+
+All real providers are intentionally disabled in this release. Setting
+`apple.enabled`, `google.enabled`, or `huawei.enabled` to `true` is a config
+error until that provider's verified adapter lands. The custom deterministic
+validator remains available for local prototypes and console tests.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `max_receipt_bytes` | integer | `65536` | Raw receipt cap before parsing or egress; must be `1..=1048576`. |
+| `max_concurrent_requests` | integer | `16` | Server-owned simultaneous provider request bound; must be `1..=1024`. |
+| `max_requests_per_minute` | integer | `120` | Server-owned rolling 60-second provider request bound; must be `1..=1000000`. |
+| `timeout_ms` | integer | `5000` | Per-provider request deadline; must be `1..=60000`. |
+| `max_retries` | integer | `2` | Reserved retry budget for future explicitly idempotent provider operations; `0..=3`. This foundation never retries arbitrary POSTs. |
+| `allowed_hosts` | hostname array | Apple/Google endpoints | Exact public DNS host allowlist; required, at most 16 entries. HTTPS port 443 only. |
+| `apple.enabled`, `google.enabled`, `huawei.enabled` | bool | `false` | Rejected if `true` until each provider adapter ships. |
+| `*.credential_env` | optional string | unset | Environment-variable **name** for a future provider credential; no credential value is accepted in TOML. |
+
 Restart the node after changing this policy. Validate the exact
 `citadel.toml` before deployment:
 
@@ -668,6 +802,41 @@ not write the data tree; use operating-system permissions or a read-only volume
 when the operator also needs to prevent other local processes from editing it.
 See [Use shared static gameplay data](/guides/static-game-data/) for the ordered
 setup and reload workflow.
+
+### `[lag_diagnostics]`
+
+Optional, server-owned ingestion for the explicit JavaScript lag-recorder
+debug feature. It is disabled by default. It has no player-facing HTTP API and
+does not enable recording remotely: opted-in, authenticated SDKs still require
+a trusted native `START` followed by a per-client `FLUSH` grant. See
+[Lag diagnostics operations](/reference/operations/lag-diagnostics/) for the
+collection lifecycle and metric limitations.
+
+Raw ingestion is node-local private filesystem storage. Derived analysis and
+the report Console require the SQLite, PostgreSQL, or CockroachDB report
+adapter. A MongoDB deployment may collect raw artifacts only; `analyze = true`
+is rejected fail-closed until MongoDB gains a durable report adapter. Set
+`analyze = false` for MongoDB captures.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Enables trusted capture control and state-gated ingest. Disabled nodes reject uploads. |
+| `raw_root` | absolute path | *(unset)* | Required when enabled. Private root for staging, manifests, leases, and compressed raw artifacts; never configure a served/public path. |
+| `active_key_id` | string | *(unset)* | Required when enabled. Selects the signing key for new one-use uploads. |
+| `upload_hmac_keys` | object | `{}` | Base64url-without-padding HMAC-SHA256 keyring. The active decoded key must be at least 32 bytes and is redacted from diagnostics. |
+| `allowed_origins` | string array | `[]` | Exact HTTPS browser origins; loopback HTTP is allowed only for local development. Empty disables CORS. Wildcards, paths, queries, and fragments are rejected. |
+| `max_compressed_bytes` | integer | `4194304` | Global gzip upload cap; every grant can narrow it. |
+| `max_decompressed_bytes` | integer | `67108864` | Bounded post-gzip `CLAG` validation cap. |
+| `max_decompression_ratio` | integer | `32` | Maximum decompressed/compressed expansion ratio (1–128). |
+| `max_concurrent_uploads` | integer | `4` | Node-local concurrent upload admissions (1–64). |
+| `max_raw_bytes` | integer | `4294967296` | Node-local raw-root quota; must cover at least one maximum upload. |
+| `retention_hours` | integer | `168` | Raw-artifact retention period (1 through 8760 hours). Derived reports may remain after raw removal. |
+| `shared_raw_store` | bool | `false` | Reserved compatibility field. It does not enable clustering today. |
+
+The current lease, replay-marker, recovery, and capture-control implementation
+is node-local. Therefore `lag_diagnostics.enabled = true` is rejected whenever
+`cluster.enabled = true`, even if `shared_raw_store` is set. This is a
+fail-closed safety rule, not a request to place raw files in the database.
 
 ### `[console]`
 
