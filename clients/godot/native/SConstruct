@@ -30,8 +30,10 @@ if os.name == "nt":
     # dependency also resolves GetAdaptersAddresses from iphlpapi. Current std
     # resolves GetUserProfileDirectoryW (userenv) for env::home_dir, and getrandom
     # resolves SystemFunction036 (advapi32); both must be linked when the Rust
-    # archive is pulled into the GDExtension.
-    env.Append(LIBS=["ntdll", "iphlpapi", "userenv", "advapi32"])
+    # archive is pulled into the GDExtension. rustls-platform-verifier also
+    # imports CryptoAPI certificate-chain functions (crypt32), while current
+    # getrandom uses BCryptGenRandom (bcrypt).
+    env.Append(LIBS=["ntdll", "iphlpapi", "userenv", "advapi32", "crypt32", "bcrypt"])
 
 sources = Glob("src/*.cpp")
 library = env.SharedLibrary(
