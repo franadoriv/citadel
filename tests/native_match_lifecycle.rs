@@ -12,13 +12,13 @@ use citadel::realtime::registry::{Outbound, ParticipantIdentity, SessionHandle};
 use citadel::realtime::rooms::{JoinError, MATCH_ID_PREFIX};
 use citadel::realtime::{Gateway, ParticipantId, RoomLabel};
 use citadel::runtime::{
-    LifecycleHook, NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE, NativeMatchContext,
-    NativeMatchLifecycleHook, NativeMatchLifecycleUnavailable, OutboundCommand, RoomSpec,
-    RpcOutcome, Runtime, RuntimeIntrospection,
+    GameScriptReadiness, LifecycleHook, NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+    NativeMatchContext, NativeMatchLifecycleHook, NativeMatchLifecycleUnavailable, OutboundCommand,
+    RoomSpec, RpcOutcome, Runtime, RuntimeIntrospection,
 };
 use citadel::session::SessionId;
 use citadel::storage::UserId;
-use citadel::time::TimestampMillis;
+use citadel::time::{Clock, SystemClock, TimestampMillis};
 use citadel::transport::TransportKind;
 use citadel_wire::Envelope;
 use citadel_wire::protocol::{
@@ -194,8 +194,11 @@ fn unsupported_native_lifecycle_rejects_room_create_before_match_creation() {
         events: Mutex::new(Vec::new()),
         native_lifecycle_available: false,
     });
+    let readiness = Arc::new(GameScriptReadiness::new(SystemClock.now()));
+    readiness.record_loaded("sha256:unsupported", Clock::now(&SystemClock));
     let gateway =
-        Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime.clone()));
+        Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime.clone()))
+            .with_script_readiness(readiness);
     let participant = gateway.next_participant_id();
     let (outbound, mut receiver) = mpsc::channel(8);
     gateway.register_session(SessionHandle {
@@ -237,8 +240,11 @@ fn unsupported_native_lifecycle_refuses_trusted_room_boundaries_before_mutation(
         events: Mutex::new(Vec::new()),
         native_lifecycle_available: false,
     });
+    let readiness = Arc::new(GameScriptReadiness::new(SystemClock.now()));
+    readiness.record_loaded("sha256:unsupported", Clock::now(&SystemClock));
     let gateway =
-        Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime.clone()));
+        Gateway::with_metrics_and_runtime(Arc::new(NodeMetrics::new()), Some(runtime.clone()))
+            .with_script_readiness(readiness);
     let participant = register(&gateway);
 
     assert_eq!(

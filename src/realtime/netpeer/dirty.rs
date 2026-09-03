@@ -61,9 +61,7 @@ impl DirtyMask {
 
     /// Clear every bit.
     pub fn clear(&mut self) {
-        for w in &mut self.words {
-            *w = 0;
-        }
+        self.words.fill(0);
     }
 
     /// Whether no bit is set.

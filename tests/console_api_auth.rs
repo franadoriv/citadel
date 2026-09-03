@@ -600,7 +600,11 @@ async fn matches_listing_fails_closed_under_the_script_readiness_gate() {
     use citadel::runtime::GameScriptReadiness;
     use citadel::time::{Clock, SystemClock};
 
-    let app = App::new(console_config());
+    let mut config = console_config();
+    config.runtime.enabled = true;
+    config.runtime.require_script = true;
+    config.validate().expect("strict runtime config validates");
+    let app = App::new(config);
     let (addr, tx, server) = spawn_server(app.clone()).await;
     let token = login(addr, "ops", "operator-secret")
         .await

@@ -289,24 +289,24 @@ async fn handle_session(
     }
     tracing::debug!(%session_id, authenticated, "WebTransport session authenticated; registered");
 
-    if handshake.replay_first {
-        if !route_envelope(
+    if handshake.replay_first
+        && !route_envelope(
             session_id,
             first,
             &metrics,
             &gateway,
             &superseded,
             &supersession_gate,
-        ) {
-            session.close(0, b"session replaced");
-            if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
-                inbound_supersession_drained.cancelled().await;
-            }
-            gateway.unregister_session(session_id);
-            metrics.connection_closed();
-            gateway.connection_closed();
-            return Ok(());
+        )
+    {
+        session.close(0, b"session replaced");
+        if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+            inbound_supersession_drained.cancelled().await;
         }
+        gateway.unregister_session(session_id);
+        metrics.connection_closed();
+        gateway.connection_closed();
+        return Ok(());
     }
     for env in queued {
         if !route_envelope(
@@ -690,6 +690,7 @@ async fn send_reliable_envelope(session: &Session, env: &Envelope) {
 
 /// Drain the gateway-fed outbound channel to the session: unreliable envelopes
 /// go as datagrams, reliable ones as fresh uni streams.
+#[allow(clippy::too_many_arguments)]
 async fn outbound_writer(
     session: Session,
     mut rx: mpsc::Receiver<Outbound>,

@@ -569,8 +569,10 @@ mod tests {
 
     #[tokio::test]
     async fn composite_validator_rejects_oversized_receipts_before_provider_dispatch() {
-        let mut config = PurchaseValidationConfig::default();
-        config.max_receipt_bytes = 3;
+        let config = PurchaseValidationConfig {
+            max_receipt_bytes: 3,
+            ..PurchaseValidationConfig::default()
+        };
         let validator =
             CompositeReceiptValidator::from_config(&config, Arc::new(NodeMetrics::new()));
 

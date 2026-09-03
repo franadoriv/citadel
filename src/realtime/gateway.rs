@@ -4183,30 +4183,28 @@ impl Gateway {
                     self.sync_party_presence_for_session(user_id, id);
                 }
             }
-            if initialize_replication {
-                if let Some(rep) = &self.rep {
-                    let room_bound = {
-                        let _scope = self.lock_room_scope();
-                        let assigned_room = self
-                            .rep_rooms
-                            .lock()
-                            .ok()
-                            .and_then(|bindings| bindings.connections.get(&id).copied());
-                        if let Some(room_id) = assigned_room {
-                            self.bind_rep_connection_to_room_under_scope(id, room_id);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if room_bound {
-                        let _ = self.send_rep_bootstrap(id);
-                    } else if self.bridge.is_some() && !rep.is_joined(id.get()) {
-                        let _ = self.send_rep_schema(id);
-                    } else if self.bridge.is_none() {
-                        rep.join_match(id.get(), 0, self.registry.user_id_of(id).is_none());
-                        let _ = self.send_rep_bootstrap(id);
+            if initialize_replication && let Some(rep) = &self.rep {
+                let room_bound = {
+                    let _scope = self.lock_room_scope();
+                    let assigned_room = self
+                        .rep_rooms
+                        .lock()
+                        .ok()
+                        .and_then(|bindings| bindings.connections.get(&id).copied());
+                    if let Some(room_id) = assigned_room {
+                        self.bind_rep_connection_to_room_under_scope(id, room_id);
+                        true
+                    } else {
+                        false
                     }
+                };
+                if room_bound {
+                    let _ = self.send_rep_bootstrap(id);
+                } else if self.bridge.is_some() && !rep.is_joined(id.get()) {
+                    let _ = self.send_rep_schema(id);
+                } else if self.bridge.is_none() {
+                    rep.join_match(id.get(), 0, self.registry.user_id_of(id).is_none());
+                    let _ = self.send_rep_bootstrap(id);
                 }
             }
             self.dispatch_lifecycle(LifecycleHook::Join, id);
@@ -7753,7 +7751,7 @@ impl Gateway {
                             }
                         }
                     };
-                    return self.join_and_reply(sender, existing.id, binding);
+                    return self.join_and_reply(sender, existing.id, binding, KIND_ROOM_CREATE);
                 }
                 let (label, requested_mode) = self.room_spec_for_create(sender, &create.params);
                 let (bridge_mode, binding) = match requested_mode {
@@ -7761,6 +7759,13 @@ impl Gateway {
                     RoomBridgeMode::Relay => {
                         // `require_script` remains deployment-wide strict: it
                         // upgrades the compatibility default to authoritative.
+                        if self.require_authoritative_match_lifecycle().is_err() {
+                            return self.reply_room_reject_with_reason(
+                                sender,
+                                KIND_ROOM_CREATE,
+                                NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
+                            );
+                        }
                         match self.script_gate(ScriptGateSurface::RoomCreate) {
                             Ok(Some(binding)) => (BridgeMode::Authoritative, Some(binding)),
                             Ok(None) | Err(()) => {
@@ -7883,7 +7888,7 @@ impl Gateway {
                         return 0;
                     }
                 }
-                self.join_and_reply(sender, join.room_id, binding)
+                self.join_and_reply(sender, join.room_id, binding, KIND_ROOM_JOIN)
             }
             KIND_ROOM_LEAVE => {
                 if RoomLeave::decode(&env.body).is_err() {
@@ -7916,13 +7921,14 @@ impl Gateway {
         sender: ParticipantId,
         room_id: RoomId,
         binding: Option<ScriptBinding>,
+        request_kind: u16,
     ) -> usize {
         if self.rooms.bridge_mode(room_id) == Some(BridgeMode::Authoritative)
             && self.require_authoritative_match_lifecycle().is_err()
         {
             return self.reply_room_reject_with_reason(
                 sender,
-                KIND_ROOM_JOIN,
+                request_kind,
                 NATIVE_MATCH_LIFECYCLE_UNAVAILABLE_MESSAGE,
             );
         }
@@ -7943,7 +7949,7 @@ impl Gateway {
                 self.dispatch_local_match_admission(sender, previous, room_id, false);
                 self.reply_joined(sender, room_id, label)
             }
-            Err(JoinError::StaleScript) => self.reply_room_reject(sender, KIND_ROOM_JOIN),
+            Err(JoinError::StaleScript) => self.reply_room_reject(sender, request_kind),
             Err(reason) => {
                 tracing::debug!(
                     participant = sender.get(),
@@ -13761,6 +13767,7 @@ mod transform_tests {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)]
     use super::*;
     use crate::realtime::auth::RejectReason;
     use crate::realtime::registry::{ParticipantIdentity, SessionHandle};
@@ -17863,10 +17870,13 @@ mod script_gate_tests {
 
     #[tokio::test]
     async fn unsupported_native_lifecycle_refuses_local_and_remote_handoffs_before_mutation() {
+        let readiness = boot_readiness();
+        readiness.record_loaded("sha256:unsupported", now());
         let gw = Gateway::with_metrics_and_runtime(
             Arc::new(NodeMetrics::new()),
             Some(Arc::new(UnsupportedNativeLifecycleRuntime)),
-        );
+        )
+        .with_script_readiness(readiness);
         let (alice, mut replies) = register(&gw, Some("alice"));
 
         assert_eq!(

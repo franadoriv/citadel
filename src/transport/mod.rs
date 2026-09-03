@@ -1325,6 +1325,7 @@ fn build_external_runtime(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_runtime(
     config: &Config,
     domain: Option<Arc<dyn crate::runtime::DomainHost>>,
@@ -1526,6 +1527,7 @@ fn build_runtime_with_readiness(
 }
 
 #[cfg(feature = "runtime-python")]
+#[allow(clippy::too_many_arguments)]
 fn load_python_runtime(
     rc: &crate::config::RuntimeConfig,
     domain: Option<Arc<dyn crate::runtime::DomainHost>>,
@@ -1583,6 +1585,7 @@ fn load_python_runtime(
 }
 
 #[cfg(not(feature = "runtime-python"))]
+#[allow(clippy::too_many_arguments)]
 fn load_python_runtime(
     rc: &crate::config::RuntimeConfig,
     _domain: Option<Arc<dyn crate::runtime::DomainHost>>,
@@ -1603,6 +1606,7 @@ fn load_python_runtime(
 }
 
 #[cfg(feature = "runtime-js")]
+#[allow(clippy::too_many_arguments)]
 fn load_js_runtime(
     rc: &crate::config::RuntimeConfig,
     domain: Option<Arc<dyn crate::runtime::DomainHost>>,
@@ -1660,6 +1664,7 @@ fn load_js_runtime(
 }
 
 #[cfg(not(feature = "runtime-js"))]
+#[allow(clippy::too_many_arguments)]
 fn load_js_runtime(
     rc: &crate::config::RuntimeConfig,
     _domain: Option<Arc<dyn crate::runtime::DomainHost>>,

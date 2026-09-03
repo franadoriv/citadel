@@ -43,11 +43,18 @@ async fn websocket_sdk_relays_to_other_client() {
         .await
         .expect("A sends");
 
-    let relayed = tokio::time::timeout(Duration::from_secs(5), b.recv())
-        .await
-        .expect("B recv did not time out")
-        .expect("recv ok")
-        .expect("an envelope");
+    // The server may emit diagnostics clock frames independently of relay
+    // traffic. Drain those unrelated control frames until the peer relay arrives.
+    let relayed = loop {
+        let envelope = tokio::time::timeout(Duration::from_secs(5), b.recv())
+            .await
+            .expect("B recv did not time out")
+            .expect("recv ok")
+            .expect("an envelope");
+        if envelope.kind == KIND_PEER_POSITION {
+            break envelope;
+        }
+    };
     assert_eq!(relayed.kind, KIND_PEER_POSITION);
     let (_sender, rest) = split_sender(&relayed.body).expect("tagged");
     assert_eq!(rest, &payload[..]);

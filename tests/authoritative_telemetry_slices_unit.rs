@@ -179,6 +179,7 @@ fn active_runtime_scope_is_server_set_and_can_be_cleared() {
 }
 
 #[test]
+#[allow(clippy::panic)]
 fn runtime_scope_guard_overrides_and_restores_a_prior_scope() {
     set_active_runtime_scope(Some(41));
     {

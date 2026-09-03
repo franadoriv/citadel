@@ -366,8 +366,8 @@ async fn handle_connection(
     let result: AppResult<()> = async {
         // Replay the first frame for a pre-handshake (legacy) client, then any
         // frames batched behind it, so nothing sent before registration is lost.
-        if handshake.replay_first {
-            if !route_envelope(
+        if handshake.replay_first
+            && !route_envelope(
                 session_id,
                 first,
                 &metrics,
@@ -377,7 +377,6 @@ async fn handle_connection(
             ) {
                 return Ok(());
             }
-        }
         for env in queued {
             if !route_envelope(
                 session_id,
@@ -519,7 +518,7 @@ async fn handle_connection(
                                 break;
                             }
                         }
-                        Message::Pong(_) => {
+                        Message::Pong(_)
                             if pong_deadline.is_some()
                                 && route_pong_received(
                                     &metrics,
@@ -527,10 +526,9 @@ async fn handle_connection(
                                     &superseded,
                                     &supersession_gate,
                                 )
-                            {
+                            => {
                                 pong_deadline = None;
                             }
-                        }
                         // Text and other frames are ignored in the binary-only MVP.
                         _ => {}
                     }

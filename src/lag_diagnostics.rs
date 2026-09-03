@@ -1927,7 +1927,7 @@ fn decode_capture_label(value: &str) -> Option<[u8; 16]> {
         return None;
     }
     let mut bytes = [0_u8; 16];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = (chunk[0] as char).to_digit(16)? as u8;
         let low = (chunk[1] as char).to_digit(16)? as u8;
         bytes[index] = high << 4 | low;
@@ -2026,9 +2026,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::Write as _;
 
-    use base64::Engine as _;
     use flate2::Compression;
     use flate2::write::GzEncoder;
 

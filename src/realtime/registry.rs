@@ -841,6 +841,7 @@ impl SessionRegistry {
         self.register_authenticated_at(handle, initials, now, user_id, session_id, || {}, || {})
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_authenticated_at<F, H>(
         &self,
         handle: SessionHandle,
@@ -1804,6 +1805,7 @@ impl SessionRegistry {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock, clippy::panic)]
     use super::*;
 
     fn handle(id: u64, kind: TransportKind) -> (SessionHandle, mpsc::Receiver<Outbound>) {

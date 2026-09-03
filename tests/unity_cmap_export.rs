@@ -13,7 +13,9 @@ fn fixture_bytes() -> Vec<u8> {
         .filter(|character| !character.is_whitespace())
         .collect::<String>()
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hex = std::str::from_utf8(pair).expect("fixture hex is UTF-8");
             u8::from_str_radix(hex, 16).expect("fixture contains valid hexadecimal")

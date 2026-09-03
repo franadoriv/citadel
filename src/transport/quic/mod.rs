@@ -346,8 +346,8 @@ async fn handle_connection(
     );
 
     // Replay the first frame for a legacy client, then any queued frames.
-    if handshake.replay_first {
-        if !route_envelope(
+    if handshake.replay_first
+        && !route_envelope(
             session_id,
             first,
             &metrics,
@@ -355,16 +355,16 @@ async fn handle_connection(
             &superseded,
             &superseding,
             &supersession_gate,
-        ) {
-            connection.close(0u32.into(), b"session replaced");
-            if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
-                inbound_supersession_drained.cancelled().await;
-            }
-            gateway.unregister_session(session_id);
-            metrics.connection_closed();
-            gateway.connection_closed();
-            return Ok(());
+        )
+    {
+        connection.close(0u32.into(), b"session replaced");
+        if superseded.is_cancelled() || superseding.load(std::sync::atomic::Ordering::Acquire) {
+            inbound_supersession_drained.cancelled().await;
         }
+        gateway.unregister_session(session_id);
+        metrics.connection_closed();
+        gateway.connection_closed();
+        return Ok(());
     }
     for env in queued {
         if !route_envelope(
@@ -542,6 +542,7 @@ fn route_envelope(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_envelope_with_before_handoff<F>(
     session_id: crate::realtime::ParticipantId,
     env: &Envelope,
@@ -658,6 +659,7 @@ fn route_framed_envelope(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_framed_envelope_with_before_decode<F>(
     session_id: crate::realtime::ParticipantId,
     buf: &mut BytesMut,
@@ -783,6 +785,7 @@ async fn send_reliable_envelope(connection: &QuinnConnection, env: &Envelope) {
 
 /// Drain the gateway-fed outbound channel to the socket: unreliable envelopes go
 /// as datagrams, reliable ones as fresh uni streams.
+#[allow(clippy::too_many_arguments)]
 async fn outbound_writer(
     connection: QuinnConnection,
     mut rx: mpsc::Receiver<Outbound>,

@@ -288,8 +288,13 @@ fn ffi_send_poll_relay_round_trip() {
         };
         if status == CitadelStatus::Ok {
             assert!(!truncated, "256 bytes is plenty for the test payload");
-            got = Some((out_kind, buf[..out_len].to_vec()));
-            break;
+            // Diagnostics control frames may arrive independently of relay
+            // traffic; keep polling until the peer-position relay arrives.
+            if out_kind == KIND_PEER_POSITION {
+                got = Some((out_kind, buf[..out_len].to_vec()));
+                break;
+            }
+            continue;
         }
         assert_eq!(
             status,
@@ -368,8 +373,13 @@ fn ffi_quic_receives_reliable_uni_stream_frames() {
             )
         };
         if status == CitadelStatus::Ok {
-            got = Some((out_kind, buf[..out_len].to_vec()));
-            break;
+            // Diagnostics control frames may arrive independently of relay
+            // traffic; keep polling until the peer-position relay arrives.
+            if out_kind == KIND_PEER_POSITION {
+                got = Some((out_kind, buf[..out_len].to_vec()));
+                break;
+            }
+            continue;
         }
         assert_eq!(status, CitadelStatus::Again, "poll should be Ok or Again");
         std::thread::sleep(Duration::from_millis(20));
